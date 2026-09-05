@@ -19,7 +19,7 @@ final class StreamSessionViewModel: ObservableObject {
 
     private let browser = BonjourBrowser()
     private let audioSession = AudioSessionManager()
-    private let backgroundPlayback = BackgroundPlaybackCoordinator()
+    private let backgroundPlayback = BackgroundPlaybackCoordinator.shared
     private var streamSession: StreamSession?
     private var connectTask: Task<Void, Never>?
     private var metricsTask: Task<Void, Never>?

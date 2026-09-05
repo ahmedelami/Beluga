@@ -3441,6 +3441,17 @@ enum WebRTCIPhoneMicrophoneTrackCreationPolicy {
 public actor WebRTCPeer {
     private static let controlHistoryLimit = 256
     private static let inputHistoryLimit = 256
+    private static let remoteMediaHistoryLimit = 256
+    private static let remoteMediaAcknowledgementRetryDelays: [Duration] = [
+        .milliseconds(50),
+        .milliseconds(100),
+        .milliseconds(200),
+        .milliseconds(400),
+        .milliseconds(800),
+        .seconds(1),
+        .seconds(1),
+        .seconds(1),
+    ]
     private static let retiredScreenMediaAttemptLimit = 64
     private static let maximumPendingRemoteCandidateCount = 256
     private static let maximumCandidateBytes = 8_192
@@ -3471,6 +3482,7 @@ public actor WebRTCPeer {
 
     private let role: RemotePeerRole
     private let configuredMaximumVideoBitrate: Int?
+    private let remoteMediaControlsCapabilityIsLocallyAvailable: Bool
     private let eventContinuation: AsyncStream<WebRTCTransportEvent>.Continuation
     private let screenClientDiagnosticsEventContinuation:
         AsyncStream<WebRTCScreenClientDiagnosticsEvent>.Continuation
@@ -3658,6 +3670,39 @@ public actor WebRTCPeer {
     // Client diagnostics use a distinct unreliable lane so malformed or backpressured telemetry
     // can never revoke input or mutate the ordered screen-media state machine.
     private var screenClientDiagnosticsNegotiationEpoch: UInt64?
+    // Remote media uses its own replay histories and an exact SDP echo. Unknown message kinds are
+    // never sent to an older peer sharing the strict v2 control-channel envelope.
+    private var remoteMediaControlsNegotiationEpoch: UInt64?
+    private var pendingRemoteMediaAuthorization:
+        WebRTCRemoteMediaAuthorization?
+    private var activeRemoteMediaAuthorization:
+        WebRTCRemoteMediaAuthorization?
+    private var activeRemoteMediaCommandAuthorization: WebRTCControlAuthorization?
+    private var nextRemoteMediaCommandID: UInt64 = 1
+    private var sentRemoteMediaCommands: [UInt64: WebRTCRemoteMediaCommandRequest] = [:]
+    private var sentRemoteMediaCommandOrder: [UInt64] = []
+    private var receivedRemoteMediaCommandAcknowledgements:
+        [UInt64: WebRTCRemoteMediaCommandAcknowledgement] = [:]
+    private var highestReceivedRemoteMediaCommandID: UInt64?
+    private var receivedRemoteMediaCommands:
+        [UInt64: WebRTCRemoteMediaCommandRequest] = [:]
+    private var receivedRemoteMediaCommandOrder: [UInt64] = []
+    private var sentRemoteMediaCommandAcknowledgements:
+        [UInt64: WebRTCRemoteMediaCommandAcknowledgement] = [:]
+    // A terminal acknowledgement is cached before its first send. Until delivery succeeds it is
+    // non-evictable and retried only under the exact negotiation authorization that created it.
+    private var pendingRemoteMediaCommandAcknowledgementIDs: [UInt64] = []
+    private var remoteMediaAcknowledgementRetryTask: Task<Void, Never>?
+    private var remoteMediaAcknowledgementRetryToken: UUID?
+    #if DEBUG
+    private var debugRemoteMediaAcknowledgementSendFailuresRemaining = 0
+    private var debugRemoteMediaAcknowledgementRetryDelay: Duration?
+    private var debugRemoteMediaAcknowledgementsReceived = 0
+    #endif
+    private var highestSentRemoteMediaStateRevision: UInt64 = 0
+    private var highestReceivedRemoteMediaStateRevision: UInt64 = 0
+    private var lastSentRemoteMediaStateUpdate:
+        WebRTCRemoteMediaStateUpdate?
     private var screenClientDiagnosticsCapabilityIsLocallyAvailable = false
     private var highestSentScreenClientDiagnosticsSequence: UInt64 = 0
     private var highestReceivedScreenClientDiagnosticsSequence: UInt64 = 0
@@ -3754,6 +3799,8 @@ public actor WebRTCPeer {
             probeEventPair.continuation
         let probeEventContinuation = probeEventPair.continuation
         role = configuration.role
+        remoteMediaControlsCapabilityIsLocallyAvailable =
+            configuration.supportsRemoteMediaControls
         // A viewer can receive the host-created optional channel. A host advertises support only
         // after native allocation of that channel succeeds below.
         screenClientDiagnosticsCapabilityIsLocallyAvailable =
@@ -4233,6 +4280,7 @@ public actor WebRTCPeer {
         delegateEventTask?.cancel()
         screenDiagnosticsDelegateEventTask?.cancel()
         screenVideoEncoderProbeEventTask?.cancel()
+        remoteMediaAcknowledgementRetryTask?.cancel()
         screenVideoEncoderProbeEventContinuation.finish()
         screenClientDiagnosticsEventContinuation.finish()
         delegateProxy.close()
@@ -4262,6 +4310,10 @@ public actor WebRTCPeer {
         resetMacHostedCallEvidenceNegotiation()
         resetScreenMediaSuspensionNegotiation()
         resetScreenClientDiagnosticsNegotiation()
+        resetRemoteMediaControlsNegotiation()
+        if remoteMediaControlsCapabilityIsLocallyAvailable {
+            pendingRemoteMediaAuthorization = WebRTCRemoteMediaAuthorization()
+        }
         outstandingLocalOfferEpoch = offerEpoch
         hasStarted = true
         localDescriptionIsAnnounced = false
@@ -4309,6 +4361,7 @@ public actor WebRTCPeer {
             resetMacHostedCallEvidenceNegotiation()
             resetScreenMediaSuspensionNegotiation()
             resetScreenClientDiagnosticsNegotiation()
+            resetRemoteMediaControlsNegotiation()
             applyingRemoteOfferEpoch = offerEpoch
             defer {
                 if applyingRemoteOfferEpoch == offerEpoch {
@@ -4374,6 +4427,17 @@ public actor WebRTCPeer {
             // viewer. The application may retry its current challenge only after forwarding this
             // answer; the peer-side transport/capability check remains authoritative.
             try announceLocalDescription(.answer(sdp: answerSDP))
+            if remoteMediaControlsCapabilityIsLocallyAvailable,
+               let authorization = RemoteMediaControlsSDP.negotiatedAuthorization(
+                hostOfferSDP: sdp,
+                viewerAnswerSDP: answerSDP
+               ) {
+                activeRemoteMediaAuthorization = authorization
+                remoteMediaControlsNegotiationEpoch = offerEpoch
+                // The outbound answer is enqueued first. Application code cannot arm native
+                // controls until it has forwarded that exact answer through signaling.
+                emit(.remoteMediaControlsAvailabilityChanged(true))
+            }
 
         case .answer(let sdp):
             guard role == .host,
@@ -4423,6 +4487,15 @@ public actor WebRTCPeer {
             } else {
                 screenClientDiagnosticsNegotiationEpoch = nil
             }
+            let negotiatedRemoteMediaAuthorization =
+                remoteMediaControlsCapabilityIsLocallyAvailable
+                    ? pendingScreenMediaHostOfferSDP.flatMap { hostOfferSDP in
+                        RemoteMediaControlsSDP.negotiatedAuthorization(
+                            hostOfferSDP: hostOfferSDP,
+                            viewerAnswerSDP: sdp
+                        )
+                    }
+                    : nil
             try installRemoteICEUsernameFragments(from: sdp)
             remoteDescriptionIsSet = true
             try await flushRemoteCandidates(expectedEpoch: offerEpoch)
@@ -4433,6 +4506,16 @@ public actor WebRTCPeer {
             }
             outstandingLocalOfferEpoch = nil
             pendingScreenMediaHostOfferSDP = nil
+            let expectedRemoteMediaAuthorization =
+                pendingRemoteMediaAuthorization
+            pendingRemoteMediaAuthorization = nil
+            if let authorization = negotiatedRemoteMediaAuthorization,
+               authorization == expectedRemoteMediaAuthorization {
+                activeRemoteMediaAuthorization = authorization
+                remoteMediaControlsNegotiationEpoch = offerEpoch
+                // Commit only after answer parsing, candidate application, and offer retirement.
+                emit(.remoteMediaControlsAvailabilityChanged(true))
+            }
 
         case .candidate(let candidate):
             guard Self.isValidCandidateEnvelope(candidate) else {
@@ -4485,6 +4568,10 @@ public actor WebRTCPeer {
         resetMacHostedCallEvidenceNegotiation()
         resetScreenMediaSuspensionNegotiation()
         resetScreenClientDiagnosticsNegotiation()
+        resetRemoteMediaControlsNegotiation()
+        if remoteMediaControlsCapabilityIsLocallyAvailable {
+            pendingRemoteMediaAuthorization = WebRTCRemoteMediaAuthorization()
+        }
         outstandingLocalOfferEpoch = offerEpoch
         localDescriptionIsAnnounced = false
         remoteDescriptionIsSet = false
@@ -5306,6 +5393,50 @@ public actor WebRTCPeer {
         isTransportHealthyForMedia()
     }
 
+    func failNextRemoteMediaAcknowledgementSendsForTesting(
+        _ count: Int = 1
+    ) {
+        precondition(count >= 0)
+        debugRemoteMediaAcknowledgementSendFailuresRemaining = count
+    }
+
+    func setRemoteMediaAcknowledgementRetryDelayForTesting(
+        _ delay: Duration?
+    ) {
+        precondition(delay.map { $0 > .zero } ?? true)
+        debugRemoteMediaAcknowledgementRetryDelay = delay
+    }
+
+    func sendRemoteMediaCommandForTesting(
+        _ request: WebRTCRemoteMediaCommandRequest,
+        state: WebRTCReceivedRemoteMediaState
+    ) throws {
+        try ensureOpen()
+        guard role == .viewer else { throw WebRTCTransportError.invalidRole }
+        try delegateProxy.sendControlData(try JSONEncoder().encode(
+            ControlChannelMessage.remoteMediaCommand(.init(
+                authorization: state.authorization, request: request
+            ))
+        ))
+    }
+
+    var remoteMediaAcknowledgementsReceivedForTesting: Int {
+        debugRemoteMediaAcknowledgementsReceived
+    }
+
+    func remoteMediaAcknowledgementRetryStateForTesting()
+        -> (
+            pendingCount: Int,
+            isScheduled: Bool,
+            forcedFailuresRemaining: Int
+        ) {
+        (
+            pendingRemoteMediaCommandAcknowledgementIDs.count,
+            remoteMediaAcknowledgementRetryTask != nil,
+            debugRemoteMediaAcknowledgementSendFailuresRemaining
+        )
+    }
+
     var isSystemAudioEnabledForTesting: Bool {
         localAudioTrack?.isEnabled == true
             && activeSystemAudioAuthorization?.isValid == true
@@ -5557,6 +5688,7 @@ public actor WebRTCPeer {
     /// request history, clears any optional negotiated suspension transcript without attempting a
     /// wire send on an already-uncertain route, and proves the RTP zero-video floor by readback.
     public func suspendScreenMediaForTransportUncertainty() {
+        revokeRemoteMediaCommandAuthorization()
         if screenMediaResumeProbeAttemptIsActive {
             screenVideoEncoderResumeProbe.cancelForMutation(.transportChanged)
         }
@@ -5659,6 +5791,131 @@ public actor WebRTCPeer {
     public func screenClientDiagnosticsIsNegotiated() -> Bool {
         screenClientDiagnosticsCapabilityIsLocallyAvailable
             && screenClientDiagnosticsNegotiationEpoch == negotiationEpoch
+    }
+
+    /// True only for the current host offer and viewer answer that both carried media-controls v1.
+    public func remoteMediaControlsAreNegotiated() -> Bool {
+        remoteMediaControlsCapabilityIsLocallyAvailable
+            && remoteMediaControlsNegotiationEpoch == negotiationEpoch
+            && activeRemoteMediaAuthorization != nil
+    }
+
+    /// Publishes one authoritative Mac Now Playing revision to the negotiated viewer.
+    public func sendRemoteMediaState(
+        _ update: WebRTCRemoteMediaStateUpdate,
+        respondingTo refresh: WebRTCReceivedRemoteMediaStateRefreshRequest? = nil
+    ) throws {
+        try ensureOpen()
+        guard role == .host else { throw WebRTCTransportError.invalidRole }
+        guard remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              refresh.map({ $0.authorization == authorization }) ?? true,
+              isTransportHealthyForMedia(),
+              update.isValid,
+              update.revision > highestSentRemoteMediaStateRevision else {
+            throw WebRTCTransportError.transportNotHealthy
+        }
+        let envelope = WebRTCRemoteMediaStateEnvelope(
+            authorization: authorization,
+            update: update,
+            refreshID: refresh?.id
+        )
+        try delegateProxy.sendControlData(
+            try JSONEncoder().encode(ControlChannelMessage.remoteMediaState(envelope))
+        )
+        highestSentRemoteMediaStateRevision = update.revision
+        lastSentRemoteMediaStateUpdate = update
+    }
+
+    /// Requests a fresh snapshot for one bounded application readiness attempt.
+    public func requestRemoteMediaStateRefresh(id: UUID) throws {
+        try ensureOpen()
+        guard role == .viewer else { throw WebRTCTransportError.invalidRole }
+        guard remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              isTransportHealthyForMedia() else {
+            throw WebRTCTransportError.transportNotHealthy
+        }
+        let envelope = WebRTCRemoteMediaStateRefreshEnvelope(
+            authorization: authorization,
+            id: id
+        )
+        try delegateProxy.sendControlData(
+            try JSONEncoder().encode(ControlChannelMessage.remoteMediaStateRefresh(envelope))
+        )
+    }
+
+    /// Enqueues one absolute command for the exact media context currently shown on iOS.
+    @discardableResult
+    public func requestRemoteMediaCommand(
+        _ command: WebRTCRemoteMediaCommand,
+        state: WebRTCReceivedRemoteMediaState,
+        authorization presentationAuthorization: WebRTCControlAuthorization
+    ) throws -> UInt64 {
+        try ensureOpen()
+        guard role == .viewer else { throw WebRTCTransportError.invalidRole }
+        guard remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              state.authorization == authorization,
+              state.update.isValid,
+              let item = state.update.item,
+              isTransportHealthyForMedia(),
+              nextRemoteMediaCommandID < UInt64.max else {
+            throw WebRTCTransportError.transportNotHealthy
+        }
+        guard prepareSentRemoteMediaHistoryForNewRequest() else {
+            throw WebRTCTransportError.dataChannelBackpressured
+        }
+        let request = WebRTCRemoteMediaCommandRequest(
+            id: nextRemoteMediaCommandID,
+            contextID: item.contextID,
+            observedRevision: state.update.revision,
+            command: command
+        )
+        guard request.isValid else { throw WebRTCTransportError.unexpectedSignal }
+        try presentationAuthorization.withValidAuthorization {
+            try delegateProxy.sendControlData(
+                try JSONEncoder().encode(
+                    ControlChannelMessage.remoteMediaCommand(
+                        WebRTCRemoteMediaCommandEnvelope(
+                            authorization: authorization,
+                            request: request
+                        )
+                    )
+                )
+            )
+        }
+        nextRemoteMediaCommandID += 1
+        sentRemoteMediaCommands[request.id] = request
+        sentRemoteMediaCommandOrder.append(request.id)
+        return request.id
+    }
+
+    /// Completes one host-side command. The acknowledgement is retained for safe replay without
+    /// repeating non-idempotent Next/Previous work.
+    public func acknowledgeRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        result: WebRTCRemoteMediaCommandResult
+    ) throws {
+        try ensureOpen()
+        guard role == .host,
+              remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              command.authorization == authorization,
+              command.isValid,
+              isTransportHealthyForMedia(),
+              let request = receivedRemoteMediaCommands[command.request.id],
+              request == command.request else {
+            throw WebRTCTransportError.unexpectedSignal
+        }
+        let acknowledgement = WebRTCRemoteMediaCommandAcknowledgement(
+            id: request.id,
+            result: result
+        )
+        try sendRemoteMediaCommandAcknowledgement(
+            acknowledgement,
+            authorization: authorization
+        )
     }
 
     /// Best-effort viewer evidence. Failure or backpressure on this lane never changes screen,
@@ -8842,6 +9099,7 @@ public actor WebRTCPeer {
     private func failClosedForEventDeliveryLoss(_ reason: String) {
         guard !isClosed else { return }
         resetMacHostedCallEvidenceTransportState()
+        resetRemoteMediaControlsNegotiation(emitAvailability: false)
         suspendSystemAudioForTransportUncertainty()
         forceIPhoneMicrophoneNativeTeardown()
         #if os(iOS)
@@ -8925,6 +9183,14 @@ public actor WebRTCPeer {
                 receiveInputRequest(request)
             case .inputFeedback(let feedback):
                 receiveInputFeedback(feedback)
+            case .remoteMediaState(let envelope):
+                receiveRemoteMediaState(envelope)
+            case .remoteMediaStateRefresh(let envelope):
+                receiveRemoteMediaStateRefresh(envelope)
+            case .remoteMediaCommand(let envelope):
+                receiveRemoteMediaCommand(envelope)
+            case .remoteMediaCommandAcknowledgement(let envelope):
+                receiveRemoteMediaCommandAcknowledgement(envelope)
             case .macHostedCallChallenge(let challenge):
                 receiveMacHostedCallChallenge(challenge)
             case .macHostedCallEvidence(let evidence):
@@ -8995,6 +9261,327 @@ public actor WebRTCPeer {
                 "Invalid screen-client diagnostics message; diagnostics lane closed."
             ))
         }
+    }
+
+    private func receiveRemoteMediaState(
+        _ envelope: WebRTCRemoteMediaStateEnvelope
+    ) {
+        guard role == .viewer,
+              remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              envelope.authorization == authorization,
+              envelope.isValid else {
+            emit(.diagnosticFailure("Unexpected remote-media state."))
+            return
+        }
+        let update = envelope.update
+        guard update.revision > highestReceivedRemoteMediaStateRevision else {
+            // The ordered channel should not duplicate state; an exact old revision is harmless.
+            return
+        }
+        highestReceivedRemoteMediaStateRevision = update.revision
+        emit(.remoteMediaStateChanged(WebRTCReceivedRemoteMediaState(envelope: envelope)))
+    }
+
+    private func receiveRemoteMediaStateRefresh(
+        _ envelope: WebRTCRemoteMediaStateRefreshEnvelope
+    ) {
+        guard role == .host,
+              remoteMediaControlsAreNegotiated(),
+              envelope.authorization == activeRemoteMediaAuthorization else {
+            emit(.diagnosticFailure("Unexpected remote-media state refresh."))
+            return
+        }
+        emit(.remoteMediaStateRefreshRequested(
+            WebRTCReceivedRemoteMediaStateRefreshRequest(envelope: envelope)
+        ))
+    }
+
+    private func receiveRemoteMediaCommand(
+        _ envelope: WebRTCRemoteMediaCommandEnvelope
+    ) {
+        guard role == .host,
+              remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              envelope.authorization == authorization,
+              envelope.isValid else {
+            emit(.diagnosticFailure("Unexpected remote-media command."))
+            return
+        }
+        let request = envelope.request
+        if let existing = receivedRemoteMediaCommands[request.id] {
+            guard existing == request else {
+                emit(.diagnosticFailure("Conflicting remote-media command replay."))
+                return
+            }
+            if let acknowledgement = sentRemoteMediaCommandAcknowledgements[request.id] {
+                do {
+                    try sendRemoteMediaCommandAcknowledgement(
+                        acknowledgement,
+                        authorization: authorization
+                    )
+                } catch {
+                    emit(.diagnosticFailure("Could not replay remote-media acknowledgement."))
+                }
+            }
+            return
+        }
+        guard highestReceivedRemoteMediaCommandID.map({ request.id > $0 }) ?? true else {
+            emit(.diagnosticFailure("Stale remote-media command ignored."))
+            return
+        }
+        guard prepareReceivedRemoteMediaHistoryForNewRequest() else {
+            emit(.diagnosticFailure("Remote-media command backlog exceeded its safe bound."))
+            return
+        }
+        highestReceivedRemoteMediaCommandID = request.id
+        receivedRemoteMediaCommands[request.id] = request
+        receivedRemoteMediaCommandOrder.append(request.id)
+        if let rejection = WebRTCRemoteMediaCommandAdmission.rejection(
+            for: request,
+            latestSuccessfullySent: lastSentRemoteMediaStateUpdate
+        ) {
+            let acknowledgement = WebRTCRemoteMediaCommandAcknowledgement(
+                id: request.id,
+                result: rejection
+            )
+            do {
+                try sendRemoteMediaCommandAcknowledgement(
+                    acknowledgement,
+                    authorization: authorization
+                )
+            } catch {
+                // The terminal result remains cached and scheduled for bounded-rate retry without
+                // executing relative Next/Previous work again.
+                emit(.diagnosticFailure("Could not send remote-media rejection."))
+            }
+            return
+        }
+        guard isTransportHealthyForMedia() else { return }
+        let executionAuthorization: WebRTCControlAuthorization
+        if let current = activeRemoteMediaCommandAuthorization, current.isValid {
+            executionAuthorization = current
+        } else {
+            let fresh = WebRTCControlAuthorization()
+            guard delegateProxy.installMediaCommandAuthorization(fresh) else { return }
+            activeRemoteMediaCommandAuthorization = fresh
+            executionAuthorization = fresh
+        }
+        emit(.remoteMediaCommandReceived(WebRTCReceivedRemoteMediaCommand(
+            envelope: envelope,
+            executionAuthorization: executionAuthorization
+        )))
+    }
+
+    private func receiveRemoteMediaCommandAcknowledgement(
+        _ envelope: WebRTCRemoteMediaCommandAcknowledgementEnvelope
+    ) {
+        guard role == .viewer,
+              remoteMediaControlsAreNegotiated(),
+              let authorization = activeRemoteMediaAuthorization,
+              envelope.authorization == authorization,
+              envelope.isValid,
+              case let acknowledgement = envelope.acknowledgement,
+              let request = sentRemoteMediaCommands[acknowledgement.id],
+              request.id == acknowledgement.id else {
+            emit(.diagnosticFailure("Unknown remote-media acknowledgement ignored."))
+            return
+        }
+        #if DEBUG
+        debugRemoteMediaAcknowledgementsReceived += 1
+        #endif
+        if let existing = receivedRemoteMediaCommandAcknowledgements[acknowledgement.id] {
+            if existing != acknowledgement {
+                emit(.diagnosticFailure("Conflicting remote-media acknowledgement ignored."))
+            }
+            return
+        }
+        receivedRemoteMediaCommandAcknowledgements[acknowledgement.id] = acknowledgement
+        emit(.remoteMediaCommandAcknowledgementReceived(acknowledgement))
+    }
+
+    private func sendRemoteMediaCommandAcknowledgement(
+        _ acknowledgement: WebRTCRemoteMediaCommandAcknowledgement,
+        authorization: WebRTCRemoteMediaAuthorization
+    ) throws {
+        if let existing = sentRemoteMediaCommandAcknowledgements[acknowledgement.id],
+           existing != acknowledgement {
+            throw WebRTCTransportError.unexpectedSignal
+        }
+        // Cache before delivery. A transient send failure enters the bounded retry queue, and an
+        // exact duplicate can also flush it without repeating non-idempotent application work.
+        sentRemoteMediaCommandAcknowledgements[acknowledgement.id] = acknowledgement
+        do {
+            try transmitRemoteMediaCommandAcknowledgement(
+                acknowledgement,
+                authorization: authorization
+            )
+            pendingRemoteMediaCommandAcknowledgementIDs.removeAll {
+                $0 == acknowledgement.id
+            }
+        } catch {
+            enqueueRemoteMediaAcknowledgementRetry(
+                id: acknowledgement.id,
+                authorization: authorization
+            )
+            throw error
+        }
+    }
+
+    private func transmitRemoteMediaCommandAcknowledgement(
+        _ acknowledgement: WebRTCRemoteMediaCommandAcknowledgement,
+        authorization: WebRTCRemoteMediaAuthorization
+    ) throws {
+        guard remoteMediaControlsAreNegotiated(),
+              activeRemoteMediaAuthorization == authorization,
+              isTransportHealthyForMedia() else {
+            throw WebRTCTransportError.transportNotHealthy
+        }
+        #if DEBUG
+        if debugRemoteMediaAcknowledgementSendFailuresRemaining > 0 {
+            debugRemoteMediaAcknowledgementSendFailuresRemaining -= 1
+            throw WebRTCTransportError.dataChannelBackpressured
+        }
+        #endif
+        let envelope = WebRTCRemoteMediaCommandAcknowledgementEnvelope(
+            authorization: authorization,
+            acknowledgement: acknowledgement
+        )
+        try delegateProxy.sendControlData(
+            try JSONEncoder().encode(
+                ControlChannelMessage.remoteMediaCommandAcknowledgement(envelope)
+            )
+        )
+    }
+
+    private func enqueueRemoteMediaAcknowledgementRetry(
+        id: UInt64,
+        authorization: WebRTCRemoteMediaAuthorization
+    ) {
+        guard remoteMediaControlsAreNegotiated(),
+              activeRemoteMediaAuthorization == authorization else {
+            return
+        }
+        if !pendingRemoteMediaCommandAcknowledgementIDs.contains(id) {
+            guard pendingRemoteMediaCommandAcknowledgementIDs.count
+                    < Self.remoteMediaHistoryLimit else {
+                emit(.diagnosticFailure(
+                    "Remote-media acknowledgement retry backlog exceeded its safe bound."
+                ))
+                return
+            }
+            pendingRemoteMediaCommandAcknowledgementIDs.append(id)
+        }
+        scheduleRemoteMediaAcknowledgementRetry(
+            authorization: authorization
+        )
+    }
+
+    private func scheduleRemoteMediaAcknowledgementRetry(
+        authorization: WebRTCRemoteMediaAuthorization
+    ) {
+        guard remoteMediaAcknowledgementRetryTask == nil,
+              !pendingRemoteMediaCommandAcknowledgementIDs.isEmpty,
+              let authorizationEpoch = remoteMediaControlsNegotiationEpoch,
+              authorizationEpoch == negotiationEpoch,
+              activeRemoteMediaAuthorization == authorization else {
+            return
+        }
+        let retryToken = UUID()
+        remoteMediaAcknowledgementRetryToken = retryToken
+        remoteMediaAcknowledgementRetryTask = Task { [weak self] in
+            await self?.runRemoteMediaAcknowledgementRetry(
+                retryToken: retryToken,
+                authorizationEpoch: authorizationEpoch,
+                authorization: authorization
+            )
+        }
+    }
+
+    private func runRemoteMediaAcknowledgementRetry(
+        retryToken: UUID,
+        authorizationEpoch: UInt64,
+        authorization: WebRTCRemoteMediaAuthorization
+    ) async {
+        var consecutiveFailures = 0
+        while true {
+            guard !Task.isCancelled,
+                  remoteMediaAcknowledgementRetryToken == retryToken,
+                  remoteMediaControlsNegotiationEpoch == authorizationEpoch,
+                  negotiationEpoch == authorizationEpoch,
+                  activeRemoteMediaAuthorization == authorization,
+                  !pendingRemoteMediaCommandAcknowledgementIDs.isEmpty else {
+                finishRemoteMediaAcknowledgementRetry(retryToken: retryToken)
+                return
+            }
+
+            let productionRetryDelay = Self.remoteMediaAcknowledgementRetryDelays[
+                min(
+                    consecutiveFailures,
+                    Self.remoteMediaAcknowledgementRetryDelays.count - 1
+                )
+            ]
+            #if DEBUG
+            let retryDelay = debugRemoteMediaAcknowledgementRetryDelay
+                ?? productionRetryDelay
+            #else
+            let retryDelay = productionRetryDelay
+            #endif
+            do {
+                try await Task.sleep(for: retryDelay)
+            } catch {
+                finishRemoteMediaAcknowledgementRetry(retryToken: retryToken)
+                return
+            }
+            guard !Task.isCancelled,
+                  remoteMediaAcknowledgementRetryToken == retryToken,
+                  remoteMediaControlsNegotiationEpoch == authorizationEpoch,
+                  negotiationEpoch == authorizationEpoch,
+                  activeRemoteMediaAuthorization == authorization else {
+                finishRemoteMediaAcknowledgementRetry(retryToken: retryToken)
+                return
+            }
+
+            var deliveredAcknowledgement = false
+            while let id = pendingRemoteMediaCommandAcknowledgementIDs.first {
+                guard let acknowledgement =
+                        sentRemoteMediaCommandAcknowledgements[id] else {
+                    pendingRemoteMediaCommandAcknowledgementIDs.removeFirst()
+                    continue
+                }
+                do {
+                    try transmitRemoteMediaCommandAcknowledgement(
+                        acknowledgement,
+                        authorization: authorization
+                    )
+                    pendingRemoteMediaCommandAcknowledgementIDs.removeFirst()
+                    deliveredAcknowledgement = true
+                } catch {
+                    // Remote media is auxiliary. Keep memory and retry rate bounded, but do not
+                    // tear down screen/audio merely because the ordered lane stays congested.
+                    consecutiveFailures = min(
+                        consecutiveFailures + 1,
+                        Self.remoteMediaAcknowledgementRetryDelays.count - 1
+                    )
+                    break
+                }
+            }
+            if pendingRemoteMediaCommandAcknowledgementIDs.isEmpty {
+                finishRemoteMediaAcknowledgementRetry(retryToken: retryToken)
+                return
+            }
+            if deliveredAcknowledgement {
+                consecutiveFailures = 0
+            }
+        }
+    }
+
+    private func finishRemoteMediaAcknowledgementRetry(
+        retryToken: UUID
+    ) {
+        guard remoteMediaAcknowledgementRetryToken == retryToken else { return }
+        remoteMediaAcknowledgementRetryTask = nil
+        remoteMediaAcknowledgementRetryToken = nil
     }
 
     private func emitScreenClientDiagnosticsEvent(
@@ -9116,6 +9703,41 @@ public actor WebRTCPeer {
         screenClientDiagnosticsNegotiationEpoch = nil
         highestSentScreenClientDiagnosticsSequence = 0
         highestReceivedScreenClientDiagnosticsSequence = 0
+    }
+
+    private func resetRemoteMediaControlsNegotiation(
+        emitAvailability: Bool = true
+    ) {
+        let wasNegotiated = remoteMediaControlsNegotiationEpoch != nil
+        revokeRemoteMediaCommandAuthorization()
+        remoteMediaAcknowledgementRetryTask?.cancel()
+        remoteMediaAcknowledgementRetryTask = nil
+        remoteMediaAcknowledgementRetryToken = nil
+        remoteMediaControlsNegotiationEpoch = nil
+        pendingRemoteMediaAuthorization = nil
+        activeRemoteMediaAuthorization = nil
+        nextRemoteMediaCommandID = 1
+        sentRemoteMediaCommands.removeAll(keepingCapacity: true)
+        sentRemoteMediaCommandOrder.removeAll(keepingCapacity: true)
+        receivedRemoteMediaCommandAcknowledgements.removeAll(keepingCapacity: true)
+        highestReceivedRemoteMediaCommandID = nil
+        receivedRemoteMediaCommands.removeAll(keepingCapacity: true)
+        receivedRemoteMediaCommandOrder.removeAll(keepingCapacity: true)
+        sentRemoteMediaCommandAcknowledgements.removeAll(keepingCapacity: true)
+        pendingRemoteMediaCommandAcknowledgementIDs.removeAll(
+            keepingCapacity: true
+        )
+        #if DEBUG
+        debugRemoteMediaAcknowledgementSendFailuresRemaining = 0
+        debugRemoteMediaAcknowledgementRetryDelay = nil
+        debugRemoteMediaAcknowledgementsReceived = 0
+        #endif
+        highestSentRemoteMediaStateRevision = 0
+        highestReceivedRemoteMediaStateRevision = 0
+        lastSentRemoteMediaStateUpdate = nil
+        if wasNegotiated, emitAvailability {
+            emit(.remoteMediaControlsAvailabilityChanged(false))
+        }
     }
 
     private func screenMediaShowWasAcknowledgedActive(
@@ -9906,6 +10528,7 @@ public actor WebRTCPeer {
     }
 
     private func failCloseScreenMedia() async {
+        revokeRemoteMediaCommandAuthorization()
         suspendSystemAudioForTransportUncertainty()
         disableRemoteAudioPlayback()
         clearScreenMediaSuspensionState(
@@ -9926,6 +10549,12 @@ public actor WebRTCPeer {
         receivedControlRequests.removeAll(keepingCapacity: true)
         receivedControlRequestOrder.removeAll(keepingCapacity: true)
         sentControlAcknowledgements.removeAll(keepingCapacity: true)
+    }
+
+    private func revokeRemoteMediaCommandAuthorization() {
+        delegateProxy.installMediaCommandAuthorization(nil)
+        activeRemoteMediaCommandAuthorization?.revoke()
+        activeRemoteMediaCommandAuthorization = nil
     }
 
     private func replaceHostInputSession(
@@ -10030,6 +10659,35 @@ public actor WebRTCPeer {
         return true
     }
 
+    private func prepareSentRemoteMediaHistoryForNewRequest() -> Bool {
+        while sentRemoteMediaCommandOrder.count >= Self.remoteMediaHistoryLimit {
+            guard let index = sentRemoteMediaCommandOrder.firstIndex(where: {
+                receivedRemoteMediaCommandAcknowledgements[$0] != nil
+            }) else {
+                return false
+            }
+            let id = sentRemoteMediaCommandOrder.remove(at: index)
+            sentRemoteMediaCommands.removeValue(forKey: id)
+            receivedRemoteMediaCommandAcknowledgements.removeValue(forKey: id)
+        }
+        return true
+    }
+
+    private func prepareReceivedRemoteMediaHistoryForNewRequest() -> Bool {
+        while receivedRemoteMediaCommandOrder.count >= Self.remoteMediaHistoryLimit {
+            guard let index = receivedRemoteMediaCommandOrder.firstIndex(where: {
+                sentRemoteMediaCommandAcknowledgements[$0] != nil
+                    && !pendingRemoteMediaCommandAcknowledgementIDs.contains($0)
+            }) else {
+                return false
+            }
+            let id = receivedRemoteMediaCommandOrder.remove(at: index)
+            receivedRemoteMediaCommands.removeValue(forKey: id)
+            sentRemoteMediaCommandAcknowledgements.removeValue(forKey: id)
+        }
+        return true
+    }
+
     private func prepareSentInputHistoryForNewRequest() -> Bool {
         while sentInputRequestOrder.count >= Self.inputHistoryLimit {
             guard let index = sentInputRequestOrder.firstIndex(where: {
@@ -10126,6 +10784,7 @@ public actor WebRTCPeer {
         try applyHighFidelityAudioSenderParameters()
         let advertisesScreenClientDiagnostics =
             screenClientDiagnosticsCapabilityIsLocallyAvailable
+        let remoteMediaAuthorization = pendingRemoteMediaAuthorization
         let sdp = try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<String, any Error>) in
             peerConnection.offer(for: mediaConstraints) { [peerConnection] description, error in
@@ -10144,11 +10803,17 @@ public actor WebRTCPeer {
                     )
                 let suspensionSDP = ScreenMediaSuspensionSDP
                     .advertisingHostSupport(in: evidenceSDP)
+                let remoteMediaSDP = remoteMediaAuthorization.map {
+                    RemoteMediaControlsSDP.advertisingHostSupport(
+                        in: suspensionSDP,
+                        authorization: $0
+                    )
+                } ?? suspensionSDP
                 let diagnosticsSDP = advertisesScreenClientDiagnostics
                     ? ScreenClientDiagnosticsSDP.advertisingHostSupport(
-                        in: suspensionSDP
+                        in: remoteMediaSDP
                     )
-                    : suspensionSDP
+                    : remoteMediaSDP
                 let localDescription = LKRTCSessionDescription(
                     type: productDescription.type,
                     sdp: diagnosticsSDP
@@ -10171,6 +10836,8 @@ public actor WebRTCPeer {
         let expectedNegotiationEpoch = negotiationEpoch
         let advertisesScreenClientDiagnostics =
             screenClientDiagnosticsCapabilityIsLocallyAvailable
+        let advertisesRemoteMediaControls =
+            remoteMediaControlsCapabilityIsLocallyAvailable
         let answerSDP = try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<String, any Error>) in
             peerConnection.answer(for: mediaConstraints) { [peerConnection] description, error in
@@ -10194,12 +10861,18 @@ public actor WebRTCPeer {
                         in: evidenceSDP,
                         remoteOfferSDP: remoteOfferSDP
                     )
-                let diagnosticsSDP = advertisesScreenClientDiagnostics
-                    ? ScreenClientDiagnosticsSDP.advertisingViewerSupport(
+                let remoteMediaSDP = advertisesRemoteMediaControls
+                    ? RemoteMediaControlsSDP.advertisingViewerSupport(
                         in: suspensionSDP,
                         remoteOfferSDP: remoteOfferSDP
                     )
                     : suspensionSDP
+                let diagnosticsSDP = advertisesScreenClientDiagnostics
+                    ? ScreenClientDiagnosticsSDP.advertisingViewerSupport(
+                        in: remoteMediaSDP,
+                        remoteOfferSDP: remoteOfferSDP
+                    )
+                    : remoteMediaSDP
                 let localDescription = LKRTCSessionDescription(
                     type: productDescription.type,
                     sdp: diagnosticsSDP
@@ -11462,6 +12135,7 @@ public actor WebRTCPeer {
             return retireOwnedAudioDeviceForPeerClosure()
         }
         resetMacHostedCallEvidenceTransportState()
+        resetRemoteMediaControlsNegotiation()
         suspendSystemAudioForTransportUncertainty()
         forceIPhoneMicrophoneNativeTeardown()
         #if os(iOS)
@@ -11825,6 +12499,12 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
     case acknowledgement(WebRTCControlAcknowledgement)
     case input(WebRTCInputRequest)
     case inputFeedback(WebRTCInputFeedback)
+    case remoteMediaState(WebRTCRemoteMediaStateEnvelope)
+    case remoteMediaStateRefresh(WebRTCRemoteMediaStateRefreshEnvelope)
+    case remoteMediaCommand(WebRTCRemoteMediaCommandEnvelope)
+    case remoteMediaCommandAcknowledgement(
+        WebRTCRemoteMediaCommandAcknowledgementEnvelope
+    )
     case macHostedCallChallenge(WebRTCMacHostedCallChallenge)
     case macHostedCallEvidence(WebRTCMacHostedCallEvidence)
     case screenMediaSuspension(WebRTCScreenMediaSuspensionNotice)
@@ -11847,6 +12527,10 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
         case acknowledgement = "ack"
         case input
         case inputFeedback
+        case remoteMediaState
+        case remoteMediaStateRefresh
+        case remoteMediaCommand
+        case remoteMediaCommandAcknowledgement
         case macHostedCallChallenge
         case macHostedCallEvidence
         case screenMediaSuspension
@@ -11866,6 +12550,10 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
         case acknowledgement
         case input
         case inputFeedback
+        case remoteMediaState
+        case remoteMediaStateRefresh
+        case remoteMediaCommand
+        case remoteMediaCommandAcknowledgement
         case macHostedCallChallenge
         case macHostedCallEvidence
         case screenMediaSuspension
@@ -11899,6 +12587,34 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
         case .inputFeedback:
             self = .inputFeedback(
                 try container.decode(WebRTCInputFeedback.self, forKey: .inputFeedback)
+            )
+        case .remoteMediaState:
+            self = .remoteMediaState(
+                try container.decode(
+                    WebRTCRemoteMediaStateEnvelope.self,
+                    forKey: .remoteMediaState
+                )
+            )
+        case .remoteMediaStateRefresh:
+            self = .remoteMediaStateRefresh(
+                try container.decode(
+                    WebRTCRemoteMediaStateRefreshEnvelope.self,
+                    forKey: .remoteMediaStateRefresh
+                )
+            )
+        case .remoteMediaCommand:
+            self = .remoteMediaCommand(
+                try container.decode(
+                    WebRTCRemoteMediaCommandEnvelope.self,
+                    forKey: .remoteMediaCommand
+                )
+            )
+        case .remoteMediaCommandAcknowledgement:
+            self = .remoteMediaCommandAcknowledgement(
+                try container.decode(
+                    WebRTCRemoteMediaCommandAcknowledgementEnvelope.self,
+                    forKey: .remoteMediaCommandAcknowledgement
+                )
             )
         case .macHostedCallChallenge:
             self = .macHostedCallChallenge(
@@ -11989,6 +12705,24 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
         case .inputFeedback(let feedback):
             try container.encode(Kind.inputFeedback, forKey: .kind)
             try container.encode(feedback, forKey: .inputFeedback)
+        case .remoteMediaState(let update):
+            try container.encode(Kind.remoteMediaState, forKey: .kind)
+            try container.encode(update, forKey: .remoteMediaState)
+        case .remoteMediaStateRefresh(let refresh):
+            try container.encode(Kind.remoteMediaStateRefresh, forKey: .kind)
+            try container.encode(refresh, forKey: .remoteMediaStateRefresh)
+        case .remoteMediaCommand(let request):
+            try container.encode(Kind.remoteMediaCommand, forKey: .kind)
+            try container.encode(request, forKey: .remoteMediaCommand)
+        case .remoteMediaCommandAcknowledgement(let acknowledgement):
+            try container.encode(
+                Kind.remoteMediaCommandAcknowledgement,
+                forKey: .kind
+            )
+            try container.encode(
+                acknowledgement,
+                forKey: .remoteMediaCommandAcknowledgement
+            )
         case .macHostedCallChallenge(let challenge):
             try container.encode(
                 Kind.macHostedCallChallenge,

@@ -681,6 +681,133 @@ struct WorldwideIOSHostedCallPlayoutDebugProjection: Equatable {
 }
 #endif
 
+/// Pure admission rule shared by the native-command callback and deterministic tests. Timeline
+/// metadata may advance while a command crosses onto MainActor, so a newer revision remains valid
+/// only while it still names the same media context and still permits the requested command.
+enum RemoteMediaCommandAdmission {
+    static func permits(
+        _ command: WebRTCRemoteMediaCommand,
+        contextID: String,
+        observedRevision: UInt64,
+        currentUpdate: WebRTCRemoteMediaStateUpdate?
+    ) -> Bool {
+        guard observedRevision > 0,
+              let currentUpdate,
+              currentUpdate.revision >= observedRevision,
+              let item = currentUpdate.item,
+              item.contextID == contextID,
+              item.capabilities.permits(command) else {
+            return false
+        }
+        return true
+    }
+}
+
+/// A remote-media state becomes command authority only after it is observed on the exact healthy
+/// transport generation. Negotiated capability alone is intentionally insufficient during an ICE
+/// or control-channel recovery boundary.
+enum RemoteMediaTransportAdmission {
+    static func permitsIncomingState(
+        isNegotiated: Bool,
+        isPeerConnected: Bool,
+        isICEConnected: Bool,
+        isControlChannelReady: Bool,
+        recoveryProofRequired: Bool
+    ) -> Bool {
+        isNegotiated
+            && isPeerConnected
+            && isICEConnected
+            && isControlChannelReady
+            && !recoveryProofRequired
+    }
+
+    static func permitsCommands(
+        isNegotiated: Bool,
+        hasPeer: Bool,
+        isPeerConnected: Bool,
+        isICEConnected: Bool,
+        isControlChannelReady: Bool,
+        recoveryProofRequired: Bool,
+        stateTransportGeneration: UUID?,
+        currentTransportGeneration: UUID,
+        hasMediaItem: Bool
+    ) -> Bool {
+        permitsIncomingState(
+            isNegotiated: isNegotiated,
+            isPeerConnected: isPeerConnected,
+            isICEConnected: isICEConnected,
+            isControlChannelReady: isControlChannelReady,
+            recoveryProofRequired: recoveryProofRequired
+        )
+            && hasPeer
+            && stateTransportGeneration == currentTransportGeneration
+            && hasMediaItem
+    }
+}
+
+/// Only a snapshot echoing this healthy boundary's nonce can reopen native commands. An early
+/// unsolicited update is never promoted to authority later, even when its item is unchanged.
+struct RemoteMediaRefreshGate {
+    struct Ticket: Equatable, Sendable {
+        let generation: UUID
+        let id: UUID
+    }
+
+    static let maximumImmediateAttempts = 3
+    private(set) var ticket: Ticket?
+    private(set) var attempts = 0
+    private(set) var hasAcceptedSnapshot = false
+
+    var retryDelay: Duration {
+        attempts < Self.maximumImmediateAttempts ? .seconds(1) : .seconds(10)
+    }
+
+    mutating func begin(generation: UUID) -> Ticket? {
+        guard ticket == nil else { return nil }
+        let ticket = Ticket(generation: generation, id: UUID())
+        self.ticket = ticket
+        attempts = 1
+        return ticket
+    }
+
+    mutating func retry(_ ticket: Ticket) -> Bool {
+        guard self.ticket == ticket, !hasAcceptedSnapshot else { return false }
+        attempts = min(attempts + 1, Self.maximumImmediateAttempts)
+        return true
+    }
+
+    mutating func accept(refreshID: UUID?, generation: UUID) -> Bool {
+        guard let ticket, !hasAcceptedSnapshot,
+              ticket.generation == generation, ticket.id == refreshID else { return false }
+        hasAcceptedSnapshot = true
+        return true
+    }
+
+    mutating func invalidate() {
+        ticket = nil
+        attempts = 0
+        hasAcceptedSnapshot = false
+    }
+}
+
+enum RemoteMediaStateAdmission {
+    static func accept(
+        _ state: WebRTCReceivedRemoteMediaState,
+        currentState: WebRTCReceivedRemoteMediaState?,
+        refresh: inout RemoteMediaRefreshGate,
+        generation: UUID,
+        transportIsReady: Bool
+    ) -> Bool {
+        guard transportIsReady, state.update.isValid else { return false }
+        if let currentState {
+            return refresh.hasAcceptedSnapshot
+                && currentState.isSameNegotiation(as: state)
+                && state.update.revision > currentState.update.revision
+        }
+        return refresh.accept(refreshID: state.refreshID, generation: generation)
+    }
+}
+
 /// Process-wide owner of an authenticated worldwide WebRTC media session.
 ///
 /// The model deliberately separates signaling/ICE, audio proof, screen presentation, and remote
@@ -799,6 +926,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var peer: WebRTCPeer? {
         didSet {
             guard oldValue !== peer else { return }
+            remoteMediaControlsNegotiated = false
+            clearRemoteMediaPresentation()
             cancelScreenMediaViewerSuspension(
                 reason: "The media peer changed during screen resume.",
                 notifyPeer: oldValue != nil
@@ -857,6 +986,16 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
     private var remoteAudioTrack: WebRTCRemoteAudioTrack?
     private let audioLifecycle: WorldwideAudioLifecycleController
+    private let backgroundPlayback = BackgroundPlaybackCoordinator.shared
+    private var remoteMediaCommandOwner: RemoteMediaCommandOwnerToken?
+    private var remoteMediaControlsNegotiated = false
+    private var currentRemoteMediaState: WebRTCReceivedRemoteMediaState?
+    private var currentRemoteMediaUpdate: WebRTCRemoteMediaStateUpdate? {
+        currentRemoteMediaState?.update
+    }
+    private var remoteMediaStateTransportAuthorizationGeneration: UUID?
+    private var remoteMediaRefresh = RemoteMediaRefreshGate()
+    private var remoteMediaRefreshTask: Task<Void, Never>?
     private var recoveryCoordinator: ICERecoveryCoordinator?
     private var nextICERestartRequestID: UInt64 = 1
     private var iceIsConnected = false
@@ -1131,6 +1270,8 @@ final class WorldwideSessionViewModel: ObservableObject {
         (@MainActor (WebRTCPeer, String) -> Void)?
     private var debugScreenLivenessUptimeClock:
         (@MainActor () -> UInt64)?
+    private var debugRemoteMediaCommandSender:
+        (@MainActor (RemoteMediaCommandDispatch) async throws -> Void)?
     #endif
 
     init(audioLifecycle: WorldwideAudioLifecycleController = WorldwideAudioLifecycleController()) {
@@ -1223,11 +1364,28 @@ final class WorldwideSessionViewModel: ObservableObject {
                 requiresFreshRecovery: requiresFreshRecovery
             )
         }
+        remoteMediaCommandOwner = backgroundPlayback.claimRemoteMediaCommandSender {
+            [weak self] dispatch in
+            Task { @MainActor [weak self] in
+                _ = self?.enqueueRemoteMediaCommand(dispatch)
+            }
+        }
+        reconcileRemoteMediaCommandAvailability()
     }
 
     deinit {
+        let remoteMediaCommandOwner = remoteMediaCommandOwner
         audioTransactionEventTask?.cancel()
+        remoteMediaRefreshTask?.cancel()
         NotificationCenter.default.removeObserver(self)
+        if let remoteMediaCommandOwner {
+            Task { @MainActor in
+                BackgroundPlaybackCoordinator.shared
+                    .releaseRemoteMediaCommandSender(
+                        owner: remoteMediaCommandOwner
+                    )
+            }
+        }
     }
 
     // MARK: - Published capabilities
@@ -5636,7 +5794,8 @@ final class WorldwideSessionViewModel: ObservableObject {
                 configuration: WebRTCTransportConfiguration(
                     role: .viewer,
                     iceServers: iceServers,
-                    icePolicy: .directPreferred
+                    icePolicy: .directPreferred,
+                    supportsRemoteMediaControls: true
                 )
             )
             guard let audioTransactionDeviceBinding =
@@ -5946,6 +6105,7 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         case .peerStateChanged(let state):
             await handlePeerState(state, generation: generation)
+            reconcileRemoteMediaCommandAvailability()
 
         case .iceStateChanged(let state):
             iceStateText = state.displayText
@@ -5974,6 +6134,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                     await recoveryCoordinator?.iceStateChanged(.disconnected)
                 }
             }
+            reconcileRemoteMediaCommandAvailability()
 
         case .iceGatheringStateChanged:
             break
@@ -5991,6 +6152,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             } else {
                 isControlChannelReady = false
             }
+            reconcileRemoteMediaCommandAvailability()
 
         case .controlRequestReceived:
             // Only the Mac host receives viewer control requests.
@@ -6013,6 +6175,49 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         case .inputSessionInvalidated:
             invalidateRemoteInputState()
+
+        case .remoteMediaControlsAvailabilityChanged(let isAvailable):
+            remoteMediaControlsNegotiated = isAvailable
+            if !isAvailable {
+                clearRemoteMediaPresentation()
+            }
+            reconcileRemoteMediaCommandAvailability()
+
+        case .remoteMediaStateChanged(let receivedState):
+            guard RemoteMediaStateAdmission.accept(
+                receivedState,
+                currentState: currentRemoteMediaState,
+                refresh: &remoteMediaRefresh,
+                generation: transportAuthorizationGeneration,
+                transportIsReady: RemoteMediaTransportAdmission.permitsIncomingState(
+                    isNegotiated: remoteMediaControlsNegotiated,
+                    isPeerConnected: isPeerConnected,
+                    isICEConnected: iceIsConnected,
+                    isControlChannelReady: isControlChannelReady,
+                    recoveryProofRequired: recoveryProofRequired
+                )
+            ) else { break }
+            remoteMediaRefreshTask?.cancel()
+            remoteMediaRefreshTask = nil
+            currentRemoteMediaState = receivedState
+            remoteMediaStateTransportAuthorizationGeneration =
+                transportAuthorizationGeneration
+            if let remoteMediaCommandOwner {
+                backgroundPlayback.publishRemoteMedia(
+                    receivedState,
+                    owner: remoteMediaCommandOwner
+                )
+            }
+            reconcileRemoteMediaCommandAvailability()
+
+        case .remoteMediaCommandAcknowledgementReceived:
+            // The host state stream remains authoritative; acknowledgements only terminate the
+            // command request and must not optimistically rewrite Now Playing metadata.
+            break
+
+        case .remoteMediaCommandReceived, .remoteMediaStateRefreshRequested:
+            // Only the Mac host receives viewer-originated media commands.
+            break
 
         case .screenMediaSuspensionReceived(let notice):
             receiveScreenMediaSuspension(
@@ -6567,6 +6772,9 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     private func resetPublishedSessionState() {
+        remoteMediaControlsNegotiated = false
+        clearRemoteMediaPresentation()
+        reconcileRemoteMediaCommandAvailability()
         ordinaryPlayoutLivenessTracker.reset()
         microphoneAutomaticRecoveryConsumedBinding = nil
         microphoneAdmissionRecoveryPendingBinding = nil
@@ -9506,6 +9714,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         // that permits remote audio to leave the fail-closed mute gate.
         recordViewerTransportHealthProof()
         audioLifecycle.transportBecameHealthy()
+        reconcileRemoteMediaCommandAvailability()
         establishAutomaticIPhoneMicrophoneIntentIfEligible()
         continueIPhoneMicrophoneEnablementIfPossible()
         await recoveryCoordinator?.iceStateChanged(.connected)
@@ -11116,6 +11325,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
         recordViewerTransportHealthProof()
         audioLifecycle.transportBecameHealthy()
+        reconcileRemoteMediaCommandAvailability()
         await activatePendingIOSStartupConnectedCallPlayoutIfPossible()
         establishAutomaticIPhoneMicrophoneIntentIfEligible()
         continueIPhoneMicrophoneEnablementIfPossible()
@@ -11208,6 +11418,232 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneError = nil
     }
 
+    @discardableResult
+    private func enqueueRemoteMediaCommand(
+        _ dispatch: RemoteMediaCommandDispatch
+    ) -> Task<Void, Never>? {
+        let command = dispatch.command
+        guard dispatch.authorization.isValid,
+              let contextID = dispatch.state.update.item?.contextID,
+              let currentRemoteMediaState,
+              currentRemoteMediaState.isSameNegotiation(as: dispatch.state),
+              remoteMediaControlsNegotiated,
+              let sourcePeer = peer,
+              isPeerConnected,
+              iceIsConnected,
+              isControlChannelReady,
+              !recoveryProofRequired,
+              remoteMediaStateTransportAuthorizationGeneration
+                == transportAuthorizationGeneration,
+              RemoteMediaCommandAdmission.permits(
+                command,
+                contextID: contextID,
+                observedRevision: dispatch.state.update.revision,
+                currentUpdate: currentRemoteMediaUpdate
+              ) else {
+            reconcileRemoteMediaCommandAvailability()
+            return nil
+        }
+        let sourceGeneration = sessionGeneration
+        let sourceTransportGeneration = transportAuthorizationGeneration
+        return Task { @MainActor [weak self, weak sourcePeer] in
+            guard let self, let sourcePeer,
+                  dispatch.authorization.isValid,
+                  self.peer === sourcePeer,
+                  self.sessionGeneration == sourceGeneration,
+                  self.transportAuthorizationGeneration
+                    == sourceTransportGeneration,
+                  self.remoteMediaControlsNegotiated,
+                  self.isPeerConnected,
+                  self.iceIsConnected,
+                  self.isControlChannelReady,
+                  !self.recoveryProofRequired,
+                  self.remoteMediaStateTransportAuthorizationGeneration
+                    == sourceTransportGeneration,
+                  let currentState = self.currentRemoteMediaState,
+                  currentState.isSameNegotiation(as: dispatch.state),
+                  RemoteMediaCommandAdmission.permits(
+                    command,
+                    contextID: contextID,
+                    observedRevision: dispatch.state.update.revision,
+                    currentUpdate: self.currentRemoteMediaUpdate
+                  ) else {
+                return
+            }
+            do {
+                #if DEBUG
+                if let sender = self.debugRemoteMediaCommandSender {
+                    try await sender(dispatch)
+                } else {
+                    try await sourcePeer.requestRemoteMediaCommand(
+                        command,
+                        state: dispatch.state,
+                        authorization: dispatch.authorization
+                    )
+                }
+                #else
+                try await sourcePeer.requestRemoteMediaCommand(
+                    command,
+                    state: dispatch.state,
+                    authorization: dispatch.authorization
+                )
+                #endif
+            } catch {
+                guard self.peer === sourcePeer,
+                      self.sessionGeneration == sourceGeneration,
+                      self.transportAuthorizationGeneration == sourceTransportGeneration,
+                      dispatch.authorization.isValid else { return }
+                // Backpressure rejects this press, not the healthy presentation. Never replay
+                // Next/Previous; actual transport events independently revoke command authority.
+                self.reconcileRemoteMediaCommandAvailability()
+            }
+        }
+    }
+
+    private func reconcileRemoteMediaCommandAvailability() {
+        let transportIsReady = RemoteMediaTransportAdmission.permitsIncomingState(
+            isNegotiated: remoteMediaControlsNegotiated,
+            isPeerConnected: isPeerConnected,
+            isICEConnected: iceIsConnected,
+            isControlChannelReady: isControlChannelReady,
+            recoveryProofRequired: recoveryProofRequired
+        )
+        if !transportIsReady {
+            clearRemoteMediaPresentation()
+        } else if let peer,
+                  let ticket = remoteMediaRefresh.begin(
+                    generation: transportAuthorizationGeneration
+                  ) {
+            requestRemoteMediaRefresh(ticket, through: peer)
+        }
+        let ready = RemoteMediaTransportAdmission.permitsCommands(
+            isNegotiated: remoteMediaControlsNegotiated,
+            hasPeer: peer != nil,
+            isPeerConnected: isPeerConnected,
+            isICEConnected: iceIsConnected,
+            isControlChannelReady: isControlChannelReady,
+            recoveryProofRequired: recoveryProofRequired,
+            stateTransportGeneration:
+                remoteMediaStateTransportAuthorizationGeneration,
+            currentTransportGeneration: transportAuthorizationGeneration,
+            hasMediaItem: currentRemoteMediaUpdate?.item != nil
+        )
+        if let remoteMediaCommandOwner {
+            backgroundPlayback.setRemoteMediaTransportReady(
+                ready,
+                owner: remoteMediaCommandOwner
+            )
+        }
+    }
+
+    private func clearRemoteMediaPresentation() {
+        remoteMediaRefreshTask?.cancel()
+        remoteMediaRefreshTask = nil
+        remoteMediaRefresh.invalidate()
+        currentRemoteMediaState = nil
+        remoteMediaStateTransportAuthorizationGeneration = nil
+        guard let remoteMediaCommandOwner else { return }
+        backgroundPlayback.clearRemoteMedia(owner: remoteMediaCommandOwner)
+    }
+
+    private func requestRemoteMediaRefresh(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer
+    ) {
+        let sourceSessionGeneration = sessionGeneration
+        remoteMediaRefreshTask = Task { @MainActor [weak self, weak sourcePeer] in
+            guard let sourcePeer else { return }
+            while !Task.isCancelled {
+                guard let delay = await self?.sendRemoteMediaRefreshIfCurrent(
+                    ticket, through: sourcePeer, session: sourceSessionGeneration
+                ) else { return }
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+                guard self?.retryRemoteMediaRefreshIfCurrent(
+                    ticket, through: sourcePeer, session: sourceSessionGeneration
+                ) == true else { return }
+            }
+        }
+    }
+
+    private func remoteMediaRefreshIsCurrent(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer,
+        session: UUID
+    ) -> Bool {
+        peer === sourcePeer && sessionGeneration == session
+            && transportAuthorizationGeneration == ticket.generation
+            && remoteMediaRefresh.ticket == ticket
+            && !remoteMediaRefresh.hasAcceptedSnapshot
+            && RemoteMediaTransportAdmission.permitsIncomingState(
+                isNegotiated: remoteMediaControlsNegotiated,
+                isPeerConnected: isPeerConnected,
+                isICEConnected: iceIsConnected,
+                isControlChannelReady: isControlChannelReady,
+                recoveryProofRequired: recoveryProofRequired
+            )
+    }
+
+    private func sendRemoteMediaRefreshIfCurrent(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer,
+        session: UUID
+    ) async -> Duration? {
+        guard remoteMediaRefreshIsCurrent(ticket, through: sourcePeer, session: session)
+        else { return nil }
+        do {
+            try await sourcePeer.requestRemoteMediaStateRefresh(id: ticket.id)
+        } catch {
+            // Only the idempotent snapshot may retry, with slow probes after the short episode.
+        }
+        guard remoteMediaRefreshIsCurrent(ticket, through: sourcePeer, session: session)
+        else { return nil }
+        return remoteMediaRefresh.retryDelay
+    }
+
+    private func retryRemoteMediaRefreshIfCurrent(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer,
+        session: UUID
+    ) -> Bool {
+        remoteMediaRefreshIsCurrent(ticket, through: sourcePeer, session: session)
+            && remoteMediaRefresh.retry(ticket)
+    }
+
+    #if DEBUG
+    func debugInstallRemoteMediaCommandPathForTests(
+        peer newPeer: WebRTCPeer,
+        state: WebRTCReceivedRemoteMediaState,
+        sender: @escaping @MainActor (RemoteMediaCommandDispatch) async throws -> Void
+    ) {
+        clearRemoteMediaPresentation()
+        peer = newPeer
+        remoteMediaControlsNegotiated = true
+        isPeerConnected = true
+        iceIsConnected = true
+        isControlChannelReady = true
+        recoveryProofRequired = false
+        let ticket = remoteMediaRefresh.begin(generation: transportAuthorizationGeneration)!
+        _ = remoteMediaRefresh.accept(refreshID: ticket.id, generation: ticket.generation)
+        currentRemoteMediaState = state
+        remoteMediaStateTransportAuthorizationGeneration = transportAuthorizationGeneration
+        debugRemoteMediaCommandSender = sender
+        if let remoteMediaCommandOwner {
+            backgroundPlayback.publishRemoteMedia(state, owner: remoteMediaCommandOwner)
+        }
+        reconcileRemoteMediaCommandAvailability()
+    }
+
+    func debugEnqueueRemoteMediaCommandForTests(
+        _ dispatch: RemoteMediaCommandDispatch
+    ) -> Task<Void, Never>? {
+        enqueueRemoteMediaCommand(dispatch)
+    }
+    #endif
+
     private func markTransportUncertain(
         _ state: String,
         requiresProof: Bool = false
@@ -11224,6 +11660,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             )
         }
         transportAuthorizationGeneration = UUID()
+        clearRemoteMediaPresentation()
         invalidateMacHostedCallEvidence(notifyLifecycle: false)
         retireIOSHostedCallPlayoutAttempt()
         audioLifecycle.transportBecameUncertain()

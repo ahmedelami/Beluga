@@ -15,17 +15,22 @@ public struct WebRTCTransportConfiguration: Sendable {
     public let iceServers: [RemoteICEServer]
     public let icePolicy: WebRTCICEPolicy
     public let maximumVideoBitrate: Int?
+    /// Explicit local opt-in for the versioned Mac Now Playing control protocol.
+    /// Both peers must independently enable and negotiate it before any wire message is sent.
+    public let supportsRemoteMediaControls: Bool
 
     public init(
         role: RemotePeerRole,
         iceServers: [RemoteICEServer],
         icePolicy: WebRTCICEPolicy = .directPreferred,
-        maximumVideoBitrate: Int? = nil
+        maximumVideoBitrate: Int? = nil,
+        supportsRemoteMediaControls: Bool = false
     ) {
         self.role = role
         self.iceServers = iceServers
         self.icePolicy = icePolicy
         self.maximumVideoBitrate = maximumVideoBitrate
+        self.supportsRemoteMediaControls = supportsRemoteMediaControls
     }
 }
 
@@ -157,6 +162,18 @@ public enum WebRTCTransportEvent: Sendable {
     case inputFeedbackReceived(WebRTCInputFeedback)
     /// The input capability was fail-closed independently of screen media/control state.
     case inputSessionInvalidated(String)
+    /// Whether the exact current offer/answer generation negotiated Mac media controls.
+    case remoteMediaControlsAvailabilityChanged(Bool)
+    /// Authoritative Mac system Now Playing state. A nil item clears a prior source.
+    case remoteMediaStateChanged(WebRTCReceivedRemoteMediaState)
+    /// A current viewer requests a fresh snapshot after its native presentation is ready.
+    case remoteMediaStateRefreshRequested(WebRTCReceivedRemoteMediaStateRefreshRequest)
+    /// A validated viewer command that the Mac host must execute and acknowledge at most once.
+    case remoteMediaCommandReceived(WebRTCReceivedRemoteMediaCommand)
+    /// The Mac's terminal result for one viewer media command.
+    case remoteMediaCommandAcknowledgementReceived(
+        WebRTCRemoteMediaCommandAcknowledgement
+    )
     /// A current-peer viewer challenge that the Mac must satisfy with a fresh native process scan.
     case macHostedCallChallengeReceived(WebRTCMacHostedCallChallenge)
     /// Current-peer Mac-hosted call proof, or nil when any evidence boundary is uncertain.

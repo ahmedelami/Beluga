@@ -19,6 +19,8 @@ passes the unrelated-network and forced-TURN gates described in
 
 - Mac system-audio capture with ScreenCaptureKit and 48 kHz stereo Opus transport.
 - H.264 screen video with Show/Hide independent from audio playback.
+- Native iPhone Lock Screen and Control Center Play/Pause/Next/Previous controls for
+  the Mac's active Now Playing source, when both peers negotiate support.
 - An opt-in adjustable portrait display for a headless Mac. It replaces the sole Apple headless
   placeholder with the same desktop plus verified iPhone-resolution choices; screen video uses
   the active framebuffer while system-audio selection remains independent.
@@ -86,6 +88,28 @@ During an active iPhone call, opensteamer keeps authenticated streamed playback 
 output-only mode, temporarily mutes the iPhone microphone uplink, and automatically restores
 the microphone after the call ends and the exact built-in-microphone route is healthy again.
 
+## Native media controls
+
+The iPhone mirrors the Mac's active system Now Playing source, including bounded title,
+artist, elapsed-time, and duration metadata. Only commands supported by that source are
+enabled. Changing the active player or media item replaces the old context; queued controls
+must not operate on a replacement item or survive a connection recovery boundary.
+
+These commands control playback on the Mac, not the iPhone's local audio-route policy.
+An iPhone interruption or headphone-loss privacy mute is not cleared by pressing Play.
+The displayed playback state describes the Mac source and can therefore remain Playing
+while local audio is muted. Force-quitting the iPhone app still ends its session; the
+controls do not create background execution through synthetic audio. Artwork and seeking
+are not included in the bounded control-channel protocol.
+
+The directly distributed Mac host uses a narrowly gated private MediaRemote adapter to
+follow the same active owner as macOS Control Center. Its ABI is currently gated to
+macOS 26.5, with development verification on 26.5.1; unsupported versions or missing
+symbols disable this feature without disabling streaming. The private adapter is
+macOS-only and is not linked into the iOS/TestFlight app. Source tests do not certify
+Lock Screen behavior on a physical iPhone; see the media-controls release boundary in
+[TESTING_ORACLES.md](TESTING_ORACLES.md).
+
 ## Configure before building
 
 1. For a fork or self-hosted deployment, deploy the backend from `services/RendezvousWorker` and
@@ -121,7 +145,7 @@ The authoritative values for the maintainer build are:
 | Configuration field | Checked-in value |
 | --- | --- |
 | Protected legacy Release bundle | <code>com.elamin.AudioStreamer</code>, build `36` |
-| Side-by-side TestFlight bundle | <code>com.elamin.opensteamer</code>, build `63` |
+| Side-by-side TestFlight bundle | <code>com.elamin.opensteamer</code>, build `64` |
 | Development team | `MSMG8CJLB3` |
 | Marketing version | `0.1.0` |
 | Release rendezvous | `OPENSTEAMER_RENDEZVOUS_URL` uses the production WSS Worker origin declared in [`project.yml`](iOS/opensteamer/project.yml) |

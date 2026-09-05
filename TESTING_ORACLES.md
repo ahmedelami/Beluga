@@ -88,6 +88,25 @@ driver evidence and does not certify a later build from this source cleanup.
   prove restoration after `SIGKILL`, process crash, kernel failure, or power loss;
   release claims must state that limitation rather than inferring crash recovery.
 
+## Native media controls release boundary
+
+Before shipping a change to Now Playing controls, require deterministic coverage of
+negotiation with legacy peers, the 4 KiB wire bound, exact current-source command
+admission, at-most-once Next/Previous execution, and fresh state after startup and
+same-peer ICE recovery. Queue-delay mutations must demonstrate that a command or
+acknowledgement admitted before recovery cannot acquire a new generation's authority.
+Backpressure must not replay a relative command or permanently disable controls for an
+unchanged paused item. Native metadata tests must cover owner replacement, source clear,
+unsupported controls, and preservation of local interruption/headphone privacy policy.
+
+A physical release claim additionally requires the deployed host and intended iPhone
+build: observe the system Lock Screen/Control Center metadata, change between two real
+Mac media sources, and verify Play/Pause/Next/Previous affect only the active source.
+Repeat while paused, through a connection recovery, and with local audio muted by its
+privacy policy. A successful command acknowledgement or metadata dictionary alone does
+not prove native iOS presentation or the Mac player's observable response. Keep this
+physical evidence separate from compile, simulator, upload, and deployment results.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac

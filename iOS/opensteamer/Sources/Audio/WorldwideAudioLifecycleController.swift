@@ -525,7 +525,7 @@ final class WorldwideAudioLifecycleController {
     convenience init() {
         self.init(
             playback: WebRTCAudioPlaybackSession(),
-            backgroundPlayback: BackgroundPlaybackCoordinator(),
+            backgroundPlayback: BackgroundPlaybackCoordinator.shared,
             events: AudioSessionManager(),
             callActivity: WorldwideCallActivityObserver()
         )

@@ -1,6 +1,7 @@
 import AVFAudio
 import Dispatch
 import IOSWebRTCAudioDeviceShim
+@preconcurrency import MediaPlayer
 import RemoteSessionCore
 import XCTest
 @testable import opensteamer
@@ -21563,6 +21564,541 @@ private actor AudioManualContinuationStepper {
         await withCheckedContinuation {
             (continuation: CheckedContinuation<Void, Never>) in
             completionWaiters[ordinal, default: []].append(continuation)
+        }
+    }
+}
+
+@MainActor
+final class RemoteMediaCommandDispatchGateTests: XCTestCase {
+    func testAllFourCommandsRequireExactReadyPublishedContext() {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        let item = WebRTCRemoteMediaItem(
+            contextID: "context-a",
+            sourceName: "Music",
+            title: "Track",
+            playbackState: .playing,
+            playbackRate: 1,
+            capabilities: WebRTCRemoteMediaCapabilities(
+                canPlay: true,
+                canPause: true,
+                canSkipForward: true,
+                canSkipBackward: true
+            )
+        )
+        let sender: RemoteMediaCommandSender = { dispatch in
+            recorder.append(dispatch)
+        }
+        gate.claim(owner: owner, sender: sender)
+
+        gate.update(
+            owner: owner,
+            state: makeReceivedState(item: item, revision: 4),
+            transportIsReady: false
+        )
+        XCTAssertFalse(gate.dispatch(.play))
+        XCTAssertTrue(recorder.values.isEmpty)
+
+        gate.update(
+            owner: owner,
+            state: makeReceivedState(item: item, revision: 4),
+            transportIsReady: true
+        )
+        for command in WebRTCRemoteMediaCommand.allCases {
+            XCTAssertTrue(gate.dispatch(command))
+        }
+        XCTAssertEqual(recorder.values.map(\.command), WebRTCRemoteMediaCommand.allCases)
+        XCTAssertTrue(recorder.values.allSatisfy { $0.contextID == "context-a" })
+        XCTAssertTrue(recorder.values.allSatisfy { $0.revision == 4 })
+
+        gate.update(
+            owner: owner,
+            state: makeReceivedState(item: nil, revision: 5),
+            transportIsReady: true
+        )
+        XCTAssertFalse(gate.dispatch(.pause))
+        XCTAssertEqual(recorder.values.count, 4)
+    }
+
+    func testReplacementContextCannotReuseOldCapabilities() {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        let sender: RemoteMediaCommandSender = { dispatch in
+            recorder.append(dispatch)
+        }
+        gate.claim(owner: owner, sender: sender)
+        let noSkipItem = WebRTCRemoteMediaItem(
+            contextID: "context-b",
+            sourceName: "Browser",
+            title: "Video",
+            playbackState: .paused,
+            playbackRate: 0,
+            capabilities: WebRTCRemoteMediaCapabilities(
+                canPlay: true,
+                canPause: true,
+                canSkipForward: false,
+                canSkipBackward: false
+            )
+        )
+        gate.update(
+            owner: owner,
+            state: makeReceivedState(item: noSkipItem, revision: 9),
+            transportIsReady: true
+        )
+
+        XCTAssertFalse(gate.dispatch(.nextTrack))
+        XCTAssertTrue(gate.dispatch(.play))
+        XCTAssertEqual(recorder.values.count, 1)
+        XCTAssertEqual(recorder.values.first?.contextID, "context-b")
+        XCTAssertEqual(recorder.values.first?.revision, 9)
+    }
+
+    func testSupersededOwnerCannotMutateOrReleaseReplacement() {
+        let gate = RemoteMediaCommandDispatchGate()
+        let firstOwner = RemoteMediaCommandOwnerToken()
+        let replacementOwner = RemoteMediaCommandOwnerToken()
+        let firstRecorder = LockedRemoteMediaCommandRecorder()
+        let replacementRecorder = LockedRemoteMediaCommandRecorder()
+        let firstItem = makeRemoteMediaItem(contextID: "first")
+        let replacementItem = makeRemoteMediaItem(contextID: "replacement")
+
+        gate.claim(owner: firstOwner) { dispatch in
+            firstRecorder.append(dispatch)
+        }
+        XCTAssertTrue(
+            gate.update(
+                owner: firstOwner,
+                state: makeReceivedState(item: firstItem, revision: 3),
+                transportIsReady: true
+            )
+        )
+
+        gate.claim(owner: replacementOwner) { dispatch in
+            replacementRecorder.append(dispatch)
+        }
+        XCTAssertFalse(
+            gate.update(
+                owner: firstOwner,
+                state: makeReceivedState(item: firstItem, revision: 4),
+                transportIsReady: true
+            )
+        )
+        XCTAssertFalse(gate.release(owner: firstOwner))
+        XCTAssertTrue(
+            gate.update(
+                owner: replacementOwner,
+                state: makeReceivedState(item: replacementItem, revision: 1),
+                transportIsReady: true
+            )
+        )
+
+        XCTAssertTrue(gate.dispatch(.pause))
+        XCTAssertTrue(firstRecorder.values.isEmpty)
+        XCTAssertEqual(replacementRecorder.values.count, 1)
+        XCTAssertEqual(replacementRecorder.values.first?.contextID, "replacement")
+        XCTAssertTrue(gate.release(owner: replacementOwner))
+        XCTAssertFalse(gate.dispatch(.pause))
+    }
+
+    func testNewerTimelineRevisionPreservesSameContextCommandAdmission() {
+        let observed = WebRTCRemoteMediaStateUpdate(
+            revision: 7,
+            item: makeRemoteMediaItem(contextID: "same-context")
+        )
+        let refreshed = WebRTCRemoteMediaStateUpdate(
+            revision: 8,
+            item: makeRemoteMediaItem(contextID: "same-context")
+        )
+
+        XCTAssertTrue(
+            RemoteMediaCommandAdmission.permits(
+                .nextTrack,
+                contextID: "same-context",
+                observedRevision: observed.revision,
+                currentUpdate: refreshed
+            )
+        )
+        XCTAssertFalse(
+            RemoteMediaCommandAdmission.permits(
+                .nextTrack,
+                contextID: "replacement",
+                observedRevision: observed.revision,
+                currentUpdate: refreshed
+            )
+        )
+        XCTAssertFalse(
+            RemoteMediaCommandAdmission.permits(
+                .nextTrack,
+                contextID: "same-context",
+                observedRevision: 9,
+                currentUpdate: refreshed
+            )
+        )
+    }
+
+    func testNewerRevisionCannotReuseRevokedCapability() {
+        let refreshed = WebRTCRemoteMediaStateUpdate(
+            revision: 11,
+            item: makeRemoteMediaItem(
+                contextID: "same-context",
+                canSkipForward: false
+            )
+        )
+
+        XCTAssertFalse(
+            RemoteMediaCommandAdmission.permits(
+                .nextTrack,
+                contextID: "same-context",
+                observedRevision: 10,
+                currentUpdate: refreshed
+            )
+        )
+        XCTAssertTrue(
+            RemoteMediaCommandAdmission.permits(
+                .pause,
+                contextID: "same-context",
+                observedRevision: 10,
+                currentUpdate: refreshed
+            )
+        )
+    }
+
+    func testTransportGenerationRequiresFreshHealthyState() {
+        let retiredGeneration = UUID()
+        let currentGeneration = UUID()
+
+        XCTAssertFalse(
+            RemoteMediaTransportAdmission.permitsIncomingState(
+                isNegotiated: true,
+                isPeerConnected: true,
+                isICEConnected: false,
+                isControlChannelReady: true,
+                recoveryProofRequired: false
+            )
+        )
+        XCTAssertFalse(
+            RemoteMediaTransportAdmission.permitsIncomingState(
+                isNegotiated: true,
+                isPeerConnected: true,
+                isICEConnected: true,
+                isControlChannelReady: true,
+                recoveryProofRequired: true
+            )
+        )
+        XCTAssertFalse(
+            RemoteMediaTransportAdmission.permitsCommands(
+                isNegotiated: true,
+                hasPeer: true,
+                isPeerConnected: true,
+                isICEConnected: true,
+                isControlChannelReady: true,
+                recoveryProofRequired: false,
+                stateTransportGeneration: retiredGeneration,
+                currentTransportGeneration: currentGeneration,
+                hasMediaItem: true
+            )
+        )
+        XCTAssertTrue(
+            RemoteMediaTransportAdmission.permitsCommands(
+                isNegotiated: true,
+                hasPeer: true,
+                isPeerConnected: true,
+                isICEConnected: true,
+                isControlChannelReady: true,
+                recoveryProofRequired: false,
+                stateTransportGeneration: currentGeneration,
+                currentTransportGeneration: currentGeneration,
+                hasMediaItem: true
+            )
+        )
+    }
+
+    func testRefreshRequiresExactHealthyBoundaryAndRetriesAreBounded() throws {
+        var gate = RemoteMediaRefreshGate()
+        let generation = UUID()
+        let ticket = try XCTUnwrap(gate.begin(generation: generation))
+        XCTAssertNil(gate.begin(generation: generation))
+        XCTAssertFalse(gate.accept(refreshID: nil, generation: generation))
+        XCTAssertFalse(gate.accept(refreshID: UUID(), generation: generation))
+        XCTAssertFalse(gate.accept(refreshID: ticket.id, generation: UUID()))
+        XCTAssertTrue(gate.retry(ticket))
+        XCTAssertTrue(gate.retry(ticket))
+        XCTAssertEqual(gate.retryDelay, .seconds(10))
+        for _ in 0..<20 {
+            XCTAssertTrue(gate.retry(ticket))
+            XCTAssertEqual(gate.retryDelay, .seconds(10))
+        }
+        XCTAssertEqual(gate.attempts, RemoteMediaRefreshGate.maximumImmediateAttempts)
+        XCTAssertTrue(gate.accept(refreshID: ticket.id, generation: generation))
+        XCTAssertFalse(gate.retry(ticket))
+        gate.invalidate()
+        let replacement = try XCTUnwrap(gate.begin(generation: UUID()))
+        XCTAssertFalse(gate.accept(refreshID: ticket.id, generation: replacement.generation))
+        XCTAssertFalse(gate.retry(ticket))
+        XCTAssertTrue(gate.accept(refreshID: replacement.id, generation: replacement.generation))
+    }
+
+    func testEveryUnsupportedNativeCommandIsExplicitlyDisabled() {
+        _ = BackgroundPlaybackCoordinator.shared
+        let commandCenter = MPRemoteCommandCenter.shared()
+        let unsupportedCommands: [MPRemoteCommand] = [
+            commandCenter.togglePlayPauseCommand,
+            commandCenter.stopCommand,
+            commandCenter.enableLanguageOptionCommand,
+            commandCenter.disableLanguageOptionCommand,
+            commandCenter.changePlaybackRateCommand,
+            commandCenter.changeRepeatModeCommand,
+            commandCenter.changeShuffleModeCommand,
+            commandCenter.skipForwardCommand,
+            commandCenter.skipBackwardCommand,
+            commandCenter.seekForwardCommand,
+            commandCenter.seekBackwardCommand,
+            commandCenter.changePlaybackPositionCommand,
+            commandCenter.ratingCommand,
+            commandCenter.likeCommand,
+            commandCenter.dislikeCommand,
+            commandCenter.bookmarkCommand
+        ]
+
+        XCTAssertTrue(unsupportedCommands.allSatisfy { !$0.isEnabled })
+    }
+
+    func testPausedUnchangedSnapshotReopensOnlyAfterStartupAndRecoveryEcho() throws {
+        let item = WebRTCRemoteMediaItem(
+            contextID: "paused-track", sourceName: "Music", title: "Paused track",
+            playbackState: .paused, playbackRate: 0,
+            capabilities: .init(canPlay: true, canPause: false,
+                                canSkipForward: true, canSkipBackward: true)
+        )
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        var refresh = RemoteMediaRefreshGate()
+        var current: WebRTCReceivedRemoteMediaState?
+        let early = makeReceivedState(item: item, negotiation: negotiation)
+        let initialGeneration = UUID()
+        XCTAssertFalse(RemoteMediaStateAdmission.accept(
+            early, currentState: current, refresh: &refresh,
+            generation: initialGeneration, transportIsReady: false
+        ))
+        let initial = try XCTUnwrap(refresh.begin(generation: initialGeneration))
+        XCTAssertFalse(RemoteMediaStateAdmission.accept(
+            early, currentState: current, refresh: &refresh,
+            generation: initialGeneration, transportIsReady: true
+        ))
+        let snapshot = makeReceivedState(item: item, revision: 2,
+            negotiation: negotiation, refreshID: initial.id)
+        XCTAssertTrue(RemoteMediaStateAdmission.accept(
+            snapshot, currentState: current, refresh: &refresh,
+            generation: initialGeneration, transportIsReady: true
+        ))
+        current = snapshot
+        let sameItemNewNegotiation = makeReceivedState(item: item, revision: 3)
+        XCTAssertFalse(RemoteMediaStateAdmission.accept(
+            sameItemNewNegotiation, currentState: current, refresh: &refresh,
+            generation: initialGeneration, transportIsReady: true
+        ))
+        refresh.invalidate()
+        current = nil
+        let recoveredGeneration = UUID()
+        let recovered = try XCTUnwrap(refresh.begin(generation: recoveredGeneration))
+        XCTAssertFalse(RemoteMediaStateAdmission.accept(
+            snapshot, currentState: current, refresh: &refresh,
+            generation: recoveredGeneration, transportIsReady: true
+        ))
+        let recoverySnapshot = makeReceivedState(item: item, revision: 3,
+            negotiation: negotiation, refreshID: recovered.id)
+        XCTAssertTrue(RemoteMediaStateAdmission.accept(
+            recoverySnapshot, currentState: current, refresh: &refresh,
+            generation: recoveredGeneration, transportIsReady: true
+        ))
+        XCTAssertEqual(recoverySnapshot.update.item, snapshot.update.item)
+    }
+
+    func testQueuedCommandCannotAcquireRenewedAuthorityAfterSameContextRecovery() throws {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        let item = makeRemoteMediaItem(contextID: "unchanged")
+        gate.claim(owner: owner) { recorder.append($0) }
+        gate.update(owner: owner,
+            state: makeReceivedState(item: item, revision: 8, negotiation: negotiation),
+            transportIsReady: true)
+        XCTAssertTrue(gate.dispatch(.nextTrack))
+        let queued = try XCTUnwrap(recorder.values.first?.dispatch)
+        gate.update(owner: owner, state: nil, transportIsReady: false)
+        gate.update(owner: owner,
+            state: makeReceivedState(item: item, revision: 9, negotiation: negotiation),
+            transportIsReady: true)
+        var delivered = 0
+        XCTAssertThrowsError(try queued.authorization.withValidAuthorization { delivered += 1 })
+        XCTAssertEqual(delivered, 0)
+        XCTAssertTrue(gate.dispatch(.nextTrack))
+        let fresh = try XCTUnwrap(recorder.values.last?.dispatch)
+        try fresh.authorization.withValidAuthorization { delivered += 1 }
+        XCTAssertEqual(delivered, 1)
+        gate.claim(owner: RemoteMediaCommandOwnerToken()) { _ in }
+        XCTAssertThrowsError(try fresh.authorization.withValidAuthorization { delivered += 1 })
+        XCTAssertEqual(delivered, 1)
+    }
+
+    func testTimelineUpdatePreservesTokenButSourceAndCapabilityChangesRevokeIt() throws {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        let item = makeRemoteMediaItem(contextID: "same")
+        gate.claim(owner: owner) { recorder.append($0) }
+        gate.update(owner: owner,
+            state: makeReceivedState(item: item, revision: 2, negotiation: negotiation),
+            transportIsReady: true)
+        XCTAssertTrue(gate.dispatch(.nextTrack))
+        let old = try XCTUnwrap(recorder.values.last?.dispatch)
+        gate.update(owner: owner,
+            state: makeReceivedState(item: item, revision: 3, negotiation: negotiation),
+            transportIsReady: true)
+        XCTAssertTrue(old.authorization.isValid)
+        gate.update(owner: owner, state: makeReceivedState(
+            item: makeRemoteMediaItem(contextID: "same", canSkipForward: false),
+            revision: 4, negotiation: negotiation), transportIsReady: true)
+        XCTAssertFalse(old.authorization.isValid)
+        XCTAssertFalse(gate.dispatch(.nextTrack))
+        XCTAssertTrue(gate.dispatch(.pause))
+        let paused = try XCTUnwrap(recorder.values.last?.dispatch)
+        gate.update(owner: owner, state: makeReceivedState(
+            item: makeRemoteMediaItem(contextID: "new-source"), revision: 5,
+            negotiation: negotiation), transportIsReady: true)
+        XCTAssertFalse(paused.authorization.isValid)
+    }
+
+    func testNativeMetadataReplacementAndLocalAudioPauseRemainIndependent() {
+        let coordinator = BackgroundPlaybackCoordinator.shared
+        let owner = coordinator.claimRemoteMediaCommandSender { _ in }
+        defer {
+            coordinator.releaseRemoteMediaCommandSender(owner: owner)
+            coordinator.clear()
+        }
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        let first = WebRTCRemoteMediaItem(
+            contextID: "first", sourceName: "Music", title: "First",
+            artist: "Artist", album: "Album", playbackState: .playing,
+            elapsedTime: 12, duration: 120, playbackRate: 1,
+            capabilities: .init(canPlay: true, canPause: true,
+                                canSkipForward: true, canSkipBackward: true))
+        coordinator.publishRemoteMedia(makeReceivedState(item: first,
+            negotiation: negotiation), owner: owner)
+        coordinator.setRemoteMediaTransportReady(true, owner: owner)
+        coordinator.publishLiveStream(serverName: "private host name", isPlaying: false)
+        let center = MPNowPlayingInfoCenter.default()
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "First")
+        // These controls reflect Mac playback, never authorize local Resume Audio.
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1)
+        XCTAssertTrue(MPRemoteCommandCenter.shared().pauseCommand.isEnabled)
+        let replacement = WebRTCRemoteMediaItem(
+            contextID: "second", sourceName: "Browser", title: "Second",
+            playbackState: .paused, playbackRate: 0,
+            capabilities: .init(canPlay: true, canPause: false,
+                                canSkipForward: false, canSkipBackward: false))
+        coordinator.publishRemoteMedia(makeReceivedState(item: replacement, revision: 2,
+            negotiation: negotiation), owner: owner)
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Second")
+        XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyAlbumTitle])
+        XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0)
+        XCTAssertFalse(MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled)
+        coordinator.clearRemoteMedia(owner: owner)
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+        XCTAssertFalse(MPRemoteCommandCenter.shared().playCommand.isEnabled)
+    }
+
+    func testPausedCommandBackpressureDoesNotDisableControlsOrReplayPress() async throws {
+        let peer = try WebRTCPeer(configuration: .init(role: .viewer, iceServers: []))
+        let viewModel = WorldwideSessionViewModel()
+        let item = WebRTCRemoteMediaItem(
+            contextID: "paused", sourceName: "Music", title: "Paused",
+            playbackState: .paused, playbackRate: 0,
+            capabilities: .init(canPlay: true, canPause: false,
+                                canSkipForward: true, canSkipBackward: true))
+        let state = makeReceivedState(item: item)
+        var attempts = 0
+        viewModel.debugInstallRemoteMediaCommandPathForTests(peer: peer, state: state) { _ in
+            attempts += 1
+            if attempts == 1 { throw WebRTCTransportError.dataChannelBackpressured }
+        }
+        let command = RemoteMediaCommandDispatch(command: .play, state: state,
+            authorization: WebRTCControlAuthorization())
+        let failedSend = try XCTUnwrap(viewModel.debugEnqueueRemoteMediaCommandForTests(command))
+        await failedSend.value
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(MPRemoteCommandCenter.shared().playCommand.isEnabled)
+        let freshPress = try XCTUnwrap(viewModel.debugEnqueueRemoteMediaCommandForTests(command))
+        await freshPress.value
+        XCTAssertEqual(attempts, 2)
+        XCTAssertTrue(MPRemoteCommandCenter.shared().playCommand.isEnabled)
+        viewModel.disconnect()
+        let retired = await peer.close()
+        XCTAssertTrue(retired)
+    }
+
+    private func makeRemoteMediaItem(
+        contextID: String,
+        canSkipForward: Bool = true
+    ) -> WebRTCRemoteMediaItem {
+        WebRTCRemoteMediaItem(
+            contextID: contextID,
+            sourceName: "Music",
+            title: "Track",
+            playbackState: .playing,
+            playbackRate: 1,
+            capabilities: WebRTCRemoteMediaCapabilities(
+                canPlay: true,
+                canPause: true,
+                canSkipForward: canSkipForward,
+                canSkipBackward: true
+            )
+        )
+    }
+
+    private func makeReceivedState(
+        item: WebRTCRemoteMediaItem?,
+        revision: UInt64 = 1,
+        negotiation: WebRTCRemoteMediaAuthorization = WebRTCRemoteMediaAuthorization(),
+        refreshID: UUID? = nil
+    ) -> WebRTCReceivedRemoteMediaState {
+        WebRTCReceivedRemoteMediaState(envelope: WebRTCRemoteMediaStateEnvelope(
+            authorization: negotiation,
+            update: WebRTCRemoteMediaStateUpdate(revision: revision, item: item),
+            refreshID: refreshID
+        ))
+    }
+}
+
+private final class LockedRemoteMediaCommandRecorder: @unchecked Sendable {
+    struct Value {
+        let command: WebRTCRemoteMediaCommand
+        let contextID: String
+        let revision: UInt64
+        let dispatch: RemoteMediaCommandDispatch
+    }
+
+    private let lock = NSLock()
+    private var storage: [Value] = []
+
+    var values: [Value] { lock.withLock { storage } }
+
+    func append(
+        _ dispatch: RemoteMediaCommandDispatch
+    ) {
+        lock.withLock {
+            storage.append(
+                Value(
+                    command: dispatch.command,
+                    contextID: dispatch.state.update.item?.contextID ?? "",
+                    revision: dispatch.state.update.revision,
+                    dispatch: dispatch
+                )
+            )
         }
     }
 }

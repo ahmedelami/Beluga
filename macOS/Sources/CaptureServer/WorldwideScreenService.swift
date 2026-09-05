@@ -5,6 +5,191 @@ import Foundation
 import RemoteSessionCore
 import WebRTCTransport
 
+struct WorldwideRemoteMediaPublicationMachine: Sendable, Equatable {
+    struct Attempt: Sendable, Equatable {
+        struct ID: Sendable, Equatable {
+            fileprivate let peerEpoch: UInt64
+            fileprivate let ordinal: UInt64
+        }
+
+        let id: ID
+        let desiredVersion: UInt64
+        let update: WebRTCRemoteMediaStateUpdate
+    }
+
+    enum Completion: Sendable, Equatable {
+        case ignored
+        case finished
+        case publishNewest
+        case retryLatest
+    }
+
+    private(set) var peerEpoch: UInt64 = 0
+    private(set) var nextAttemptOrdinal: UInt64 = 0
+    private(set) var desiredControllerRevision: UInt64?
+    private(set) var desiredItem: WebRTCRemoteMediaItem?
+    private(set) var desiredVersion: UInt64 = 0
+    private(set) var publishedVersion: UInt64 = 0
+    private(set) var lastSuccessfullySent: WebRTCRemoteMediaStateUpdate?
+    private(set) var remoteMediaIsAvailable = false
+    private(set) var inFlight: Attempt?
+
+    var hasPendingPublication: Bool {
+        desiredControllerRevision != nil && desiredVersion != publishedVersion
+    }
+
+    mutating func applyControllerUpdate(_ update: WebRTCRemoteMediaStateUpdate) {
+        guard update.isValid,
+              update.revision > (desiredControllerRevision ?? 0) else { return }
+        desiredControllerRevision = update.revision
+        desiredItem = update.item
+        advanceDesiredVersion()
+    }
+
+    mutating func requestRefresh() {
+        guard desiredControllerRevision != nil else { return }
+        advanceDesiredVersion()
+    }
+
+    mutating func setRemoteMediaAvailable(_ isAvailable: Bool) {
+        guard remoteMediaIsAvailable != isAvailable else { return }
+        if !isAvailable,
+           desiredControllerRevision != nil,
+           (inFlight != nil || !hasPendingPublication) {
+            // A same-peer authorization renegotiation must republish the last desired value but
+            // must not reset the monotonically increasing wire revision.
+            advanceDesiredVersion()
+        }
+        remoteMediaIsAvailable = isAvailable
+    }
+
+    mutating func beginIfPossible(transportIsReady: Bool) -> Attempt? {
+        guard transportIsReady,
+              remoteMediaIsAvailable,
+              inFlight == nil,
+              hasPendingPublication else { return nil }
+        guard let wireRevision = Self.nextWireRevision(
+            after: lastSuccessfullySent?.revision
+        ) else {
+            // The viewer's recovery floor saturates at max; wrapping to one on the same peer
+            // would be rejected. Only a fresh peer authorization may reset the wire sequence.
+            return nil
+        }
+        nextAttemptOrdinal &+= 1
+        if nextAttemptOrdinal == 0 { nextAttemptOrdinal = 1 }
+        let attempt = Attempt(
+            id: Attempt.ID(
+                peerEpoch: peerEpoch,
+                ordinal: nextAttemptOrdinal
+            ),
+            desiredVersion: desiredVersion,
+            update: WebRTCRemoteMediaStateUpdate(
+                revision: wireRevision,
+                item: desiredItem
+            )
+        )
+        inFlight = attempt
+        return attempt
+    }
+
+    static func nextWireRevision(after revision: UInt64?) -> UInt64? {
+        let revision = revision ?? 0
+        guard revision < UInt64.max else { return nil }
+        return revision + 1
+    }
+
+    mutating func complete(
+        _ attempt: Attempt,
+        succeeded: Bool
+    ) -> Completion {
+        guard inFlight?.id == attempt.id,
+              attempt.id.peerEpoch == peerEpoch else { return .ignored }
+        inFlight = nil
+        if succeeded {
+            lastSuccessfullySent = attempt.update
+            publishedVersion = attempt.desiredVersion
+        }
+        if desiredVersion != attempt.desiredVersion {
+            return .publishNewest
+        }
+        return succeeded ? .finished : .retryLatest
+    }
+
+    mutating func startNewPeer() {
+        peerEpoch &+= 1
+        nextAttemptOrdinal = 0
+        publishedVersion = 0
+        lastSuccessfullySent = nil
+        remoteMediaIsAvailable = false
+        inFlight = nil
+    }
+
+    mutating func stop() {
+        startNewPeer()
+        desiredControllerRevision = nil
+        desiredItem = nil
+        desiredVersion = 0
+        publishedVersion = 0
+    }
+
+    private mutating func advanceDesiredVersion() {
+        desiredVersion &+= 1
+        if desiredVersion == 0 { desiredVersion = 1 }
+    }
+}
+
+struct WorldwideRemoteMediaPublicationRetryGate: Sendable, Equatable {
+    struct Token: Sendable, Equatable {
+        fileprivate let epoch: UInt64
+    }
+
+    private(set) var epoch: UInt64 = 0
+    private(set) var isScheduled = false
+
+    mutating func schedule() -> Token? {
+        guard !isScheduled else { return nil }
+        isScheduled = true
+        return Token(epoch: epoch)
+    }
+
+    mutating func consume(_ token: Token) -> Bool {
+        guard isScheduled, token.epoch == epoch else { return false }
+        isScheduled = false
+        return true
+    }
+
+    mutating func cancel() {
+        epoch &+= 1
+        isScheduled = false
+    }
+}
+
+struct WorldwideRemoteMediaCommandQueueCapacity: Sendable, Equatable {
+    static let maximumCount = 16
+    private(set) var count = 0
+    private(set) var generation: UInt64 = 0
+
+    mutating func reserve() -> UInt64? {
+        guard count < Self.maximumCount else { return nil }
+        count += 1
+        return generation
+    }
+
+    mutating func finish(generation candidate: UInt64) {
+        guard candidate == generation else { return }
+        if count > 0 { count -= 1 }
+    }
+
+    func admits(generation candidate: UInt64) -> Bool {
+        candidate == generation
+    }
+
+    mutating func reset() {
+        generation &+= 1
+        count = 0
+    }
+}
+
 enum WorldwideRemoteInputFormatOrigin: Equatable, Sendable {
     case captureGateUnavailable(WorldwideScreenCaptureGateDiagnostic?)
     case controller(MacRemoteInputScreenFormatDiagnostic)
@@ -581,6 +766,7 @@ actor WorldwideScreenService {
     private var screenVideoAdaptationPolicy:
         WorldwideScreenVideoAdaptationPolicy
     private let remoteInputController: MacRemoteInputController
+    private let remoteMediaController: any MacRemoteMediaControlling
     private weak var captureLifetime: CaptureServiceLifetime?
     private let captureLifetimeIsRequired: Bool
     private let iPhoneMicrophoneForwardingPolicy:
@@ -617,6 +803,9 @@ actor WorldwideScreenService {
     private var screenVideoAdaptationFreshnessFence =
         WorldwideScreenVideoAdaptationFreshnessFence()
     private var keyFrameControlTask: Task<Void, Never>?
+    private var remoteMediaCommandTask: Task<Void, Never>?
+    private var remoteMediaCommandCapacity =
+        WorldwideRemoteMediaCommandQueueCapacity()
     private var peer: WebRTCPeer?
     private var recoveryCoordinator: ICERecoveryCoordinator?
     private var peerGeneration: UInt64 = 0
@@ -624,6 +813,15 @@ actor WorldwideScreenService {
     private var peerIsConnected = false
     private var iceIsConnected = false
     private var controlChannelIsOpen = false
+    private var latestRemoteMediaControllerRevision: UInt64 = 0
+    private var latestRemoteMediaItem: WebRTCRemoteMediaItem?
+    private var remoteMediaPublication =
+        WorldwideRemoteMediaPublicationMachine()
+    private var remoteMediaPublicationRetryGate =
+        WorldwideRemoteMediaPublicationRetryGate()
+    private var remoteMediaPublicationRetryTask: Task<Void, Never>?
+    private var pendingRemoteMediaStateRefresh:
+        WebRTCReceivedRemoteMediaStateRefreshRequest?
     private var isRecovering = false
     private var recoveryProofRequired = false
     private var recoveryProofEpoch: UInt64 = 0
@@ -852,6 +1050,8 @@ actor WorldwideScreenService {
         framesPerSecond: Int,
         maximumVideoBitrate: Int,
         remoteInputController: MacRemoteInputController,
+        remoteMediaController: any MacRemoteMediaControlling =
+            MacSystemNowPlayingController(),
         captureLifetime: CaptureServiceLifetime? = nil,
         iPhoneMicrophoneForwardingPolicy:
             WorldwideIPhoneMicrophoneForwardingPolicy = .enabled,
@@ -883,6 +1083,7 @@ actor WorldwideScreenService {
             baseFramesPerSecond: framesPerSecond
         )
         self.remoteInputController = remoteInputController
+        self.remoteMediaController = remoteMediaController
         self.captureLifetime = captureLifetime
         captureLifetimeIsRequired = captureLifetime != nil
         self.iPhoneMicrophoneForwardingPolicy =
@@ -904,6 +1105,8 @@ actor WorldwideScreenService {
         framesPerSecond: Int,
         maximumVideoBitrate: Int,
         remoteInputController: MacRemoteInputController,
+        remoteMediaController: any MacRemoteMediaControlling =
+            MacSystemNowPlayingController(),
         captureLifetime: CaptureServiceLifetime? = nil,
         iPhoneMicrophoneForwardingPolicy:
             WorldwideIPhoneMicrophoneForwardingPolicy = .enabled,
@@ -934,6 +1137,7 @@ actor WorldwideScreenService {
             baseFramesPerSecond: framesPerSecond
         )
         self.remoteInputController = remoteInputController
+        self.remoteMediaController = remoteMediaController
         self.captureLifetime = captureLifetime
         captureLifetimeIsRequired = captureLifetime != nil
         self.iPhoneMicrophoneForwardingPolicy =
@@ -970,6 +1174,10 @@ actor WorldwideScreenService {
         }
         isStarted = true
 
+        remoteMediaController.start { [weak self] update in
+            Task { await self?.remoteMediaStateDidChange(update) }
+        }
+
         await startIPhoneMicrophoneDeviceMonitoringIfNeeded()
         do {
             let events = try await signaling.connect()
@@ -978,6 +1186,7 @@ actor WorldwideScreenService {
             }
         } catch {
             isStopped = true
+            remoteMediaController.stop()
             shutdownBlackHoleAudioRouting()
             iPhoneMicrophoneForwarding.shutdown()
             completionContinuation.finish()
@@ -1038,6 +1247,10 @@ actor WorldwideScreenService {
         screenVideoAdaptationPolicyRevision &+= 1
         keyFrameControlTask?.cancel()
         keyFrameControlTask = nil
+        resetRemoteMediaCommandQueue()
+        remoteMediaController.stop()
+        latestRemoteMediaControllerRevision = 0
+        latestRemoteMediaItem = nil
         let coordinator = recoveryCoordinator
         recoveryCoordinator = nil
         peerGeneration &+= 1
@@ -1046,6 +1259,9 @@ actor WorldwideScreenService {
         peerIsConnected = false
         iceIsConnected = false
         controlChannelIsOpen = false
+        cancelRemoteMediaPublicationRetry()
+        remoteMediaPublication.stop()
+        pendingRemoteMediaStateRefresh = nil
         isRecovering = false
         recoveryProofRequired = false
         recoveryProofEpoch &+= 1
@@ -1225,7 +1441,8 @@ actor WorldwideScreenService {
                 role: .host,
                 iceServers: iceServers,
                 icePolicy: icePolicy,
-                maximumVideoBitrate: maximumVideoBitrate
+                maximumVideoBitrate: maximumVideoBitrate,
+                supportsRemoteMediaControls: remoteMediaController.isAvailable
             )
         )
         cancelSharedClockEpochRecovery(
@@ -1253,6 +1470,10 @@ actor WorldwideScreenService {
         peerIsConnected = false
         iceIsConnected = false
         controlChannelIsOpen = false
+        resetRemoteMediaCommandQueue()
+        cancelRemoteMediaPublicationRetry()
+        remoteMediaPublication.startNewPeer()
+        pendingRemoteMediaStateRefresh = nil
         isRecovering = false
         recoveryProofRequired = false
         recoveryProofEpoch &+= 1
@@ -1380,6 +1601,234 @@ actor WorldwideScreenService {
         }
     }
 
+    // MARK: - System Now Playing
+
+    private func remoteMediaStateDidChange(
+        _ update: WebRTCRemoteMediaStateUpdate
+    ) async {
+        guard !isStopped,
+              update.isValid,
+              update.revision > latestRemoteMediaControllerRevision else {
+            return
+        }
+        latestRemoteMediaControllerRevision = update.revision
+        latestRemoteMediaItem = update.item
+        remoteMediaPublication.applyControllerUpdate(update)
+        await publishCurrentRemoteMediaStateIfPossible()
+    }
+
+    private func publishCurrentRemoteMediaStateIfPossible() async {
+        while transportAllowsCapture, let peer {
+            let remoteMediaIsAvailable =
+                await peer.remoteMediaControlsAreNegotiated()
+            remoteMediaPublication.setRemoteMediaAvailable(
+                remoteMediaIsAvailable
+            )
+            guard let attempt = remoteMediaPublication.beginIfPossible(
+                transportIsReady: transportAllowsCapture
+            ) else {
+                return
+            }
+            let sourcePeerGeneration = peerGeneration
+            let refresh = pendingRemoteMediaStateRefresh
+            var succeeded = false
+            do {
+                try await peer.sendRemoteMediaState(attempt.update, respondingTo: refresh)
+                if self.peer === peer,
+                   peerGeneration == sourcePeerGeneration {
+                    succeeded = true
+                    if pendingRemoteMediaStateRefresh == refresh {
+                        pendingRemoteMediaStateRefresh = nil
+                    }
+                }
+            } catch {
+                // Peer/ICE/data-channel events own recovery. Keep the newest desired value dirty;
+                // the bounded same-peer retry or a later state/recovery event will redrive it.
+                logger.debug(
+                    "Worldwide remote media state deferred: \(error.localizedDescription)"
+                )
+            }
+            let completion = remoteMediaPublication.complete(
+                attempt,
+                succeeded: succeeded
+            )
+            if succeeded {
+                cancelRemoteMediaPublicationRetry()
+            } else if completion == .retryLatest,
+                      !isStopped,
+                      self.peer === peer,
+                      peerGeneration == sourcePeerGeneration {
+                scheduleRemoteMediaPublicationRetry(
+                    sourcePeer: peer,
+                    sourcePeerGeneration: sourcePeerGeneration
+                )
+            }
+            guard completion == .publishNewest else { return }
+        }
+    }
+
+    private func scheduleRemoteMediaPublicationRetry(
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard remoteMediaPublication.hasPendingPublication,
+              let token = remoteMediaPublicationRetryGate.schedule() else {
+            return
+        }
+        remoteMediaPublicationRetryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            await self.remoteMediaPublicationRetryDidFire(
+                token,
+                sourcePeer: sourcePeer,
+                sourcePeerGeneration: sourcePeerGeneration
+            )
+        }
+    }
+
+    private func remoteMediaPublicationRetryDidFire(
+        _ token: WorldwideRemoteMediaPublicationRetryGate.Token,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        guard remoteMediaPublicationRetryGate.consume(token) else { return }
+        remoteMediaPublicationRetryTask = nil
+        guard !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration else { return }
+        await publishCurrentRemoteMediaStateIfPossible()
+    }
+
+    private func cancelRemoteMediaPublicationRetry() {
+        remoteMediaPublicationRetryGate.cancel()
+        remoteMediaPublicationRetryTask?.cancel()
+        remoteMediaPublicationRetryTask = nil
+    }
+
+    private func enqueueRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        guard let commandGeneration = remoteMediaCommandCapacity.reserve() else {
+            await acknowledgeRemoteMediaCommand(
+                command,
+                result: .failed,
+                sourcePeer: sourcePeer,
+                sourcePeerGeneration: sourcePeerGeneration
+            )
+            return
+        }
+        let predecessor = remoteMediaCommandTask
+        remoteMediaCommandTask = Task { [weak self] in
+            _ = await predecessor?.result
+            guard let self else { return }
+            if !Task.isCancelled {
+                await self.executeRemoteMediaCommand(
+                    command,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    commandGeneration: commandGeneration
+                )
+            }
+            await self.finishRemoteMediaCommand(generation: commandGeneration)
+        }
+    }
+
+    private func executeRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64,
+        commandGeneration: UInt64
+    ) async {
+        guard !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              remoteMediaCommandCapacity.admits(generation: commandGeneration),
+              command.isValid,
+              transportAllowsCapture else {
+            return
+        }
+
+        let request = command.request
+        let result: WebRTCRemoteMediaCommandResult
+        if let rejection = WebRTCRemoteMediaCommandAdmission.rejection(
+            for: request,
+            latestSuccessfullySent: remoteMediaPublication.lastSuccessfullySent
+        ) {
+            result = rejection
+        } else if let item = latestRemoteMediaItem {
+            if item.contextID != request.contextID {
+                result = .staleContext
+            } else if !item.capabilities.permits(request.command) {
+                result = .unsupported
+            } else if let prepared = remoteMediaController.prepareCommand(
+                request.command,
+                contextID: request.contextID,
+                isAuthorized: { command.isValid }
+            ) {
+                result = await remoteMediaController.perform(prepared)
+            } else {
+                result = .staleContext
+            }
+        } else {
+            result = .noActiveMedia
+        }
+
+        guard !Task.isCancelled,
+              !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              remoteMediaCommandCapacity.admits(generation: commandGeneration),
+              transportAllowsCapture else {
+            return
+        }
+        await acknowledgeRemoteMediaCommand(
+            command,
+            result: result,
+            sourcePeer: sourcePeer,
+            sourcePeerGeneration: sourcePeerGeneration
+        )
+    }
+
+    private func acknowledgeRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        result: WebRTCRemoteMediaCommandResult,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        guard !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              transportAllowsCapture else { return }
+        do {
+            try await sourcePeer.acknowledgeRemoteMediaCommand(
+                command,
+                result: result
+            )
+        } catch {
+            logger.debug(
+                "Worldwide remote media command acknowledgement deferred: "
+                    + error.localizedDescription
+            )
+        }
+    }
+
+    private func finishRemoteMediaCommand(generation: UInt64) {
+        remoteMediaCommandCapacity.finish(generation: generation)
+    }
+
+    private func resetRemoteMediaCommandQueue() {
+        remoteMediaCommandTask?.cancel()
+        remoteMediaCommandTask = nil
+        remoteMediaCommandCapacity.reset()
+        remoteMediaController.invalidateCommands()
+    }
+
     /// Updates transport health, routes protocol requests, and emits sanitized diagnostics.
     private func handlePeerEvent(
         _ event: WebRTCTransportEvent,
@@ -1417,6 +1866,7 @@ actor WorldwideScreenService {
                 } else if await markRecoveryHealthyIfPossible() {
                     await recoveryCoordinator?.iceStateChanged(.connected)
                 }
+                await publishCurrentRemoteMediaStateIfPossible()
             case .disconnected:
                 peerIsConnected = false
                 await enterRecovery(reason: "peer disconnected")
@@ -1442,6 +1892,7 @@ actor WorldwideScreenService {
                 } else if await markRecoveryHealthyIfPossible() {
                     await recoveryCoordinator?.iceStateChanged(state)
                 }
+                await publishCurrentRemoteMediaStateIfPossible()
             case .disconnected, .failed:
                 iceIsConnected = false
                 await enterRecovery(reason: "ICE route unavailable")
@@ -1480,6 +1931,7 @@ actor WorldwideScreenService {
                 } else if await markRecoveryHealthyIfPossible() {
                     await recoveryCoordinator?.iceStateChanged(.connected)
                 }
+                await publishCurrentRemoteMediaStateIfPossible()
             }
             if state == .closing || state == .closed || (wasOpen && state != .open) {
                 await enterRecovery(reason: "control channel unavailable")
@@ -1503,6 +1955,34 @@ actor WorldwideScreenService {
         case .inputSessionInvalidated(let reason):
             revokeRemoteInputAuthorization()
             logger.info("Worldwide remote input stopped: \(reason)")
+
+        case .remoteMediaControlsAvailabilityChanged(let isAvailable):
+            remoteMediaPublication.setRemoteMediaAvailable(isAvailable)
+            if isAvailable {
+                await publishCurrentRemoteMediaStateIfPossible()
+            } else {
+                pendingRemoteMediaStateRefresh = nil
+                resetRemoteMediaCommandQueue()
+            }
+
+        case .remoteMediaStateRefreshRequested(let refresh):
+            // One latest request is sufficient: a superseded readiness UUID cannot authorize the
+            // viewer's current controls. Congestion uses the existing single-flight retry path.
+            pendingRemoteMediaStateRefresh = refresh
+            remoteMediaPublication.requestRefresh()
+            await publishCurrentRemoteMediaStateIfPossible()
+
+        case .remoteMediaCommandReceived(let command):
+            await enqueueRemoteMediaCommand(
+                command,
+                sourcePeer: sourcePeer,
+                sourcePeerGeneration: sourcePeerGeneration
+            )
+
+        case .remoteMediaStateChanged,
+             .remoteMediaCommandAcknowledgementReceived:
+            // These messages are host-originated and are consumed only by the iPhone viewer.
+            break
 
         case .macHostedCallChallengeReceived(let challenge):
             installMacHostedCallChallenge(
@@ -3954,6 +4434,7 @@ actor WorldwideScreenService {
     /// Enters fail-closed recovery and invalidates any pre-uncertainty authorization.
     private func enterRecovery(reason: String) async {
         isRecovering = true
+        resetRemoteMediaCommandQueue()
         resetAutomaticScreenMediaSuspensionState()
         revokeCaptureAuthorization()
         pauseSystemAudioForTransportUncertainty()
@@ -3978,6 +4459,7 @@ actor WorldwideScreenService {
     /// Creates a fresh epoch that requires answer installation plus a Hide/Inactive proof.
     @discardableResult
     private func installRecoveryProofBoundary(awaitingAnswer: Bool) -> UInt64 {
+        resetRemoteMediaCommandQueue()
         resetAutomaticScreenMediaSuspensionState()
         revokeCaptureAuthorization()
         pauseSystemAudioForTransportUncertainty()
