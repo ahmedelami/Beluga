@@ -5,6 +5,7 @@
 
 #include <CoreAudio/AudioHardwareBase.h>
 #include <CoreFoundation/CFPlugInCOM.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
@@ -1760,8 +1761,10 @@ static bool TestClientLifecycleWithoutRunningNotifications(void) {
                                   second.mClientID),
                noErr);
   CHECK(gFakeHostState.notificationCount == 0);
+  AudioServerPlugInClientInfo wrongProcess = first;
+  wrongProcess.mProcessID += 1;
   CHECK_STATUS((*driver)->RemoveDeviceClient(
-                   driver, kOSVAObjectIDVisibleInputDevice, &first),
+                   driver, kOSVAObjectIDVisibleInputDevice, &wrongProcess),
                kAudioHardwareIllegalOperationError);
 
   CHECK_STATUS((*driver)->StopIO(driver, kOSVAObjectIDVisibleInputDevice,
@@ -1830,6 +1833,674 @@ static bool AllSamplesEqual(const Float32 *samples, size_t count,
     }
   }
   return true;
+}
+
+static bool ClientLeaseStateUnchanged(
+    const OSVADiagnosticSnapshot *before,
+    const OSVADiagnosticSnapshot *after) {
+  CHECK(DiagnosticSnapshotIsCoherent(after));
+  CHECK(after->core_lifecycle_sequence == before->core_lifecycle_sequence);
+  CHECK(after->timeline_seed == before->timeline_seed);
+  CHECK(after->anchor_host_ticks == before->anchor_host_ticks);
+  CHECK(after->active_client_count == before->active_client_count);
+  CHECK(after->visible_input_active_count == before->visible_input_active_count);
+  CHECK(after->hidden_writer_active_count == before->hidden_writer_active_count);
+  CHECK(after->driver_registered_count == before->driver_registered_count);
+  CHECK(after->driver_started_count == before->driver_started_count);
+  CHECK(after->global_start_transition_count ==
+        before->global_start_transition_count);
+  CHECK(after->global_stop_transition_count ==
+        before->global_stop_transition_count);
+  CHECK(after->driver_client_remove_count == before->driver_client_remove_count);
+  CHECK(after->seed_create_count == before->seed_create_count);
+  CHECK(after->seed_clear_count == before->seed_clear_count);
+  CHECK(memcmp(after->driver_client_slots, before->driver_client_slots,
+               sizeof(after->driver_client_slots)) == 0);
+  CHECK(memcmp(after->core_client_slots, before->core_client_slots,
+               sizeof(after->core_client_slots)) == 0);
+  return true;
+}
+
+static bool ClientRemovalReachedIdle(
+    const OSVADiagnosticSnapshot *snapshot, UInt64 retiredSeed) {
+  CHECK(DiagnosticSnapshotIsCoherent(snapshot));
+  CHECK(snapshot->active_client_count == 0);
+  CHECK(snapshot->driver_registered_count == 0);
+  CHECK(snapshot->driver_started_count == 0);
+  CHECK(snapshot->core_active_slot_bitmap == 0);
+  CHECK(snapshot->driver_registered_slot_bitmap == 0);
+  CHECK(snapshot->driver_started_slot_bitmap == 0);
+  CHECK(snapshot->timeline_seed == 0);
+  CHECK(snapshot->anchor_host_ticks == 0);
+  CHECK(snapshot->current_seed_generation == 0);
+  CHECK(snapshot->last_cleared_seed == retiredSeed);
+  CHECK(snapshot->seed_create_count == snapshot->seed_clear_count);
+  CHECK(snapshot->global_start_transition_count ==
+        snapshot->global_stop_transition_count);
+  return true;
+}
+
+static bool TestActiveRemovalClearsLeaseAndRestartsFreshEpoch(void) {
+  AudioServerPlugInDriverRef driver = FreshDriver();
+  CHECK(driver != NULL);
+  AudioServerPlugInClientInfo reader = ClientInfo(901);
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  reader.mClientID), noErr);
+  OSVADiagnosticSnapshot active;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &active), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&active));
+  const OSVADiagnosticDriverClientSlotSnapshot *originalSlot =
+      FindDiagnosticDriverSlot(&active, reader.mClientID);
+  CHECK(originalSlot != NULL);
+  CHECK(originalSlot->io_start_depth == 1);
+
+  // The interface rejects nested starts; rejection must not add hidden depth.
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  reader.mClientID),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterDuplicateStart;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterDuplicateStart), noErr);
+  CHECK(ClientLeaseStateUnchanged(&active, &afterDuplicateStart));
+
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader), noErr);
+  OSVADiagnosticSnapshot idle;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &idle), noErr);
+  CHECK(ClientRemovalReachedIdle(&idle, active.timeline_seed));
+  CHECK(idle.last_driver_transition.type ==
+        kOSVADiagnosticTransitionDriverClientRemoved);
+  CHECK(idle.last_driver_transition.client_id == reader.mClientID);
+  CHECK(idle.last_driver_transition.process_id == reader.mProcessID);
+  CHECK(idle.last_driver_transition.driver_client_generation ==
+        originalSlot->generation);
+  CHECK(idle.last_driver_transition.core_session_id ==
+        originalSlot->lease_session_id);
+  CHECK(idle.last_driver_transition.pre_global_active_count == 1);
+  CHECK(idle.last_driver_transition.post_global_active_count == 0);
+  CHECK(idle.last_core_transition.type == kOSVADiagnosticTransitionSeedCleared);
+  CHECK(idle.last_core_transition.core_session_id == originalSlot->lease_session_id);
+  CHECK(gFakeHostState.notificationCount == 0);
+  CHECK(GetUInt32(driver, kOSVAObjectIDVisibleInputDevice,
+                  Address(kAudioDevicePropertyDeviceIsRunning,
+                          kAudioObjectPropertyScopeGlobal), 0));
+  CHECK_STATUS((*driver)->StopIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                 reader.mClientID),
+               kAudioHardwareIllegalOperationError);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterLateTeardown;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterLateTeardown), noErr);
+  CHECK(ClientLeaseStateUnchanged(&idle, &afterLateTeardown));
+  CHECK(gFakeHostState.notificationCount == 0);
+
+  AudioServerPlugInClientInfo replacement = reader;
+  replacement.mProcessID = 2345;
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &replacement), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  replacement.mClientID), noErr);
+  OSVADiagnosticSnapshot restarted;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &restarted), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&restarted));
+  CHECK(restarted.timeline_seed > active.timeline_seed);
+  CHECK(restarted.anchor_host_ticks > active.anchor_host_ticks);
+  const OSVADiagnosticDriverClientSlotSnapshot *replacementSlot =
+      FindDiagnosticDriverSlot(&restarted, replacement.mClientID);
+  CHECK(replacementSlot != NULL);
+  CHECK(replacementSlot->generation > originalSlot->generation);
+  CHECK(replacementSlot->lease_session_id > originalSlot->lease_session_id);
+  CHECK(replacementSlot->process_id == replacement.mProcessID);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterStaleRemoval;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterStaleRemoval), noErr);
+  CHECK(ClientLeaseStateUnchanged(&restarted, &afterStaleRemoval));
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &replacement), noErr);
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &idle), noErr);
+  CHECK(ClientRemovalReachedIdle(&idle, restarted.timeline_seed));
+  return true;
+}
+
+static bool RunActiveRemovalWithLiveSibling(bool visibleFirst) {
+  AudioServerPlugInDriverRef driver = FreshDriver();
+  CHECK(driver != NULL);
+  AudioServerPlugInClientInfo reader = ClientInfo(902);
+  AudioServerPlugInClientInfo writer = ClientInfo(903);
+  const AudioObjectID firstDevice = visibleFirst
+      ? kOSVAObjectIDVisibleInputDevice : kOSVAObjectIDHiddenWriterDevice;
+  const AudioObjectID secondDevice = visibleFirst
+      ? kOSVAObjectIDHiddenWriterDevice : kOSVAObjectIDVisibleInputDevice;
+  const AudioServerPlugInClientInfo *first = visibleFirst ? &reader : &writer;
+  const AudioServerPlugInClientInfo *second = visibleFirst ? &writer : &reader;
+  CHECK_STATUS((*driver)->AddDeviceClient(driver, firstDevice, first), noErr);
+  CHECK_STATUS((*driver)->AddDeviceClient(driver, secondDevice, second), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, firstDevice, first->mClientID), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, secondDevice, second->mClientID), noErr);
+
+  Float32 source[] = {0.125F, -0.25F, 0.5F, -0.75F};
+  Float32 destination[4];
+  AudioServerPlugInIOCycleInfo outputCycle = CycleAtOutputFrame(512.0);
+  AudioServerPlugInIOCycleInfo inputCycle = CycleAtInputFrame(512.0);
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDHiddenWriterDevice,
+                   kOSVAObjectIDHiddenWriterStream, writer.mClientID,
+                   kAudioServerPlugInIOOperationWriteMix, 4, &outputCycle,
+                   source, NULL), noErr);
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDVisibleInputDevice,
+                   kOSVAObjectIDVisibleInputStream, reader.mClientID,
+                   kAudioServerPlugInIOOperationReadInput, 4, &inputCycle,
+                   destination, NULL), noErr);
+  CHECK(memcmp(source, destination, sizeof(source)) == 0);
+
+  OSVADiagnosticSnapshot both;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, firstDevice, &both), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&both));
+  const OSVADiagnosticDriverClientSlotSnapshot *siblingBefore =
+      FindDiagnosticDriverSlot(&both, second->mClientID);
+  CHECK(siblingBefore != NULL);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(driver, firstDevice, first), noErr);
+  OSVADiagnosticSnapshot sibling;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, secondDevice, &sibling), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&sibling));
+  CHECK(sibling.active_client_count == 1);
+  CHECK(sibling.driver_registered_count == 1);
+  CHECK(sibling.timeline_seed == both.timeline_seed);
+  CHECK(sibling.anchor_host_ticks == both.anchor_host_ticks);
+  CHECK(sibling.seed_clear_count == both.seed_clear_count);
+  CHECK(sibling.visible_input_active_count == (visibleFirst ? 0 : 1));
+  CHECK(sibling.hidden_writer_active_count == (visibleFirst ? 1 : 0));
+  CHECK(FindDiagnosticDriverSlot(&sibling, first->mClientID) == NULL);
+  const OSVADiagnosticDriverClientSlotSnapshot *siblingAfter =
+      FindDiagnosticDriverSlot(&sibling, second->mClientID);
+  CHECK(siblingAfter != NULL);
+  CHECK(memcmp(siblingBefore, siblingAfter, sizeof(*siblingBefore)) == 0);
+  CHECK(gFakeHostState.notificationCount == 0);
+  CHECK(gFakeHostState.lastObjectID == 0);
+  CHECK(GetUInt32(driver, secondDevice,
+                  Address(kAudioDevicePropertyDeviceIsRunning,
+                          kAudioObjectPropertyScopeGlobal), 1));
+
+  CHECK_STATUS((*driver)->StopIO(driver, firstDevice, first->mClientID),
+               kAudioHardwareIllegalOperationError);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(driver, firstDevice, first),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterDuplicateTeardown;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, secondDevice,
+                                      &afterDuplicateTeardown), noErr);
+  CHECK(ClientLeaseStateUnchanged(&sibling, &afterDuplicateTeardown));
+  CHECK(gFakeHostState.notificationCount == 0);
+
+  // An absent reader or retired producer cannot deliver the earlier samples.
+  memset(destination, 0x7F, sizeof(destination));
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDVisibleInputDevice,
+                   kOSVAObjectIDVisibleInputStream, reader.mClientID,
+                   kAudioServerPlugInIOOperationReadInput, 4, &inputCycle,
+                   destination, NULL), noErr);
+  CHECK(AllSamplesEqual(destination, 4, 0.0F));
+  CHECK_STATUS((*driver)->RemoveDeviceClient(driver, secondDevice, second), noErr);
+  OSVADiagnosticSnapshot idle;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, firstDevice, &idle), noErr);
+  CHECK(ClientRemovalReachedIdle(&idle, both.timeline_seed));
+  CHECK(gFakeHostState.notificationCount == 0);
+
+  CHECK_STATUS((*driver)->AddDeviceClient(driver, firstDevice, first), noErr);
+  CHECK_STATUS((*driver)->AddDeviceClient(driver, secondDevice, second), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, firstDevice, first->mClientID), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, secondDevice, second->mClientID), noErr);
+  OSVADiagnosticSnapshot restarted;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, firstDevice, &restarted), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&restarted));
+  CHECK(restarted.timeline_seed > both.timeline_seed);
+  CHECK(restarted.anchor_host_ticks > both.anchor_host_ticks);
+  memset(destination, 0x7F, sizeof(destination));
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDVisibleInputDevice,
+                   kOSVAObjectIDVisibleInputStream, reader.mClientID,
+                   kAudioServerPlugInIOOperationReadInput, 4, &inputCycle,
+                   destination, NULL), noErr);
+  CHECK(AllSamplesEqual(destination, 4, 0.0F));
+  source[0] = -0.875F;
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDHiddenWriterDevice,
+                   kOSVAObjectIDHiddenWriterStream, writer.mClientID,
+                   kAudioServerPlugInIOOperationWriteMix, 4, &outputCycle,
+                   source, NULL), noErr);
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDVisibleInputDevice,
+                   kOSVAObjectIDVisibleInputStream, reader.mClientID,
+                   kAudioServerPlugInIOOperationReadInput, 4, &inputCycle,
+                   destination, NULL), noErr);
+  CHECK(memcmp(source, destination, sizeof(source)) == 0);
+  CHECK_STATUS((*driver)->StopIO(driver, firstDevice, first->mClientID), noErr);
+  CHECK_STATUS((*driver)->StopIO(driver, secondDevice, second->mClientID), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(driver, firstDevice, first), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(driver, secondDevice, second), noErr);
+  return true;
+}
+
+static bool TestActiveRemovalPreservesWriterSiblingAndDropsStalePCM(void) {
+  return RunActiveRemovalWithLiveSibling(true);
+}
+
+static bool TestActiveRemovalPreservesReaderSiblingAndDropsStalePCM(void) {
+  return RunActiveRemovalWithLiveSibling(false);
+}
+
+static bool TestRemovalRejectsMismatchedProcessIdentity(void) {
+  AudioServerPlugInDriverRef driver = FreshDriver();
+  CHECK(driver != NULL);
+  AudioServerPlugInClientInfo reader = ClientInfo(904);
+  AudioServerPlugInClientInfo wrongProcess = reader;
+  wrongProcess.mProcessID = 3456;
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader), noErr);
+  OSVADiagnosticSnapshot registered;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &registered), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &wrongProcess),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterMismatch;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterMismatch), noErr);
+  CHECK(ClientLeaseStateUnchanged(&registered, &afterMismatch));
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  reader.mClientID), noErr);
+  OSVADiagnosticSnapshot active;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &active), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &wrongProcess),
+               kAudioHardwareIllegalOperationError);
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterMismatch), noErr);
+  CHECK(ClientLeaseStateUnchanged(&active, &afterMismatch));
+  CHECK_STATUS((*driver)->StopIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                 reader.mClientID), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader), noErr);
+  return true;
+}
+
+static bool TestRecycledClientIDRejectsStaleProcessRemoval(void) {
+  AudioServerPlugInDriverRef driver = FreshDriver();
+  CHECK(driver != NULL);
+  AudioServerPlugInClientInfo original = ClientInfo(905);
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &original), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  original.mClientID), noErr);
+  OSVADiagnosticSnapshot first;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &first), noErr);
+  const OSVADiagnosticDriverClientSlotSnapshot *originalSlot =
+      FindDiagnosticDriverSlot(&first, original.mClientID);
+  CHECK(originalSlot != NULL);
+  const size_t originalIndex =
+      (size_t)(originalSlot - first.driver_client_slots);
+  CHECK_STATUS((*driver)->StopIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                 original.mClientID), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &original), noErr);
+
+  AudioServerPlugInClientInfo replacement = original;
+  replacement.mProcessID = 4567;
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &replacement), noErr);
+  OSVADiagnosticSnapshot registered;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &registered), noErr);
+  const OSVADiagnosticDriverClientSlotSnapshot *replacementSlot =
+      FindDiagnosticDriverSlot(&registered, replacement.mClientID);
+  CHECK(replacementSlot != NULL);
+  CHECK((size_t)(replacementSlot - registered.driver_client_slots) ==
+        originalIndex);
+  CHECK(replacementSlot->generation > originalSlot->generation);
+  CHECK(replacementSlot->process_id == replacement.mProcessID);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &original),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterStaleRemoval;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterStaleRemoval), noErr);
+  CHECK(ClientLeaseStateUnchanged(&registered, &afterStaleRemoval));
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  replacement.mClientID), noErr);
+  OSVADiagnosticSnapshot active;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &active), noErr);
+  CHECK(active.timeline_seed > first.timeline_seed);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &original),
+               kAudioHardwareIllegalOperationError);
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &afterStaleRemoval), noErr);
+  CHECK(ClientLeaseStateUnchanged(&active, &afterStaleRemoval));
+  CHECK_STATUS((*driver)->StopIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                 replacement.mClientID), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &replacement), noErr);
+  return true;
+}
+
+static bool TestActiveRemovalDoesNotRetireSameIDOnSiblingEndpoint(void) {
+  AudioServerPlugInDriverRef driver = FreshDriver();
+  CHECK(driver != NULL);
+  AudioServerPlugInClientInfo client = ClientInfo(906);
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &client), noErr);
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDHiddenWriterDevice, &client), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  client.mClientID), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDHiddenWriterDevice,
+                                  client.mClientID), noErr);
+  OSVADiagnosticSnapshot both;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &both), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&both));
+  CHECK(both.active_client_count == 2);
+  size_t writerSlot = kOSVADiagnosticClientSlotCapacity;
+  for (size_t index = 0; index < kOSVADiagnosticClientSlotCapacity; ++index) {
+    if (both.driver_client_slots[index].client_id == client.mClientID &&
+        both.driver_client_slots[index].device_object_id ==
+            kOSVAObjectIDHiddenWriterDevice) {
+      writerSlot = index;
+    }
+  }
+  CHECK(writerSlot < kOSVADiagnosticClientSlotCapacity);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &client), noErr);
+  OSVADiagnosticSnapshot sibling;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDHiddenWriterDevice,
+                                      &sibling), noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&sibling));
+  CHECK(sibling.visible_input_active_count == 0);
+  CHECK(sibling.hidden_writer_active_count == 1);
+  CHECK(sibling.driver_registered_count == 1);
+  CHECK(sibling.timeline_seed == both.timeline_seed);
+  CHECK(sibling.anchor_host_ticks == both.anchor_host_ticks);
+  CHECK(memcmp(&sibling.driver_client_slots[writerSlot],
+               &both.driver_client_slots[writerSlot],
+               sizeof(sibling.driver_client_slots[writerSlot])) == 0);
+  CHECK_STATUS((*driver)->StopIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                 client.mClientID),
+               kAudioHardwareIllegalOperationError);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &client),
+               kAudioHardwareIllegalOperationError);
+  OSVADiagnosticSnapshot afterLateTeardown;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDHiddenWriterDevice,
+                                      &afterLateTeardown), noErr);
+  CHECK(ClientLeaseStateUnchanged(&sibling, &afterLateTeardown));
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDHiddenWriterDevice, &client), noErr);
+  OSVADiagnosticSnapshot idle;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDHiddenWriterDevice,
+                                      &idle), noErr);
+  CHECK(ClientRemovalReachedIdle(&idle, both.timeline_seed));
+  CHECK(gFakeHostState.notificationCount == 0);
+  return true;
+}
+
+typedef struct {
+  AudioServerPlugInDriverRef driver;
+  AudioObjectID device;
+  AudioServerPlugInClientInfo client;
+  _Atomic(bool) *start;
+  bool stop;
+  OSStatus result;
+} ClientTeardownRaceWork;
+
+static void *ClientTeardownRaceMain(void *rawContext) {
+  ClientTeardownRaceWork *work = rawContext;
+  while (!atomic_load_explicit(work->start, memory_order_acquire)) {
+    sched_yield();
+  }
+  work->result = work->stop
+      ? (*work->driver)->StopIO(work->driver, work->device,
+                                work->client.mClientID)
+      : (*work->driver)->RemoveDeviceClient(work->driver, work->device,
+                                            &work->client);
+  return NULL;
+}
+
+static bool TestConcurrentStopAndDuplicateRemovalRetireExactlyOnce(void) {
+  for (UInt32 iteration = 0; iteration < 32; ++iteration) {
+    AudioServerPlugInDriverRef driver = FreshDriver();
+    CHECK(driver != NULL);
+    const AudioObjectID device = iteration % 2 == 0
+        ? kOSVAObjectIDVisibleInputDevice : kOSVAObjectIDHiddenWriterDevice;
+    AudioServerPlugInClientInfo client = ClientInfo(1000U + iteration);
+    CHECK_STATUS((*driver)->AddDeviceClient(driver, device, &client), noErr);
+    CHECK_STATUS((*driver)->StartIO(driver, device, client.mClientID), noErr);
+    OSVADiagnosticSnapshot active;
+    CHECK_STATUS(CopyDiagnosticSnapshot(driver, device, &active), noErr);
+    _Atomic(bool) start = false;
+    ClientTeardownRaceWork work[3];
+    pthread_t threads[3];
+    size_t created = 0;
+    for (size_t index = 0; index < 3; ++index) {
+      work[index] = (ClientTeardownRaceWork){
+          .driver = driver, .device = device, .client = client,
+          .start = &start, .stop = index == iteration % 3,
+          .result = kAudioHardwareUnspecifiedError,
+      };
+      if (pthread_create(&threads[index], NULL, ClientTeardownRaceMain,
+                          &work[index]) != 0) {
+        break;
+      }
+      created += 1;
+    }
+    atomic_store_explicit(&start, true, memory_order_release);
+    bool allJoined = true;
+    for (size_t index = 0; index < created; ++index) {
+      if (pthread_join(threads[index], NULL) != 0) {
+        allJoined = false;
+      }
+    }
+    CHECK(allJoined);
+    CHECK(created == 3);
+    size_t successfulRemovals = 0;
+    for (size_t index = 0; index < 3; ++index) {
+      CHECK(work[index].result == noErr ||
+            work[index].result == kAudioHardwareIllegalOperationError);
+      if (!work[index].stop && work[index].result == noErr) {
+        successfulRemovals += 1;
+      }
+    }
+    CHECK(successfulRemovals == 1);
+    OSVADiagnosticSnapshot idle;
+    CHECK_STATUS(CopyDiagnosticSnapshot(driver, device, &idle), noErr);
+    CHECK(ClientRemovalReachedIdle(&idle, active.timeline_seed));
+    CHECK(idle.global_stop_transition_count ==
+          active.global_stop_transition_count + 1);
+    CHECK(idle.driver_client_remove_count ==
+          active.driver_client_remove_count + 1);
+    CHECK(gFakeHostState.notificationCount == 0);
+  }
+  return true;
+}
+
+static bool TestRetirementFailurePreservesExactLeaseAndClock(void) {
+  for (UInt32 iteration = 0; iteration < 4; ++iteration) {
+    AudioServerPlugInDriverRef driver = FreshDriver();
+    CHECK(driver != NULL);
+    const AudioObjectID device = iteration % 2 == 0
+        ? kOSVAObjectIDVisibleInputDevice : kOSVAObjectIDHiddenWriterDevice;
+    AudioServerPlugInClientInfo client = ClientInfo(1100U + iteration);
+    CHECK_STATUS((*driver)->AddDeviceClient(driver, device, &client), noErr);
+    CHECK_STATUS((*driver)->StartIO(driver, device, client.mClientID), noErr);
+    OSVADiagnosticSnapshot active;
+    CHECK_STATUS(CopyDiagnosticSnapshot(driver, device, &active), noErr);
+    CHECK_STATUS(OSVADriverFailNextClientRetirementForTesting(), noErr);
+    CHECK_STATUS(OSVADriverFailNextClientRetirementForTesting(),
+                 kAudioHardwareIllegalOperationError);
+    const OSStatus failed = iteration < 2
+        ? (*driver)->StopIO(driver, device, client.mClientID)
+        : (*driver)->RemoveDeviceClient(driver, device, &client);
+    CHECK_STATUS(failed, kAudioHardwareIllegalOperationError);
+    OSVADiagnosticSnapshot afterFailure;
+    CHECK_STATUS(CopyDiagnosticSnapshot(driver, device, &afterFailure), noErr);
+    CHECK(ClientLeaseStateUnchanged(&active, &afterFailure));
+    CHECK_STATUS((*driver)->RemoveDeviceClient(driver, device, &client), noErr);
+    OSVADiagnosticSnapshot idle;
+    CHECK_STATUS(CopyDiagnosticSnapshot(driver, device, &idle), noErr);
+    CHECK(ClientRemovalReachedIdle(&idle, active.timeline_seed));
+    CHECK(gFakeHostState.notificationCount == 0);
+  }
+  return true;
+}
+
+typedef struct {
+  AudioServerPlugInDriverRef driver;
+  AudioObjectID device;
+  AudioObjectID stream;
+  UInt32 clientID;
+  UInt32 operation;
+  AudioServerPlugInIOCycleInfo cycle;
+  Float32 samples[4];
+  OSStatus result;
+} PausedClientIOWork;
+
+static void *PausedClientIOMain(void *rawContext) {
+  PausedClientIOWork *work = rawContext;
+  work->result = (*work->driver)->DoIOOperation(
+      work->driver, work->device, work->stream, work->clientID,
+      work->operation, 4, &work->cycle, work->samples, NULL);
+  return NULL;
+}
+
+static bool RunCapturedIOLeaseCannotAdoptReplacement(bool writerPaused) {
+  AudioServerPlugInDriverRef driver = FreshDriver();
+  CHECK(driver != NULL);
+  AudioServerPlugInClientInfo reader = ClientInfo(1110);
+  AudioServerPlugInClientInfo writer = ClientInfo(1111);
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader), noErr);
+  CHECK_STATUS((*driver)->AddDeviceClient(
+                   driver, kOSVAObjectIDHiddenWriterDevice, &writer), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDVisibleInputDevice,
+                                  reader.mClientID), noErr);
+  CHECK_STATUS((*driver)->StartIO(driver, kOSVAObjectIDHiddenWriterDevice,
+                                  writer.mClientID), noErr);
+  OSVADiagnosticSnapshot before;
+  CHECK_STATUS(CopyDiagnosticSnapshot(driver, kOSVAObjectIDVisibleInputDevice,
+                                      &before), noErr);
+  const AudioObjectID targetDevice = writerPaused
+      ? kOSVAObjectIDHiddenWriterDevice : kOSVAObjectIDVisibleInputDevice;
+  AudioServerPlugInClientInfo *target = writerPaused ? &writer : &reader;
+  PausedClientIOWork work = {
+      .driver = driver, .device = targetDevice,
+      .stream = writerPaused ? kOSVAObjectIDHiddenWriterStream
+                             : kOSVAObjectIDVisibleInputStream,
+      .clientID = target->mClientID,
+      .operation = writerPaused ? kAudioServerPlugInIOOperationWriteMix
+                                : kAudioServerPlugInIOOperationReadInput,
+      .cycle = writerPaused ? CycleAtOutputFrame(512.0)
+                            : CycleAtInputFrame(512.0),
+      .samples = {0.875F, 0.75F, -0.625F, -0.5F},
+      .result = kAudioHardwareUnspecifiedError,
+  };
+  CHECK_STATUS(OSVADriverPauseNextIOAfterLeaseForTesting(
+                   writerPaused ? kOSVADiagnosticEndpointHiddenWriter
+                                : kOSVADiagnosticEndpointVisibleInput), noErr);
+  pthread_t thread;
+  CHECK(pthread_create(&thread, NULL, PausedClientIOMain, &work) == 0);
+  const uint64_t waitStarted = mach_absolute_time();
+  bool paused = false;
+  while (mach_absolute_time() - waitStarted < before.host_ticks_per_second * 2) {
+    if (OSVADriverIOAfterLeaseIsPausedForTesting()) {
+      paused = true;
+      break;
+    }
+    sched_yield();
+  }
+
+  OSStatus removed = kAudioHardwareUnspecifiedError;
+  OSStatus added = kAudioHardwareUnspecifiedError;
+  OSStatus restarted = kAudioHardwareUnspecifiedError;
+  OSStatus written = kAudioHardwareUnspecifiedError;
+  OSStatus snapshotStatus = kAudioHardwareUnspecifiedError;
+  OSVADiagnosticSnapshot replacement;
+  Float32 fresh[] = {-0.125F, 0.25F, -0.375F, 0.5F};
+  AudioServerPlugInIOCycleInfo outputCycle = CycleAtOutputFrame(512.0);
+  if (paused) {
+    removed = (*driver)->RemoveDeviceClient(driver, targetDevice, target);
+    if (removed == noErr) {
+      target->mProcessID += 1;
+      added = (*driver)->AddDeviceClient(driver, targetDevice, target);
+      if (added == noErr) {
+        restarted = (*driver)->StartIO(driver, targetDevice, target->mClientID);
+      }
+    }
+    if (restarted == noErr) {
+      snapshotStatus = CopyDiagnosticSnapshot(driver, targetDevice, &replacement);
+      written = (*driver)->DoIOOperation(
+          driver, kOSVAObjectIDHiddenWriterDevice,
+          kOSVAObjectIDHiddenWriterStream, writer.mClientID,
+          kAudioServerPlugInIOOperationWriteMix, 4, &outputCycle, fresh, NULL);
+    }
+  }
+  const OSStatus resumed = OSVADriverResumeIOAfterLeaseForTesting();
+  // Drain the real callback before any assertion can release its stack context.
+  CHECK(pthread_join(thread, NULL) == 0);
+  CHECK(paused);
+  CHECK_STATUS(removed, noErr);
+  CHECK_STATUS(added, noErr);
+  CHECK_STATUS(restarted, noErr);
+  CHECK_STATUS(snapshotStatus, noErr);
+  CHECK_STATUS(written, noErr);
+  CHECK_STATUS(resumed, noErr);
+  CHECK_STATUS(work.result, noErr);
+  CHECK(DiagnosticSnapshotIsCoherent(&replacement));
+  CHECK(replacement.timeline_seed == before.timeline_seed);
+  const OSVADiagnosticDriverClientSlotSnapshot *oldSlot =
+      FindDiagnosticDriverSlot(&before, target->mClientID);
+  const OSVADiagnosticDriverClientSlotSnapshot *newSlot =
+      FindDiagnosticDriverSlot(&replacement, target->mClientID);
+  CHECK(oldSlot != NULL && newSlot != NULL);
+  CHECK(newSlot->generation > oldSlot->generation);
+  CHECK(newSlot->lease_session_id > oldSlot->lease_session_id);
+  if (!writerPaused) {
+    CHECK(AllSamplesEqual(work.samples, 4, 0.0F));
+  }
+  Float32 destination[4];
+  AudioServerPlugInIOCycleInfo inputCycle = CycleAtInputFrame(512.0);
+  CHECK_STATUS((*driver)->DoIOOperation(
+                   driver, kOSVAObjectIDVisibleInputDevice,
+                   kOSVAObjectIDVisibleInputStream, reader.mClientID,
+                   kAudioServerPlugInIOOperationReadInput, 4, &inputCycle,
+                   destination, NULL), noErr);
+  CHECK(memcmp(destination, fresh, sizeof(fresh)) == 0);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDVisibleInputDevice, &reader), noErr);
+  CHECK_STATUS((*driver)->RemoveDeviceClient(
+                   driver, kOSVAObjectIDHiddenWriterDevice, &writer), noErr);
+  CHECK(gFakeHostState.notificationCount == 0);
+  return true;
+}
+
+static bool TestCapturedReaderLeaseCannotAdoptReplacement(void) {
+  return RunCapturedIOLeaseCannotAdoptReplacement(false);
+}
+
+static bool TestCapturedWriterLeaseCannotAdoptReplacement(void) {
+  return RunCapturedIOLeaseCannotAdoptReplacement(true);
 }
 
 static bool TestDiagnosticSnapshotLifecycleAndAudioRecords(void) {
@@ -3848,7 +4519,11 @@ static bool TestDiagnosticSnapshotConcurrentCoherencyAndProgress(void) {
   return true;
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+  if (argc > 2) {
+    fprintf(stderr, "usage: %s [exact-test-name]\n", argv[0]);
+    return 2;
+  }
   const struct {
     const char *name;
     bool (*run)(void);
@@ -3877,6 +4552,26 @@ int main(void) {
        TestSeedGenerationDriverInstanceDisambiguation},
       {"client lifecycle without running notifications",
        TestClientLifecycleWithoutRunningNotifications},
+      {"active removal clears lease and restarts fresh epoch",
+       TestActiveRemovalClearsLeaseAndRestartsFreshEpoch},
+      {"active removal preserves writer sibling and drops stale PCM",
+       TestActiveRemovalPreservesWriterSiblingAndDropsStalePCM},
+      {"active removal preserves reader sibling and drops stale PCM",
+       TestActiveRemovalPreservesReaderSiblingAndDropsStalePCM},
+      {"removal rejects mismatched process identity",
+       TestRemovalRejectsMismatchedProcessIdentity},
+      {"recycled client ID rejects stale process removal",
+       TestRecycledClientIDRejectsStaleProcessRemoval},
+      {"active removal does not retire same ID on sibling endpoint",
+       TestActiveRemovalDoesNotRetireSameIDOnSiblingEndpoint},
+      {"concurrent stop and duplicate removal retire exactly once",
+       TestConcurrentStopAndDuplicateRemovalRetireExactlyOnce},
+      {"retirement failure preserves exact lease and clock",
+       TestRetirementFailurePreservesExactLeaseAndClock},
+      {"captured reader lease cannot adopt replacement",
+       TestCapturedReaderLeaseCannotAdoptReplacement},
+      {"captured writer lease cannot adopt replacement",
+       TestCapturedWriterLeaseCannotAdoptReplacement},
       {"production I/O transfer and stale silence",
        TestProductionIOTransferAndStaleSilence},
       {"diagnostic snapshot lifecycle and audio records",
@@ -3901,7 +4596,12 @@ int main(void) {
        TestDiagnosticSnapshotConcurrentCoherencyAndProgress},
   };
   size_t passed = 0;
+  size_t selected = 0;
   for (size_t index = 0; index < sizeof(tests) / sizeof(tests[0]); ++index) {
+    if (argc == 2 && strcmp(argv[1], tests[index].name) != 0) {
+      continue;
+    }
+    selected += 1;
     if (!tests[index].run()) {
       fprintf(stderr, "FAILED: %s\n", tests[index].name);
       return 1;
@@ -3909,7 +4609,11 @@ int main(void) {
     printf("PASS: %s\n", tests[index].name);
     passed += 1;
   }
+  if (selected == 0) {
+    fprintf(stderr, "no matching test: %s\n", argv[1]);
+    return 2;
+  }
   printf("PASS: %zu/%zu production driver interface tests\n", passed,
-         sizeof(tests) / sizeof(tests[0]));
+         selected);
   return 0;
 }

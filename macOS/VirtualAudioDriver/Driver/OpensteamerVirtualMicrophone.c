@@ -47,6 +47,7 @@ static OSStatus
 OSVAAddDeviceClient(AudioServerPlugInDriverRef driver,
                     AudioObjectID deviceObjectID,
                     const AudioServerPlugInClientInfo *clientInfo);
+
 static OSStatus
 OSVARemoveDeviceClient(AudioServerPlugInDriverRef driver,
                        AudioObjectID deviceObjectID,
@@ -173,6 +174,10 @@ static _Atomic(uint32_t) gHeldDiagnosticRecordKindForTesting = 0;
 static _Atomic(uint32_t) gHeldDiagnosticEndpointIndexForTesting = 0;
 static _Atomic(bool) gDiagnosticRecordWriterHeldForTesting = false;
 static _Atomic(bool) gResumeDiagnosticRecordWriterForTesting = false;
+static _Atomic(bool) gFailNextClientRetirementForTesting = false;
+static _Atomic(uint32_t) gPauseNextIOAfterLeaseEndpointForTesting = 0;
+static _Atomic(bool) gIOAfterLeasePausedForTesting = false;
+static _Atomic(bool) gResumeIOAfterLeaseForTesting = false;
 static bool OSVABeginLifecycleFenceForTesting(uint64_t *oddSequenceOut);
 static void OSVAEndLifecycleFenceForTesting(uint64_t oddSequence);
 #endif
@@ -2782,6 +2787,32 @@ static void OSVAEndLifecycleFenceForTesting(uint64_t oddSequence) {
   atomic_store_explicit(&gCore.lifecycle_sequence, oddSequence + 1,
                         memory_order_release);
 }
+
+static bool OSVAMaybePauseIOAfterLeaseForTesting(OSVAEndpoint endpoint) {
+  uint32_t expectedEndpoint = (uint32_t)endpoint;
+  if (!atomic_compare_exchange_strong_explicit(
+          &gPauseNextIOAfterLeaseEndpointForTesting, &expectedEndpoint, 0,
+          memory_order_acq_rel, memory_order_acquire)) {
+    return true;
+  }
+  const uint64_t started = mach_absolute_time();
+  bool resumed = false;
+  atomic_store_explicit(&gIOAfterLeasePausedForTesting, true,
+                        memory_order_release);
+  while (mach_absolute_time() - started < gCore.host_ticks_per_second * 5) {
+    if (atomic_load_explicit(&gResumeIOAfterLeaseForTesting,
+                              memory_order_acquire)) {
+      resumed = true;
+      break;
+    }
+    sched_yield();
+  }
+  atomic_store_explicit(&gResumeIOAfterLeaseForTesting, false,
+                        memory_order_release);
+  atomic_store_explicit(&gIOAfterLeasePausedForTesting, false,
+                        memory_order_release);
+  return resumed;
+}
 #endif
 
 static OSStatus
@@ -2854,6 +2885,11 @@ OSVADoIOOperation(AudioServerPlugInDriverRef driver,
   diagnostic.epoch_mapping_available = diagnostic.seed_generation != 0;
 
 #if defined(OSVA_DRIVER_TESTING)
+  if (!OSVAMaybePauseIOAfterLeaseForTesting(endpoint)) {
+    diagnostic.status = OSVA_STATUS_LIFECYCLE_ERROR;
+    OSVAPublishIODiagnostic(endpoint, diagnostic);
+    return kAudioHardwareUnspecifiedError;
+  }
   uint64_t testingFenceSequence = 0;
   bool testingFenceActive = atomic_exchange_explicit(
       &gFenceNextIOForTesting, false, memory_order_acq_rel);
@@ -2908,6 +2944,55 @@ OSVADoIOOperation(AudioServerPlugInDriverRef driver,
 }
 
 #if defined(OSVA_DRIVER_TESTING)
+OSStatus OSVADriverFailNextClientRetirementForTesting(void) {
+  pthread_mutex_lock(&gStateMutex);
+  if (!gCoreInitialized ||
+      atomic_load_explicit(&gFailNextClientRetirementForTesting,
+                            memory_order_acquire)) {
+    pthread_mutex_unlock(&gStateMutex);
+    return kAudioHardwareIllegalOperationError;
+  }
+  atomic_store_explicit(&gFailNextClientRetirementForTesting, true,
+                        memory_order_release);
+  pthread_mutex_unlock(&gStateMutex);
+  return noErr;
+}
+
+OSStatus OSVADriverPauseNextIOAfterLeaseForTesting(UInt32 endpointRole) {
+  pthread_mutex_lock(&gStateMutex);
+  if (!gCoreInitialized ||
+      (endpointRole != OSVA_ENDPOINT_VISIBLE_INPUT &&
+       endpointRole != OSVA_ENDPOINT_HIDDEN_WRITER) ||
+      atomic_load_explicit(&gPauseNextIOAfterLeaseEndpointForTesting,
+                            memory_order_acquire) != 0 ||
+      atomic_load_explicit(&gIOAfterLeasePausedForTesting,
+                            memory_order_acquire)) {
+    pthread_mutex_unlock(&gStateMutex);
+    return kAudioHardwareIllegalOperationError;
+  }
+  atomic_store_explicit(&gResumeIOAfterLeaseForTesting, false,
+                        memory_order_release);
+  atomic_store_explicit(&gPauseNextIOAfterLeaseEndpointForTesting, endpointRole,
+                        memory_order_release);
+  pthread_mutex_unlock(&gStateMutex);
+  return noErr;
+}
+
+Boolean OSVADriverIOAfterLeaseIsPausedForTesting(void) {
+  return atomic_load_explicit(&gIOAfterLeasePausedForTesting,
+                              memory_order_acquire);
+}
+
+OSStatus OSVADriverResumeIOAfterLeaseForTesting(void) {
+  if (!atomic_load_explicit(&gIOAfterLeasePausedForTesting,
+                             memory_order_acquire)) {
+    return kAudioHardwareIllegalOperationError;
+  }
+  atomic_store_explicit(&gResumeIOAfterLeaseForTesting, true,
+                        memory_order_release);
+  return noErr;
+}
+
 OSStatus OSVADriverFenceNextIOForTesting(void) {
   pthread_mutex_lock(&gStateMutex);
   bool initialized =
@@ -3068,6 +3153,14 @@ OSStatus OSVADriverResetForTesting(void) {
   memset(&gDiagnosticLifecycle, 0, sizeof(gDiagnosticLifecycle));
   OSVAResetDiagnosticAtomics();
   gCoreInitialized = false;
+  atomic_store_explicit(&gFailNextClientRetirementForTesting, false,
+                        memory_order_relaxed);
+  atomic_store_explicit(&gPauseNextIOAfterLeaseEndpointForTesting, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&gIOAfterLeasePausedForTesting, false,
+                        memory_order_relaxed);
+  atomic_store_explicit(&gResumeIOAfterLeaseForTesting, false,
+                        memory_order_relaxed);
   atomic_store_explicit(&gReferenceCount, 1, memory_order_relaxed);
   atomic_store_explicit(&gInvalidCycleTimestampCount, 0, memory_order_relaxed);
   atomic_store_explicit(&gFenceNextIOForTesting, false, memory_order_relaxed);
@@ -3155,6 +3248,69 @@ OSVAAddDeviceClient(AudioServerPlugInDriverRef driver,
   return noErr;
 }
 
+// gStateMutex serializes the cached lease with registration and diagnostics.
+static OSVAStatus OSVARetireStartedClientLocked(OSVADriverClient *client) {
+  const AudioObjectID deviceObjectID = client->device_object_id;
+  const UInt32 clientID = client->client_id;
+  const OSVAEndpoint endpoint = OSVAEndpointForDevice(deviceObjectID);
+  const size_t driverSlotIndex = (size_t)(client - gDriverClients);
+  const uint64_t coreClientID = OSVACoreClientID(deviceObjectID, clientID);
+  const uint32_t coreSlotIndex = client->lease.client_slot;
+  const uint64_t coreSessionID = client->lease.session_id;
+  const uint64_t driverClientGeneration = client->generation;
+  const pid_t processID = client->process_id;
+  const uint64_t transitionHostTicks = mach_absolute_time();
+  const uint64_t preActiveCount = atomic_load_explicit(
+      &gCore.active_client_count, memory_order_relaxed);
+  const uint64_t retiringSeed = atomic_load_explicit(
+      &gCore.timeline_seed, memory_order_relaxed);
+  const uint64_t retiringAnchor = atomic_load_explicit(
+      &gCore.anchor_host_ticks, memory_order_relaxed);
+  OSVAStatus status;
+#if defined(OSVA_DRIVER_TESTING)
+  if (atomic_exchange_explicit(&gFailNextClientRetirementForTesting, false,
+                                memory_order_acq_rel)) {
+    status = OSVA_STATUS_LIFECYCLE_ERROR;
+  } else
+#endif
+  {
+    status = OSVACoreStopClient(&gCore, client->lease);
+  }
+  if (status == OSVA_STATUS_OK) {
+    const uint64_t postActiveCount = atomic_load_explicit(
+        &gCore.active_client_count, memory_order_relaxed);
+    OSVAIncrementDiagnosticCounter(
+        &gDiagnosticLifecycle.global_stop_transition_count);
+    const bool clearedSeed = preActiveCount == 1 && postActiveCount == 0;
+    if (clearedSeed) {
+      OSVAIncrementDiagnosticCounter(&gDiagnosticLifecycle.seed_clear_count);
+      gDiagnosticLifecycle.last_seed_clear_host_ticks = transitionHostTicks;
+      gDiagnosticLifecycle.last_cleared_seed = retiringSeed;
+      gDiagnosticLifecycle.last_cleared_seed_generation =
+          retiringSeed;
+      gDiagnosticLifecycle.last_cleared_anchor_host_ticks = retiringAnchor;
+      gDiagnosticLifecycle.current_seed_generation = 0;
+    }
+    OSVARecordDiagnosticTransition(
+        &gDiagnosticLifecycle.last_driver_transition,
+        kOSVADiagnosticTransitionIOStopped, endpoint, driverSlotIndex,
+        (uint64_t)clientID, processID, driverClientGeneration, coreSessionID,
+        preActiveCount, postActiveCount, transitionHostTicks);
+    OSVARecordDiagnosticTransition(
+        &gDiagnosticLifecycle.last_core_transition,
+        clearedSeed ? kOSVADiagnosticTransitionSeedCleared
+                    : kOSVADiagnosticTransitionIOStopped,
+        endpoint, coreSlotIndex, coreClientID, processID,
+        driverClientGeneration, coreSessionID, preActiveCount,
+        postActiveCount, transitionHostTicks);
+    memset(&client->lease, 0, sizeof(client->lease));
+    client->started = false;
+    client->io_start_depth = 0;
+    client->last_transition_host_ticks = transitionHostTicks;
+  }
+  return status;
+}
+
 static OSStatus
 OSVARemoveDeviceClient(AudioServerPlugInDriverRef driver,
                        AudioObjectID deviceObjectID,
@@ -3171,12 +3327,25 @@ OSVARemoveDeviceClient(AudioServerPlugInDriverRef driver,
   OSVAAdvanceDiagnosticLifecycleSequence();
   OSVADriverClient *client =
       OSVAFindDriverClient(deviceObjectID, clientInfo->mClientID);
-  if (client == NULL || client->started) {
+  if (!gCoreInitialized || client == NULL ||
+      client->process_id != clientInfo->mProcessID) {
     pthread_mutex_unlock(&gStateMutex);
     return kAudioHardwareIllegalOperationError;
   }
   const size_t slotIndex = (size_t)(client - gDriverClients);
   const uint64_t generation = client->generation;
+  const uint64_t retiringSessionID = client->lease.session_id;
+  const uint64_t preActiveCount = atomic_load_explicit(
+      &gCore.active_client_count, memory_order_relaxed);
+  if (client->started) {
+    OSVAIncrementDiagnosticCounter(
+        &gDiagnosticLifecycle.global_stop_attempt_count);
+    const OSVAStatus status = OSVARetireStartedClientLocked(client);
+    if (status != OSVA_STATUS_OK) {
+      pthread_mutex_unlock(&gStateMutex);
+      return OSVAStatusToOSStatus(status);
+    }
+  }
   const uint64_t transitionHostTicks = mach_absolute_time();
   const uint64_t activeCount = atomic_load_explicit(
       &gCore.active_client_count, memory_order_relaxed);
@@ -3186,8 +3355,8 @@ OSVARemoveDeviceClient(AudioServerPlugInDriverRef driver,
       &gDiagnosticLifecycle.last_driver_transition,
       kOSVADiagnosticTransitionDriverClientRemoved,
       OSVAEndpointForDevice(deviceObjectID), slotIndex,
-      (uint64_t)clientInfo->mClientID, client->process_id, generation, 0,
-      activeCount, activeCount, transitionHostTicks);
+      (uint64_t)clientInfo->mClientID, client->process_id, generation,
+      retiringSessionID, preActiveCount, activeCount, transitionHostTicks);
   memset(client, 0, sizeof(*client));
   client->generation = generation;
   client->last_transition_host_ticks = transitionHostTicks;
@@ -3269,53 +3438,7 @@ static OSStatus OSVAStopIO(AudioServerPlugInDriverRef driver,
     pthread_mutex_unlock(&gStateMutex);
     return kAudioHardwareIllegalOperationError;
   }
-  const OSVAEndpoint endpoint = OSVAEndpointForDevice(deviceObjectID);
-  const size_t driverSlotIndex = (size_t)(client - gDriverClients);
-  const uint64_t coreClientID = OSVACoreClientID(deviceObjectID, clientID);
-  const uint32_t coreSlotIndex = client->lease.client_slot;
-  const uint64_t coreSessionID = client->lease.session_id;
-  const uint64_t driverClientGeneration = client->generation;
-  const pid_t processID = client->process_id;
-  const uint64_t transitionHostTicks = mach_absolute_time();
-  const uint64_t preActiveCount = atomic_load_explicit(
-      &gCore.active_client_count, memory_order_relaxed);
-  const uint64_t retiringSeed = atomic_load_explicit(
-      &gCore.timeline_seed, memory_order_relaxed);
-  const uint64_t retiringAnchor = atomic_load_explicit(
-      &gCore.anchor_host_ticks, memory_order_relaxed);
-  OSVAStatus status = OSVACoreStopClient(&gCore, client->lease);
-  if (status == OSVA_STATUS_OK) {
-    const uint64_t postActiveCount = atomic_load_explicit(
-        &gCore.active_client_count, memory_order_relaxed);
-    OSVAIncrementDiagnosticCounter(
-        &gDiagnosticLifecycle.global_stop_transition_count);
-    const bool clearedSeed = preActiveCount == 1 && postActiveCount == 0;
-    if (clearedSeed) {
-      OSVAIncrementDiagnosticCounter(&gDiagnosticLifecycle.seed_clear_count);
-      gDiagnosticLifecycle.last_seed_clear_host_ticks = transitionHostTicks;
-      gDiagnosticLifecycle.last_cleared_seed = retiringSeed;
-      gDiagnosticLifecycle.last_cleared_seed_generation =
-          retiringSeed;
-      gDiagnosticLifecycle.last_cleared_anchor_host_ticks = retiringAnchor;
-      gDiagnosticLifecycle.current_seed_generation = 0;
-    }
-    OSVARecordDiagnosticTransition(
-        &gDiagnosticLifecycle.last_driver_transition,
-        kOSVADiagnosticTransitionIOStopped, endpoint, driverSlotIndex,
-        (uint64_t)clientID, processID, driverClientGeneration, coreSessionID,
-        preActiveCount, postActiveCount, transitionHostTicks);
-    OSVARecordDiagnosticTransition(
-        &gDiagnosticLifecycle.last_core_transition,
-        clearedSeed ? kOSVADiagnosticTransitionSeedCleared
-                    : kOSVADiagnosticTransitionIOStopped,
-        endpoint, coreSlotIndex, coreClientID, processID,
-        driverClientGeneration, coreSessionID, preActiveCount,
-        postActiveCount, transitionHostTicks);
-    memset(&client->lease, 0, sizeof(client->lease));
-    client->started = false;
-    client->io_start_depth = 0;
-    client->last_transition_host_ticks = transitionHostTicks;
-  }
+  const OSVAStatus status = OSVARetireStartedClientLocked(client);
   pthread_mutex_unlock(&gStateMutex);
   return OSVAStatusToOSStatus(status);
 }

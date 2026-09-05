@@ -637,6 +637,15 @@ OpensteamerVirtualMicrophone_Create(CFAllocatorRef allocator,
 /// Tests may call this only while no I/O operation is active.
 OSStatus OSVADriverResetForTesting(void);
 
+/// Makes the next exact-lease retirement report a pre-mutation core failure.
+OSStatus OSVADriverFailNextClientRetirementForTesting(void);
+
+/// Pauses the next selected endpoint's I/O after lease capture for at most five
+/// seconds. Timeout returns an error; normal release proceeds with that lease.
+OSStatus OSVADriverPauseNextIOAfterLeaseForTesting(UInt32 endpointRole);
+Boolean OSVADriverIOAfterLeaseIsPausedForTesting(void);
+OSStatus OSVADriverResumeIOAfterLeaseForTesting(void);
+
 /// Fences the core lifecycle sequence after the next I/O call acquires its
 /// client lease. The test build clears the fence before that call returns.
 OSStatus OSVADriverFenceNextIOForTesting(void);

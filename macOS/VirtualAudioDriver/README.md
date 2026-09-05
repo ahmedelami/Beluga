@@ -25,6 +25,22 @@ The plug-in wrapper is based on Apple's MIT-licensed “Creating an Audio Server
 Driver Plug-in” sample. `APPLE_SAMPLE_LICENSE.txt` preserves that notice. No
 BlackHole source is incorporated.
 
+## Client retirement
+
+`RemoveDeviceClient` must retire a matching client's active core lease before
+unregistering it, even when no successful `StopIO` preceded removal. Removal
+checks the cached process identity and shares the exact-lease retirement path
+with `StopIO`. Other active clients keep their timeline; only the final client
+clears it. A retirement error must not fabricate successful removal or idle.
+The installed host-owned running-state policy remains unchanged: these paths
+do not emit `PropertiesChanged` running notifications.
+
+This handles a delivered removal callback, not a missing callback or an orphan
+already retained by an older loaded driver. It adds no process-death sweep or
+clock-reset shortcut. Core leases fence I/O after lease capture, but Core Audio
+callbacks expose no registration-generation token: matching numeric client and
+process IDs cannot distinguish every stale callback after identity reuse.
+
 ## Local verification
 
 Run the core, direct plug-in-interface, and sanitizer suites without loading a
