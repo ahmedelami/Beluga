@@ -322,7 +322,7 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
             return sources[connection.id] != nil
         }
         if current, let response = try? MediaBridgeProtocol.encode(MediaAuthorizationResult(id: id, result: result)) {
-            try? connection.send(response)
+            _ = try? connection.send(response)
         }
     }
 
