@@ -74,10 +74,14 @@ final class MacHostBundleIdentityTests: XCTestCase {
         XCTAssertEqual(build.status, 0, build.diagnostic)
         let app = outputDirectory.appendingPathComponent("opensteamer Host.app")
         let executable = app.appendingPathComponent("Contents/MacOS/CaptureServer")
+        let mediaBridge = app.appendingPathComponent("Contents/MacOS/OpensteamerMediaBridge")
         let framework = app.appendingPathComponent(
             "Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC"
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mediaBridge.path))
+        XCTAssertEqual(try readArchitectures(mediaBridge), try readArchitectures(executable))
+        XCTAssertEqual(try readRPaths(mediaBridge), [])
         XCTAssertTrue(FileManager.default.fileExists(atPath: framework.path))
         let frameworkRoot = app.appendingPathComponent(
             "Contents/Frameworks/LiveKitWebRTC.framework"
@@ -181,6 +185,13 @@ final class MacHostBundleIdentityTests: XCTestCase {
         )
         let positive = try run(executable: verifier, arguments: [app.path])
         XCTAssertEqual(positive.status, 0, positive.diagnostic)
+        let mediaPositive = try run(
+            executable: verifier,
+            arguments: ["--media-integration-v1", app.path]
+        )
+        XCTAssertEqual(mediaPositive.status, 0, mediaPositive.diagnostic)
+        try assertMediaContractMutationsRejected(app: app, verifier: verifier)
+        try assertLegacyBundleContractRemainsExact(app: app, verifier: verifier)
         let noncanonicalRuntimeMode = try run(
             executable: verifier,
             arguments: ["--installed-runtime", app.path]
@@ -533,6 +544,10 @@ final class MacHostBundleIdentityTests: XCTestCase {
                 at: captureSource,
                 to: fixtureBin.appendingPathComponent("CaptureServer")
             )
+            try FileManager.default.copyItem(
+                at: originalBin.appendingPathComponent("OpensteamerMediaBridge"),
+                to: fixtureBin.appendingPathComponent("OpensteamerMediaBridge")
+            )
             let framework = fixtureBin.appendingPathComponent("LiveKitWebRTC.framework")
             let copy = try run(
                 executable: URL(fileURLWithPath: "/usr/bin/ditto"),
@@ -679,6 +694,260 @@ final class MacHostBundleIdentityTests: XCTestCase {
         )
         XCTAssertTrue(verifier.contains("${#MACL_HEX} -eq 144"))
         XCTAssertTrue(verifier.contains("\"$MACL_HEX\" != *[!0]*"))
+    }
+
+    private func assertMediaContractMutationsRejected(app: URL, verifier: URL) throws {
+        let bridgePath = "Contents/MacOS/OpensteamerMediaBridge"
+        let manifestPath = "Contents/Resources/org.example.opensteamer.media.json"
+        let infoPath = "Contents/Info.plist"
+
+        for (name, relative, diagnostic) in [
+            ("missing-media-bridge", bridgePath, "media bridge executable is not a real regular file"),
+            ("missing-native-manifest", manifestPath, "native messaging manifest is not a real regular file"),
+        ] {
+            try assertMutationRejected(
+                app: app, verifier: verifier, name: name, expectedDiagnostic: diagnostic
+            ) { mutant in
+                try FileManager.default.removeItem(at: mutant.appendingPathComponent(relative))
+            }
+        }
+        for (name, relative) in [("linked-media-bridge", bridgePath), ("linked-native-manifest", manifestPath)] {
+            try assertMutationRejected(
+                app: app, verifier: verifier, name: name, expectedDiagnostic: "is not a real regular file"
+            ) { mutant in
+                let target = mutant.appendingPathComponent(relative)
+                try FileManager.default.removeItem(at: target)
+                try FileManager.default.createSymbolicLink(
+                    at: target, withDestinationURL: app.appendingPathComponent(relative)
+                )
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "hardlinked-media-bridge",
+            expectedDiagnostic: "media bridge executable must have one hard link"
+        ) { mutant in
+            try FileManager.default.linkItem(
+                at: mutant.appendingPathComponent(bridgePath),
+                to: mutant.appendingPathComponent("Contents/MacOS/bridge-alias")
+            )
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "extra-media-helper",
+            expectedDiagnostic: "MacOS directory has unexpected entries"
+        ) { mutant in
+            try FileManager.default.copyItem(
+                at: mutant.appendingPathComponent(bridgePath),
+                to: mutant.appendingPathComponent("Contents/MacOS/UnexpectedBridge")
+            )
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "extra-media-resource",
+            expectedDiagnostic: "Resources directory has unexpected entries"
+        ) { mutant in
+            try Data("unexpected".utf8).write(to: mutant.appendingPathComponent("Contents/Resources/extra.json"))
+        }
+        for (name, value, diagnostic) in [
+            ("wrong-media-version", 2 as Any, "unsupported media integration contract version"),
+            ("string-media-version", "1" as Any, "media integration version must be an integer"),
+            ("boolean-media-version", true as Any, "media integration version must be an integer"),
+        ] {
+            try assertMutationRejected(
+                app: app, verifier: verifier, name: name, expectedDiagnostic: diagnostic
+            ) { mutant in
+                try self.editPlist(mutant.appendingPathComponent(infoPath)) {
+                    $0["OpensteamerMediaIntegrationVersion"] = value
+                }
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "removed-media-version",
+            expectedDiagnostic: "MacOS directory has unexpected entries"
+        ) { mutant in
+            try self.editPlist(mutant.appendingPathComponent(infoPath)) {
+                $0.removeValue(forKey: "OpensteamerMediaIntegrationVersion")
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "wrong-automation-usage",
+            expectedDiagnostic: "Apple Events usage description differs"
+        ) { mutant in
+            try self.editPlist(mutant.appendingPathComponent(infoPath)) {
+                $0["NSAppleEventsUsageDescription"] = ""
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "missing-automation-usage",
+            expectedDiagnostic: "missing Apple Events usage description"
+        ) { mutant in
+            try self.editPlist(mutant.appendingPathComponent(infoPath)) {
+                $0.removeValue(forKey: "NSAppleEventsUsageDescription")
+            }
+        }
+        for (key, value) in [
+            ("name", "org.example.unreviewed" as Any),
+            ("path", "/tmp/OpensteamerMediaBridge" as Any),
+            ("type", "socket" as Any),
+            ("description", "unreviewed bridge" as Any),
+            ("allowed_origins", ["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"] as Any),
+        ] {
+            try assertMutationRejected(
+                app: app, verifier: verifier, name: "native-manifest-\(key)",
+                expectedDiagnostic: "native messaging manifest field differs"
+            ) { mutant in
+                try self.editJSON(mutant.appendingPathComponent(manifestPath)) { $0[key] = value }
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "native-manifest-extra-origin",
+            expectedDiagnostic: "native messaging requires exactly one allowed origin"
+        ) { mutant in
+            try self.editJSON(mutant.appendingPathComponent(manifestPath)) {
+                $0["allowed_origins"] = [
+                    "chrome-extension://dhmdpbpcldmnkjfibepklolofapiceab/",
+                    "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+                ]
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "native-manifest-extra-key",
+            expectedDiagnostic: "native messaging manifest keys differ"
+        ) { mutant in
+            try self.editJSON(mutant.appendingPathComponent(manifestPath)) { $0["extra"] = true }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "bridge-not-macho",
+            expectedDiagnostic: "media bridge is not a Mach-O executable"
+        ) { mutant in
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: mutant.appendingPathComponent(bridgePath))
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "bridge-rpath",
+            expectedDiagnostic: "media bridge must not contain LC_RPATH entries"
+        ) { mutant in
+            let change = try self.run(
+                executable: URL(fileURLWithPath: "/usr/bin/install_name_tool"),
+                arguments: ["-add_rpath", "@executable_path/../Frameworks", mutant.appendingPathComponent(bridgePath).path]
+            )
+            XCTAssertEqual(change.status, 0, change.diagnostic)
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "bridge-webrtc-dependency",
+            expectedDiagnostic: "media bridge contains an unreviewed dependency"
+        ) { mutant in
+            let change = try self.run(
+                executable: URL(fileURLWithPath: "/usr/bin/install_name_tool"),
+                arguments: [
+                    "-change", "/usr/lib/libSystem.B.dylib", "@rpath/LiveKitWebRTC.framework/LiveKitWebRTC",
+                    mutant.appendingPathComponent(bridgePath).path,
+                ]
+            )
+            XCTAssertEqual(change.status, 0, change.diagnostic)
+        }
+
+        let appleEvents = "com.apple.security.automation.apple-events"
+        let invalidHostEntitlements: [(String, [String: Any])] = [
+            ("missing-host-entitlement", [:]),
+            ("false-host-entitlement", [appleEvents: false]),
+            ("string-host-entitlement", [appleEvents: "true"]),
+            ("extra-host-entitlement", [appleEvents: true, "com.apple.security.get-task-allow": true]),
+            ("empty-dictionary-entitlement-bypass", [appleEvents: true, "unreviewed": [:] as [String: Any]]),
+        ]
+        for (name, entitlements) in invalidHostEntitlements {
+            try assertMutationRejected(
+                app: app, verifier: verifier, name: name,
+                expectedDiagnostic: "signed code entitlements differ from the exact reviewed contract"
+            ) { mutant in
+                try self.signCode(mutant, identifier: "com.elamin.AudioStreamer.CaptureServer", entitlements: entitlements)
+            }
+        }
+        for (name, relative, identifier) in [
+            ("bridge-apple-events", bridgePath, "org.example.opensteamer.MediaBridge"),
+            ("framework-apple-events", "Contents/Frameworks/LiveKitWebRTC.framework", "io.livekit.LiveKitWebRTC"),
+        ] {
+            try assertMutationRejected(
+                app: app, verifier: verifier, name: name,
+                expectedDiagnostic: "signed code entitlements differ from the exact reviewed contract"
+            ) { mutant in
+                let nestedCode = mutant.appendingPathComponent(relative)
+                try self.signCode(nestedCode, identifier: identifier, entitlements: [appleEvents: true])
+                try self.signCode(mutant, identifier: "com.elamin.AudioStreamer.CaptureServer", entitlements: [appleEvents: true])
+                let nestedExecutable = relative.hasSuffix(".framework")
+                    ? nestedCode.appendingPathComponent("Versions/A/LiveKitWebRTC") : nestedCode
+                for architecture in try self.readArchitectures(nestedExecutable) {
+                    let displayed = try self.run(
+                        executable: URL(fileURLWithPath: "/usr/bin/codesign"),
+                        arguments: ["-d", "--arch", architecture, "--entitlements", ":-", nestedExecutable.path]
+                    )
+                    XCTAssertEqual(displayed.status, 0, displayed.diagnostic)
+                    let actual = try XCTUnwrap(
+                        PropertyListSerialization.propertyList(from: Data(displayed.standardOutput.utf8), format: nil) as? [String: Any]
+                    )
+                    XCTAssertEqual(actual[appleEvents] as? Bool, true, "\(name) did not inject the entitlement into \(architecture).")
+                }
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "bridge-host-code-identity",
+            expectedDiagnostic: "wrong media bridge signature identifier"
+        ) { mutant in
+            try self.signCode(mutant.appendingPathComponent(bridgePath), identifier: "com.elamin.AudioStreamer.CaptureServer")
+            try self.signCode(mutant, identifier: "com.elamin.AudioStreamer.CaptureServer", entitlements: [appleEvents: true])
+        }
+    }
+
+    private func assertLegacyBundleContractRemainsExact(app: URL, verifier: URL) throws {
+        let parent = app.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("legacy-contract")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        let legacy = parent.appendingPathComponent("opensteamer Host.app")
+        let clone = try run(executable: URL(fileURLWithPath: "/bin/cp"), arguments: ["-cR", app.path, legacy.path])
+        XCTAssertEqual(clone.status, 0, clone.diagnostic)
+        try FileManager.default.removeItem(at: legacy.appendingPathComponent("Contents/MacOS/OpensteamerMediaBridge"))
+        try FileManager.default.removeItem(at: legacy.appendingPathComponent("Contents/Resources/org.example.opensteamer.media.json"))
+        try editPlist(legacy.appendingPathComponent("Contents/Info.plist")) {
+            $0.removeValue(forKey: "OpensteamerMediaIntegrationVersion")
+            $0.removeValue(forKey: "NSAppleEventsUsageDescription")
+        }
+        try signCode(legacy, identifier: "com.elamin.AudioStreamer.CaptureServer")
+        let positive = try run(executable: verifier, arguments: [legacy.path])
+        XCTAssertEqual(positive.status, 0, positive.diagnostic)
+        let downgrade = try run(executable: verifier, arguments: ["--media-integration-v1", legacy.path])
+        XCTAssertNotEqual(downgrade.status, 0, downgrade.diagnostic)
+        XCTAssertTrue(downgrade.standardError.contains("media integration v1 contract is required"), downgrade.diagnostic)
+        try assertMutationRejected(
+            app: legacy, verifier: verifier, name: "legacy-automation-entitlement",
+            expectedDiagnostic: "signed code entitlements differ from the exact reviewed contract"
+        ) { mutant in
+            try self.signCode(
+                mutant, identifier: "com.elamin.AudioStreamer.CaptureServer",
+                entitlements: ["com.apple.security.automation.apple-events": true]
+            )
+        }
+    }
+
+    private func signCode(_ target: URL, identifier: String, entitlements: [String: Any] = [:]) throws {
+        let directory = makeTemporaryDirectory(prefix: "entitlements")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("fixture.entitlements")
+        try PropertyListSerialization.data(fromPropertyList: entitlements, format: .xml, options: 0).write(to: file)
+        let signed = try run(
+            executable: URL(fileURLWithPath: "/usr/bin/codesign"),
+            // macOS 15+ omits library entitlements unless this is explicit. A
+            // framework mutation must alter its signature, not silently no-op.
+            arguments: ["--force", "--force-library-entitlements", "--sign", "-", "--identifier", identifier, "--timestamp=none", "--entitlements", file.path, target.path]
+        )
+        XCTAssertEqual(signed.status, 0, signed.diagnostic)
+    }
+
+    private func editPlist(_ file: URL, mutate: (inout [String: Any]) throws -> Void) throws {
+        var contents = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: file), format: nil) as? [String: Any])
+        try mutate(&contents)
+        try PropertyListSerialization.data(fromPropertyList: contents, format: .xml, options: 0).write(to: file)
+    }
+
+    private func editJSON(_ file: URL, mutate: (inout [String: Any]) throws -> Void) throws {
+        var contents = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        try mutate(&contents)
+        try JSONSerialization.data(withJSONObject: contents, options: [.sortedKeys]).write(to: file)
     }
 
     private func assertMutationRejected(

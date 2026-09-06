@@ -18,6 +18,7 @@ let package = Package(
         .library(name: "WebRTCTransport", targets: ["WebRTCTransport"]),
         .executable(name: "CaptureCLI", targets: ["CaptureCLI"]),
         .executable(name: "CaptureServer", targets: ["CaptureServer"]),
+        .executable(name: "OpensteamerMediaBridge", targets: ["OpensteamerMediaBridge"]),
         .executable(name: "PCMClient", targets: ["PCMClient"]),
         .executable(name: "PCMPlayer", targets: ["PCMPlayer"])
     ],
@@ -32,6 +33,7 @@ let package = Package(
             name: "CaptureServer",
             dependencies: [
                 "CaptureCore",
+                "MediaBridgeCore",
                 .target(
                     name: "MacWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.macOS])
@@ -58,6 +60,17 @@ let package = Package(
             name: "PCMClient",
             dependencies: ["Streaming", "Utilities"],
             path: "macOS/Sources/PCMClient"
+        ),
+        .target(name: "MediaBridgeCore", path: "macOS/Sources/MediaBridgeCore"),
+        .executableTarget(
+            name: "OpensteamerMediaBridge",
+            dependencies: ["MediaBridgeCore"],
+            path: "macOS/Sources/OpensteamerMediaBridge"
+        ),
+        .testTarget(
+            name: "MediaBridgeCoreTests",
+            dependencies: ["MediaBridgeCore"],
+            path: "macOS/Tests/MediaBridgeCoreTests"
         ),
         .executableTarget(
             name: "PCMPlayer",
@@ -192,7 +205,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CaptureServerTests",
-            dependencies: ["CaptureServer", "WebRTCTransport"],
+            dependencies: ["CaptureServer", "WebRTCTransport", "MediaBridgeCore"],
             path: "macOS/Tests/CaptureServerTests"
         ),
         .testTarget(

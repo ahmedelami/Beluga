@@ -24,6 +24,8 @@
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
 	<string>4</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>opensteamer reads playback information and controls Music when you enable Music integration.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>opensteamer captures system audio from this Mac so it can stream playback to your iPhone.</string>
 	<key>NSMicrophoneUsageDescription</key>

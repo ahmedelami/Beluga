@@ -30,6 +30,10 @@
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>OpensteamerMediaIntegrationVersion</key>
+	<integer>1</integer>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>opensteamer reads playback information and controls Music when you enable Music integration.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>opensteamer captures this Mac's audio so it can stream playback to your iPhone.</string>
 	<key>NSMicrophoneUsageDescription</key>

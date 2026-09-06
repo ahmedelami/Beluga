@@ -20,7 +20,7 @@ passes the unrelated-network and forced-TURN gates described in
 - Mac system-audio capture with ScreenCaptureKit and 48 kHz stereo Opus transport.
 - H.264 screen video with Show/Hide independent from audio playback.
 - Native iPhone Lock Screen and Control Center Play/Pause/Next/Previous controls for
-  the Mac's active Now Playing source, when both peers negotiate support.
+  a supported Mac media source, when both peers negotiate support.
 - An opt-in adjustable portrait display for a headless Mac. It replaces the sole Apple headless
   placeholder with the same desktop plus verified iPhone-resolution choices; screen video uses
   the active framebuffer while system-audio selection remains independent.
@@ -90,7 +90,7 @@ the microphone after the call ends and the exact built-in-microphone route is he
 
 ## Native media controls
 
-The iPhone mirrors the Mac's active system Now Playing source, including bounded title,
+The iPhone mirrors a supported Mac media source, including bounded title,
 artist, elapsed-time, and duration metadata. Only commands supported by that source are
 enabled. Changing the active player or media item replaces the old context; queued controls
 must not operate on a replacement item or survive a connection recovery boundary.
@@ -107,12 +107,21 @@ while local audio is muted. Force-quitting the iPhone app still ends its session
 controls do not create background execution through synthetic audio. Artwork and seeking
 are not included in the bounded control-channel protocol.
 
-The directly distributed Mac host uses a narrowly gated private MediaRemote adapter to
-follow the same active owner as macOS Control Center. Its ABI is currently gated to
-macOS 26.5, with development verification on 26.5.1; unsupported versions or missing
-symbols disable this feature without disabling streaming. The private adapter is
-macOS-only and is not linked into the iOS/TestFlight app. Source tests do not certify
-Lock Screen behavior on a physical iPhone; see the media-controls release boundary in
+The directly distributed Mac host supports YouTube in Chrome through the local
+[media extension](browser/opensteamer-media/README.md), and Apple Music through
+permissioned Apple Events. The signed native helper communicates over a private,
+same-user Unix socket; it opens no network port and cannot start the host. Music is
+never automatically launched or prompted during discovery. Use the extension popup's
+Enable Music controls button to request the normal macOS Automation permission.
+
+A newly playing supported source wins; a paused source stays selected until another
+source starts. This is explicit supported-player arbitration, not a claim to mirror
+the private global owner in macOS Control Center. Missing/stale metadata disables
+source-backed controls without disabling streamed audio. Music Next/Previous require
+a proven playlist neighbor, and YouTube requires an available control on the exact
+current player. Unsupported apps retain the generic card. No iOS private API or
+additional iPhone permission is involved. Source tests do not certify Lock Screen
+behavior on a physical iPhone; see the media-controls release boundary in
 [TESTING_ORACLES.md](TESTING_ORACLES.md).
 
 ## Configure before building

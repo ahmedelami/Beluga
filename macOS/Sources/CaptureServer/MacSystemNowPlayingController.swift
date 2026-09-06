@@ -91,6 +91,7 @@ enum MacNowPlayingRuntimeSnapshotResult: @unchecked Sendable {
 
 protocol MacSystemNowPlayingRuntime: Sendable {
     var isAvailable: Bool { get }
+    func stop()
 
     func fetchSnapshot(
         completion: @escaping @Sendable (MacNowPlayingRuntimeSnapshotResult) -> Void
@@ -102,6 +103,10 @@ protocol MacSystemNowPlayingRuntime: Sendable {
         isAuthorized: @escaping @Sendable () -> Bool,
         completion: @escaping @Sendable (WebRTCRemoteMediaCommandResult) -> Void
     )
+}
+
+extension MacSystemNowPlayingRuntime {
+    func stop() {}
 }
 
 enum MacMediaRemoteABIGate {
@@ -713,7 +718,7 @@ final class MacSystemNowPlayingController: MacRemoteMediaControlling,
     var isAvailable: Bool { runtime?.isAvailable == true }
 
     init() {
-        runtime = DynamicMediaRemoteRuntime()
+        runtime = MacSupportedNowPlayingRuntime()
         pollInterval = 1
         operationTimeout = 2
         now = Date.init
@@ -774,6 +779,7 @@ final class MacSystemNowPlayingController: MacRemoteMediaControlling,
         gate.close()
         queue.async { [weak self] in
             guard let self else { return }
+            self.runtime?.stop()
             self.timer?.setEventHandler {}
             self.timer?.cancel()
             self.timer = nil

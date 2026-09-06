@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "opensteamer Media",
+  "version": "1.0.0",
+  "description": "Share current YouTube media and narrowly scoped playback controls with opensteamer.",
+  "minimum_chrome_version": "120",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo2bauB8u1hHN5Q+jlh1+JCqy2Mwd2ar8EqKEJHVOkKuPTm5kAl3IfrW5U2viUqsr5UHBSjpxpy0uAFzN4wqHpPi2WernrnOwUNEVGbcFaXO7oKOTENejXmg8tQTD6lgaC7zVuEl1fnCO7iZwnuMXt953Rq1smolGENMrXiEqMZeIe8ih7nSM9sk/UMjkeA0IAwz3FOgpj9i/KnW7hJnfHWtrWIfOMxv278uLQAdVKg7ViXQULqAwR/j9G6+bppF3yl4JweQKh8Jxrf2hU3l2WOk73RdPi3QdToGlc+bsZuiY+UTvEoAcj6WakCfZBmMsHL0CeXtUm807znPDh1bnOQIDAQAB",
+  "permissions": ["nativeMessaging", "scripting"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "background": { "service_worker": "worker.js" },
+  "action": { "default_popup": "popup.html" },
+  "content_scripts": [
+    { "matches": ["https://www.youtube.com/*"], "js": ["adapter.js"], "run_at": "document_start", "world": "MAIN", "all_frames": false },
+    { "matches": ["https://www.youtube.com/*"], "js": ["bridge.js"], "run_at": "document_start", "world": "ISOLATED", "all_frames": false }
+  ]
+}
