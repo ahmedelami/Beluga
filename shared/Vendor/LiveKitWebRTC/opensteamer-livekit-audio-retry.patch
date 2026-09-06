@@ -1,0 +1,720 @@
+diff --git a/sdk/BUILD.gn b/sdk/BUILD.gn
+index be902a1e6ae601e0ef343fe0405a8e43f3521255..572bb8bf1c97d3f1da00c8478f501a573fb62bce 100644
+--- a/sdk/BUILD.gn
++++ b/sdk/BUILD.gn
+@@ -1438,6 +1438,33 @@ if (is_ios || is_mac) {
+           ldflags = [ "-all_load" ]
+         }
+ 
++        rtc_test("custom_audio_device_retry_unittests") {
++          testonly = true
++          is_xctest = true
++          info_plist = "objc/unittests/RTCCustomAudioDeviceRetry-Info.plist"
++          sources = [
++            "objc/unittests/RTCCustomAudioDeviceRetryMain.mm",
++            "objc/unittests/RTCCustomAudioDeviceRetry_xctest.mm",
++          ]
++          deps = [
++            ":audio_device_objc",
++            ":base_objc",
++            "../api:make_ref_counted",
++            "../api:scoped_refptr",
++            "../api/environment:environment_factory",
++            "../common_audio",
++            "../modules/audio_device:audio_device_buffer",
++            "../rtc_base:threading",
++            "//build/config/ios:xctest",
++          ]
++          frameworks = [
++            "Foundation.framework",
++            "UIKit.framework",
++          ]
++          ldflags = [ "-all_load" ]
++          retries = 0
++        }
++
+         # These tests link to the framework.
+         rtc_test("sdk_framework_unittests") {
+           is_xctest = true
+@@ -1461,7 +1488,7 @@ if (is_ios || is_mac) {
+     if (is_ios) {
+       apple_framework_bundle_with_umbrella_header("framework_objc") {
+         info_plist = "objc/Info.plist"
+-        output_name = "WebRTC"
++        output_name = "LiveKitWebRTC"
+ 
+         common_objc_headers = [
+           "objc/base/RTCCodecSpecificInfo.h",
+@@ -1641,7 +1668,7 @@ if (is_ios || is_mac) {
+ 
+       bundle_data("ios_framework_bundle") {
+         deps = [ "../sdk:framework_objc" ]
+-        sources = [ "$root_build_dir/WebRTC.framework" ]
++        sources = [ "$root_build_dir/LiveKitWebRTC.framework" ]
+         outputs = [ "{{bundle_resources_dir}}/Frameworks/{{source_file_part}}" ]
+       }
+     }
+@@ -1649,7 +1676,7 @@ if (is_ios || is_mac) {
+     if (is_mac) {
+       apple_framework_bundle_with_umbrella_header("mac_framework_objc") {
+         info_plist = "objc/Info.plist"
+-        output_name = "WebRTC"
++        output_name = "LiveKitWebRTC"
+ 
+         sources = [
+           "objc/api/peerconnection/RTCAudioDeviceModule.h",
+@@ -1798,7 +1825,7 @@ if (is_ios || is_mac) {
+ 
+       bundle_data("mac_framework_bundle") {
+         deps = [ "../sdk:mac_framework_objc" ]
+-        sources = [ "$root_build_dir/WebRTC.framework" ]
++        sources = [ "$root_build_dir/LiveKitWebRTC.framework" ]
+         outputs = [ "{{bundle_contents_dir}}/Frameworks/{{source_file_part}}" ]
+       }
+     }
+diff --git a/sdk/objc/Info.plist b/sdk/objc/Info.plist
+index 38c437e7feda9bfa1ee8aafb864174af1c891913..814989d53484f2b009f08ccfd2c6d0ad60e6f5ce 100644
+--- a/sdk/objc/Info.plist
++++ b/sdk/objc/Info.plist
+@@ -5,13 +5,13 @@
+ 	<key>CFBundleDevelopmentRegion</key>
+ 	<string>en</string>
+ 	<key>CFBundleExecutable</key>
+-	<string>WebRTC</string>
++	<string>LiveKitWebRTC</string>
+ 	<key>CFBundleIdentifier</key>
+-	<string>org.webrtc.WebRTC</string>
++	<string>io.livekit.LiveKitWebRTC</string>
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
+ 	<key>CFBundleName</key>
+-	<string>WebRTC</string>
++	<string>LiveKitWebRTC</string>
+ 	<key>CFBundlePackageType</key>
+ 	<string>FMWK</string>
+ 	<key>CFBundleShortVersionString</key>
+diff --git a/sdk/objc/base/RTCMacros.h b/sdk/objc/base/RTCMacros.h
+index 09418b86ac77a1a1dc8672775ce05bca0061377d..269e8acd718e51c65fba57304bee03ce6d94db80 100644
+--- a/sdk/objc/base/RTCMacros.h
++++ b/sdk/objc/base/RTCMacros.h
+@@ -40,13 +40,9 @@
+ // problem.
+ //
+ // This macro must be defined uniformily across all the translation units.
+-#ifndef RTC_OBJC_TYPE_PREFIX
+-#define RTC_OBJC_TYPE_PREFIX
+-#endif
++#define RTC_OBJC_TYPE_PREFIX LK
+ 
+-#ifndef RTC_CONSTANT_TYPE_PREFIX
+-#define RTC_CONSTANT_TYPE_PREFIX k
+-#endif
++#define RTC_CONSTANT_TYPE_PREFIX kLK
+ 
+ // RCT_OBJC_TYPE
+ //
+diff --git a/sdk/objc/components/audio/RTCAudioDevice.h b/sdk/objc/components/audio/RTCAudioDevice.h
+index e578940f93a6b13317d6c9a37de0bdb57ad1e711..8a2aeea919c77adf7cd9c7a3002a667308e91b3f 100644
+--- a/sdk/objc/components/audio/RTCAudioDevice.h
++++ b/sdk/objc/components/audio/RTCAudioDevice.h
+@@ -15,6 +15,8 @@
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
++@protocol RTC_OBJC_TYPE(RTCAudioDevice);
++
+ typedef OSStatus (^RTC_OBJC_TYPE(RTCAudioDeviceGetPlayoutDataBlock))(
+     AudioUnitRenderActionFlags *_Nonnull actionFlags,
+     const AudioTimeStamp *_Nonnull timestamp,
+@@ -166,6 +168,21 @@ RTC_OBJC_EXPORT @protocol RTC_OBJC_TYPE
+  */
+ - (void)dispatchSync:(dispatch_block_t)block;
+ 
++@optional
++/**
++ * Retries the owning custom ADM's playout initialization and start inline.
++ * Returns YES only when the same device/delegate still owns an initialized,
++ * playing ADM and its playout buffer. Nil, retired, or mismatched owners fail.
++ * Does not change recording intent or configure a replacement audio device.
++ *
++ * Must run on the ADM thread, within dispatchAsync or dispatchSync, after the
++ * caller authorizes playback. The device's initializePlayout/startPlayout are
++ * called synchronously; do not hold a device lock that they also acquire.
++ * Older delegates may not implement this optional recovery capability.
++ */
++- (BOOL)retryPlayoutForAudioDevice:
++    (nullable id<RTC_OBJC_TYPE(RTCAudioDevice)>)audioDevice;
++
+ @end
+ 
+ /**
+diff --git a/sdk/objc/native/src/objc_audio_device.h b/sdk/objc/native/src/objc_audio_device.h
+index e0ed401f7b0279e3c27ca3819af9bae157408f72..5ac6255720b6772f5df9fab214322be09ef0ccf5 100644
+--- a/sdk/objc/native/src/objc_audio_device.h
++++ b/sdk/objc/native/src/objc_audio_device.h
+@@ -174,7 +174,12 @@ class ObjCAudioDeviceModule : public AudioDeviceModule {
+   // is interrupted.
+   void HandleAudioOutputInterrupted();
+ 
++  bool RetryPlayout(id<RTC_OBJC_TYPE(RTCAudioDevice)> audio_device,
++                   id<RTC_OBJC_TYPE(RTCAudioDeviceDelegate)> delegate);
++
+  private:
++  friend class ObjCAudioDeviceModuleRetryTestPeer;
++
+   // Update our audio parameters if they are different from current device audio
+   // parameters Returns true when our parameters are update, false - otherwise.
+   // `ObjCAudioDeviceModule` has audio device buffer (ADB) which has audio
+diff --git a/sdk/objc/native/src/objc_audio_device.mm b/sdk/objc/native/src/objc_audio_device.mm
+index b3a35109760c6e26dfd777997930abaed755acd7..1d95b7b80a14bc563b42682d7e97d7d2399b2688 100644
+--- a/sdk/objc/native/src/objc_audio_device.mm
++++ b/sdk/objc/native/src/objc_audio_device.mm
+@@ -212,6 +212,8 @@
+     playout_fine_audio_buffer_->ResetPlayout();
+   }
+   if (![audio_device_ startPlayout]) {
++    playing_.store(false, std::memory_order_release);
++    audio_device_buffer_->StopPlayout();
+     RTC_LOG_F(LS_ERROR) << "Failed to start audio device playout";
+     return -1;
+   }
+@@ -220,6 +222,43 @@
+   return 0;
+ }
+ 
++bool ObjCAudioDeviceModule::RetryPlayout(
++    id<RTC_OBJC_TYPE(RTCAudioDevice)> audio_device,
++    id<RTC_OBJC_TYPE(RTCAudioDeviceDelegate)> delegate) {
++  RTC_DCHECK_RUN_ON(&thread_checker_);
++  const auto owns_device = [&] {
++    return audio_device != nil && audio_device == audio_device_ &&
++           delegate != nil && delegate == audio_device_delegate_ &&
++           Initialized();
++  };
++  if (!owns_device()) {
++    return false;
++  }
++  if (playing_.load() && ![audio_device_ isPlaying]) {
++    // A native policy rebuild may stop output without passing through ADM Stop.
++    // Retire only the stale playout side before re-entering InitPlayout.
++    playing_.store(false, std::memory_order_release);
++    audio_device_buffer_->StopPlayout();
++  }
++  if (playing_.load() && !PlayoutIsInitialized()) {
++    return false;
++  }
++  if (InitPlayout() != 0 || !owns_device() ||
++      !PlayoutIsInitialized()) {
++    return false;
++  }
++  if (StartPlayout() != 0 || !owns_device()) {
++    return false;
++  }
++  if (PlayoutIsInitialized() && Playing() &&
++      audio_device_buffer_->IsPlaying()) {
++    return true;
++  }
++  playing_.store(false, std::memory_order_release);
++  audio_device_buffer_->StopPlayout();
++  return false;
++}
++
+ int32_t ObjCAudioDeviceModule::StopPlayout() {
+   RTC_DLOG_F(LS_VERBOSE) << "";
+   RTC_DCHECK_RUN_ON(&thread_checker_);
+diff --git a/sdk/objc/native/src/objc_audio_device_delegate.mm b/sdk/objc/native/src/objc_audio_device_delegate.mm
+index ef091eaf5d9c8b263aeda89d3691048d7d6158f0..e29e68919de021926f1cb7f22cfaf36f314c4e86 100644
+--- a/sdk/objc/native/src/objc_audio_device_delegate.mm
++++ b/sdk/objc/native/src/objc_audio_device_delegate.mm
+@@ -183,6 +183,17 @@ - (void)dispatchAsync:(dispatch_block_t)block {
+   });
+ }
+ 
++- (BOOL)retryPlayoutForAudioDevice:
++    (nullable id<RTC_OBJC_TYPE(RTCAudioDevice)>)audioDevice {
++  // Compare thread identities without dereferencing a retired worker pointer.
++  if (audioDevice == nil || webrtc::Thread::Current() != impl_->thread()) {
++    return NO;
++  }
++  webrtc::scoped_refptr<webrtc::objc_adm::ObjCAudioDeviceModule> module(
++      impl_->audio_device_module());
++  return module && module->RetryPlayout(audioDevice, self);
++}
++
+ - (void)dispatchSync:(dispatch_block_t)block {
+   webrtc::Thread* thread = impl_->thread();
+   RTC_DCHECK(thread);
+diff --git a/tools_webrtc/apple/copy_framework_header.py b/tools_webrtc/apple/copy_framework_header.py
+index 3574a67d2a243d4f95217b0a9e855f08b437c739..a68f22d887cbf798c4546ef4937fab75fd03e8ba 100755
+--- a/tools_webrtc/apple/copy_framework_header.py
++++ b/tools_webrtc/apple/copy_framework_header.py
+@@ -20,7 +20,7 @@ def _ReplaceDoubleQuote(line):
+   if not match:
+     return line
+ 
+-  return '%s#import <WebRTC/%sRTC%s.h>%s' % (match.group(1), match.group(3),
++  return '%s#import <LiveKitWebRTC/%sRTC%s.h>%s' % (match.group(1), match.group(3),
+                                              match.group(4), match.group(5))
+ 
+ 
+diff --git a/tools_webrtc/ios/build_ios_libs.py b/tools_webrtc/ios/build_ios_libs.py
+index e7967db56bbed4058622e113fc945709a5159d6c..408da7c963cbcdb3b8f7a79e16a1ccbea2bd8aeb 100755
+--- a/tools_webrtc/ios/build_ios_libs.py
++++ b/tools_webrtc/ios/build_ios_libs.py
+@@ -28,9 +28,9 @@ sys.path.append(os.path.join(SRC_DIR, 'build'))
+ import find_depot_tools
+ 
+ SDK_OUTPUT_DIR = os.path.join(SRC_DIR, 'out_ios_libs')
+-SDK_FRAMEWORK_NAME = 'WebRTC.framework'
+-SDK_DSYM_NAME = 'WebRTC.dSYM'
+-SDK_XCFRAMEWORK_NAME = 'WebRTC.xcframework'
++SDK_FRAMEWORK_NAME = 'LiveKitWebRTC.framework'
++SDK_DSYM_NAME = 'LiveKitWebRTC.dSYM'
++SDK_XCFRAMEWORK_NAME = 'LiveKitWebRTC.xcframework'
+ 
+ ENABLED_ARCHS = [
+     'device:arm64', 'simulator:arm64', 'simulator:x64',
+diff --git a/tools_webrtc/ios/generate_umbrella_header.py b/tools_webrtc/ios/generate_umbrella_header.py
+index 1fd1eed38eedd64b11302c962d24c0cb0f60dc99..055732e044d61af98bec7c71949c18f84c54ea79 100644
+--- a/tools_webrtc/ios/generate_umbrella_header.py
++++ b/tools_webrtc/ios/generate_umbrella_header.py
+@@ -41,7 +41,7 @@ def GenerateUmbrellaHeader():
+      */\n\n""" % datetime.datetime.now().year))
+ 
+     for s in args.sources:
+-      outfile.write("#import <WebRTC/{}>\n".format(os.path.basename(s)))
++      outfile.write("#import <LiveKitWebRTC/{}>\n".format(os.path.basename(s)))
+ 
+   return 0
+ 
+diff --git a/sdk/objc/unittests/RTCCustomAudioDeviceRetry-Info.plist b/sdk/objc/unittests/RTCCustomAudioDeviceRetry-Info.plist
+new file mode 100644
+index 0000000000000000000000000000000000000000..2882e65a1251f0b5412bdc172f61180b1bc3a38b
+--- /dev/null
++++ b/sdk/objc/unittests/RTCCustomAudioDeviceRetry-Info.plist
+@@ -0,0 +1,20 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>CFBundleIdentifier</key>
++  <string>org.webrtc.custom-audio-device-retry-tests</string>
++  <key>CFBundleExecutable</key>
++  <string>${EXECUTABLE_NAME}</string>
++  <key>CFBundleName</key>
++  <string>${PRODUCT_NAME}</string>
++  <key>CFBundlePackageType</key>
++  <string>APPL</string>
++  <key>CFBundleVersion</key>
++  <string>1</string>
++  <key>CFBundleShortVersionString</key>
++  <string>1.0</string>
++  <key>LSRequiresIPhoneOS</key>
++  <true/>
++</dict>
++</plist>
+diff --git a/sdk/objc/unittests/RTCCustomAudioDeviceRetryMain.mm b/sdk/objc/unittests/RTCCustomAudioDeviceRetryMain.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..18972d8519e8cec66df237889f22f9bc1f7c3923
+--- /dev/null
++++ b/sdk/objc/unittests/RTCCustomAudioDeviceRetryMain.mm
+@@ -0,0 +1,16 @@
++/*
++ * Copyright 2026 The WebRTC project authors. All Rights Reserved.
++ * Use of this source code is governed by a BSD-style license
++ * that can be found in the LICENSE file in the root of the source tree.
++ */
++
++#import <UIKit/UIKit.h>
++
++#include "rtc_base/thread.h"
++
++int main(int argc, char* argv[]) {
++  webrtc::AutoThread main_thread;
++  @autoreleasepool {
++    return UIApplicationMain(argc, argv, nil, nil);
++  }
++}
+diff --git a/sdk/objc/unittests/RTCCustomAudioDeviceRetry_xctest.mm b/sdk/objc/unittests/RTCCustomAudioDeviceRetry_xctest.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..5328d4f637a44e510ee205467944117b0555872e
+--- /dev/null
++++ b/sdk/objc/unittests/RTCCustomAudioDeviceRetry_xctest.mm
+@@ -0,0 +1,377 @@
++/*
++ * Copyright 2026 The WebRTC project authors. All Rights Reserved.
++ *
++ * Use of this source code is governed by a BSD-style license
++ * that can be found in the LICENSE file in the root of the source
++ * tree. An additional intellectual property rights grant can be found
++ * in the file PATENTS. All contributing project authors may
++ * be found in the AUTHORS file in the root of the source tree.
++ */
++
++#import <XCTest/XCTest.h>
++
++#include <algorithm>
++#include <array>
++#include <memory>
++
++#include "api/environment/environment_factory.h"
++#include "api/make_ref_counted.h"
++#include "api/scoped_refptr.h"
++#include "rtc_base/thread.h"
++#include "sdk/objc/native/src/objc_audio_device.h"
++
++namespace webrtc::objc_adm {
++
++class ObjCAudioDeviceModuleRetryTestPeer {
++ public:
++  static bool BufferPlaying(ObjCAudioDeviceModule* module) {
++    return module->audio_device_buffer_->IsPlaying();
++  }
++
++  static bool BufferRecording(ObjCAudioDeviceModule* module) {
++    return module->audio_device_buffer_->IsRecording();
++  }
++};
++
++}  // namespace webrtc::objc_adm
++
++// This device never opens AVAudioSession, an AudioUnit, or physical audio I/O.
++@interface RTCRetryTestAudioDevice : NSObject <RTC_OBJC_TYPE(RTCAudioDevice)>
++@property(nonatomic, strong) id<RTC_OBJC_TYPE(RTCAudioDeviceDelegate)> delegate;
++@property(nonatomic) BOOL isInitialized;
++@property(nonatomic) BOOL isPlayoutInitialized;
++@property(nonatomic) BOOL isPlaying;
++@property(nonatomic) BOOL isRecordingInitialized;
++@property(nonatomic) BOOL isRecording;
++@property(nonatomic) NSUInteger playoutInitializations;
++@property(nonatomic) NSUInteger playoutStarts;
++@property(nonatomic) NSUInteger playoutStops;
++@property(nonatomic) NSUInteger recordingStarts;
++@property(nonatomic) NSUInteger recordingStops;
++@property(nonatomic) NSUInteger initializationFailures;
++@property(nonatomic) NSUInteger startFailures;
++@property(nonatomic) BOOL omitPlayingReadback;
++@end
++
++@implementation RTCRetryTestAudioDevice
++- (double)deviceInputSampleRate { return 48000; }
++- (NSTimeInterval)inputIOBufferDuration { return 0.01; }
++- (NSInteger)inputNumberOfChannels { return 1; }
++- (NSTimeInterval)inputLatency { return 0; }
++- (double)deviceOutputSampleRate { return 48000; }
++- (NSTimeInterval)outputIOBufferDuration { return 0.01; }
++- (NSInteger)outputNumberOfChannels { return 2; }
++- (NSTimeInterval)outputLatency { return 0; }
++
++- (BOOL)initializeWithDelegate:(id<RTC_OBJC_TYPE(RTCAudioDeviceDelegate)>)delegate {
++  self.delegate = delegate;
++  self.isInitialized = YES;
++  return YES;
++}
++
++- (BOOL)terminateDevice {
++  self.delegate = nil;
++  self.isInitialized = NO;
++  self.isPlayoutInitialized = NO;
++  self.isPlaying = NO;
++  self.isRecordingInitialized = NO;
++  self.isRecording = NO;
++  return YES;
++}
++
++- (BOOL)initializePlayout {
++  ++self.playoutInitializations;
++  if (self.initializationFailures != 0) {
++    --self.initializationFailures;
++    return NO;
++  }
++  self.isPlayoutInitialized = YES;
++  return YES;
++}
++
++- (BOOL)startPlayout {
++  ++self.playoutStarts;
++  if (self.startFailures != 0) {
++    --self.startFailures;
++    self.isPlaying = NO;
++    return NO;
++  }
++  self.isPlaying = !self.omitPlayingReadback;
++  return YES;
++}
++
++- (BOOL)stopPlayout {
++  ++self.playoutStops;
++  self.isPlaying = NO;
++  return YES;
++}
++
++- (BOOL)initializeRecording {
++  self.isRecordingInitialized = YES;
++  return YES;
++}
++
++- (BOOL)startRecording {
++  ++self.recordingStarts;
++  self.isRecording = YES;
++  return YES;
++}
++
++- (BOOL)stopRecording {
++  ++self.recordingStops;
++  self.isRecording = NO;
++  return YES;
++}
++@end
++
++namespace {
++
++class RetryTestAudioTransport final : public webrtc::AudioTransport {
++ public:
++  size_t playout_calls = 0;
++
++  int32_t NeedMorePlayData(size_t samples, size_t,
++                          size_t channels, uint32_t, void* output,
++                          size_t& samples_out, int64_t* elapsed_time_ms,
++                          int64_t* ntp_time_ms) override {
++    ++playout_calls;
++    std::fill_n(static_cast<int16_t*>(output), samples * channels, 1234);
++    // AudioTransport reports total interleaved samples; AudioDeviceBuffer
++    // divides by channels before validating the requested per-channel frames.
++    samples_out = samples * channels;
++    *elapsed_time_ms = 0;
++    *ntp_time_ms = 0;
++    return 0;
++  }
++
++  int32_t RecordedDataIsAvailable(const void*, size_t, size_t, size_t, uint32_t,
++                                 uint32_t, int32_t, uint32_t current_level,
++                                 bool, uint32_t& new_level) override {
++    new_level = current_level;
++    return 0;
++  }
++
++  void PullRenderData(int, int, size_t, size_t, void*, int64_t*,
++                      int64_t*) override {}
++};
++
++using webrtc::objc_adm::ObjCAudioDeviceModule;
++using webrtc::objc_adm::ObjCAudioDeviceModuleRetryTestPeer;
++
++}  // namespace
++
++@interface RTCCustomAudioDeviceRetryTests : XCTestCase {
++  std::unique_ptr<webrtc::Thread> _worker;
++  webrtc::scoped_refptr<ObjCAudioDeviceModule> _module;
++  std::unique_ptr<RetryTestAudioTransport> _transport;
++  RTCRetryTestAudioDevice* _device;
++}
++@end
++
++@implementation RTCCustomAudioDeviceRetryTests
++
++- (void)setUp {
++  [super setUp];
++  _worker = webrtc::Thread::Create();
++  XCTAssertTrue(_worker->Start());
++  _device = [[RTCRetryTestAudioDevice alloc] init];
++  _transport = std::make_unique<RetryTestAudioTransport>();
++  _worker->BlockingCall([&] {
++    _module = webrtc::make_ref_counted<ObjCAudioDeviceModule>(
++        webrtc::CreateEnvironment(), _device);
++    XCTAssertEqual(_module->Init(), 0);
++    XCTAssertEqual(_module->RegisterAudioCallback(_transport.get()), 0);
++  });
++}
++
++- (void)tearDown {
++  _worker->BlockingCall([&] {
++    _module->StopPlayout();
++    _module->StopRecording();
++    _module->Terminate();
++    _module = nullptr;
++  });
++  _worker->Stop();
++  _worker.reset();
++  _transport.reset();
++  _device = nil;
++  [super tearDown];
++}
++
++- (void)assertPlayoutSamples:(int16_t)value silence:(BOOL)silence {
++  std::array<int16_t, 960> samples;
++  samples.fill(-1);
++  AudioBufferList buffers = {};
++  buffers.mNumberBuffers = 1;
++  buffers.mBuffers[0].mNumberChannels = 2;
++  buffers.mBuffers[0].mDataByteSize = sizeof(samples);
++  buffers.mBuffers[0].mData = samples.data();
++  AudioTimeStamp timestamp = {};
++  AudioUnitRenderActionFlags flags = 0;
++  XCTAssertEqual(_device.delegate.getPlayoutData(&flags, &timestamp, 0, 480,
++                                                &buffers), noErr);
++  XCTAssertEqual((flags & kAudioUnitRenderAction_OutputIsSilence) != 0, silence);
++  XCTAssertTrue(std::all_of(samples.begin(), samples.end(),
++                            [value](int16_t sample) { return sample == value; }));
++}
++
++- (void)testInitialFailureRetriesActualWrapperAndProducesTransportPCM {
++  _worker->BlockingCall([&] {
++    _device.initializationFailures = 1;
++    XCTAssertEqual(_module->InitPlayout(), -1);
++    XCTAssertFalse(_module->PlayoutIsInitialized());
++    XCTAssertFalse(_module->Playing());
++    XCTAssertFalse(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    XCTAssertEqual(_device.playoutStarts, 0u);
++    [self assertPlayoutSamples:0 silence:YES];
++    XCTAssertEqual(_transport->playout_calls, 0u);
++
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertTrue(_module->PlayoutIsInitialized());
++    XCTAssertTrue(_module->Playing());
++    XCTAssertTrue(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    XCTAssertEqual(_device.playoutInitializations, 2u);
++    XCTAssertEqual(_device.playoutStarts, 1u);
++    [self assertPlayoutSamples:1234 silence:NO];
++    XCTAssertEqual(_transport->playout_calls, 1u);
++  });
++}
++
++- (void)testStartFailureRollsBackBufferAndCanRetryAgain {
++  _worker->BlockingCall([&] {
++    _device.startFailures = 1;
++    XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertTrue(_module->PlayoutIsInitialized());
++    XCTAssertFalse(_module->Playing());
++    XCTAssertFalse(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    [self assertPlayoutSamples:0 silence:YES];
++    XCTAssertEqual(_transport->playout_calls, 0u);
++
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertEqual(_device.playoutInitializations, 1u);
++    XCTAssertEqual(_device.playoutStarts, 2u);
++    XCTAssertTrue(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    [self assertPlayoutSamples:1234 silence:NO];
++  });
++}
++
++- (void)testRepeatedInitializationFailuresDoNotClaimProgress {
++  _worker->BlockingCall([&] {
++    _device.initializationFailures = 2;
++    for (int attempt = 0; attempt < 2; ++attempt) {
++      XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:_device]);
++      XCTAssertFalse(_module->PlayoutIsInitialized());
++      XCTAssertFalse(_module->Playing());
++      XCTAssertFalse(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    }
++    XCTAssertEqual(_device.playoutStarts, 0u);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++  });
++}
++
++- (void)testSuccessfulNativeReturnWithoutPlayingProofFailsAndRollsBackBuffer {
++  _worker->BlockingCall([&] {
++    _device.omitPlayingReadback = YES;
++    XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertFalse(_module->Playing());
++    XCTAssertFalse(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    [self assertPlayoutSamples:0 silence:YES];
++    XCTAssertEqual(_transport->playout_calls, 0u);
++    _device.omitPlayingReadback = NO;
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    [self assertPlayoutSamples:1234 silence:NO];
++  });
++}
++
++- (void)testHealthyRetryIsIdempotentAndPreservesRecording {
++  _worker->BlockingCall([&] {
++    XCTAssertEqual(_module->InitRecording(), 0);
++    XCTAssertEqual(_module->StartRecording(), 0);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertEqual(_device.playoutInitializations, 1u);
++    XCTAssertEqual(_device.playoutStarts, 1u);
++    XCTAssertEqual(_device.playoutStops, 0u);
++    XCTAssertTrue(_module->Recording());
++    XCTAssertTrue(ObjCAudioDeviceModuleRetryTestPeer::BufferRecording(_module.get()));
++    XCTAssertEqual(_device.recordingStarts, 1u);
++    XCTAssertEqual(_device.recordingStops, 0u);
++  });
++}
++
++- (void)testNativeLossAfterSuccessfulStartReinitializesWithoutLosingRecording {
++  _worker->BlockingCall([&] {
++    XCTAssertEqual(_module->InitRecording(), 0);
++    XCTAssertEqual(_module->StartRecording(), 0);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    _device.isPlaying = NO;
++    _device.isPlayoutInitialized = NO;
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertTrue(_module->PlayoutIsInitialized());
++    XCTAssertTrue(_module->Playing());
++    XCTAssertEqual(_device.playoutInitializations, 2u);
++    XCTAssertEqual(_device.playoutStarts, 2u);
++    XCTAssertEqual(_device.playoutStops, 0u);
++    XCTAssertTrue(_module->Recording());
++    XCTAssertTrue(ObjCAudioDeviceModuleRetryTestPeer::BufferRecording(_module.get()));
++    XCTAssertEqual(_device.recordingStarts, 1u);
++    XCTAssertEqual(_device.recordingStops, 0u);
++    [self assertPlayoutSamples:1234 silence:NO];
++  });
++}
++
++- (void)testNilAndDifferentDeviceCannotStartOwner {
++  _worker->BlockingCall([&] {
++    RTCRetryTestAudioDevice* other = [[RTCRetryTestAudioDevice alloc] init];
++    XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:nil]);
++    XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:other]);
++    XCTAssertEqual(_device.playoutInitializations, 0u);
++    XCTAssertEqual(_device.playoutStarts, 0u);
++    XCTAssertFalse(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++  });
++}
++
++- (void)testNativeLossStartFailureRollsBackWithoutStoppingRecording {
++  _worker->BlockingCall([&] {
++    XCTAssertEqual(_module->InitRecording(), 0);
++    XCTAssertEqual(_module->StartRecording(), 0);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    _device.isPlaying = NO;
++    _device.isPlayoutInitialized = NO;
++    _device.startFailures = 1;
++    XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertFalse(_module->Playing());
++    XCTAssertFalse(ObjCAudioDeviceModuleRetryTestPeer::BufferPlaying(_module.get()));
++    XCTAssertTrue(_module->Recording());
++    XCTAssertTrue(ObjCAudioDeviceModuleRetryTestPeer::BufferRecording(_module.get()));
++    XCTAssertEqual(_device.recordingStarts, 1u);
++    XCTAssertEqual(_device.recordingStops, 0u);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    [self assertPlayoutSamples:1234 silence:NO];
++  });
++}
++
++- (void)testRetiredDelegateCannotAdoptReplacementEvenForSameDevice {
++  _worker->BlockingCall([&] {
++    id<RTC_OBJC_TYPE(RTCAudioDeviceDelegate)> old_delegate = _device.delegate;
++    XCTAssertEqual(_module->Terminate(), 0);
++    XCTAssertFalse([old_delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertEqual(_module->Init(), 0);
++    XCTAssertNotEqual(old_delegate, _device.delegate);
++    XCTAssertFalse([old_delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertEqual(_device.playoutStarts, 0u);
++    XCTAssertTrue([_device.delegate retryPlayoutForAudioDevice:_device]);
++    XCTAssertEqual(_device.playoutStarts, 1u);
++  });
++}
++
++- (void)testWrongThreadFailsWithoutDispatchOrMutation {
++  XCTAssertFalse([_device.delegate retryPlayoutForAudioDevice:_device]);
++  _worker->BlockingCall([&] {
++    XCTAssertEqual(_device.playoutInitializations, 0u);
++    XCTAssertEqual(_device.playoutStarts, 0u);
++    XCTAssertFalse(_module->Playing());
++  });
++}
++
++@end

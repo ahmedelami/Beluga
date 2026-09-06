@@ -2202,9 +2202,10 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             )
         )
         var diagnosticsReadCount: UInt64 = 0
+        var permitFreshMediaCounters = false
         viewModel.debugInstallIOSPlayoutDiagnosticsReader { requestedPeer in
             XCTAssertTrue(requestedPeer === peer)
-            diagnosticsReadCount += 1
+            if permitFreshMediaCounters { diagnosticsReadCount += 1 }
             return iosPlayoutDiagnostics(
                 callbacks: 9 + diagnosticsReadCount,
                 frames: 4_320 + (480 * diagnosticsReadCount),
@@ -2275,10 +2276,28 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             authorization.generation
         )
         XCTAssertEqual(terminalReceipt.outcome, .accepted)
-        XCTAssertFalse(
+        XCTAssertTrue(
             terminalReceipt.policyMatchesRequestedTarget,
-            "An unconnected simulator peer must publish its exact policy mismatch rather than forge recovery success."
+            "The actual native retry must establish the exact output-only policy even before a media track is connected."
         )
+
+        for _ in 0..<100
+        where viewModel.debugIOSPlayoutProofState.stage != .awaitingFreshEvidence {
+            await viewModel.debugRefreshIOSPlayoutProofForRaceTests()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(viewModel.debugIOSPlayoutProofState.stage, .awaitingFreshEvidence)
+        XCTAssertEqual(
+            fixture.controller.debugCurrentAudioTransactionOperationForTests,
+            transaction.operation
+        )
+        XCTAssertFalse(fixture.controller.snapshot.isPlaying,
+                       "Native acceptance plus unchanged counters cannot complete runtime media proof.")
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        XCTAssertNil(fixture.controller.snapshot.errorText)
+
+        // These are explicit fixture counters, not evidence of media on the unconnected peer.
+        permitFreshMediaCounters = true
 
         for _ in 0..<100
         where fixture.controller
@@ -2289,13 +2308,102 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         XCTAssertNil(
             fixture.controller.debugCurrentAudioTransactionOperationForTests
         )
-        XCTAssertFalse(fixture.controller.snapshot.isPlaying)
-        XCTAssertEqual(
-            fixture.controller.snapshot.errorText,
-            "The iPhone audio recovery could not be verified. Tap Retry Audio."
-        )
+        XCTAssertTrue(fixture.controller.snapshot.isPlaying)
+        XCTAssertTrue(fixture.remoteAudio.isEnabled)
+        XCTAssertNil(fixture.controller.snapshot.errorText)
+        XCTAssertNil(fixture.controller.snapshot.diagnosticText)
 
         viewModel.disconnect()
+        await peer.close()
+    }
+
+    func testExactFailedRecoveryReceiptPreservesDiagnosticBeforePublicationAndRejectsRetiredReceipt()
+        async throws {
+        let authority = AudioTransactionAuthority()
+        let fixture = makeFixture(audioTransactionAuthority: authority)
+        fixture.playback.requiresRuntimePlayoutProof = true
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        fixture.controller.updateRuntimePlayout(isReady: true)
+
+        let peer = try makeAudioRacePeer()
+        let binding = try XCTUnwrap(peer.iOSAudioTransactionDeviceBinding)
+        XCTAssertTrue(fixture.controller.bindIOSAudioTransactionDevice(binding))
+        var stagedAuthorization: WebRTCIOSPlayoutRecoveryAuthorization?
+        var requestedTransaction: WorldwideAudioRecoveryTransaction?
+        fixture.controller.onPlayoutRecoveryTransactionStagingRequested = {
+            context, inputRequired in
+            let authorization = WebRTCIOSPlayoutRecoveryAuthorization(transaction: context)
+            guard peer.stageIOSPlayoutRecoveryTransaction(
+                authorization: authorization, inputRequired: inputRequired
+            ) else { return nil }
+            stagedAuthorization = authorization
+            return authorization
+        }
+        // Use the existing deterministic receipt seam; do not run native B for this rejection case.
+        fixture.controller.onTransactionalPlaybackRecoveryRequested = { requestedTransaction = $0 }
+        var drainRequests: [WorldwideAudioTransactionDrainRequest] = []
+        fixture.controller.onAudioTransactionDrainRequested = {
+            drainRequests.append($0)
+            return true
+        }
+        XCTAssertTrue(fixture.controller.requestAutomaticRuntimeAudioRecovery())
+        let transaction = try XCTUnwrap(requestedTransaction)
+        let authorization = try XCTUnwrap(stagedAuthorization)
+        let tag = try XCTUnwrap(authorization.stagedTransactionTagGeneration)
+        XCTAssertNotEqual(tag, 0)
+        XCTAssertTrue(transaction.authorization === authorization)
+        XCTAssertEqual(authorization.transaction, transaction.operation.nativeContext)
+        XCTAssertEqual(fixture.controller.debugCurrentAudioTransactionOperationForTests,
+                       transaction.operation)
+
+        let receipt = WebRTCIOSPlayoutRecoveryReceipt(
+            transaction: transaction.operation.nativeContext,
+            authorizationGeneration: authorization.generation,
+            terminalGeneration: authorization.generation,
+            outcome: .accepted,
+            policyMatchesRequestedTarget: false
+        )
+        let diagnostic = "Native recovery outcome=accepted, targetMatched=false, playoutInitialized=false, status=-50"
+        var publishedFailureDiagnostics: [String?] = []
+        fixture.controller.onSnapshotChanged = { snapshot in
+            if snapshot.errorText != nil { publishedFailureDiagnostics.append(snapshot.diagnosticText) }
+        }
+        fixture.controller.consumeIOSPlayoutRecoveryReceipt(receipt, diagnostic: diagnostic)
+        XCTAssertEqual(drainRequests.count, 1)
+        XCTAssertEqual(drainRequests.first?.operation, transaction.operation)
+        XCTAssertEqual(drainRequests.first?.tagGeneration, tag)
+        XCTAssertNil(fixture.controller.debugCurrentAudioTransactionOperationForTests)
+        XCTAssertFalse(authorization.isValid)
+        XCTAssertFalse(fixture.controller.snapshot.isPlaying)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        XCTAssertEqual(fixture.controller.snapshot.errorText,
+                       "The iPhone audio recovery could not be verified. Tap Retry Audio.")
+        XCTAssertEqual(fixture.controller.snapshot.diagnosticText, diagnostic)
+        XCTAssertFalse(publishedFailureDiagnostics.isEmpty)
+        XCTAssertTrue(publishedFailureDiagnostics.allSatisfy { $0 == diagnostic },
+                      "The exact failure evidence must exist at the first synchronous failure publication.")
+
+        let failedAuthority = authority.snapshot
+        let publicationCount = publishedFailureDiagnostics.count
+        fixture.controller.consumeIOSPlayoutRecoveryReceipt(
+            receipt, diagnostic: "A retired receipt must not overwrite the failure."
+        )
+        XCTAssertEqual(authority.snapshot, failedAuthority)
+        XCTAssertEqual(publishedFailureDiagnostics.count, publicationCount)
+        XCTAssertEqual(fixture.controller.snapshot.diagnosticText, diagnostic)
+        XCTAssertEqual(drainRequests.count, 1)
+
+        XCTAssertTrue(fixture.controller.consumeIOSAudioTransactionDeviceTeardown(
+            WebRTCIOSAudioCategoryDeviceTeardownReceipt(
+                deviceInstanceGeneration: binding.deviceInstanceGeneration,
+                observationRegistrationGeneration: binding.observationRegistrationGeneration,
+                notificationSequenceWatermark: authority.snapshot?.lastObservationSequence ?? 0,
+                teardownGeneration: 1,
+                ingressInFlightCount: 0
+            )
+        ))
         await peer.close()
     }
 

@@ -21,12 +21,7 @@ let package = Package(
         .executable(name: "PCMClient", targets: ["PCMClient"]),
         .executable(name: "PCMPlayer", targets: ["PCMPlayer"])
     ],
-    dependencies: [
-        .package(
-            url: "https://github.com/livekit/webrtc-xcframework.git",
-            exact: "144.7559.11"
-        )
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "CaptureCLI",
@@ -132,12 +127,13 @@ let package = Package(
                     name: "MacWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.macOS])
                 ),
-                .product(
-                    name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework"
-                )
+                .target(name: "LiveKitWebRTC")
             ],
             path: "shared/Sources/WebRTCTransport"
+        ),
+        .binaryTarget(
+            name: "LiveKitWebRTC",
+            path: "shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"
         ),
         .binaryTarget(
             name: "OpensteamerAudioTransactionAuthority",
@@ -146,10 +142,7 @@ let package = Package(
         .target(
             name: "MacWebRTCAudioDeviceShim",
             dependencies: [
-                .product(
-                    name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework"
-                )
+                .target(name: "LiveKitWebRTC")
             ],
             path: "shared/Sources/MacWebRTCAudioDeviceShim",
             publicHeadersPath: "include",
@@ -160,10 +153,7 @@ let package = Package(
         .target(
             name: "IOSWebRTCAudioDeviceShim",
             dependencies: [
-                .product(
-                    name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework"
-                )
+                .target(name: "LiveKitWebRTC")
             ],
             path: "shared/Sources/IOSWebRTCAudioDeviceShim",
             publicHeadersPath: "include",
@@ -179,9 +169,8 @@ let package = Package(
                     name: "MacWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.macOS])
                 ),
-                .product(
+                .target(
                     name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework",
                     condition: .when(platforms: [.macOS])
                 )
             ],
@@ -250,9 +239,8 @@ let package = Package(
                     name: "MacWebRTCAudioDeviceShimTestSupport",
                     condition: .when(platforms: [.macOS])
                 ),
-                .product(
+                .target(
                     name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework",
                     condition: .when(platforms: [.macOS])
                 )
             ],

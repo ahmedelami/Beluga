@@ -2067,6 +2067,9 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         XCTAssertTrue(viewModel.debugSignalingIs(replacementClient))
         XCTAssertTrue(viewModel.hasActiveSession)
         viewModel.disconnect()
+        // The next fixture must not race the exact asynchronous peer/signaling teardown.
+        let retired = await viewModel.admitFreshConnectionPreparation()
+        XCTAssertTrue(retired)
     }
 
     func testStaleInputUnavailableCannotRevokeReplacementInputSession() async throws {

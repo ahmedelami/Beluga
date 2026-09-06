@@ -561,7 +561,15 @@ typedef NS_ENUM(NSInteger, ASIOSAudioCategoryReceiptTestScenario) {
     ASIOSAudioCategoryReceiptTestScenarioExpectedUncorrelated = 4,
 };
 
-/// Drives the real queued recovery boundary without starting playout or touching audio hardware.
+typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
+    ASIOSPlayoutRetryFailureTestScenarioMissingHook = 0,
+    ASIOSPlayoutRetryFailureTestScenarioRejectedAfterNativeStart = 1,
+    ASIOSPlayoutRetryFailureTestScenarioNativeInitializationFailure = 2,
+    ASIOSPlayoutRetryFailureTestScenarioRevokedWhileQueued = 3,
+    ASIOSPlayoutRetryFailureTestScenarioRetiredTagWhileQueued = 4,
+};
+
+/// Drives the real queued recovery boundary without touching audio hardware.
 @interface ASIOSStereoPlayoutRecoveryTestHarness : NSObject
 
 @property(nonatomic, readonly) ASIOSStereoPlayoutDiagnostics diagnostics;
@@ -625,6 +633,10 @@ typedef NS_ENUM(NSInteger, ASIOSAudioCategoryReceiptTestScenario) {
 - (BOOL)debugAppAudioPolicyOperationTagFencingForTesting;
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting;
 - (BOOL)debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugPlayoutRetryFailureForTesting:
+    (ASIOSPlayoutRetryFailureTestScenario)scenario
+    NS_SWIFT_NAME(debugPlayoutRetryFailureForTesting(_:));
 - (BOOL)debugAudioCategoryObservationRegistrationFencingForTesting;
 - (BOOL)debugAudioCategoryDrainOrderingForTesting;
 - (BOOL)debugAudioCategoryDrainLateIngressIsUntaggedForTesting;

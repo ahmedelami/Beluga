@@ -1904,15 +1904,33 @@ require_rejection "$CASE" 'side-by-side TestFlight package update suppression'
 
 CASE=$(new_case testflight-package-manifest-pin)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
-  'EXPECTED_PACKAGE_MANIFEST_SHA256="d9f6aef25647c8a209c88305391017049d122976f0f3069fb32dd2219b9b91b8"' \
+  'EXPECTED_PACKAGE_MANIFEST_SHA256="59368397825697a878ba3219377bfff26be040735c9a6732a8952dc55a4c031b"' \
   'EXPECTED_PACKAGE_MANIFEST_SHA256="0000000000000000000000000000000000000000000000000000000000000000"'
 require_rejection "$CASE" 'side-by-side TestFlight exact package manifest pin'
 
-CASE=$(new_case testflight-package-resolved-pin)
+CASE=$(new_case testflight-package-resolved-state)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
-  'EXPECTED_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"' \
-  'EXPECTED_PACKAGE_RESOLVED_SHA256="0000000000000000000000000000000000000000000000000000000000000000"'
-require_rejection "$CASE" 'side-by-side TestFlight exact resolved package pin'
+  'EXPECTED_PACKAGE_RESOLVED_STATE="absent"' \
+  'EXPECTED_PACKAGE_RESOLVED_STATE="allow-stale-remote-lock"'
+require_rejection "$CASE" 'side-by-side TestFlight exact absent-lock state'
+
+CASE=$(new_case testflight-vendor-missing-contract)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'&& verify_pinned_vendor_archive \\\n      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"' \
+  '&& true # unverified vendor archive'
+require_rejection "$CASE" 'side-by-side TestFlight required vendor artifact verification'
+
+CASE=$(new_case testflight-vendor-digest)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  '"$(sha256_file "${archive_path}")" == "${expected_sha256}"' \
+  '-n "${expected_sha256}"'
+require_rejection "$CASE" 'side-by-side TestFlight vendor digest cannot be bypassed'
+
+CASE=$(new_case testflight-vendor-mutation-fence)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  '"$(vendor_archive_identity "${archive_path}")" == "${identity}"' \
+  '-n "${identity}"'
+require_rejection "$CASE" 'side-by-side TestFlight vendor hash must be identity-fenced'
 
 CASE=$(new_case testflight-cache-enrollment-package-manifest-pin)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
@@ -2823,6 +2841,75 @@ BEHAVIOR_EXPECTED_BUILD_NUMBER=$(/usr/bin/awk '
 }
 readonly BEHAVIOR_EXPECTED_BUILD_NUMBER
 mkdir -p "$BEHAVIOR_CONTROL"
+
+VENDOR_FIXTURE_ROOT="$BEHAVIOR_ROOT/vendor-archive"
+mkdir -p "$VENDOR_FIXTURE_ROOT"
+WRAPPER_PATH="$BEHAVIOR_WRAPPER" VENDOR_FIXTURE_ROOT="$VENDOR_FIXTURE_ROOT" \
+/bin/zsh <<'VENDORARCHIVETEST'
+source <(/usr/bin/sed '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
+trap - EXIT HUP INT QUIT TERM
+
+typeset archive="$VENDOR_FIXTURE_ROOT/fixture.zip"
+typeset original="$VENDOR_FIXTURE_ROOT/original.zip"
+typeset hash_log="$VENDOR_FIXTURE_ROOT/hash-calls"
+print -rn -- 'reviewed fixture' >"$archive"
+cp -p "$archive" "$original"
+typeset checksum
+checksum=$(sha256_file "$archive")
+function reset_vendor_identity_for_test() {
+  TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY=''
+  TESTFLIGHT_VENDOR_ARCHIVE_SHA256=''
+}
+function require_vendor_rejection() {
+  if verify_pinned_vendor_archive "$@"; then
+    print -u2 -r -- 'unreviewed or changed vendor artifact was accepted'
+    exit 1
+  fi
+}
+function sha256_file() {
+  print -r -- hashed >>"$hash_log"
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+# Missing bytes, a placeholder, malformed digest, wrong bytes and symlinks all fail before
+# any archive/signing action. Tiny text fixtures exercise the real digest guard, not WebRTC.
+require_vendor_rejection "$VENDOR_FIXTURE_ROOT/missing.zip" "$checksum"
+require_vendor_rejection "$archive" 'UNPREPARED_PATCHED_LIVEKIT_ARTIFACT'
+require_vendor_rejection "$archive" "${checksum:u}"
+require_vendor_rejection "$archive" '0000000000000000000000000000000000000000000000000000000000000000'
+ln -s "$archive" "$VENDOR_FIXTURE_ROOT/symlink.zip"
+require_vendor_rejection "$VENDOR_FIXTURE_ROOT/symlink.zip" "$checksum"
+
+reset_vendor_identity_for_test
+: >"$hash_log"
+verify_pinned_vendor_archive "$archive" "$checksum"
+verify_pinned_vendor_archive "$archive" "$checksum"
+[[ "$(/usr/bin/wc -l <"$hash_log" | /usr/bin/tr -d ' ')" == 1 ]]
+
+# Same-length in-place tamper remains rejected even after restoring mtime; ctime is fenced.
+print -rn -- 'tampered fixture' >"$archive"
+touch -r "$original" "$archive"
+require_vendor_rejection "$archive" "$checksum"
+
+# Once cached, replacement by byte-identical content must not silently renew source identity.
+cp -p "$original" "$archive"
+reset_vendor_identity_for_test
+verify_pinned_vendor_archive "$archive" "$checksum"
+mv "$archive" "$VENDOR_FIXTURE_ROOT/retired.zip"
+cp -p "$original" "$archive"
+require_vendor_rejection "$archive" "$checksum"
+
+# Mutating during the initial hash must fail its post-hash identity check.
+reset_vendor_identity_for_test
+function sha256_file() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+  print -rn -- 'tampered fixture' >"$1"
+  touch -r "$original" "$1"
+}
+require_vendor_rejection "$archive" "$checksum"
+[[ -z "$TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY" \
+    && -z "$TESTFLIGHT_VENDOR_ARCHIVE_SHA256" ]]
+VENDORARCHIVETEST
 
 DOTTED_KEY_FIXTURE="$BEHAVIOR_ROOT/dotted-entitlement-keys.plist"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
@@ -4541,7 +4628,7 @@ source <(/usr/bin/sed \
   -e 's|^readonly TESTFLIGHT_BUILD_ROOT=.*$|readonly TESTFLIGHT_BUILD_ROOT="${ENROLLMENT_RECOVERY_BUILD_ROOT}"|' \
   -e 's|^readonly TESTFLIGHT_BUILD_MOUNT_ROOT=.*$|readonly TESTFLIGHT_BUILD_MOUNT_ROOT="${ENROLLMENT_RECOVERY_MOUNT_ROOT}"|' \
   -e 's|^readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256=.*$|readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="${EXPECTED_PACKAGE_MANIFEST_SHA256}"|' \
-  -e 's|^readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256=.*$|readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="${EXPECTED_PACKAGE_RESOLVED_SHA256}"|' \
+  -e 's|^readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256=.*$|readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="${EXPECTED_PACKAGE_RESOLVED_STATE}"|' \
   -e '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
 trap - EXIT HUP INT QUIT TERM
 

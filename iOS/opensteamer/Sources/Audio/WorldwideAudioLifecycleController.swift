@@ -3243,11 +3243,20 @@ final class WorldwideAudioLifecycleController {
     /// Consumes the exact native terminal recovery receipt. Tuple history and the currently
     /// visible operation are never used to re-infer its application identity.
     func consumeIOSPlayoutRecoveryReceipt(
-        _ receipt: WebRTCIOSPlayoutRecoveryReceipt
+        _ receipt: WebRTCIOSPlayoutRecoveryReceipt,
+        diagnostic: String? = nil
     ) {
         guard isPrepared else { return }
+        let decision = audioTransactionAuthority.acknowledgeNative(receipt)
+        if case .failedClosed(let operation) = decision,
+           expectedAudioCategoryTransition?.transactionOperation == operation {
+            // Failure retirement can synchronously invalidate the VM's proof attempt. Preserve
+            // this exact receipt's evidence before that boundary; stale receipts cannot replace it.
+            playbackDiagnosticText = diagnostic
+                ?? "Native recovery outcome=\(receipt.outcome), targetMatched=\(receipt.policyMatchesRequestedTarget)."
+        }
         handleAudioTransactionDecision(
-            audioTransactionAuthority.acknowledgeNative(receipt),
+            decision,
             context: "native recovery acknowledgement"
         )
     }

@@ -736,7 +736,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_CONFIGURATION="TestFlight"' 1 \
   'side-by-side TestFlight configuration guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_BUILD_NUMBER="64"' 1 \
+  'EXPECTED_BUILD_NUMBER="65"' 1 \
   'side-by-side TestFlight build-number guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'PRIVATE_TEMPORARY_ROOT="/private/tmp"' 1 \
@@ -1030,8 +1030,8 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   '"${EXPECTED_PACKAGE_MANIFEST_SHA256}"' 2 \
   'side-by-side TestFlight current release package-manifest binding'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  '"${EXPECTED_PACKAGE_RESOLVED_SHA256}"' 2 \
-  'side-by-side TestFlight current release resolved-package binding'
+  '"${EXPECTED_PACKAGE_RESOLVED_STATE}"' 2 \
+  'side-by-side TestFlight current release absent-lock binding'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   '"${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256}"' 3 \
   'side-by-side TestFlight cache-enrollment package-manifest provenance'
@@ -1282,11 +1282,32 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'function resolve_pinned_package_dependencies() {' 1 \
   'side-by-side TestFlight one-time native package resolution'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_PACKAGE_MANIFEST_SHA256="d9f6aef25647c8a209c88305391017049d122976f0f3069fb32dd2219b9b91b8"' 1 \
+  'EXPECTED_PACKAGE_MANIFEST_SHA256="59368397825697a878ba3219377bfff26be040735c9a6732a8952dc55a4c031b"' 1 \
   'side-by-side TestFlight exact package manifest pin'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"' 1 \
-  'side-by-side TestFlight exact resolved package pin'
+  'EXPECTED_PACKAGE_RESOLVED_STATE="absent"' 1 \
+  'side-by-side TestFlight exact absent-lock state'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '&& ! -e "${PACKAGE_RESOLVED_PATH}" && ! -L "${PACKAGE_RESOLVED_PATH}"' 1 \
+  'side-by-side TestFlight rejects stale remote dependency lock'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'VENDOR_ARCHIVE_PATH="${REPOSITORY_ROOT}/shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"' 1 \
+  'side-by-side TestFlight exact local vendor path'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'EXPECTED_VENDOR_ARCHIVE_SHA256="1399ee6f9a34a6926d2abe9196c1361a40a7fbc9551becd5d13b15a73f510cf7"' 1 \
+  'side-by-side TestFlight unprepared vendor artifact is release-blocked'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'&& verify_pinned_vendor_archive \\\n      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"' 1 \
+  'side-by-side TestFlight package contract requires exact vendor bytes'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"$(sha256_file "${archive_path}")" == "${expected_sha256}"' 1 \
+  'side-by-side TestFlight one exact vendor digest verification'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"$(vendor_archive_identity "${archive_path}")" == "${identity}"' 1 \
+  'side-by-side TestFlight vendor hash identity fence'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"${identity}" == "${TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY}"' 1 \
+  'side-by-side TestFlight unchanged vendor artifact reuse'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"' 1 \
   'side-by-side TestFlight exact enrolled package-manifest pin'

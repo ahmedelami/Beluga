@@ -9067,7 +9067,24 @@ final class WorldwideSessionViewModel: ObservableObject {
                 }
                 if !attempt.nativeRecoveryReceiptWasConsumed {
                     audioLifecycle.consumeIOSPlayoutRecoveryReceipt(
-                        terminalReceipt
+                        terminalReceipt,
+                        diagnostic: [
+                            "Native recovery outcome=\(terminalReceipt.outcome)",
+                            "targetMatched=\(terminalReceipt.policyMatchesRequestedTarget)",
+                            "initialized=\(diagnostics.initialized)",
+                            "playoutInitialized=\(diagnostics.playoutInitialized)",
+                            "playing=\(diagnostics.playing)",
+                            "sessionActive=\(diagnostics.sessionActive)",
+                            "input=\(diagnostics.inputBusEnabled)",
+                            "output=\(diagnostics.outputBusEnabled)",
+                            "hasOutputRoute=\(diagnostics.hasOutputRoute)",
+                            "categoryPlayback=\(diagnostics.categoryIsMediaPlayback)",
+                            "categoryPlayAndRecord=\(diagnostics.categoryIsMediaPlayAndRecord)",
+                            "modeDefault=\(diagnostics.modeIsDefault)",
+                            "failure=\(diagnostics.failureCode)",
+                            "status=\(diagnostics.lastLifecycleStatus)",
+                            "renderStatus=\(diagnostics.lastPlayoutStatus)",
+                        ].joined(separator: ", ")
                     )
                     attempt.nativeRecoveryReceiptWasConsumed = true
                 }

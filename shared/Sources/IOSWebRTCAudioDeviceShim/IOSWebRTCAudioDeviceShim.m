@@ -11,6 +11,12 @@
 #import <os/lock.h>
 #import <stdatomic.h>
 
+// The vendor hook is optional so older framework headers can still compile a fail-closed client.
+@protocol ASIOSAuthorizedPlayoutRetryDelegate <LKRTCAudioDeviceDelegate>
+@optional
+- (BOOL)retryPlayoutForAudioDevice:(id<LKRTCAudioDevice> _Nullable)audioDevice;
+@end
+
 // The custom iOS device keeps playback/output available at all times. Microphone/input is activated
 // only after authorization and only while recording is requested. Native lifecycle work stays on
 // WebRTC's ADM queue; realtime callbacks must not allocate or dispatch application work.
@@ -4670,6 +4676,14 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
 
 @interface ASIOSStereoPlayoutRecoveryHarnessDelegate : NSObject <LKRTCAudioDeviceDelegate>
 @property(nonatomic, strong) NSMutableArray<dispatch_block_t> *queuedOperations;
+@property(nonatomic, weak) id<LKRTCAudioDevice> boundDevice;
+@property(nonatomic) NSUInteger retryPlayoutInvocationCount;
+@property(nonatomic) BOOL hidesRetryHook;
+@property(nonatomic) BOOL rejectsAfterNativeStart;
+@property(nonatomic) BOOL nativePlayingBeforeRetryReturn;
+@property(nonatomic) ASIOSStereoPlayoutFailureCode retryFailureCode;
+@property(nonatomic) int32_t retryFailureStatus;
+@property(nonatomic, copy, nullable) NSString *retryFailureMessage;
 - (nullable dispatch_block_t)takeNextOperation;
 @end
 
@@ -4718,6 +4732,41 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
 - (void)notifyAudioOutputParametersChange {}
 - (void)notifyAudioInputInterrupted {}
 - (void)notifyAudioOutputInterrupted {}
+
+- (BOOL)respondsToSelector:(SEL)selector {
+    if (self.hidesRetryHook && selector == @selector(retryPlayoutForAudioDevice:)) {
+        return NO;
+    }
+    return [super respondsToSelector:selector];
+}
+
+- (BOOL)retryPlayoutForAudioDevice:(id<LKRTCAudioDevice>)audioDevice {
+    // This no-I/O double exercises the app's exact authorization boundary.
+    // RTCCustomAudioDeviceRetry_xctest separately proves the real vendor ADM's
+    // initialization, AudioDeviceBuffer start, rollback, and worker ownership.
+    self.retryPlayoutInvocationCount += 1;
+    if (audioDevice == nil || audioDevice != self.boundDevice
+        || !audioDevice.isInitialized) {
+        return NO;
+    }
+    if (!audioDevice.isPlayoutInitialized && ![audioDevice initializePlayout]) {
+        ASIOSStereoPlayoutAudioDevice *device =
+            (ASIOSStereoPlayoutAudioDevice *)audioDevice;
+        self.retryFailureCode = device.diagnostics.failureCode;
+        self.retryFailureStatus = device.diagnostics.lastLifecycleStatus;
+        self.retryFailureMessage = device.lastLifecycleFailureMessage;
+        return NO;
+    }
+    if (!audioDevice.isPlaying && ![audioDevice startPlayout]) {
+        return NO;
+    }
+    self.nativePlayingBeforeRetryReturn = audioDevice.isPlaying;
+    return !self.rejectsAfterNativeStart
+        && audioDevice == self.boundDevice
+        && audioDevice.isInitialized
+        && audioDevice.isPlayoutInitialized
+        && audioDevice.isPlaying;
+}
 
 - (void)dispatchAsync:(dispatch_block_t)block {
     @synchronized (self) {
@@ -4792,6 +4841,7 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
     }
     _device = [[ASIOSStereoPlayoutAudioDevice alloc] init];
     _delegate = [[ASIOSStereoPlayoutRecoveryHarnessDelegate alloc] init];
+    _delegate.boundDevice = _device;
     _lastChannelPreferenceOperations = @[];
     [_device debugEnableRecoveryHarnessModeForTesting];
     if (![_device initializeWithDelegate:_delegate]) {
@@ -5231,6 +5281,209 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
         && drain.appOperationTagGeneration == tagGeneration
         && drain.bindingState == ASIOSAudioCategoryDrainBindingStateStaged
         && nextRetired;
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting {
+    NSMutableDictionary<NSString *, NSNumber *> *result =
+        [NSMutableDictionary dictionary];
+    [self.device debugSetOutputRouteAvailableForTesting:NO];
+    result[@"initialInitializeFailed"] = @(![self.device initializePlayout]);
+    result[@"initialConfigurationCount"] = @(self.configurationOperationCount);
+    result[@"initialPlaying"] = @(self.diagnostics.playing);
+    result[@"initialPlayoutInitialized"] = @(self.diagnostics.playoutInitialized);
+    [self.device debugSetOutputRouteAvailableForTesting:YES];
+
+    for (uint64_t revision = 1; revision <= 2; revision += 1) {
+        NSString *prefix = [NSString stringWithFormat:@"attempt%llu", revision];
+        ASIOSStereoPlayoutRecoveryAuthorization *authorization =
+            [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+        BOOL targetBound = [authorization bindRequestedInputRequired:NO];
+        NSUUID *operationIdentifier = [NSUUID UUID];
+        uint64_t tagGeneration = [self.device
+            stageAppAudioPolicyOperationWithIdentifier:operationIdentifier
+            authorityEpoch:1
+            operationRevision:revision
+            recoveryAuthorization:authorization
+            nativeTransactionIdentifier:0
+            inputRequired:NO];
+
+        __block ASIOSAudioCategoryDrainReceipt *deliveredDrain = nil;
+        dispatch_semaphore_t drainDelivered = dispatch_semaphore_create(0);
+        ASIOSAudioCategoryObservationRegistration *registration = [self.device
+            observeAudioCategoryChanges:
+                ^(ASIOSAudioCategoryObservationReceipt *receipt) {
+                    (void)receipt;
+                }
+            drainHandler:^(ASIOSAudioCategoryDrainReceipt *receipt) {
+                deliveredDrain = receipt;
+                dispatch_semaphore_signal(drainDelivered);
+            }];
+        [self.device
+            requestPlayoutRecoveryWithAuthorization:authorization
+            appOperationTagGeneration:tagGeneration];
+        BOOL ranRecovery = [self runNextQueuedOperation];
+        BOOL terminalAccepted = targetBound
+            && tagGeneration != 0
+            && ranRecovery
+            && authorization.terminalGeneration == authorization.generation
+            && authorization.terminalOutcome
+                == ASIOSStereoPlayoutRecoveryTerminalOutcomeAccepted;
+        BOOL drainAccepted = [self.device
+            requestAudioCategoryDrainForAppOperationIdentifier:
+                operationIdentifier
+            authorityEpoch:1
+            operationRevision:revision
+            tagGeneration:tagGeneration];
+        BOOL drainArrived = drainAccepted
+            && dispatch_semaphore_wait(
+                drainDelivered,
+                dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)
+            ) == 0;
+        ASIOSAudioCategoryDrainReceipt *drain = drainArrived ? deliveredDrain : nil;
+        BOOL exactDrain = drainArrived
+            && drain != nil
+            && [drain.appOperationIdentifier isEqual:operationIdentifier]
+            && drain.appAuthorityEpoch == 1
+            && drain.appOperationRevision == revision
+            && drain.appOperationTagGeneration == tagGeneration
+            && drain.deviceInstanceGeneration
+                == self.device.audioCategoryDeviceInstanceGeneration
+            && drain.observationRegistrationGeneration == registration.generation
+            && drain.drainGeneration != 0
+            && drain.ingressInFlightCount == 0;
+        result[[prefix stringByAppendingString:@"Accepted"]] = @(terminalAccepted);
+        result[[prefix stringByAppendingString:@"PolicyMatches"]] =
+            @(authorization.policyMatchesRequestedTarget);
+        result[[prefix stringByAppendingString:@"ExactDrain"]] = @(exactDrain);
+        result[[prefix stringByAppendingString:@"ConfigurationCount"]] =
+            @(self.configurationOperationCount);
+        result[[prefix stringByAppendingString:@"DelegateRetryCount"]] =
+            @(self.delegate.retryPlayoutInvocationCount);
+        result[[prefix stringByAppendingString:@"Playing"]] = @(self.diagnostics.playing);
+        result[[prefix stringByAppendingString:@"SessionActive"]] =
+            @(self.diagnostics.sessionActive);
+        result[[prefix stringByAppendingString:@"InputBusEnabled"]] =
+            @(self.diagnostics.inputBusEnabled);
+        [registration invalidate];
+    }
+    return result;
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugPlayoutRetryFailureForTesting:
+    (ASIOSPlayoutRetryFailureTestScenario)scenario {
+    NSMutableDictionary<NSString *, NSNumber *> *result =
+        [NSMutableDictionary dictionary];
+    [self.device debugSetOutputRouteAvailableForTesting:NO];
+    result[@"initialInitializeFailed"] = @(![self.device initializePlayout]);
+    [self.device debugSetOutputRouteAvailableForTesting:
+        scenario != ASIOSPlayoutRetryFailureTestScenarioNativeInitializationFailure];
+    self.delegate.hidesRetryHook =
+        scenario == ASIOSPlayoutRetryFailureTestScenarioMissingHook;
+    self.delegate.rejectsAfterNativeStart =
+        scenario == ASIOSPlayoutRetryFailureTestScenarioRejectedAfterNativeStart;
+    if (self.delegate.hidesRetryHook) {
+        // Missing vendor support must also close an already-running native device.
+        [self.device debugMarkHealthyPlayoutForTesting];
+    }
+    result[@"initialPlaying"] = @(self.diagnostics.playing);
+    NSUInteger initialConfigurationCount = self.configurationOperationCount;
+
+    ASIOSStereoPlayoutRecoveryAuthorization *authorization =
+        [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+    BOOL targetBound = [authorization bindRequestedInputRequired:NO];
+    NSUUID *operationIdentifier = [NSUUID UUID];
+    uint64_t tagGeneration = [self.device
+        stageAppAudioPolicyOperationWithIdentifier:operationIdentifier
+        authorityEpoch:1
+        operationRevision:1
+        recoveryAuthorization:authorization
+        nativeTransactionIdentifier:0
+        inputRequired:NO];
+    result[@"staged"] = @(targetBound && tagGeneration != 0);
+
+    __block ASIOSAudioCategoryDrainReceipt *deliveredDrain = nil;
+    dispatch_semaphore_t drainDelivered = dispatch_semaphore_create(0);
+    ASIOSAudioCategoryObservationRegistration *registration = [self.device
+        observeAudioCategoryChanges:
+            ^(ASIOSAudioCategoryObservationReceipt *receipt) { (void)receipt; }
+        drainHandler:^(ASIOSAudioCategoryDrainReceipt *receipt) {
+            deliveredDrain = receipt;
+            dispatch_semaphore_signal(drainDelivered);
+        }];
+    [self.device requestPlayoutRecoveryWithAuthorization:authorization
+                             appOperationTagGeneration:tagGeneration];
+    result[@"queued"] = @(self.queuedOperationCount == 1);
+    BOOL boundaryApplied = YES;
+    if (scenario == ASIOSPlayoutRetryFailureTestScenarioRevokedWhileQueued) {
+        [authorization revoke];
+        boundaryApplied = !authorization.isValid;
+    } else if (scenario == ASIOSPlayoutRetryFailureTestScenarioRetiredTagWhileQueued) {
+        boundaryApplied = [self.device
+            retireStagedAppAudioPolicyOperationWithTagGeneration:tagGeneration];
+    }
+    result[@"boundaryApplied"] = @(boundaryApplied);
+    result[@"ranRecovery"] = @([self runNextQueuedOperation]);
+    result[@"exactTerminal"] =
+        @(authorization.terminalGeneration == authorization.generation);
+    result[@"rejected"] = @(authorization.terminalOutcome
+        == ASIOSStereoPlayoutRecoveryTerminalOutcomeRejected);
+    result[@"revoked"] = @(authorization.terminalOutcome
+        == ASIOSStereoPlayoutRecoveryTerminalOutcomeRevoked);
+    result[@"policyMatches"] = @(authorization.policyMatchesRequestedTarget);
+
+    BOOL drainAccepted = [self.device
+        requestAudioCategoryDrainForAppOperationIdentifier:operationIdentifier
+        authorityEpoch:1
+        operationRevision:1
+        tagGeneration:tagGeneration];
+    BOOL drainArrived = drainAccepted && dispatch_semaphore_wait(
+        drainDelivered,
+        dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)
+    ) == 0;
+    ASIOSAudioCategoryDrainReceipt *drain = drainArrived ? deliveredDrain : nil;
+    result[@"exactDrain"] = @(drain != nil
+        && [drain.appOperationIdentifier isEqual:operationIdentifier]
+        && drain.appAuthorityEpoch == 1
+        && drain.appOperationRevision == 1
+        && drain.appOperationTagGeneration == tagGeneration
+        && drain.deviceInstanceGeneration
+            == self.device.audioCategoryDeviceInstanceGeneration
+        && drain.observationRegistrationGeneration == registration.generation
+        && drain.drainGeneration != 0
+        && drain.ingressInFlightCount == 0);
+    result[@"delegateRetryCount"] = @(self.delegate.retryPlayoutInvocationCount);
+    result[@"nativePlayingInsideHook"] = @(self.delegate.nativePlayingBeforeRetryReturn);
+    result[@"playing"] = @(self.diagnostics.playing);
+    result[@"sessionActive"] = @(self.diagnostics.sessionActive);
+    result[@"ownsSessionActivation"] = @(self.diagnostics.ownsSessionActivation);
+    result[@"inputBusEnabled"] = @(self.diagnostics.inputBusEnabled);
+    result[@"configurationDelta"] =
+        @(self.configurationOperationCount - initialConfigurationCount);
+    result[@"failureCode"] = @(self.diagnostics.failureCode);
+    result[@"failureStatus"] = @(self.diagnostics.lastLifecycleStatus);
+    result[@"nativeFailurePreserved"] = @(
+        self.delegate.retryFailureCode != ASIOSStereoPlayoutFailureNone
+        && self.delegate.retryFailureCode == self.diagnostics.failureCode
+        && self.delegate.retryFailureStatus == self.diagnostics.lastLifecycleStatus
+        && self.delegate.retryFailureMessage.length != 0
+        && [self.delegate.retryFailureMessage
+            isEqualToString:self.device.lastLifecycleFailureMessage]);
+
+    ASIOSStereoPlayoutRecoveryAuthorization *nextAuthorization =
+        [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+    BOOL nextBound = [nextAuthorization bindRequestedInputRequired:NO];
+    uint64_t nextTag = [self.device
+        stageAppAudioPolicyOperationWithIdentifier:[NSUUID UUID]
+        authorityEpoch:1
+        operationRevision:2
+        recoveryAuthorization:nextAuthorization
+        nativeTransactionIdentifier:0
+        inputRequired:NO];
+    result[@"nextOperationCanStage"] = @(nextBound && nextTag != 0);
+    result[@"nextOperationRetired"] = [NSNumber numberWithBool:
+        [self.device retireStagedAppAudioPolicyOperationWithTagGeneration:nextTag]];
+    [registration invalidate];
+    return result;
 }
 
 - (BOOL)debugAudioCategoryObservationRegistrationFencingForTesting {
@@ -10703,6 +10956,36 @@ static OSStatus ASRemoteIOInput(
 }
 #endif
 
+- (BOOL)retryPlayoutThroughAudioDeviceDelegate:
+    (id<LKRTCAudioDeviceDelegate>)delegate {
+    BOOL supportsExactRetry = delegate != nil
+        && self.delegate == delegate
+        && [delegate respondsToSelector:
+            @selector(retryPlayoutForAudioDevice:)];
+    // The caller holds only B's authorization lock. Init/Start reenter device methods inline on
+    // this ADM worker; none of those callbacks reacquire that authorization lock.
+    BOOL started = supportsExactRetry
+        && [(id<ASIOSAuthorizedPlayoutRetryDelegate>)delegate
+            retryPlayoutForAudioDevice:self]
+        && _initialized
+        && self.delegate == delegate
+        && _playoutInitialized
+        && _playing;
+    if (!started
+        && atomic_load_explicit(
+            &_lifecycle.failureCode,
+            memory_order_relaxed
+        ) == ASIOSStereoPlayoutFailureNone) {
+        [self failAndRollbackWithCode:
+            ASIOSStereoPlayoutFailureSessionConfiguration
+                               status:kAudio_ParamError
+                              message:supportsExactRetry
+            ? @"The native audio module could not verify authorized playout retry."
+            : @"The native audio module does not support exact-device authorized playout retry."];
+    }
+    return started;
+}
+
 #if DEBUG
 - (void)debugRequestUntaggedPlayoutRecoveryWithAuthorization:
     (ASIOSStereoPlayoutRecoveryAuthorization *)authorization {
@@ -10883,16 +11166,8 @@ static OSStatus ASRemoteIOInput(
             }
 #endif
             if (healthyPlayout) {
-                BOOL started = NO;
-#if DEBUG
-                if (self->_debugRecoveryHarnessMode) {
-                    started = YES;
-                } else {
-                    started = [self startPlayout];
-                }
-#else
-                started = [self startPlayout];
-#endif
+                BOOL started = [self
+                    retryPlayoutThroughAudioDeviceDelegate:delegate];
                 if (started && requestedTargetIsBound) {
                     *policyMatchesRequestedTarget = [self
                         audioPolicyMatchesRequestedInputRequired:
@@ -10920,6 +11195,10 @@ static OSStatus ASRemoteIOInput(
                 memory_order_relaxed
             );
             BOOL rebuilt = [self rebuildAfterExplicitRecovery];
+            if (rebuilt) {
+                rebuilt = [self
+                    retryPlayoutThroughAudioDeviceDelegate:delegate];
+            }
             if (rebuilt && requestedTargetIsBound) {
                 *policyMatchesRequestedTarget = [self
                     audioPolicyMatchesRequestedInputRequired:

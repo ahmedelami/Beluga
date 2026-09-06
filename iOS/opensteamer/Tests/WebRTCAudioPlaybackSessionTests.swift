@@ -1,5 +1,10 @@
 import AVFAudio
 import AudioToolbox
+import CryptoKit
+import Darwin
+@preconcurrency import LiveKitWebRTC
+import ObjectiveC
+import os
 import RemoteSessionCore
 import XCTest
 @testable import WebRTCTransport
@@ -9,6 +14,182 @@ import XCTest
 /// revocation rules; the physical-device test remains the hardware RemoteIO oracle.
 @MainActor
 final class WebRTCAudioPlaybackSessionTests: XCTestCase {
+    func testPackagedDynamicFrameworkRetriesItsRealCustomAudioDevice() throws {
+        #if !targetEnvironment(simulator)
+        throw XCTSkip("This byte-bound artifact smoke check uses Xcode's unmodified Simulator framework; physical RemoteIO has a separate oracle.")
+        #else
+        XCTAssertTrue(LKRTCInitializeSSL())
+        let device = DynamicFrameworkRetryDevice()
+        var factory: LKRTCPeerConnectionFactory? = LKRTCPeerConnectionFactory(
+            encoderFactory: nil, decoderFactory: nil, audioDevice: device
+        )
+        let configuration = LKRTCConfiguration()
+        configuration.iceServers = []
+        configuration.sdpSemantics = .unifiedPlan
+        var peer = factory?.peerConnection(
+            with: configuration,
+            constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+            delegate: nil
+        )
+        defer {
+            peer?.close()
+            peer = nil
+            factory = nil
+            let final = device.snapshot
+            XCTAssertEqual(final.initializations, 1)
+            XCTAssertEqual(final.terminations, 1)
+            XCTAssertFalse(final.initialized)
+            XCTAssertFalse(final.playing)
+            XCTAssertFalse(final.delegateBound)
+            XCTAssertEqual(final.recordingInitializations, 0)
+            XCTAssertEqual(final.recordingStarts, 0)
+            XCTAssertEqual(final.recordingStops, 1, "The real media engine performs one harmless recording stop during teardown.")
+            XCTAssertFalse(final.wrongWorker)
+        }
+        XCTAssertNotNil(peer)
+        XCTAssertTrue(device.snapshot.initialized)
+        XCTAssertEqual(device.snapshot.playoutInitializations, 0)
+        let proof = try XCTUnwrap(device.exerciseRetry())
+        XCTAssertTrue(proof.supportsRetry)
+        let image = try XCTUnwrap(proof.imagePath)
+        let imageURL = URL(fileURLWithPath: image).resolvingSymlinksInPath().standardizedFileURL
+        let factoryImage = try XCTUnwrap(Bundle(for: LKRTCPeerConnectionFactory.self).executableURL)
+            .resolvingSymlinksInPath().standardizedFileURL
+        XCTAssertEqual(imageURL, factoryImage,
+                       "The factory and retry implementation must execute from the same dynamic framework.")
+        // Pinned Xcode injects its build-products framework through DYLD_FRAMEWORK_PATH
+        // during hosted Simulator tests. Bind the actual loaded image to the exact verified
+        // Simulator artifact bytes instead of assuming it uses the app's re-signed copy.
+        let imageDigest = SHA256.hash(data: try Data(contentsOf: imageURL))
+            .map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(imageDigest,
+                       "89ad833585353cc20f8bad3272170a574c0ae4c7dea433c8abd45ff2b53d2abe")
+        XCTAssertEqual(proof.accepted, [false, true, true])
+        XCTAssertEqual(proof.snapshots.map(\.playoutInitializations), [1, 2, 2])
+        XCTAssertEqual(proof.snapshots.map(\.playoutStarts), [0, 1, 1])
+        XCTAssertEqual(proof.snapshots.map(\.playing), [false, true, true])
+        XCTAssertTrue(proof.snapshots.allSatisfy {
+            $0.initialized && !$0.wrongWorker
+                && $0.recordingInitializations == 0 && $0.recordingStarts == 0
+                && $0.recordingStops == 0
+        })
+        XCTAssertEqual(proof.inactivePCM?.status, noErr)
+        XCTAssertEqual(proof.activePCM?.status, noErr)
+        XCTAssertEqual(proof.inactivePCM?.flags, .unitRenderAction_OutputIsSilence)
+        XCTAssertEqual(proof.activePCM?.flags, [])
+        XCTAssertEqual(proof.inactivePCM?.allZero, true)
+        XCTAssertEqual(proof.activePCM?.allZero, true, "No track is present; this proves wrapper dispatch, not audibility.")
+        #endif
+    }
+
+    func testExactRecoveryReconfiguresAfterInitialPlayoutFailureBeforeStart() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRetryAfterFailedInitialPlayoutForTesting()
+
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+
+        XCTAssertTrue(try value("initialInitializeFailed").boolValue)
+        XCTAssertFalse(try value("initialPlaying").boolValue)
+        XCTAssertFalse(try value("initialPlayoutInitialized").boolValue)
+        let initialConfigurations = try value("initialConfigurationCount").intValue
+        XCTAssertGreaterThan(initialConfigurations, 0)
+        for attempt in 1...2 {
+            let prefix = "attempt\(attempt)"
+            XCTAssertTrue(try value(prefix + "Accepted").boolValue, "\(result)")
+            XCTAssertTrue(try value(prefix + "PolicyMatches").boolValue, "\(result)")
+            XCTAssertTrue(try value(prefix + "ExactDrain").boolValue, "\(result)")
+            XCTAssertFalse(try value(prefix + "InputBusEnabled").boolValue)
+            XCTAssertTrue(try value(prefix + "Playing").boolValue, "\(result)")
+            XCTAssertTrue(try value(prefix + "SessionActive").boolValue, "\(result)")
+            XCTAssertEqual(try value(prefix + "DelegateRetryCount").intValue, attempt)
+        }
+        let firstConfigurations = try value("attempt1ConfigurationCount").intValue
+        XCTAssertGreaterThan(
+            firstConfigurations,
+            initialConfigurations,
+            "An exact retry after failed initialization must attempt configuration, not only retire its tag. \(result)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            try value("attempt2ConfigurationCount").intValue,
+            firstConfigurations
+        )
+    }
+
+    func testExactRecoveryMissingVendorHookClosesNativeOnlyPlayback() throws {
+        let result = try assertExactRetryFailure(.missingHook)
+        XCTAssertTrue(try retryValue("initialPlaying", in: result).boolValue)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("failureCode", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("failureStatus", in: result).intValue, Int(kAudio_ParamError))
+    }
+
+    func testExactRecoveryRejectedVendorHookRollsBackNativeStart() throws {
+        let result = try assertExactRetryFailure(.rejectedAfterNativeStart)
+        XCTAssertFalse(try retryValue("initialPlaying", in: result).boolValue)
+        XCTAssertTrue(try retryValue("nativePlayingInsideHook", in: result).boolValue)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 1)
+        XCTAssertGreaterThan(try retryValue("configurationDelta", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("failureCode", in: result).intValue, 1)
+    }
+
+    func testExactRecoveryPreservesNativeInitializationFailureDetails() throws {
+        let result = try assertExactRetryFailure(.nativeInitializationFailure)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 1)
+        XCTAssertGreaterThan(try retryValue("configurationDelta", in: result).intValue, 0)
+        XCTAssertGreaterThan(try retryValue("failureCode", in: result).intValue, 1)
+        XCTAssertTrue(try retryValue("nativeFailurePreserved", in: result).boolValue)
+    }
+
+    func testExactRecoveryRevokedWhileQueuedNeverInvokesVendorHook() throws {
+        let result = try assertExactRetryFailure(.revokedWhileQueued)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("configurationDelta", in: result).intValue, 0)
+    }
+
+    func testExactRecoveryRetiredTagWhileQueuedNeverInvokesVendorHook() throws {
+        let result = try assertExactRetryFailure(.retiredTagWhileQueued)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("configurationDelta", in: result).intValue, 0)
+    }
+
+    private func assertExactRetryFailure(
+        _ scenario: WebRTCIOSPlayoutRetryFailureTestScenario,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [String: NSNumber] {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugPlayoutRetryFailureForTesting(scenario)
+        for key in [
+            "initialInitializeFailed", "staged", "queued", "boundaryApplied",
+            "ranRecovery", "exactTerminal", "exactDrain", "nextOperationCanStage",
+            "nextOperationRetired",
+        ] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)", file: file, line: line)
+        }
+        XCTAssertEqual(
+            try retryValue("revoked", in: result).boolValue,
+            scenario == .revokedWhileQueued,
+            "\(result)", file: file, line: line
+        )
+        XCTAssertEqual(
+            try retryValue("rejected", in: result).boolValue,
+            scenario != .revokedWhileQueued,
+            "\(result)", file: file, line: line
+        )
+        for key in ["policyMatches", "playing", "sessionActive", "ownsSessionActivation", "inputBusEnabled"] {
+            XCTAssertFalse(try retryValue(key, in: result).boolValue, "\(key): \(result)", file: file, line: line)
+        }
+        return result
+    }
+
+    private func retryValue(_ key: String, in result: [String: NSNumber]) throws -> NSNumber {
+        try XCTUnwrap(result[key], "Missing native result: \(key)")
+    }
+
     func testRecoveryAuthorizationPublishesExactTerminalOutcomeAndGeneration() {
         let accepted = WebRTCIOSPlayoutRecoveryAuthorization()
         let rejected = WebRTCIOSPlayoutRecoveryAuthorization()
@@ -1310,7 +1491,8 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertEqual(accepted.requestCount, 2)
         XCTAssertEqual(accepted.authorizationRejectionCount, 1)
         XCTAssertEqual(accepted.rebuildCount, 1)
-        XCTAssertFalse(accepted.sessionActive)
+        XCTAssertTrue(accepted.sessionActive)
+        XCTAssertFalse(accepted.inputBusEnabled)
         XCTAssertFalse(accepted.remoteIOCreated)
     }
 
@@ -3179,6 +3361,179 @@ private final class LockedOnce: @unchecked Sendable {
             wasClaimed = true
             return true
         }
+    }
+}
+
+// Only this test device is fake. Its delegate, ADM, audio buffer and transport come from the
+// packaged dynamic framework. No method creates an audio session, AudioUnit, track or socket.
+private final class DynamicFrameworkRetryDevice: NSObject, LKRTCAudioDevice, Sendable {
+    struct Snapshot: Sendable {
+        var initialized = false
+        var playoutInitialized = false
+        var playing = false
+        var delegateBound = false
+        var initializations = 0
+        var terminations = 0
+        var playoutInitializations = 0
+        var playoutStarts = 0
+        var recordingInitializations = 0
+        var recordingStarts = 0
+        var recordingStops = 0
+        var wrongWorker = false
+    }
+
+    struct PCMObservation: Sendable {
+        let status: OSStatus
+        let flags: AudioUnitRenderActionFlags
+        let allZero: Bool
+    }
+
+    struct Proof: Sendable {
+        var supportsRetry = false
+        var imagePath: String?
+        var accepted: [Bool] = []
+        var snapshots: [Snapshot] = []
+        var inactivePCM: PCMObservation?
+        var activePCM: PCMObservation?
+    }
+
+    private struct State {
+        var delegate: (any LKRTCAudioDeviceDelegate)?
+        var snapshot = Snapshot()
+        var worker: mach_port_t?
+
+        mutating func checkWorker() {
+            snapshot.wrongWorker = snapshot.wrongWorker
+                || worker != pthread_mach_thread_np(pthread_self())
+        }
+    }
+
+    // Every mutable value is lock-owned. A copied delegate is used only to dispatch onto its
+    // worker; no lock is held while framework code can reenter this device.
+    private let state = OSAllocatedUnfairLock(uncheckedState: State())
+    var snapshot: Snapshot { state.withLock { $0.snapshot } }
+    var deviceInputSampleRate: Double { 48_000 }
+    var inputIOBufferDuration: TimeInterval { 0.01 }
+    var inputNumberOfChannels: Int { 1 }
+    var inputLatency: TimeInterval { 0 }
+    var deviceOutputSampleRate: Double { 48_000 }
+    var outputIOBufferDuration: TimeInterval { 0.01 }
+    var outputNumberOfChannels: Int { 2 }
+    var outputLatency: TimeInterval { 0 }
+    var isInitialized: Bool { snapshot.initialized }
+    var isPlayoutInitialized: Bool { snapshot.playoutInitialized }
+    var isPlaying: Bool { snapshot.playing }
+    var isRecordingInitialized: Bool { false }
+    var isRecording: Bool { false }
+
+    func initialize(with delegate: any LKRTCAudioDeviceDelegate) -> Bool {
+        state.withLockUnchecked {
+            $0.worker = pthread_mach_thread_np(pthread_self())
+            $0.delegate = delegate
+            $0.snapshot.delegateBound = true
+            $0.snapshot.initializations += 1
+            $0.snapshot.initialized = true
+        }
+        return true
+    }
+
+    func terminateDevice() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.delegate = nil
+            $0.snapshot.delegateBound = false
+            $0.snapshot.terminations += 1
+            $0.snapshot.initialized = false
+            $0.snapshot.playoutInitialized = false
+            $0.snapshot.playing = false
+        }
+        return true
+    }
+
+    func initializePlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playoutInitializations += 1
+            $0.snapshot.playoutInitialized = $0.snapshot.playoutInitializations > 1
+            return $0.snapshot.playoutInitialized
+        }
+    }
+
+    func startPlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playoutStarts += 1
+            $0.snapshot.playing = $0.snapshot.playoutInitialized
+            return $0.snapshot.playing
+        }
+    }
+
+    func stopPlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playing = false
+        }
+        return true
+    }
+
+    func initializeRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingInitializations += 1 }
+        return false
+    }
+
+    func startRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingStarts += 1 }
+        return false
+    }
+
+    func stopRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingStops += 1 }
+        return true
+    }
+
+    func exerciseRetry() -> Proof? {
+        guard let delegate = state.withLockUnchecked({ $0.delegate }) else { return nil }
+        let result = OSAllocatedUnfairLock(initialState: Proof?.none)
+        delegate.dispatchSync { [self] in
+            guard let current = state.withLockUnchecked({ $0.delegate }) else { return }
+            var proof = Proof()
+            let selector = NSSelectorFromString("retryPlayoutForAudioDevice:")
+            proof.supportsRetry = current.responds(to: selector)
+            guard proof.supportsRetry,
+                  let implementation = class_getMethodImplementation(object_getClass(current), selector)
+            else {
+                let incomplete = proof
+                result.withLock { $0 = incomplete }
+                return
+            }
+            var image = Dl_info()
+            let address = unsafeBitCast(implementation, to: UnsafeRawPointer.self)
+            if dladdr(address, &image) != 0, let path = image.dli_fname {
+                proof.imagePath = String(cString: path)
+            }
+            for attempt in 0..<3 {
+                proof.accepted.append(current.retryPlayout?(for: self) ?? false)
+                proof.snapshots.append(snapshot)
+                if attempt == 0 { proof.inactivePCM = Self.readPCM(current) }
+                if attempt == 1 { proof.activePCM = Self.readPCM(current) }
+            }
+            let completed = proof
+            result.withLock { $0 = completed }
+        }
+        return result.withLock { $0 }
+    }
+
+    private static func readPCM(_ delegate: any LKRTCAudioDeviceDelegate) -> PCMObservation {
+        var samples = [Int16](repeating: 123, count: 480 * 2)
+        var flags: AudioUnitRenderActionFlags = []
+        var timestamp = AudioTimeStamp()
+        let status = samples.withUnsafeMutableBytes { bytes in
+            var data = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
+                mNumberChannels: 2, mDataByteSize: UInt32(bytes.count), mData: bytes.baseAddress
+            ))
+            return delegate.getPlayoutData(&flags, &timestamp, 0, 480, &data)
+        }
+        return PCMObservation(status: status, flags: flags, allZero: samples.allSatisfy { $0 == 0 })
     }
 }
 

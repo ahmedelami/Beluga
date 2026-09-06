@@ -2537,6 +2537,24 @@ public enum WebRTCIOSExpectedRouteChangeDisposition: Sendable {
     }
 }
 
+public enum WebRTCIOSPlayoutRetryFailureTestScenario: Int, Sendable {
+    case missingHook
+    case rejectedAfterNativeStart
+    case nativeInitializationFailure
+    case revokedWhileQueued
+    case retiredTagWhileQueued
+
+    fileprivate var native: ASIOSPlayoutRetryFailureTestScenario {
+        switch self {
+        case .missingHook: .missingHook
+        case .rejectedAfterNativeStart: .rejectedAfterNativeStart
+        case .nativeInitializationFailure: .nativeInitializationFailure
+        case .revokedWhileQueued: .revokedWhileQueued
+        case .retiredTagWhileQueued: .retiredTagWhileQueued
+        }
+    }
+}
+
 public enum WebRTCIOSExpectedRouteChangeTestScenario: Int, Sendable {
     case pendingActivation
     case pendingBound
@@ -2911,6 +2929,18 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         -> Bool
     {
         native.debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting()
+    }
+
+    public func debugRetryAfterFailedInitialPlayoutForTesting()
+        -> [String: NSNumber]
+    {
+        native.debugRetryAfterFailedInitialPlayoutForTesting()
+    }
+
+    public func debugPlayoutRetryFailureForTesting(
+        _ scenario: WebRTCIOSPlayoutRetryFailureTestScenario
+    ) -> [String: NSNumber] {
+        native.debugPlayoutRetryFailureForTesting(scenario.native)
     }
 
     public func debugAudioCategoryDrainOrderingForTesting() -> Bool {

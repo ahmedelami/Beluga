@@ -16,7 +16,7 @@ readonly EXPECTED_BUNDLE_IDENTIFIER="com.elamin.opensteamer"
 readonly PROTECTED_BUNDLE_IDENTIFIER="com.elamin.AudioStreamer"
 readonly EXPECTED_SCHEME="opensteamerTestFlight"
 readonly EXPECTED_CONFIGURATION="TestFlight"
-readonly EXPECTED_BUILD_NUMBER="64"
+readonly EXPECTED_BUILD_NUMBER="65"
 readonly EXPECTED_SHORT_VERSION="0.1.0"
 readonly EXPECTED_TEAM_ID="MSMG8CJLB3"
 readonly EXPECTED_ARCHIVE_SIGNING_IDENTITY="Apple Development: Ahmed Elamin (92LVX32M8K)"
@@ -107,8 +107,12 @@ readonly -i APP_STORE_PROCESSING_WAIT_POLL_SECONDS=5
 readonly -i APP_STORE_PROCESSING_TERMINATION_GRACE_SECONDS=5
 readonly PACKAGE_MANIFEST_PATH="${REPOSITORY_ROOT}/Package.swift"
 readonly PACKAGE_RESOLVED_PATH="${REPOSITORY_ROOT}/Package.resolved"
-readonly EXPECTED_PACKAGE_MANIFEST_SHA256="d9f6aef25647c8a209c88305391017049d122976f0f3069fb32dd2219b9b91b8"
-readonly EXPECTED_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"
+readonly EXPECTED_PACKAGE_MANIFEST_SHA256="59368397825697a878ba3219377bfff26be040735c9a6732a8952dc55a4c031b"
+readonly EXPECTED_PACKAGE_RESOLVED_STATE="absent"
+readonly VENDOR_ARCHIVE_PATH="${REPOSITORY_ROOT}/shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"
+# Replaced only after the actual patched slices and complete ZIP pass artifact verification.
+# A non-checksum placeholder deliberately prevents archive/export from consuming unreviewed code.
+readonly EXPECTED_VENDOR_ARCHIVE_SHA256="1399ee6f9a34a6926d2abe9196c1361a40a7fbc9551becd5d13b15a73f510cf7"
 # These are immutable enrollment provenance, not the current release inputs.
 # SwiftPM validates current inputs separately before it consumes the cache.
 readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"
@@ -295,6 +299,8 @@ typeset TESTFLIGHT_ARCHIVE_TREE_SHA256=""
 typeset TESTFLIGHT_ARCHIVE_TREE_WITHOUT_ROOT_INFO_SHA256=""
 typeset EXPORT_OPTIONS_IDENTITY=""
 typeset EXPORT_OPTIONS_SHA256=""
+typeset TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY=""
+typeset TESTFLIGHT_VENDOR_ARCHIVE_SHA256=""
 typeset -i EXPORT_OPTIONS_FD=-1
 typeset TESTFLIGHT_XCODEBUILD_AUTHENTICATION_MODE="xcode-account"
 typeset TESTFLIGHT_XCODEBUILD_AUTHENTICATION_ARGUMENTS_SHA256=""
@@ -533,15 +539,45 @@ function pin_app_store_connect_api_key_identity() {
   TESTFLIGHT_ASC_API_KEY_PIN_FAILURE='none'
 }
 
+function vendor_archive_identity() {
+  /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%HT:%z:%Fm:%Fc' "$1" 2>/dev/null
+}
+
+function verify_pinned_vendor_archive() {
+  local archive_path=$1
+  local expected_sha256=$2
+  local identity
+  [[ "${#expected_sha256}" == 64 \
+      && "${expected_sha256}" != *[^0-9a-f]* \
+      && "${archive_path:A}" == "${archive_path}" \
+      && -f "${archive_path}" && ! -L "${archive_path}" ]] || return 1
+  identity=$(vendor_archive_identity "${archive_path}") || return 1
+  [[ -n "${identity}" ]] || return 1
+  if [[ -n "${TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY}" ]]; then
+    [[ "${identity}" == "${TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY}" \
+        && "${expected_sha256}" == "${TESTFLIGHT_VENDOR_ARCHIVE_SHA256}" ]]
+    return $?
+  fi
+  # Hash once per unchanged release invocation, fenced by inode, size, ownership, mode and
+  # nanosecond mtime/ctime. Later stages reject mutation instead of accepting a renewed artifact.
+  [[ "$(sha256_file "${archive_path}")" == "${expected_sha256}" \
+      && "${archive_path:A}" == "${archive_path}" \
+      && -f "${archive_path}" && ! -L "${archive_path}" \
+      && "$(vendor_archive_identity "${archive_path}")" == "${identity}" ]] || return 1
+  TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY=${identity}
+  TESTFLIGHT_VENDOR_ARCHIVE_SHA256=${expected_sha256}
+}
+
 function verify_package_dependency_contract() {
   [[ "${PACKAGE_MANIFEST_PATH:A}" == "${PACKAGE_MANIFEST_PATH}" \
       && "${PACKAGE_RESOLVED_PATH:A}" == "${PACKAGE_RESOLVED_PATH}" \
       && -f "${PACKAGE_MANIFEST_PATH}" && ! -L "${PACKAGE_MANIFEST_PATH}" \
-      && -f "${PACKAGE_RESOLVED_PATH}" && ! -L "${PACKAGE_RESOLVED_PATH}" \
+      && "${EXPECTED_PACKAGE_RESOLVED_STATE}" == 'absent' \
+      && ! -e "${PACKAGE_RESOLVED_PATH}" && ! -L "${PACKAGE_RESOLVED_PATH}" \
       && "$(sha256_file "${PACKAGE_MANIFEST_PATH}")" \
-        == "${EXPECTED_PACKAGE_MANIFEST_SHA256}" \
-      && "$(sha256_file "${PACKAGE_RESOLVED_PATH}")" \
-        == "${EXPECTED_PACKAGE_RESOLVED_SHA256}" ]]
+        == "${EXPECTED_PACKAGE_MANIFEST_SHA256}" ]] \
+    && verify_pinned_vendor_archive \
+      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"
 }
 
 function archive_info_without_distributions_sha256() {
@@ -5223,7 +5259,7 @@ function run_initialize_build_cache() {
     || fail "current package inputs changed before build-cache enrollment"
   [[ "${EXPECTED_PACKAGE_MANIFEST_SHA256}" \
         == "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256}" \
-      && "${EXPECTED_PACKAGE_RESOLVED_SHA256}" \
+      && "${EXPECTED_PACKAGE_RESOLVED_STATE}" \
         == "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256}" ]] \
     || fail "build-cache enrollment provenance pins do not match the current package inputs"
   TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE=1
