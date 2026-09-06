@@ -19,6 +19,8 @@ struct IOSAudioDiagnosticsJournal {
     private var inboundObservedAt: UInt64?
     private var failureObservedAt: UInt64?
     private var highestNativeFailureSequence: UInt64 = 0
+    private var latestNativeContextIdentity: NativeFailureIdentity?
+    private var lastNativeTargetRejectionIdentity: NativeFailureIdentity?
     private var lastStatisticsSequence: UInt64?
     private var lastStatisticsCollectedAt: Date?
 
@@ -100,6 +102,7 @@ struct IOSAudioDiagnosticsJournal {
         let previous = snapshot.native
         snapshot.native = native
         nativeObservedAt = now
+        let hasDetailedRejection = observeNativeTargetRejection(native, at: now)
         let newContext = native.failureContext.flatMap {
             $0.eventSequence > highestNativeFailureSequence ? $0 : nil
         }
@@ -109,7 +112,7 @@ struct IOSAudioDiagnosticsJournal {
                 || previous?.lastLifecycleStatus != native.lastLifecycleStatus
                 || previous?.failureContext?.eventSequence != native.failureContext?.eventSequence {
             fail(phase: Self.failurePhase(native.failureCode), at: now)
-        } else if let newContext, newContext.failureCode != 0 {
+        } else if let newContext, newContext.failureCode != 0, !hasDetailedRejection {
             // This was captured before rollback, possibly before this policy/attempt existed.
             // Preserve the cause without labelling a healthy or not-yet-executed attempt failed.
             var historical = WebRTCAudioClientSnapshot()
@@ -135,6 +138,82 @@ struct IOSAudioDiagnosticsJournal {
             }
             record(.failure, evidence: historical, at: now)
         }
+    }
+
+    private struct NativeFailureIdentity: Equatable {
+        let device: UInt64
+        let event: UInt64
+        let system: UInt64
+        let configuration: UInt64
+        let operation: UInt64
+
+        init(_ context: WebRTCAudioClientFailureContext) {
+            device = context.deviceInstanceGeneration
+            event = context.eventSequence
+            system = context.systemAudioGeneration
+            configuration = context.configurationGeneration
+            operation = context.appOperationTagGeneration
+        }
+    }
+
+    /// Native target-proof rejection is historical evidence, not a reducer decision.
+    /// Its POD cannot establish a Swift policy UUID, so never assign it to the current
+    /// retry or overwrite the current controller's authorization/code (including 201).
+    private mutating func observeNativeTargetRejection(
+        _ native: WebRTCAudioClientNativeSnapshot, at now: UInt64
+    ) -> Bool {
+        guard let context = native.failureContext,
+              context.deviceInstanceGeneration != 0, context.eventSequence != 0 else { return false }
+        let identity = NativeFailureIdentity(context)
+        if let latest = latestNativeContextIdentity {
+            // Every observed native context retires older device/events, even when it
+            // contains no detailed receipt. The exact same context may gain detail once.
+            guard identity == latest || identity.device > latest.device
+                    || (identity.device == latest.device && identity.event > latest.event)
+                else { return context.targetPolicyRejection != nil }
+        }
+        latestNativeContextIdentity = identity
+        guard context.failureCode == 4, context.stage == .routeValidation,
+              context.reason == .policyMismatch,
+              let rejection = context.targetPolicyRejection else { return false }
+        if let last = lastNativeTargetRejectionIdentity {
+            // Native device identities and per-device failure events allocate monotonically.
+            // A fresh device may restart its event counter; a retired device may never replay.
+            guard identity.device > last.device
+                    || (identity.device == last.device && identity.event > last.event) else { return true }
+        }
+        lastNativeTargetRejectionIdentity = identity
+
+        var historical = WebRTCAudioClientSnapshot()
+        historical.native = native
+        historical.nativeObservationAgeMilliseconds = 0
+        historical.failurePhase = .route
+        historical.proofStage = .failed
+        historical.targetMatched = false
+        historical.authorityFailureCode = rejection.code
+
+        if failureSnapshot == nil || Self.isControllerOnlyPlaceholder(failureSnapshot) {
+            // The first concrete native cause supersedes an uncorrelated controller-only
+            // placeholder. Its old controller event remains bounded history. No concrete
+            // native cause is replaced, and no policy identity is invented by enrichment.
+            failureSnapshot = historical
+            failureObservedAt = now
+        } else if let retainedContext = failureSnapshot?.native?.failureContext,
+                  NativeFailureIdentity(retainedContext) == identity {
+            var retained = agedFailureSnapshot(at: now)
+            retained?.authorityFailureCode = rejection.code
+            failureSnapshot = retained
+            failureObservedAt = now
+        }
+        record(.failure, evidence: historical, at: now)
+        return true
+    }
+
+    private static func isControllerOnlyPlaceholder(_ evidence: WebRTCAudioClientSnapshot?) -> Bool {
+        guard let evidence else { return false }
+        guard let native = evidence.native else { return true }
+        return native.failureContext == nil && native.failureCode == 0
+            && native.lastLifecycleStatus == 0 && native.lastPlayoutStatus == 0
     }
 
     mutating func observeInbound(_ audio: WebRTCAudioStatistics?, at now: UInt64) {
@@ -291,6 +370,8 @@ struct IOSAudioDiagnosticsJournal {
     private static func hasNativeFailure(_ native: WebRTCAudioClientNativeSnapshot?) -> Bool {
         // A retained historical context is not evidence that this live observation failed.
         (native?.failureCode ?? 0) != 0
+            || (native?.lastLifecycleStatus ?? 0) != 0
+            || (native?.lastPlayoutStatus ?? 0) != 0
     }
 
     private func agedFailureSnapshot(at now: UInt64) -> WebRTCAudioClientSnapshot? {

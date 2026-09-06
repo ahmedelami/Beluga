@@ -47,7 +47,36 @@ request recording while the microphone is unauthorized; use the separate current
 permission, input-bus and route-proof fields to assess admission. Likewise,
 `routeSharingPolicyIsDefault == false` does not identify which non-default policy
 iOS reports. The retained cause has no raw sharing-policy enum, so do not infer
-long-form routing from that boolean alone.
+long-form routing from that boolean alone. From iPhone build68, a failed native
+output-policy target check additionally publishes its pre-rollback rejection in
+the existing numeric `authorityFailureCode` field on historical failure evidence.
+This is a native target-proof receipt, not a new reducer authorization decision.
+The current controller code (including failed-closed201) stays unchanged.
+
+The bounded codebook is `1024 + outcome * 8 + observedPolicy`: observedPolicy is
+default0, longFormAudio1, independent2, longFormVideo3, or unknown4. Unknown raw
+system values map to unknown, never arbitrary wire values. Outcomes1...6 mean
+invalid arguments, prior failed repair, pre-effect drain rejection, post-effect
+drain rejection, setter rejection, and persistent sharing mismatch. Outcomes7...55
+name the first failed transaction/ownership/privacy/route predicate, in exact
+production evaluation order; adding64 identifies the same predicate after the
+setter. Outcome56 means the one permitted attempt was already spent. Reserved
+outcomes and policy values are rejected by the local typed mapper. The canonical
+names are `WebRTCAudioClientNativeTargetPolicyRejection` in
+`shared/Sources/WebRTCTransport/WebRTCAudioClientFailureContext.swift`.
+For example1073 means persistent sharing mismatch with observed longFormAudio;
+it is evidence about that rejected native check only, not the current route.
+
+The receipt keeps the original native device/event/system/configuration/operation
+identity. Since native evidence cannot establish a Swift policy UUID, new detail
+events use a nil policy and attempt0. The first concrete native cause supersedes
+an uncorrelated controller-only retained placeholder; it never overwrites an
+already-concrete native cause. Enrichment of a retained native cause requires an
+exact five-part identity match established before the new read. A distinct later
+failure lives only in the bounded event history. Deduplication rejects retired
+devices and replayed events. Event trimming cannot evict the retained first cause.
+No new wire fields, enum cases, private route identifiers or success receipts are
+introduced; installed hostv48 can retain these numeric codes without redeployment.
 
 `renderingNonzero` means nonzero PCM reached the app's native render boundary.
 It does **not** prove output through the later iOS mixer, hardware, speaker or
@@ -61,7 +90,9 @@ policy reads, replayed history, missing observations, retained causes after clea
 recovery baselines, delayed statistics and blocked optional native reads. Negative
 mutations must demonstrate rejection of their target defect before release claims.
 
-Deployment requires both the updated signed Mac host and a matching iPhone build.
+The initial diagnostics lane requires the updated signed Mac host and a supporting
+iPhone build. Build68's rejection detail is compatible with the already-deployed
+v48 host; it does not require another Mac deployment or relax any audio policy.
 TestFlight acceptance is distribution evidence, not physical audio proof. Inspect
 fresh correlated telemetry from the intended remote iPhone before attributing its
 silence to a specific stage or claiming the playback issue fixed.

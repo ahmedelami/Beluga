@@ -92,7 +92,17 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         let scenarios = ["converged", "persistent", "exact", "setterRejected", "ownershipChanged",
                          "systemChanged", "targetChanged", "outputChanged", "configurationChanged",
                          "expired", "priorRejected", "queuedRejected", "wrongCategory",
-                         "recordingIntentChanged", "privacyLatchChanged", "wrongMode", "wrongOptions"]
+                         "recordingIntentChanged", "privacyLatchChanged", "wrongMode", "wrongOptions", "unknownPolicy"]
+        let expectedRejections: [String: (first: Int, repeated: Int)] = [
+            "converged": (0, 0), "persistent": (1073, 1041), "exact": (0, 0),
+            "setterRejected": (1065, 1041), "ownershipChanged": (1736, 1040),
+            "systemChanged": (1056, 1040), "targetChanged": (1856, 1040),
+            "outputChanged": (1944, 1040), "configurationChanged": (1760, 1040),
+            "expired": (1808, 1040), "priorRejected": (1049, 1049),
+            "queuedRejected": (1056, 1040), "wrongCategory": (1401, 1401),
+            "recordingIntentChanged": (1696, 1040), "privacyLatchChanged": (1720, 1040),
+            "wrongMode": (1409, 1409), "wrongOptions": (1417, 1417), "unknownPolicy": (1076, 1044),
+        ]
         for scenario in scenarios {
             let succeeds = scenario == "converged" || scenario == "exact"
             let calls = ["exact", "priorRejected", "wrongCategory", "wrongMode", "wrongOptions"].contains(scenario) ? 0 : 1
@@ -101,6 +111,9 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
             XCTAssertEqual(try value(scenario + "Repeated").boolValue, succeeds, scenario)
             XCTAssertEqual(try value(scenario + "FirstCalls").intValue, calls, scenario)
             XCTAssertEqual(try value(scenario + "TotalCalls").intValue, calls, "No second setter: \(scenario)")
+            let expected = try XCTUnwrap(expectedRejections[scenario])
+            XCTAssertEqual(try value(scenario + "RejectionCode").intValue, expected.first, scenario)
+            XCTAssertEqual(try value(scenario + "RepeatedRejectionCode").intValue, expected.repeated, scenario)
             if scenario != "systemChanged" && scenario != "expired" {
                 XCTAssertTrue(try value(scenario + "IdentityPreserved").boolValue, scenario)
             }
@@ -108,6 +121,8 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(try value("priorRejectedRejectedRemainedRejected").boolValue)
         XCTAssertTrue(try value("queuedRejectedRejectedRemainedRejected").boolValue)
         XCTAssertEqual(try value("setterRejectedError").intValue, -777)
+        XCTAssertTrue(try value("rejectionRetainedBeforeRollback").boolValue)
+        XCTAssertTrue(try value("healthyRetainsTargetPolicyRejection").boolValue)
         XCTAssertTrue(try value("noAudioIO").boolValue)
     }
 

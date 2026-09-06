@@ -82,6 +82,69 @@ typedef NS_ENUM(uint16_t, ASIOSAudioFailureReason) {
     ASIOSAudioFailureReasonHostedOwnershipChanged = 18,
 };
 
+/// Local-only rejection code: 0 is absent; otherwise 1024 + outcome * 8 + policy kind.
+/// Policy kinds: default=0, long-form audio=1, independent=2, long-form video=3, unknown=4.
+/// Outcomes 7...55 add 64 only for a post-effect fence failure. No success code is emitted.
+typedef NS_ENUM(uint16_t, ASIOSAudioTargetPolicyRejectionOutcome) {
+    ASIOSAudioTargetPolicyRejectionNone = 0,
+    ASIOSAudioTargetPolicyRejectionInvalidArguments = 1,
+    ASIOSAudioTargetPolicyRejectionPriorAttemptFailed = 2,
+    ASIOSAudioTargetPolicyRejectionPreEffectDrainRejected = 3,
+    ASIOSAudioTargetPolicyRejectionPostEffectDrainRejected = 4,
+    ASIOSAudioTargetPolicyRejectionSetterRejected = 5,
+    ASIOSAudioTargetPolicyRejectionPersistentSharingMismatch = 6,
+    ASIOSAudioTargetPolicyRejectionTransactionIdentityUnavailable = 7,
+    ASIOSAudioTargetPolicyRejectionSystemIdentityUnavailable = 8,
+    ASIOSAudioTargetPolicyRejectionDeadlineUnavailable = 9,
+    ASIOSAudioTargetPolicyRejectionRouteIdentityUnavailable = 10,
+    ASIOSAudioTargetPolicyRejectionOutputIdentityUnavailable = 11,
+    ASIOSAudioTargetPolicyRejectionDeviceUninitialized = 12,
+    ASIOSAudioTargetPolicyRejectionNativeSessionInactive = 13,
+    ASIOSAudioTargetPolicyRejectionInterrupted = 14,
+    ASIOSAudioTargetPolicyRejectionInputBusEnabled = 15,
+    ASIOSAudioTargetPolicyRejectionAlreadyPlaying = 16,
+    ASIOSAudioTargetPolicyRejectionAudioUnitPresent = 17,
+    ASIOSAudioTargetPolicyRejectionHostedAuthorizationPresent = 18,
+    ASIOSAudioTargetPolicyRejectionEffectiveMicrophoneActive = 19,
+    ASIOSAudioTargetPolicyRejectionRecordingIntentChanged = 20,
+    ASIOSAudioTargetPolicyRejectionPlayoutIntentChanged = 21,
+    ASIOSAudioTargetPolicyRejectionMicrophoneAuthorizationChanged = 22,
+    ASIOSAudioTargetPolicyRejectionExplicitResumeChanged = 23,
+    ASIOSAudioTargetPolicyRejectionDeviceOwnershipChanged = 24,
+    ASIOSAudioTargetPolicyRejectionGlobalOwnershipChanged = 25,
+    ASIOSAudioTargetPolicyRejectionPublishedSessionInactive = 26,
+    ASIOSAudioTargetPolicyRejectionSystemGenerationChanged = 27,
+    ASIOSAudioTargetPolicyRejectionActiveConfigurationChanged = 28,
+    ASIOSAudioTargetPolicyRejectionTransactionNotPending = 29,
+    ASIOSAudioTargetPolicyRejectionTransactionChanged = 30,
+    ASIOSAudioTargetPolicyRejectionTransactionSystemChanged = 31,
+    ASIOSAudioTargetPolicyRejectionTransactionConfigurationChanged = 32,
+    ASIOSAudioTargetPolicyRejectionTransactionOwnershipChanged = 33,
+    ASIOSAudioTargetPolicyRejectionTransactionDeadlineChanged = 34,
+    ASIOSAudioTargetPolicyRejectionClockUnavailable = 35,
+    ASIOSAudioTargetPolicyRejectionDeadlineExpired = 36,
+    ASIOSAudioTargetPolicyRejectionNotificationSequenceChanged = 37,
+    ASIOSAudioTargetPolicyRejectionTransactionRevisionChanged = 38,
+    ASIOSAudioTargetPolicyRejectionNotificationsInFlight = 39,
+    ASIOSAudioTargetPolicyRejectionInputTargetChanged = 40,
+    ASIOSAudioTargetPolicyRejectionPreferredInputRequirementChanged = 41,
+    ASIOSAudioTargetPolicyRejectionTargetInputPresent = 42,
+    ASIOSAudioTargetPolicyRejectionOperationTagChanged = 43,
+    ASIOSAudioTargetPolicyRejectionOperationTagDrained = 44,
+    ASIOSAudioTargetPolicyRejectionTransitionRouteChanged = 45,
+    ASIOSAudioTargetPolicyRejectionPinnedOutputChanged = 46,
+    ASIOSAudioTargetPolicyRejectionCategoryMismatch = 47,
+    ASIOSAudioTargetPolicyRejectionModeMismatch = 48,
+    ASIOSAudioTargetPolicyRejectionOptionsMismatch = 49,
+    ASIOSAudioTargetPolicyRejectionObservedOutputMissing = 50,
+    ASIOSAudioTargetPolicyRejectionObservedRouteChanged = 51,
+    ASIOSAudioTargetPolicyRejectionObservedOutputChanged = 52,
+    ASIOSAudioTargetPolicyRejectionSampleRateMismatch = 53,
+    ASIOSAudioTargetPolicyRejectionIODurationInvalid = 54,
+    ASIOSAudioTargetPolicyRejectionOutputChannelsMismatch = 55,
+    ASIOSAudioTargetPolicyRejectionAttemptAlreadySpent = 56,
+};
+
 /// One coherent, bounded historical observation, captured before native failure cleanup.
 /// eventSequence == 0 is absent. A later healthy live snapshot does not erase this record.
 /// Generations identify its original device/attempt; it is never evidence of current failure.
@@ -93,6 +156,7 @@ typedef struct ASIOSAudioFailureContext {
     uint64_t appOperationTagGeneration;
     ASIOSAudioFailureStage stage;
     ASIOSAudioFailureReason reason;
+    uint16_t targetPolicyRejectionCode;
     int32_t failureCode;
     int32_t status;
     double sampleRate;
