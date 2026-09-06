@@ -84,6 +84,23 @@ headphones. Similarly, inbound RTP progress alone does not prove decoded playbac
 
 ## Verification boundary
 
+Build 69 deliberately selects the supported `playback` category / `default` mode /
+`longFormAudio` sharing policy / no-options tuple for ordinary output-only media.
+Installed build 68's retained code 1073 proved that a successful default-policy reassertion
+still read back longFormAudio after the exact post-effect checks. The cause of that system
+readback is not established; this repair selects an explicit media-output policy
+rather than treating both policies as interchangeable. Microphone duplex and
+authorized hosted-call playback retain default sharing. Every authority target,
+native receipt, route-transaction stage and runtime proof must agree exactly.
+
+The SDK and [Apple's custom-player example](https://developer.apple.com/documentation/avfaudio/playing-custom-audio-with-your-own-player)
+support that output tuple. It uses shared media routing, with potential AirPlay
+buffering implications; existing exact output fingerprints and private-route-loss
+guards still apply. It does not add a renderer, buffer, voice processing, category
+options or mode enhancement. The native/Swift longFormAudio observation is local
+only. The v1 `routeSharingPolicyIsDefault` bit remains literal and is therefore
+false during healthy ordinary output; host v48 already supports that observation.
+
 The transport, journal, native failure-context, Mac classifier and private report
 writer have deterministic tests. Regression checks cover revoked authority, stale
 policy reads, replayed history, missing observations, retained causes after cleanup,

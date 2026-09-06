@@ -3225,6 +3225,7 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
     public let categoryOptionsAreIPhoneMicrophoneRouting: Bool
     public let categoryOptionsAreMixWithOthers: Bool
     public let routeSharingPolicyIsDefault: Bool
+    public let routeSharingPolicyIsLongFormAudio: Bool
     public let hasOutputRoute: Bool
     public let hostedCallMode: Bool
     public let hostedCallAuthorizationValid: Bool
@@ -3289,6 +3290,7 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
         categoryOptionsAreIPhoneMicrophoneRouting: Bool = false,
         categoryOptionsAreMixWithOthers: Bool = false,
         routeSharingPolicyIsDefault: Bool,
+        routeSharingPolicyIsLongFormAudio: Bool = false,
         hasOutputRoute: Bool = true,
         hostedCallMode: Bool = false,
         hostedCallAuthorizationValid: Bool = false,
@@ -3357,6 +3359,7 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
             categoryOptionsAreIPhoneMicrophoneRouting
         self.categoryOptionsAreMixWithOthers = categoryOptionsAreMixWithOthers
         self.routeSharingPolicyIsDefault = routeSharingPolicyIsDefault
+        self.routeSharingPolicyIsLongFormAudio = routeSharingPolicyIsLongFormAudio
         self.hasOutputRoute = hasOutputRoute
         self.hostedCallMode = hostedCallMode
         self.hostedCallAuthorizationValid = hostedCallAuthorizationValid
@@ -7546,6 +7549,7 @@ public actor WebRTCPeer {
             categoryOptionsAreMixWithOthers:
                 value.categoryOptionsAreMixWithOthers,
             routeSharingPolicyIsDefault: value.routeSharingPolicyIsDefault,
+            routeSharingPolicyIsLongFormAudio: value.routeSharingPolicyIsLongFormAudio,
             hasOutputRoute: value.hasOutputRoute,
             hostedCallMode: value.hostedCallMode,
             hostedCallAuthorizationValid:

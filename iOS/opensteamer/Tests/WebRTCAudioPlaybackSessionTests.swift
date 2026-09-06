@@ -89,19 +89,33 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         func value(_ key: String) throws -> NSNumber {
             try XCTUnwrap(result[key], "Missing native result: \(key)")
         }
+        XCTAssertEqual(try value("ordinaryOutputPolicy").intValue, 1)
+        XCTAssertEqual(try value("microphonePolicy").intValue, 0)
+        XCTAssertEqual(try value("hostedPolicy").intValue, 0)
+        for target in ["input", "output"] {
+            for policy in ["default", "longFormAudio", "independent", "video", "unknown"] {
+                let expected = target == "input" ? policy == "default" : policy == "longFormAudio"
+                XCTAssertEqual(try value("\(target).\(policy).exact").boolValue, expected,
+                               "\(target) must reject every policy except its exact canonical target: \(policy)")
+            }
+        }
+        for key in ["outputRoutePrepare", "outputRouteStart", "outputRouteCommit", "outputRouteConsumed",
+                    "wrongPoliciesRejectedAcrossRouteStates"] {
+            XCTAssertTrue(try value(key).boolValue, key)
+        }
         let scenarios = ["converged", "persistent", "exact", "setterRejected", "ownershipChanged",
                          "systemChanged", "targetChanged", "outputChanged", "configurationChanged",
                          "expired", "priorRejected", "queuedRejected", "wrongCategory",
                          "recordingIntentChanged", "privacyLatchChanged", "wrongMode", "wrongOptions", "unknownPolicy"]
         let expectedRejections: [String: (first: Int, repeated: Int)] = [
-            "converged": (0, 0), "persistent": (1073, 1041), "exact": (0, 0),
-            "setterRejected": (1065, 1041), "ownershipChanged": (1736, 1040),
-            "systemChanged": (1056, 1040), "targetChanged": (1856, 1040),
-            "outputChanged": (1944, 1040), "configurationChanged": (1760, 1040),
-            "expired": (1808, 1040), "priorRejected": (1049, 1049),
-            "queuedRejected": (1056, 1040), "wrongCategory": (1401, 1401),
-            "recordingIntentChanged": (1696, 1040), "privacyLatchChanged": (1720, 1040),
-            "wrongMode": (1409, 1409), "wrongOptions": (1417, 1417), "unknownPolicy": (1076, 1044),
+            "converged": (0, 0), "persistent": (1072, 1040), "exact": (0, 0),
+            "setterRejected": (1064, 1040), "ownershipChanged": (1737, 1041),
+            "systemChanged": (1057, 1041), "targetChanged": (1857, 1041),
+            "outputChanged": (1945, 1041), "configurationChanged": (1761, 1041),
+            "expired": (1809, 1041), "priorRejected": (1048, 1048),
+            "queuedRejected": (1057, 1041), "wrongCategory": (1400, 1400),
+            "recordingIntentChanged": (1697, 1041), "privacyLatchChanged": (1721, 1041),
+            "wrongMode": (1408, 1408), "wrongOptions": (1416, 1416), "unknownPolicy": (1076, 1044),
         ]
         for scenario in scenarios {
             let succeeds = scenario == "converged" || scenario == "exact"
@@ -210,7 +224,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(try retryValue("nativeFailurePreserved", in: result).boolValue)
     }
 
-    func testRealSessionPolicyAPIKeepsExactDefaultThroughOutputActivationWithoutAudioIO() throws {
+    func testRealSessionPolicyAPIKeepsExactCanonicalTargetsThroughOutputActivationWithoutAudioIO() throws {
         let harness = WebRTCIOSPlayoutRecoveryTestHarness()
         defer { _ = harness.debugTerminateForTesting() }
         let result = harness.debugProbeRealSessionPolicySetterForTesting()
@@ -230,13 +244,17 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
             for target in ["output", "input"] {
                 let prefix = "prior\(prior).\(target)."
                 for key in ["priorApplied", "applied", "categoryMatches", "modeMatches", "optionsMatch",
-                            "exactTupleAccepted", "nonDefaultTupleRejected"] {
+                            "exactTupleAccepted", "oppositePolicyRejected"] {
                     XCTAssertTrue(try retryValue(prefix + key, in: result).boolValue,
                                   "\(prefix + key): \(result)")
                 }
-                for key in ["priorError", "error", "requestedRaw", "observedRaw"] {
+                for key in ["priorError", "error"] {
                     XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 0,
                                    "\(prefix + key): \(result)")
+                }
+                for key in ["requestedRaw", "observedRaw"] {
+                    XCTAssertEqual(try retryValue(prefix + key, in: result).intValue,
+                                   target == "output" ? 1 : 0, "\(prefix + key): \(result)")
                 }
                 XCTAssertEqual(try retryValue(prefix + "priorRequestedRaw", in: result).intValue, prior)
                 XCTAssertEqual(try retryValue(prefix + "priorObservedRaw", in: result).intValue, prior,
@@ -246,8 +264,12 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
                         XCTAssertTrue(try retryValue(prefix + key, in: result).boolValue,
                                       "\(prefix + key): \(result)")
                     }
-                    for key in ["activationError", "activeObservedRaw", "deactivationError", "inactiveObservedRaw"] {
+                    for key in ["activationError", "deactivationError"] {
                         XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 0,
+                                       "\(prefix + key): \(result)")
+                    }
+                    for key in ["activeObservedRaw", "inactiveObservedRaw"] {
+                        XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 1,
                                        "\(prefix + key): \(result)")
                     }
                     XCTAssertEqual(try retryValue(prefix + "activationCount", in: result).intValue, 1)
@@ -1088,7 +1110,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
             harness.debugExpectedCategoryObservationIsAbsorbedForTesting(
                 .outputOnlyExact
             ),
-            "The exact playback/default/empty notification must remain tied to its output-only transaction."
+            "The exact playback/default-mode/empty/longFormAudio notification must remain tied to its output-only transaction."
         )
     }
 
@@ -1996,7 +2018,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(healthy.categoryOptionsAreEmpty)
         XCTAssertFalse(healthy.categoryOptionsAreIPhoneMicrophoneRouting)
         XCTAssertFalse(healthy.categoryOptionsAreMixWithOthers)
-        XCTAssertTrue(healthy.routeSharingPolicyIsDefault)
+        XCTAssertFalse(healthy.routeSharingPolicyIsDefault)
         XCTAssertTrue(healthy.hasOutputRoute)
         XCTAssertFalse(healthy.hostedCallMode)
         assertLastRecordedAudioConfiguration(
@@ -2529,7 +2551,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(normal.categoryOptionsAreEmpty)
         XCTAssertFalse(normal.categoryOptionsAreIPhoneMicrophoneRouting)
         XCTAssertFalse(normal.categoryOptionsAreMixWithOthers)
-        XCTAssertTrue(normal.routeSharingPolicyIsDefault)
+        XCTAssertFalse(normal.routeSharingPolicyIsDefault)
         XCTAssertTrue(normal.hasOutputRoute)
         XCTAssertFalse(normal.hostedCallMode)
         XCTAssertFalse(normal.hostedCallAuthorizationValid)
@@ -3445,7 +3467,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         )
         XCTAssertEqual(
             harness.lastConfiguredRouteSharingPolicy,
-            Int(AVAudioSession.RouteSharingPolicy.default.rawValue),
+            Int((options == .mixWithOthers ? AVAudioSession.RouteSharingPolicy.default : .longFormAudio).rawValue),
             file: file,
             line: line
         )

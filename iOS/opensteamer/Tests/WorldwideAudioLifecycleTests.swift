@@ -47,6 +47,158 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         XCTAssertEqual(configuration.outputNumberOfChannels, 2)
     }
 
+    func testCanonicalRouteSharingPolicyHasThreeExactTargets() {
+        let playback = AVAudioSession.Category.playback.rawValue
+        let microphone = AVAudioSession.Category.playAndRecord.rawValue
+        let cases: [(String, UInt, AVAudioSession.RouteSharingPolicy?)] = [
+            (playback, 0, .longFormAudio),
+            (microphone, Self.iPhoneMicrophoneCategoryOptionsRawValue, .default),
+            (playback, AVAudioSession.CategoryOptions.mixWithOthers.rawValue, .default),
+            (microphone, 0, nil),
+            (playback, Self.iPhoneMicrophoneCategoryOptionsRawValue, nil),
+            (microphone, AVAudioSession.CategoryOptions.mixWithOthers.rawValue, nil)
+        ]
+        for (category, options, expected) in cases {
+            XCTAssertEqual(
+                WorldwideAudioLifecycleController.canonicalRouteSharingPolicy(
+                    category: category, mode: AVAudioSession.Mode.default.rawValue,
+                    categoryOptionsRawValue: options
+                ), expected
+            )
+            XCTAssertNil(WorldwideAudioLifecycleController.canonicalRouteSharingPolicy(
+                category: category, mode: AVAudioSession.Mode.voiceChat.rawValue,
+                categoryOptionsRawValue: options
+            ))
+        }
+    }
+
+    func testRuntimeRouteSharingPolicyRequiresExactlyOneCanonicalBit() {
+        for input in [false, true] {
+            for isDefault in [false, true] {
+                for isLongForm in [false, true] {
+                    let diagnostics = iosPlayoutDiagnostics(
+                        callbacks: 10, frames: 4_800, failures: 0,
+                        inputBusEnabled: input,
+                        categoryIsMediaPlayback: !input,
+                        categoryIsMediaPlayAndRecord: input,
+                        routeSharingPolicyIsDefault: isDefault,
+                        routeSharingPolicyIsLongFormAudio: isLongForm
+                    )
+                    let expected = input
+                        ? isDefault && !isLongForm
+                        : isLongForm && !isDefault
+                    XCTAssertEqual(
+                        WorldwideAudioPlayoutOracleSnapshot.routeInvariantsHold(diagnostics),
+                        expected, "input=\(input) default=\(isDefault) longForm=\(isLongForm)"
+                    )
+                    XCTAssertEqual(
+                        WorldwideAudioPlayoutOracleSnapshot.fullQualityInvariantsHold(diagnostics),
+                        expected
+                    )
+                }
+            }
+        }
+        let hosted = iosPlayoutDiagnostics(
+            callbacks: 10, frames: 4_800, failures: 0,
+            categoryOptionsAreEmpty: false, categoryOptionsAreMixWithOthers: true,
+            hostedCallMode: true
+        )
+        XCTAssertTrue(hosted.routeSharingPolicyIsDefault)
+        XCTAssertFalse(hosted.routeSharingPolicyIsLongFormAudio)
+        XCTAssertFalse(WorldwideAudioPlayoutOracleSnapshot.routeInvariantsHold(hosted),
+                       "Hosted mix-with-others must not acquire ordinary playback proof.")
+    }
+
+    func testLifecycleArmedOutputAndMicrophoneRejectTheOtherSharingPolicy() throws {
+        for input in [false, true] {
+            for exactPolicy in [false, true] {
+                let authority = AudioTransactionAuthority()
+                let fixture = makeFixture(audioTransactionAuthority: authority)
+                fixture.controller.prepare(serverName: "Mac mini")
+                XCTAssertTrue(fixture.controller.bindIOSAudioTransactionDevice(
+                    .init(deviceInstanceGeneration: 61, observationRegistrationGeneration: 51)
+                ))
+                if input {
+                    XCTAssertGreaterThan(fixture.controller.beginMicrophoneTopologyTransition(isEnabled: true), 0)
+                } else {
+                    XCTAssertNotNil(fixture.controller.beginIPhoneMicrophoneOutputOnlyTransition(ownerEpoch: UUID()))
+                }
+                let operation = try XCTUnwrap(fixture.controller.debugCurrentAudioTransactionOperationForTests)
+                let target = input ? inputAudioTransactionTarget : outputAudioTransactionTarget
+                let wrongPolicy = Int((input
+                    ? AVAudioSession.RouteSharingPolicy.longFormAudio
+                    : AVAudioSession.RouteSharingPolicy.default).rawValue)
+                let decision = authority.observe(audioTransactionObservation(
+                    for: operation, target: target, disposition: .expectedCurrentAppOperation,
+                    sequence: 1,
+                    observedRouteSharingPolicyRawValue: exactPolicy ? target.routeSharingPolicyRawValue : wrongPolicy
+                ))
+                if exactPolicy {
+                    guard case .observationAccepted(let accepted, _) = decision else {
+                        return XCTFail("Canonical policy did not match lifecycle's actual armed target: \(decision)")
+                    }
+                    XCTAssertEqual(accepted, operation)
+                } else {
+                    XCTAssertEqual(decision, .failedClosed(operation),
+                                   "Same category/mode/options cannot excuse the other route-sharing policy.")
+                }
+            }
+        }
+    }
+
+    func testCurrentGenerationOrdinaryWaveformProofRejectsDefaultOnlyPolicy() {
+        let session = UUID()
+        let policy = UUID()
+        let inbound = WebRTCAudioStatistics(totalAudioEnergy: 0.025, totalSamplesDuration: 0.1)
+        let canonical = WorldwideAudioPlayoutOracleSnapshot(
+            sessionGeneration: session, audioPolicyGeneration: policy,
+            diagnostics: iosPlayoutDiagnostics(
+                callbacks: 10, frames: 4_800, failures: 0,
+                routeSharingPolicyIsDefault: false, routeSharingPolicyIsLongFormAudio: true
+            ), inboundAudio: inbound
+        )
+        let defaultOnly = WorldwideAudioPlayoutOracleSnapshot(
+            sessionGeneration: session, audioPolicyGeneration: policy,
+            diagnostics: iosPlayoutDiagnostics(
+                callbacks: 10, frames: 4_800, failures: 0,
+                routeSharingPolicyIsDefault: true, routeSharingPolicyIsLongFormAudio: false
+            ), inboundAudio: inbound
+        )
+        XCTAssertTrue(canonical.fullQualityInvariantsHold)
+        XCTAssertFalse(defaultOnly.fullQualityInvariantsHold,
+                       "Advancing PCM in the same session/policy cannot excuse the wrong output-sharing target.")
+    }
+
+    func testRetiredLongFormOutputObservationCannotReplaceCurrentDefaultMicrophoneTarget() throws {
+        let authority = AudioTransactionAuthority()
+        try bindAudioTransactionAuthority(authority)
+        let old = try armAudioTransactionAuthority(authority, target: outputAudioTransactionTarget)
+        let snapshot = try XCTUnwrap(authority.snapshot)
+        guard case .boundaryApplied(let boundary) = authority.applyBoundary(
+            expectedReducerRevision: snapshot.reducerRevision, observationHead: snapshot.lastObservationSequence
+        ) else { return XCTFail("Missing old-output boundary") }
+        guard case .armed(let current, _, _) = authority.armSuccessor(
+            operationID: UUID(), target: inputAudioTransactionTarget,
+            boundary: boundary, observationHead: snapshot.lastObservationSequence
+        ) else { return XCTFail("Missing microphone successor") }
+        let beforeRetired = authority.snapshot
+        let retired = authority.observe(audioTransactionObservation(
+            for: old.operation, target: outputAudioTransactionTarget,
+            disposition: .expectedRetiredAppOperation, sequence: 1
+        ))
+        guard case .ignored(let reason, let retainedCurrent, _) = retired else {
+            return XCTFail("Retired output observation was not ignored")
+        }
+        XCTAssertEqual(reason, .retiredOperation)
+        XCTAssertEqual(retainedCurrent, current)
+        XCTAssertEqual(authority.snapshot, beforeRetired)
+        guard case .observationAccepted(let accepted, _) = authority.observe(audioTransactionObservation(
+            for: current, target: inputAudioTransactionTarget,
+            disposition: .expectedCurrentAppOperation, sequence: 2
+        )) else { return XCTFail("Fresh default-policy microphone observation was not accepted") }
+        XCTAssertEqual(accepted, current)
+    }
+
     func testAudioTransactionAuthorityRoundTripsUUIDAndValidatedPredecessor()
         throws {
         let authority = AudioTransactionAuthority()
@@ -67,7 +219,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             mode: AVAudioSession.Mode.default.rawValue,
             categoryOptionsRawValue: 0,
             routeSharingPolicyRawValue:
-                Int(AVAudioSession.RouteSharingPolicy.default.rawValue),
+                Int(AVAudioSession.RouteSharingPolicy.longFormAudio.rawValue),
             inputRequired: false
         )
         let firstID = try XCTUnwrap(
@@ -1242,6 +1394,15 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(try XCTUnwrap(authority.snapshot).tombstoneCount, 0)
 
+        guard case .observationAccepted(let retryObserved, _) = authority.observe(
+            audioTransactionObservation(
+                for: retryTransaction.operation, target: outputAudioTransactionTarget,
+                disposition: .expectedCurrentAppOperation,
+                deviceGeneration: binding.deviceInstanceGeneration, sequence: 1
+            )
+        ) else { return XCTFail("Retry must arm and accept the canonical long-form output target.") }
+        XCTAssertEqual(retryObserved, retryTransaction.operation)
+
         XCTAssertTrue(
             fixture.controller.consumeIOSAudioTransactionDeviceTeardown(
                 WebRTCIOSAudioCategoryDeviceTeardownReceipt(
@@ -1249,7 +1410,8 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                         binding.deviceInstanceGeneration,
                     observationRegistrationGeneration:
                         binding.observationRegistrationGeneration,
-                    notificationSequenceWatermark: 0,
+                    notificationSequenceWatermark:
+                        authority.snapshot?.lastObservationSequence ?? 0,
                     teardownGeneration: 1,
                     ingressInFlightCount: 0
                 )
@@ -18928,7 +19090,8 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             ),
             "route-sharing-policy": iosPlayoutDiagnostics(
                 callbacks: 10, frames: 4_800, failures: 0,
-                routeSharingPolicyIsDefault: false
+                routeSharingPolicyIsDefault: true,
+                routeSharingPolicyIsLongFormAudio: false
             ),
             "sample-rate": iosPlayoutDiagnostics(
                 callbacks: 10, frames: 4_800, failures: 0, sampleRate: 44_100
@@ -21416,7 +21579,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             mode: AVAudioSession.Mode.default.rawValue,
             categoryOptionsRawValue: 0,
             routeSharingPolicyRawValue:
-                Int(AVAudioSession.RouteSharingPolicy.default.rawValue),
+                Int(AVAudioSession.RouteSharingPolicy.longFormAudio.rawValue),
             inputRequired: false
         )
     }
@@ -21492,7 +21655,8 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         target: AudioTransactionTarget,
         disposition: WebRTCIOSAudioCategoryObservationDisposition,
         deviceGeneration: UInt64 = 61,
-        sequence: UInt64
+        sequence: UInt64,
+        observedRouteSharingPolicyRawValue: Int? = nil
     ) -> WebRTCIOSAudioCategoryObservationReceipt {
         WebRTCIOSAudioCategoryObservationReceipt(
             disposition: disposition,
@@ -21515,7 +21679,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             observedCategoryOptionsRawValue:
                 target.categoryOptionsRawValue,
             observedRouteSharingPolicyRawValue:
-                target.routeSharingPolicyRawValue,
+                observedRouteSharingPolicyRawValue ?? target.routeSharingPolicyRawValue,
             expectedCategory: target.category,
             expectedMode: target.mode,
             expectedCategoryOptionsRawValue:
@@ -22577,7 +22741,8 @@ private func iosPlayoutDiagnostics(
     categoryOptionsAreEmpty: Bool? = nil,
     categoryOptionsAreIPhoneMicrophoneRouting: Bool? = nil,
     categoryOptionsAreMixWithOthers: Bool = false,
-    routeSharingPolicyIsDefault: Bool = true,
+    routeSharingPolicyIsDefault: Bool? = nil,
+    routeSharingPolicyIsLongFormAudio: Bool? = nil,
     hasOutputRoute: Bool = true,
     hostedCallMode: Bool = false,
     hostedCallAuthorizationValid: Bool = false,
@@ -22640,7 +22805,10 @@ private func iosPlayoutDiagnostics(
         categoryOptionsAreIPhoneMicrophoneRouting:
             effectiveCategoryOptionsAreIPhoneMicrophoneRouting,
         categoryOptionsAreMixWithOthers: categoryOptionsAreMixWithOthers,
-        routeSharingPolicyIsDefault: routeSharingPolicyIsDefault,
+        routeSharingPolicyIsDefault:
+            routeSharingPolicyIsDefault ?? (inputBusEnabled || hostedCallMode),
+        routeSharingPolicyIsLongFormAudio:
+            routeSharingPolicyIsLongFormAudio ?? (!inputBusEnabled && !hostedCallMode),
         hasOutputRoute: hasOutputRoute,
         hostedCallMode: hostedCallMode,
         hostedCallAuthorizationValid: hostedCallAuthorizationValid,

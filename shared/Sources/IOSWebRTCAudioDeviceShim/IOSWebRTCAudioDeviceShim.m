@@ -2171,6 +2171,13 @@ static AVAudioSessionCategoryOptions ASIPhoneMicrophoneCategoryOptions(void) {
         | AVAudioSessionCategoryOptionAllowBluetoothA2DP;
 }
 
+/// Ordinary playback explicitly joins the shared media route. Input transactions retain
+/// the default route policy; hosted-call configuration selects its own default separately.
+static AVAudioSessionRouteSharingPolicy ASOrdinaryRouteSharingPolicy(BOOL inputRequired) {
+    return inputRequired ? AVAudioSessionRouteSharingPolicyDefault
+        : AVAudioSessionRouteSharingPolicyLongFormAudio;
+}
+
 /// A category notification can be delivered after the exact native transaction that authored it
 /// has advanced or retired. Validate it against the immutable policy captured at ingress instead
 /// of recomputing policy from later microphone ownership. This is observational only: it neither
@@ -2220,7 +2227,7 @@ static BOOL ASExpectedCategoryObservationMatchesCapturedPolicy(
         && [category isEqualToString:expectedCategory]
         && [mode isEqualToString:AVAudioSessionModeDefault]
         && options == expectedOptions
-        && sharingPolicy == AVAudioSessionRouteSharingPolicyDefault;
+        && sharingPolicy == ASOrdinaryRouteSharingPolicy(inputRequired);
 }
 
 static ASIOSAudioCategoryTransactionState
@@ -2260,7 +2267,7 @@ static BOOL ASAudioCategoryPolicyTupleIsExact(
     return [category isEqualToString:expectedCategory]
         && [mode isEqualToString:AVAudioSessionModeDefault]
         && options == expectedOptions
-        && sharingPolicy == AVAudioSessionRouteSharingPolicyDefault;
+        && sharingPolicy == ASOrdinaryRouteSharingPolicy(inputRequired);
 }
 
 static ASIOSAudioCategoryObservationReceipt *
@@ -2327,7 +2334,7 @@ ASMakeAudioCategoryObservationReceipt(
         ? ASIPhoneMicrophoneCategoryOptions()
         : 0;
     receipt.expectedRouteSharingPolicy =
-        AVAudioSessionRouteSharingPolicyDefault;
+        ASOrdinaryRouteSharingPolicy(snapshot.expectedInputRequired);
     receipt.policyTupleIsExact = ASAudioCategoryPolicyTupleIsExact(
         snapshot.expectedInputRequired,
         snapshot.category,
@@ -2367,7 +2374,9 @@ static ASAudioPolicyConfiguration ASMakeAudioPolicyConfiguration(
             : (microphoneEnabled
                 ? ASIPhoneMicrophoneCategoryOptions()
                 : 0),
-        .routeSharingPolicy = AVAudioSessionRouteSharingPolicyDefault,
+        .routeSharingPolicy = hostedCallMode
+            ? AVAudioSessionRouteSharingPolicyDefault
+            : ASOrdinaryRouteSharingPolicy(microphoneEnabled),
         .inputBusEnabled = microphoneEnabled,
         .outputBusEnabled = YES,
         .outputStreamFormat = outputStreamFormat,
@@ -4913,6 +4922,7 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
 @property(nonatomic) NSInteger outputNumberOfChannels;
 @property(nonatomic) NSInteger inputNumberOfChannels;
 @property(nonatomic, strong) ASOutputPolicyRepairTestRoute *currentRoute;
+@property(nonatomic, strong) ASOutputPolicyRepairTestPort *preferredInput;
 @property(nonatomic) NSUInteger setterCalls;
 @property(nonatomic) BOOL persistMismatch;
 @property(nonatomic) BOOL rejectSetter;
@@ -5277,6 +5287,7 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
             inputRequired = NO;
             category = AVAudioSessionCategoryPlayback;
             options = 0;
+            sharingPolicy = AVAudioSessionRouteSharingPolicyLongFormAudio;
             break;
         case ASIOSExpectedCategoryObservationTestScenarioUntracked:
             trackedTransaction = NO;
@@ -8978,7 +8989,7 @@ static OSStatus ASRemoteIOInput(
             snapshot.mode = AVAudioSessionModeDefault;
             snapshot.categoryOptions = 0;
             snapshot.sharingPolicy =
-                AVAudioSessionRouteSharingPolicyDefault;
+                AVAudioSessionRouteSharingPolicyLongFormAudio;
             snapshot.inputCount = 0;
             snapshot.outputCount = 1;
             snapshot.inputChannels = 0;
@@ -9980,6 +9991,28 @@ static OSStatus ASRemoteIOInput(
 
 - (NSDictionary<NSString *, NSNumber *> *)debugOutputOnlyPolicyRepairForTesting {
     NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
+    // Exercise production target selection and exact tuple matching with independent raw
+    // policy cases. Neither the fixture nor assertions accepts a default/long-form allowlist.
+    result[@"ordinaryOutputPolicy"] = @(ASMakeAudioPolicyConfiguration(NO, NO, _streamFormat).routeSharingPolicy);
+    result[@"microphonePolicy"] = @(ASMakeAudioPolicyConfiguration(NO, YES, _streamFormat).routeSharingPolicy);
+    result[@"hostedPolicy"] = @(ASMakeAudioPolicyConfiguration(YES, NO, _streamFormat).routeSharingPolicy);
+    AVAudioSessionRouteSharingPolicy policies[] = {
+        AVAudioSessionRouteSharingPolicyDefault, AVAudioSessionRouteSharingPolicyLongFormAudio,
+        AVAudioSessionRouteSharingPolicyIndependent, AVAudioSessionRouteSharingPolicyLongFormVideo,
+        (AVAudioSessionRouteSharingPolicy)NSUIntegerMax,
+    };
+    NSArray<NSString *> *policyNames = @[@"default", @"longFormAudio", @"independent", @"video", @"unknown"];
+    for (NSUInteger inputIndex = 0; inputIndex < 2; inputIndex++) {
+        BOOL inputRequired = inputIndex != 0;
+        for (NSUInteger policyIndex = 0; policyIndex < policyNames.count; policyIndex++) {
+            NSString *key = [NSString stringWithFormat:@"%@.%@.exact",
+                inputRequired ? @"input" : @"output", policyNames[policyIndex]];
+            result[key] = @(ASAudioCategoryPolicyTupleIsExact(inputRequired,
+                inputRequired ? AVAudioSessionCategoryPlayAndRecord : AVAudioSessionCategoryPlayback,
+                AVAudioSessionModeDefault, inputRequired ? ASIPhoneMicrophoneCategoryOptions() : 0,
+                policies[policyIndex]));
+        }
+    }
     NSArray<NSString *> *cases = @[@"converged", @"persistent", @"exact", @"setterRejected",
         @"ownershipChanged", @"systemChanged", @"targetChanged", @"outputChanged",
         @"configurationChanged", @"expired", @"priorRejected", @"queuedRejected", @"wrongCategory",
@@ -9990,7 +10023,7 @@ static OSStatus ASRemoteIOInput(
         session.category = AVAudioSessionCategoryPlayback;
         session.mode = AVAudioSessionModeDefault;
         session.routeSharingPolicy = [scenario isEqualToString:@"exact"]
-            ? AVAudioSessionRouteSharingPolicyDefault : AVAudioSessionRouteSharingPolicyLongFormAudio;
+            ? AVAudioSessionRouteSharingPolicyLongFormAudio : AVAudioSessionRouteSharingPolicyDefault;
         if ([scenario isEqualToString:@"unknownPolicy"]) {
             session.routeSharingPolicy = (AVAudioSessionRouteSharingPolicy)NSUIntegerMax;
         }
@@ -10109,6 +10142,64 @@ static OSStatus ASRemoteIOInput(
         result[[scenario stringByAppendingString:@"Error"]] = @(error.code);
         result[[scenario stringByAppendingString:@"RejectionCode"]] = @(rejectionCode);
         result[[scenario stringByAppendingString:@"RepeatedRejectionCode"]] = @(repeatedRejectionCode);
+        if ([scenario isEqualToString:@"exact"]) {
+            // Drive the real route validators without creating/starting an AudioUnit. Each
+            // opposite/unsupported policy must leave the current transaction state unadvanced.
+            _debugRecoveryHarnessMode = NO;
+            os_unfair_lock_lock(&ASSessionConfigurationLock);
+            BOOL rejectsBeforePrepare = YES;
+            for (NSUInteger policyIndex = 0; policyIndex < policyNames.count; policyIndex++) {
+                if (policyIndex == 1) { continue; }
+                session.routeSharingPolicy = policies[policyIndex];
+                rejectsBeforePrepare &= ![self tryPrepareExpectedMicrophoneRouteChangeForAudioUnitStartForSession:
+                    (AVAudioSession *)session configurationGeneration:configuration ownershipToken:token];
+            }
+            session.routeSharingPolicy = AVAudioSessionRouteSharingPolicyLongFormAudio;
+            BOOL prepared = [self tryPrepareExpectedMicrophoneRouteChangeForAudioUnitStartForSession:
+                (AVAudioSession *)session configurationGeneration:configuration ownershipToken:token];
+            BOOL (^advance)(ASExpectedMicrophoneRouteChangeState, ASExpectedMicrophoneRouteChangeState) =
+                ^BOOL(ASExpectedMicrophoneRouteChangeState from, ASExpectedMicrophoneRouteChangeState to) {
+                    return [self transitionExpectedMicrophoneRouteChangeForSession:(AVAudioSession *)session
+                        transactionIdentifier:transaction expectedState:from nextState:to
+                        requirePreparedRoute:YES validatedNotificationSequence:NULL];
+                };
+            BOOL (^rejectWrongPolicies)(ASExpectedMicrophoneRouteChangeState, ASExpectedMicrophoneRouteChangeState) =
+                ^BOOL(ASExpectedMicrophoneRouteChangeState from, ASExpectedMicrophoneRouteChangeState to) {
+                    BOOL rejected = YES;
+                    AVAudioSessionRouteSharingPolicy wrongPolicies[] = {
+                        AVAudioSessionRouteSharingPolicyDefault, AVAudioSessionRouteSharingPolicyIndependent,
+                        AVAudioSessionRouteSharingPolicyLongFormVideo, (AVAudioSessionRouteSharingPolicy)NSUIntegerMax,
+                    };
+                    for (NSUInteger index = 0; index < 4; index++) {
+                        session.routeSharingPolicy = wrongPolicies[index];
+                        rejected &= !advance(from, to);
+                    }
+                    session.routeSharingPolicy = AVAudioSessionRouteSharingPolicyLongFormAudio;
+                    return rejected;
+                };
+            BOOL rejectsBeforeStart = prepared && rejectWrongPolicies(
+                ASExpectedMicrophoneRouteChangeStatePrepared, ASExpectedMicrophoneRouteChangeStateStarting);
+            BOOL starting = prepared && advance(ASExpectedMicrophoneRouteChangeStatePrepared,
+                ASExpectedMicrophoneRouteChangeStateStarting);
+            // This is the deterministic start-settlement seam, not a hardware-start claim.
+            BOOL stamped = starting && [self markExpectedMicrophoneRouteChangeAudioUnitStartCompleted];
+            BOOL rejectsBeforeCommit = stamped && rejectWrongPolicies(
+                ASExpectedMicrophoneRouteChangeStateStarting, ASExpectedMicrophoneRouteChangeStateConsumed);
+            BOOL consumed = stamped && advance(ASExpectedMicrophoneRouteChangeStateStarting,
+                ASExpectedMicrophoneRouteChangeStateConsumed);
+            BOOL rejectsConsumed = consumed && rejectWrongPolicies(
+                ASExpectedMicrophoneRouteChangeStateConsumed, ASExpectedMicrophoneRouteChangeStateConsumed);
+            BOOL revalidated = consumed && advance(ASExpectedMicrophoneRouteChangeStateConsumed,
+                ASExpectedMicrophoneRouteChangeStateConsumed);
+            result[@"outputRoutePrepare"] = @(prepared);
+            result[@"outputRouteStart"] = @(starting);
+            result[@"outputRouteCommit"] = @(consumed);
+            result[@"outputRouteConsumed"] = @(revalidated);
+            result[@"wrongPoliciesRejectedAcrossRouteStates"] = @(rejectsBeforePrepare
+                && rejectsBeforeStart && rejectsBeforeCommit && rejectsConsumed);
+            os_unfair_lock_unlock(&ASSessionConfigurationLock);
+            _debugRecoveryHarnessMode = YES;
+        }
         if ([scenario isEqualToString:@"unknownPolicy"]) {
             _debugRecoveryHarnessMode = NO;
             ASIOSAudioFailureContext context = [self captureFailureContextWithCode:
@@ -10117,7 +10208,7 @@ static OSStatus ASRemoteIOInput(
                 session:(AVAudioSession *)session];
             context.targetPolicyRejectionCode = rejectionCode;
             _debugRecoveryHarnessMode = YES;
-            session.routeSharingPolicy = AVAudioSessionRouteSharingPolicyDefault;
+            session.routeSharingPolicy = AVAudioSessionRouteSharingPolicyLongFormAudio;
             [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureMediaRouteInvariant
                 status:kAudio_ParamError context:context message:@"Injected target-policy rejection."];
             ASIOSAudioFailureContext retained = self.diagnostics.failureContext;
@@ -11460,11 +11551,12 @@ static OSStatus ASRemoteIOInput(
                 result[[prefix stringByAppendingString:@"exactTupleAccepted"]] =
                     @(ASAudioCategoryPolicyTupleIsExact(inputRequired, session.category,
                         session.mode, session.categoryOptions, observedPolicy));
-                result[[prefix stringByAppendingString:@"nonDefaultTupleRejected"]] =
+                result[[prefix stringByAppendingString:@"oppositePolicyRejected"]] =
                     @(!ASAudioCategoryPolicyTupleIsExact(inputRequired,
                         ASCategoryForAudioPolicyConfiguration(configuration),
                         AVAudioSessionModeDefault, configuration.categoryOptions,
-                        AVAudioSessionRouteSharingPolicyLongFormAudio));
+                        inputRequired ? AVAudioSessionRouteSharingPolicyLongFormAudio
+                            : AVAudioSessionRouteSharingPolicyDefault));
                 if (!inputRequired) {
                     NSError *activationError = nil;
                     BOOL activated = applied && [session setActive:YES error:&activationError];
@@ -12737,6 +12829,7 @@ static OSStatus ASRemoteIOInput(
     if (_debugRecoveryHarnessMode) {
         BOOL hasActiveRecordedConfiguration =
             _debugHasRecordedAudioPolicyConfiguration && _sessionActive;
+        AVAudioSessionRouteSharingPolicy observedSharingPolicy = _debugLastConfiguredRouteSharingPolicy;
         diagnostics.categoryOptionsAreEmpty =
             hasActiveRecordedConfiguration
             && _debugLastConfiguredCategoryOptions == 0;
@@ -12746,8 +12839,12 @@ static OSStatus ASRemoteIOInput(
                 == ASIPhoneMicrophoneCategoryOptions();
         diagnostics.routeSharingPolicyIsDefault =
             hasActiveRecordedConfiguration
-            && _debugLastConfiguredRouteSharingPolicy
+            && observedSharingPolicy
                 == AVAudioSessionRouteSharingPolicyDefault;
+        diagnostics.routeSharingPolicyIsLongFormAudio =
+            hasActiveRecordedConfiguration
+            && observedSharingPolicy
+                == AVAudioSessionRouteSharingPolicyLongFormAudio;
         diagnostics.categoryOptionsAreMixWithOthers =
             hasActiveRecordedConfiguration
             && _debugLastConfiguredCategoryOptions
@@ -12757,8 +12854,11 @@ static OSStatus ASRemoteIOInput(
         diagnostics.categoryOptionsAreEmpty = session.categoryOptions == 0;
         diagnostics.categoryOptionsAreIPhoneMicrophoneRouting =
             session.categoryOptions == ASIPhoneMicrophoneCategoryOptions();
+        AVAudioSessionRouteSharingPolicy observedSharingPolicy = session.routeSharingPolicy;
         diagnostics.routeSharingPolicyIsDefault =
-            session.routeSharingPolicy == AVAudioSessionRouteSharingPolicyDefault;
+            observedSharingPolicy == AVAudioSessionRouteSharingPolicyDefault;
+        diagnostics.routeSharingPolicyIsLongFormAudio =
+            observedSharingPolicy == AVAudioSessionRouteSharingPolicyLongFormAudio;
         diagnostics.categoryOptionsAreMixWithOthers =
             session.categoryOptions == AVAudioSessionCategoryOptionMixWithOthers;
  #if DEBUG
@@ -13757,7 +13857,7 @@ static OSStatus ASRemoteIOInput(
             && [_debugLastConfiguredMode
                 isEqualToString:AVAudioSessionModeDefault]
             && _debugLastConfiguredRouteSharingPolicy
-                == AVAudioSessionRouteSharingPolicyDefault
+                == configuration.routeSharingPolicy
             && _debugLastConfiguredCategoryOptions
                 == configuration.categoryOptions
             && _debugLastConfiguredInputBusEnabled == inputRequired
@@ -13770,7 +13870,7 @@ static OSStatus ASRemoteIOInput(
         && [session.mode isEqualToString:AVAudioSessionModeDefault]
         && session.categoryOptions == configuration.categoryOptions
         && session.routeSharingPolicy
-            == AVAudioSessionRouteSharingPolicyDefault
+            == configuration.routeSharingPolicy
         && inputBusMatches;
 }
 
@@ -14197,7 +14297,7 @@ static OSStatus ASRemoteIOInput(
         && [session.category isEqualToString:AVAudioSessionCategoryPlayback]
         && [session.mode isEqualToString:AVAudioSessionModeDefault]
         && session.categoryOptions == 0
-        && session.routeSharingPolicy != AVAudioSessionRouteSharingPolicyDefault
+        && session.routeSharingPolicy != configuration.routeSharingPolicy
         && ![self repairOutputOnlyPolicyForSession:session
             configurationGeneration:configurationGeneration ownershipToken:configurationOwnershipToken
             rejectionCode:&targetPolicyRejectionCode error:&error]) {
@@ -15180,7 +15280,7 @@ static OSStatus ASRemoteIOInput(
     }
     if (requirePolicy
         && snapshot.sharingPolicy
-            != AVAudioSessionRouteSharingPolicyDefault) {
+            != ASOrdinaryRouteSharingPolicy(snapshot.inputRequired)) {
         [failed addObject:@"sharingPolicy"];
     }
     if (requireStartSettlement
@@ -15752,7 +15852,7 @@ static OSStatus ASRemoteIOInput(
         && targetIsPreferred
         && policyIsExact
         && [mode isEqualToString:AVAudioSessionModeDefault]
-        && sharingPolicy == AVAudioSessionRouteSharingPolicyDefault;
+        && sharingPolicy == ASOrdinaryRouteSharingPolicy(inputRequired);
     dispatch_semaphore_t semaphore = nil;
     if (converged) {
         _expectedMicrophoneRouteChangeState =
@@ -15939,7 +16039,7 @@ static OSStatus ASRemoteIOInput(
         && targetIsPreferred
         && policyIsExact
         && [mode isEqualToString:AVAudioSessionModeDefault]
-        && sharingPolicy == AVAudioSessionRouteSharingPolicyDefault;
+        && sharingPolicy == ASOrdinaryRouteSharingPolicy(inputRequired);
 
     dispatch_semaphore_t semaphore = nil;
     os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
@@ -16697,7 +16797,7 @@ static OSStatus ASRemoteIOInput(
             .policyIsExact = policyIsExact
                 && [mode isEqualToString:AVAudioSessionModeDefault]
                 && sharingPolicy
-                    == AVAudioSessionRouteSharingPolicyDefault,
+                    == ASOrdinaryRouteSharingPolicy(inputRequired),
             .ownershipIsBound =
                 _expectedMicrophoneRouteChangeOwnershipToken != 0,
             .ownershipMatches =

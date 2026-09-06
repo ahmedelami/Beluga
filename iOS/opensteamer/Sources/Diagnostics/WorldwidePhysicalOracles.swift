@@ -1138,7 +1138,11 @@ struct WorldwideAudioPlayoutOracleSnapshot: Equatable, Sendable {
     ) -> Bool {
         let categoryMatchesInputPolicy: Bool
         let categoryOptionsMatchInputPolicy: Bool
+        let routeSharingPolicyMatchesInputPolicy: Bool
         if diagnostics.inputBusEnabled {
+            routeSharingPolicyMatchesInputPolicy =
+                diagnostics.routeSharingPolicyIsDefault
+                && !diagnostics.routeSharingPolicyIsLongFormAudio
             categoryMatchesInputPolicy =
                 !diagnostics.categoryIsMediaPlayback
                 && diagnostics.categoryIsMediaPlayAndRecord
@@ -1147,6 +1151,9 @@ struct WorldwideAudioPlayoutOracleSnapshot: Equatable, Sendable {
                 && diagnostics.categoryOptionsAreIPhoneMicrophoneRouting
                 && !diagnostics.categoryOptionsAreMixWithOthers
         } else {
+            routeSharingPolicyMatchesInputPolicy =
+                diagnostics.routeSharingPolicyIsLongFormAudio
+                && !diagnostics.routeSharingPolicyIsDefault
             categoryMatchesInputPolicy =
                 diagnostics.categoryIsMediaPlayback
                 && !diagnostics.categoryIsMediaPlayAndRecord
@@ -1168,7 +1175,7 @@ struct WorldwideAudioPlayoutOracleSnapshot: Equatable, Sendable {
             && categoryMatchesInputPolicy
             && diagnostics.modeIsDefault
             && categoryOptionsMatchInputPolicy
-            && diagnostics.routeSharingPolicyIsDefault
+            && routeSharingPolicyMatchesInputPolicy
             && abs(diagnostics.sampleRate - 48_000) < 1
             && diagnostics.outputIOBufferDuration > 0
             && diagnostics.outputIOBufferDuration <= 0.020

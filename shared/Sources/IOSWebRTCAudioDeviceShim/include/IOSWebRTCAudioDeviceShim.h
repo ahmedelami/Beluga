@@ -267,6 +267,7 @@ typedef struct ASIOSStereoPlayoutDiagnostics {
     bool categoryOptionsAreEmpty;
     bool categoryOptionsAreIPhoneMicrophoneRouting;
     bool routeSharingPolicyIsDefault;
+    bool routeSharingPolicyIsLongFormAudio;
     bool categoryOptionsAreMixWithOthers;
     bool hasOutputRoute;
     bool hostedCallMode;

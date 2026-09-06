@@ -423,6 +423,23 @@ final class WorldwideAudioLifecycleController {
             : normalCategoryOptionsRawValue
     }
 
+    static func canonicalRouteSharingPolicy(
+        category: String,
+        mode: String,
+        categoryOptionsRawValue: UInt
+    ) -> AVAudioSession.RouteSharingPolicy? {
+        guard mode == AVAudioSession.Mode.default.rawValue else { return nil }
+        switch (category, categoryOptionsRawValue) {
+        case (AVAudioSession.Category.playback.rawValue, normalCategoryOptionsRawValue):
+            return .longFormAudio
+        case (AVAudioSession.Category.playAndRecord.rawValue, microphoneCategoryOptionsRawValue),
+             (AVAudioSession.Category.playback.rawValue, hostedCallCategoryOptionsRawValue):
+            return .default
+        default:
+            return nil
+        }
+    }
+
     private enum ExpectedAudioCategoryTransitionPurpose: Equatable {
         case topology
         case outputOnlyMicrophone
@@ -2234,6 +2251,14 @@ final class WorldwideAudioLifecycleController {
         var validatedAdmissiblePredecessorOperationID =
             admissiblePredecessorOperationID
         if tracksNativeTransaction {
+            guard let targetRouteSharingPolicy = Self.canonicalRouteSharingPolicy(
+                category: category,
+                mode: mode,
+                categoryOptionsRawValue: categoryOptionsRawValue
+            ) else {
+                playbackDiagnosticText = "The requested audio policy was not a canonical target."
+                return nil
+            }
             guard let authoritySnapshot =
                     audioTransactionAuthority.snapshot else {
                 playbackDiagnosticText =
@@ -2245,10 +2270,7 @@ final class WorldwideAudioLifecycleController {
                 mode: mode,
                 categoryOptionsRawValue: categoryOptionsRawValue,
                 routeSharingPolicyRawValue:
-                    Int(
-                        AVAudioSession.RouteSharingPolicy.default
-                            .rawValue
-                    ),
+                    Int(targetRouteSharingPolicy.rawValue),
                 inputRequired:
                     category
                         == AVAudioSession.Category

@@ -110,8 +110,12 @@ manual IP addresses, router configuration, or public TCP ports.
   `frameCount * 2` elements. A serial dispatch queue may change pthreads, so synchronously
   notify the delegate of input interruption before delivering on a different thread.
 - The iPhone must use one custom RemoteIO device. With microphone intent off, it is
-  output-only and owns a `.playback` / `.default` audio session with no category
-  options. For a production session handed off by authenticated pairing or reconnect,
+  output-only and owns a `.playback` category / `.default` mode audio session with
+  `.longFormAudio` route-sharing policy and no category options. Microphone duplex
+  and authorized hosted-call playback retain `.default` route sharing. Match the
+  exact selected policy throughout native transactions and runtime proof; never
+  treat any non-default route as acceptable or redefine a diagnostic default bit.
+  For a production session handed off by authenticated pairing or reconnect,
   the first current-generation peer/ICE/control healthy boundary automatically
   establishes microphone intent and, while the app is active, requests permission
   once for that media session. The manual toggle remains an override; denial or a
