@@ -2881,6 +2881,14 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         native.debugTerminateForTesting()
     }
 
+    public func debugRetainedFailureContextForTesting() -> [String: NSNumber] {
+        native.debugRetainedFailureContextForTesting()
+    }
+
+    public func debugBoundedDiagnosticsReadForTesting() -> [String: NSNumber] {
+        native.debugBoundedDiagnosticsReadForTesting()
+    }
+
     public func debugApplyActiveChannelPreferencesForTesting(
         sessionActive: Bool,
         maximumInputChannels: Int,
@@ -3185,6 +3193,7 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
 /// Runtime proof that iOS is using one app-owned conditional-duplex RemoteIO media path rather
 /// than WebRTC's call-oriented default audio device or a duplicate application renderer.
 public struct WebRTCIOSPlayoutDiagnostics: Sendable {
+    public let failureContext: WebRTCAudioClientFailureContext?
     public let initialized: Bool
     public let playoutInitialized: Bool
     public let playing: Bool
@@ -3310,8 +3319,10 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
         playoutPCMEnvelopeTransitionCount: UInt64 = 0,
         playoutPCMShapeAnomalyCallbackCount: UInt64 = 0,
         playoutPCMBoundaryDiscontinuityCallbackCount: UInt64 = 0,
-        playoutLastCallbackMeanMagnitude: UInt32 = 0
+        playoutLastCallbackMeanMagnitude: UInt32 = 0,
+        failureContext: WebRTCAudioClientFailureContext? = nil
     ) {
+        self.failureContext = failureContext
         self.initialized = initialized
         self.playoutInitialized = playoutInitialized
         self.playing = playing
@@ -3502,6 +3513,9 @@ public actor WebRTCPeer {
     #endif
 
     public nonisolated let events: AsyncStream<WebRTCTransportEvent>
+    public nonisolated var audioClientDiagnosticsEvents: AsyncStream<WebRTCAudioClientDiagnosticsEvent> {
+        delegateProxy.audioDiagnosticsLane.events
+    }
     public nonisolated let screenClientDiagnosticsEvents:
         AsyncStream<WebRTCScreenClientDiagnosticsEvent>
     public nonisolated let externalAudioCapturer: MacExternalAudioCapturer?
@@ -3561,6 +3575,7 @@ public actor WebRTCPeer {
     public nonisolated let iOSAudioTransactionDeviceBinding:
         WebRTCIOSAudioTransactionDeviceBinding?
     private let iOSStereoPlayoutAudioDevice: ASIOSStereoPlayoutAudioDevice?
+    private nonisolated let iOSAudioDiagnosticsSampler: WebRTCAudioDiagnosticsSampler?
     private nonisolated let iOSAudioTransactionStager:
         WebRTCIOSAudioTransactionStager?
     private nonisolated(unsafe) let
@@ -3700,6 +3715,8 @@ public actor WebRTCPeer {
     // Client diagnostics use a distinct unreliable lane so malformed or backpressured telemetry
     // can never revoke input or mutate the ordered screen-media state machine.
     private var screenClientDiagnosticsNegotiationEpoch: UInt64?
+    private var audioClientDiagnosticsCapabilityIsLocallyAvailable = false
+    private var pendingAudioClientDiagnosticsAuthorization: UUID?
     // Remote media uses its own replay histories and an exact SDP echo. Unknown message kinds are
     // never sent to an older peer sharing the strict v2 control-channel envelope.
     private var remoteMediaControlsNegotiationEpoch: UInt64?
@@ -3835,6 +3852,8 @@ public actor WebRTCPeer {
         // after native allocation of that channel succeeds below.
         screenClientDiagnosticsCapabilityIsLocallyAvailable =
             configuration.role == .viewer
+        audioClientDiagnosticsCapabilityIsLocallyAvailable =
+            configuration.role == .viewer && configuration.supportsAudioClientDiagnostics
         configuredMaximumVideoBitrate = configuration.maximumVideoBitrate
 
         let defaultEncoderFactory = LKRTCDefaultVideoEncoderFactory()
@@ -3950,6 +3969,7 @@ public actor WebRTCPeer {
             )
         }
         iOSStereoPlayoutAudioDevice = stereoPlayoutDevice
+        iOSAudioDiagnosticsSampler = stereoPlayoutDevice.map { WebRTCAudioDiagnosticsSampler(device: $0) }
         iOSAudioTransactionStager = stereoPlayoutDevice.map {
             WebRTCIOSAudioTransactionStager(device: $0)
         }
@@ -4250,6 +4270,20 @@ public actor WebRTCPeer {
             }
             proxy.installDataChannel(dataChannel)
 
+            if configuration.supportsAudioClientDiagnostics {
+                let audioDiagnosticsConfiguration = LKRTCDataChannelConfiguration()
+                audioDiagnosticsConfiguration.isOrdered = false
+                audioDiagnosticsConfiguration.maxPacketLifeTime = -1
+                audioDiagnosticsConfiguration.maxRetransmits = 0
+                audioDiagnosticsConfiguration.isNegotiated = false
+                audioDiagnosticsConfiguration.`protocol` = AudioClientDiagnosticsLane.channelProtocol
+                if let channel = nativePeer.dataChannel(forLabel: AudioClientDiagnosticsLane.label,
+                                                       configuration: audioDiagnosticsConfiguration) {
+                    proxy.installDataChannel(channel)
+                    audioClientDiagnosticsCapabilityIsLocallyAvailable = true
+                }
+            }
+
             let diagnosticsChannelConfiguration = LKRTCDataChannelConfiguration()
             diagnosticsChannelConfiguration.isOrdered = false
             diagnosticsChannelConfiguration.maxPacketLifeTime = -1
@@ -4307,6 +4341,9 @@ public actor WebRTCPeer {
 
     deinit {
         statisticsTask?.cancel()
+        #if os(iOS)
+        iOSAudioDiagnosticsSampler?.invalidate()
+        #endif
         delegateEventTask?.cancel()
         screenDiagnosticsDelegateEventTask?.cancel()
         screenVideoEncoderProbeEventTask?.cancel()
@@ -4453,6 +4490,12 @@ public actor WebRTCPeer {
             ) {
                 screenClientDiagnosticsNegotiationEpoch = offerEpoch
             }
+            delegateProxy.audioDiagnosticsLane.configure(
+                negotiationID: audioClientDiagnosticsCapabilityIsLocallyAvailable
+                    ? AudioClientDiagnosticsSDP.negotiatedAuthorization(hostOfferSDP: sdp, viewerAnswerSDP: answerSDP)
+                    : nil,
+                acceptsIncoming: false
+            )
             // `outboundSignal(.answer)` is the ordered post-capability event consumed by the
             // viewer. The application may retry its current challenge only after forwarding this
             // answer; the peer-side transport/capability check remains authoritative.
@@ -4526,6 +4569,9 @@ public actor WebRTCPeer {
                         )
                     }
                     : nil
+            let audioDiagnosticsAuthorization = pendingScreenMediaHostOfferSDP.flatMap {
+                AudioClientDiagnosticsSDP.negotiatedAuthorization(hostOfferSDP: $0, viewerAnswerSDP: sdp)
+            }
             try installRemoteICEUsernameFragments(from: sdp)
             remoteDescriptionIsSet = true
             try await flushRemoteCandidates(expectedEpoch: offerEpoch)
@@ -4536,6 +4582,12 @@ public actor WebRTCPeer {
             }
             outstandingLocalOfferEpoch = nil
             pendingScreenMediaHostOfferSDP = nil
+            delegateProxy.audioDiagnosticsLane.configure(
+                negotiationID: audioClientDiagnosticsCapabilityIsLocallyAvailable
+                    && audioDiagnosticsAuthorization == pendingAudioClientDiagnosticsAuthorization
+                    ? audioDiagnosticsAuthorization : nil,
+                acceptsIncoming: true
+            )
             let expectedRemoteMediaAuthorization =
                 pendingRemoteMediaAuthorization
             pendingRemoteMediaAuthorization = nil
@@ -5821,6 +5873,25 @@ public actor WebRTCPeer {
     public func screenClientDiagnosticsIsNegotiated() -> Bool {
         screenClientDiagnosticsCapabilityIsLocallyAvailable
             && screenClientDiagnosticsNegotiationEpoch == negotiationEpoch
+    }
+
+    public func audioClientDiagnosticsIsNegotiated() -> Bool {
+        !isClosed && delegateProxy.audioDiagnosticsLane.currentContext()?.isValid == true
+    }
+
+    public func audioClientDiagnosticsContext() -> WebRTCAudioClientDiagnosticsContext? {
+        guard !isClosed else { return nil }
+        return delegateProxy.audioDiagnosticsLane.currentContext()
+    }
+
+    public func sendAudioClientDiagnosticsHeartbeat(
+        _ heartbeat: WebRTCAudioClientDiagnosticsHeartbeat,
+        context: WebRTCAudioClientDiagnosticsContext
+    ) throws {
+        guard !isClosed, role == .viewer else {
+            throw WebRTCAudioClientDiagnosticsLaneFailure.unavailable
+        }
+        try delegateProxy.audioDiagnosticsLane.send(heartbeat, context: context)
     }
 
     /// True only for the current host offer and viewer answer that both carried media-controls v1.
@@ -7430,6 +7501,12 @@ public actor WebRTCPeer {
     }
 
     #if os(iOS)
+    /// Best-effort sampling never enters the peer actor or the ordered peer event consumer.
+    /// Timeout returns unavailable while retaining the process-wide in-flight slot.
+    public nonisolated func iOSAudioClientDiagnostics() async -> WebRTCAudioClientNativeSnapshot? {
+        await iOSAudioDiagnosticsSampler?.sample()
+    }
+
     public func iOSPlayoutDiagnostics() -> WebRTCIOSPlayoutDiagnostics? {
         guard let device = iOSStereoPlayoutAudioDevice else { return nil }
         let value = device.diagnostics
@@ -7519,7 +7596,8 @@ public actor WebRTCPeer {
             playoutPCMBoundaryDiscontinuityCallbackCount:
                 value.playoutPCMBoundaryDiscontinuityCallbackCount,
             playoutLastCallbackMeanMagnitude:
-                value.playoutLastCallbackMeanMagnitude
+                value.playoutLastCallbackMeanMagnitude,
+            failureContext: WebRTCAudioClientFailureContext(native: value.failureContext)
         )
     }
 
@@ -9127,6 +9205,9 @@ public actor WebRTCPeer {
     /// No diagnostic event can be trusted after an event-stream loss. Revoke the shared input
     /// gate first, then synchronously close native media and finish the stream.
     private func failClosedForEventDeliveryLoss(_ reason: String) {
+        #if os(iOS)
+        iOSAudioDiagnosticsSampler?.invalidate()
+        #endif
         guard !isClosed else { return }
         resetMacHostedCallEvidenceTransportState()
         resetRemoteMediaControlsNegotiation(emitAvailability: false)
@@ -10765,6 +10846,8 @@ public actor WebRTCPeer {
     }
 
     private func nextNegotiationEpoch() -> UInt64 {
+        delegateProxy.audioDiagnosticsLane.configure(negotiationID: nil, acceptsIncoming: role == .host)
+        pendingAudioClientDiagnosticsAuthorization = nil
         negotiationEpoch &+= 1
         return negotiationEpoch
     }
@@ -10812,6 +10895,8 @@ public actor WebRTCPeer {
 
     private func createAndSetLocalOffer() async throws -> String {
         try applyHighFidelityAudioSenderParameters()
+        let audioDiagnosticsAuthorization = audioClientDiagnosticsCapabilityIsLocallyAvailable ? UUID() : nil
+        pendingAudioClientDiagnosticsAuthorization = audioDiagnosticsAuthorization
         let advertisesScreenClientDiagnostics =
             screenClientDiagnosticsCapabilityIsLocallyAvailable
         let remoteMediaAuthorization = pendingRemoteMediaAuthorization
@@ -10846,7 +10931,9 @@ public actor WebRTCPeer {
                     : remoteMediaSDP
                 let localDescription = LKRTCSessionDescription(
                     type: productDescription.type,
-                    sdp: diagnosticsSDP
+                    sdp: audioDiagnosticsAuthorization.map {
+                        AudioClientDiagnosticsSDP.advertisingHostSupport(in: diagnosticsSDP, authorization: $0)
+                    } ?? diagnosticsSDP
                 )
                 peerConnection.setLocalDescription(localDescription) { error in
                     if let error {
@@ -10863,6 +10950,7 @@ public actor WebRTCPeer {
 
     private func createAndSetLocalAnswer(remoteOfferSDP: String) async throws -> String {
         try applyHighFidelityAudioSenderParameters()
+        let advertisesAudioClientDiagnostics = audioClientDiagnosticsCapabilityIsLocallyAvailable
         let expectedNegotiationEpoch = negotiationEpoch
         let advertisesScreenClientDiagnostics =
             screenClientDiagnosticsCapabilityIsLocallyAvailable
@@ -10905,7 +10993,10 @@ public actor WebRTCPeer {
                     : remoteMediaSDP
                 let localDescription = LKRTCSessionDescription(
                     type: productDescription.type,
-                    sdp: diagnosticsSDP
+                    sdp: advertisesAudioClientDiagnostics
+                        ? AudioClientDiagnosticsSDP.advertisingViewerSupport(
+                            in: diagnosticsSDP, remoteOfferSDP: remoteOfferSDP)
+                        : diagnosticsSDP
                 )
                 peerConnection.setLocalDescription(localDescription) { error in
                     if let error {
@@ -12161,6 +12252,9 @@ public actor WebRTCPeer {
 
     @discardableResult
     private func closeTransport() -> Bool {
+        #if os(iOS)
+        iOSAudioDiagnosticsSampler?.invalidate()
+        #endif
         guard !isClosed else {
             return retireOwnedAudioDeviceForPeerClosure()
         }

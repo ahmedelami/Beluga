@@ -214,6 +214,8 @@ enum WorldwideIPhoneMicrophoneOutputOnlyCompletion {
 @MainActor
 final class WorldwideAudioLifecycleController {
     var onSnapshotChanged: ((WorldwideAudioLifecycleSnapshot) -> Void)?
+    var onDiagnosticsAuthorityFailure: ((AudioTransactionDecision) -> Void)?
+    var onDiagnosticsBoundary: ((WebRTCAudioClientEventKind) -> Void)?
     /// The custom WebRTC audio device owns AVAudioSession/RemoteIO. App lifecycle and route
     /// policy call this only after reopening WebRTC's manual audio gate so the active peer can
     /// authorize a device rebuild on its ADM thread.
@@ -495,12 +497,14 @@ final class WorldwideAudioLifecycleController {
             audioTransactionAuthority
 
         events.onInterruptionBegan = { [weak self] reason in
+            self?.onDiagnosticsBoundary?(.interruption)
             self?.interruptionBegan(reason: reason)
         }
         events.onInterruptionEnded = { [weak self] shouldResume in
             self?.interruptionEnded(shouldResume: shouldResume)
         }
         events.onRouteChanged = { [weak self] message in
+            self?.onDiagnosticsBoundary?(.routeChanged)
             self?.routeChanged(message)
         }
         events.onCategoryChanged = { [weak self] change in
@@ -2639,6 +2643,7 @@ final class WorldwideAudioLifecycleController {
         _ decision: AudioTransactionDecision,
         context: String
     ) {
+        onDiagnosticsAuthorityFailure?(decision)
         playbackDiagnosticText =
             "Audio transaction authority rejected \(context): \(String(describing: decision))."
     }
@@ -3390,6 +3395,7 @@ final class WorldwideAudioLifecycleController {
                 || transition.transactionOperation == operation else {
             return
         }
+        onDiagnosticsAuthorityFailure?(.failedClosed(operation))
         guard transition.outputOnlyToken?.state != .executing else {
             playbackIsReady = false
             runtimePlayoutIsReady = false

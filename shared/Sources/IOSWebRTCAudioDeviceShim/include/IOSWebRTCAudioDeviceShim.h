@@ -39,6 +39,79 @@ typedef NS_ENUM(NSInteger, ASIOSStereoPlayoutFailureCode) {
     ASIOSStereoPlayoutFailureMicrophoneDelivery = 25,
 };
 
+/// Stable, content-free native failure boundaries. Zero means no retained failure.
+typedef NS_ENUM(uint16_t, ASIOSAudioFailureStage) {
+    ASIOSAudioFailureStageNone = 0,
+    ASIOSAudioFailureStageSessionConfiguration = 1,
+    ASIOSAudioFailureStageSessionPreferences = 2,
+    ASIOSAudioFailureStageSessionActivation = 3,
+    ASIOSAudioFailureStageRouteValidation = 4,
+    ASIOSAudioFailureStageAudioUnitCreation = 5,
+    ASIOSAudioFailureStageAudioUnitConfiguration = 6,
+    ASIOSAudioFailureStageAudioUnitInitialization = 7,
+    ASIOSAudioFailureStageRoutePreparation = 8,
+    ASIOSAudioFailureStageRouteBeginStart = 9,
+    ASIOSAudioFailureStageAudioUnitStart = 10,
+    ASIOSAudioFailureStageRouteStartCompleted = 11,
+    ASIOSAudioFailureStageRouteCommit = 12,
+    ASIOSAudioFailureStageRoutePublication = 13,
+    ASIOSAudioFailureStageRetry = 14,
+    ASIOSAudioFailureStageSystemEvent = 15,
+    ASIOSAudioFailureStageTeardown = 16,
+};
+
+typedef NS_ENUM(uint16_t, ASIOSAudioFailureReason) {
+    ASIOSAudioFailureReasonUnspecified = 0,
+    ASIOSAudioFailureReasonActivationRejected = 1,
+    ASIOSAudioFailureReasonBuiltInInputUnavailable = 2,
+    ASIOSAudioFailureReasonPreferredInputRequest = 3,
+    ASIOSAudioFailureReasonPreferredInputConvergence = 4,
+    ASIOSAudioFailureReasonSessionOwnershipLost = 5,
+    ASIOSAudioFailureReasonOutputUnavailable = 6,
+    ASIOSAudioFailureReasonOutputChannelRequest = 7,
+    ASIOSAudioFailureReasonInputUnavailable = 8,
+    ASIOSAudioFailureReasonInputChannelRequest = 9,
+    ASIOSAudioFailureReasonSampleRateRequest = 10,
+    ASIOSAudioFailureReasonBufferDurationRequest = 11,
+    ASIOSAudioFailureReasonRetryHookUnavailable = 12,
+    ASIOSAudioFailureReasonRetryVerificationRejected = 13,
+    ASIOSAudioFailureReasonPolicyMismatch = 14,
+    ASIOSAudioFailureReasonRouteTransactionRejected = 15,
+    ASIOSAudioFailureReasonNativeOperationFailed = 16,
+    ASIOSAudioFailureReasonSessionUnavailable = 17,
+    ASIOSAudioFailureReasonHostedOwnershipChanged = 18,
+};
+
+/// One coherent, bounded historical observation, captured before native failure cleanup.
+/// eventSequence == 0 is absent. A later healthy live snapshot does not erase this record.
+/// Generations identify its original device/attempt; it is never evidence of current failure.
+typedef struct ASIOSAudioFailureContext {
+    uint64_t eventSequence;
+    uint64_t deviceInstanceGeneration;
+    uint64_t systemAudioGeneration;
+    uint64_t configurationGeneration;
+    uint64_t appOperationTagGeneration;
+    ASIOSAudioFailureStage stage;
+    ASIOSAudioFailureReason reason;
+    int32_t failureCode;
+    int32_t status;
+    double sampleRate;
+    double outputIOBufferDuration;
+    int32_t inputChannelCount;
+    int32_t outputChannelCount;
+    bool sessionAvailable;
+    bool inputRequired;
+    bool hostedCall;
+    bool sessionActive;
+    bool ownsSessionActivation;
+    bool hasOutputRoute;
+    bool categoryIsMediaPlayback;
+    bool categoryIsMediaPlayAndRecord;
+    bool modeIsDefault;
+    bool categoryOptionsAreEmpty;
+    bool categoryOptionsAreIPhoneMicrophoneRouting;
+} ASIOSAudioFailureContext;
+
 /// Exact source of one hosted-call output-only policy. Unspecified is never admissible.
 typedef NS_ENUM(NSInteger, ASIOSHostedCallPlayoutOrigin) {
     ASIOSHostedCallPlayoutOriginUnspecified = 0,
@@ -64,8 +137,8 @@ typedef NS_ENUM(NSInteger, ASIOSMicrophoneStageFailureReason) {
     ASIOSMicrophoneStageFailureRecordingGenerationBindFailed = 11,
 };
 
-/// A lock-free snapshot of counters written by the RemoteIO render callback plus atomically
-/// mirrored device lifecycle state.
+/// Lock-free render counters plus mirrored lifecycle state and one separately lock-copied
+/// failure record. The RemoteIO callbacks never acquire the failure-record lock.
 typedef struct ASIOSStereoPlayoutDiagnostics {
     bool initialized;
     bool playoutInitialized;
@@ -90,6 +163,7 @@ typedef struct ASIOSStereoPlayoutDiagnostics {
     uint32_t audioUnitSubType;
     ASIOSStereoPlayoutFailureCode failureCode;
     int32_t lastLifecycleStatus;
+    ASIOSAudioFailureContext failureContext;
     uint64_t playoutCallbackCount;
     uint64_t playoutFrameCount;
     uint64_t playoutFailureCount;
@@ -634,6 +708,8 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting;
 - (BOOL)debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugPlayoutRetryFailureForTesting:
     (ASIOSPlayoutRetryFailureTestScenario)scenario
     NS_SWIFT_NAME(debugPlayoutRetryFailureForTesting(_:));
@@ -723,6 +799,9 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 @interface ASIOSStereoPlayoutAudioDevice : NSObject <LKRTCAudioDevice>
 
 @property(nonatomic, readonly) ASIOSStereoPlayoutDiagnostics diagnostics;
+/// Best-effort coherent observation: NO leaves the output untouched on lock/counter contention.
+/// System audio-session property reads still belong on a separate, single-flight sampling queue.
+- (BOOL)copyDiagnosticsIfAvailable:(ASIOSStereoPlayoutDiagnostics *)diagnostics;
 @property(atomic, copy, readonly, nullable) NSString *lastLifecycleFailureMessage;
 /// Process-global, monotonic, nonzero identity allocated synchronously at device construction.
 @property(nonatomic, readonly) uint64_t audioCategoryDeviceInstanceGeneration;

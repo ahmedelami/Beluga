@@ -2845,6 +2845,9 @@ typedef struct ASLifecycleDiagnostics {
 @private
     atomic_uint_fast64_t _systemAudioGeneration;
     atomic_uint_fast64_t _activeAudioConfigurationGeneration;
+    os_unfair_lock _failureContextLock;
+    ASIOSAudioFailureContext _retainedFailureContext;
+    uint64_t _failureContextEventSequence;
     AudioStreamBasicDescription _streamFormat;
     AudioStreamBasicDescription _inputStreamFormat;
     BOOL _initialized;
@@ -2923,6 +2926,9 @@ typedef struct ASLifecycleDiagnostics {
     dispatch_semaphore_t _debugDeviceGateClosureSemaphore;
     atomic_bool _debugDeviceGateClosureSignaled;
     BOOL _debugRecoveryHarnessMode;
+    AVAudioSession *_debugFailureContextSession;
+    NSUInteger _debugBoundedDiagnosticsReadAttempts;
+    BOOL _debugAdvanceGenerationDuringBoundedDiagnosticsRead;
     BOOL _debugHealthyPlayoutForTesting;
     BOOL _debugHasOutputRouteOverride;
     BOOL _debugHasOutputRoute;
@@ -3071,6 +3077,29 @@ typedef struct ASLifecycleDiagnostics {
 - (void)failAndRollbackWithCode:(ASIOSStereoPlayoutFailureCode)code
                          status:(int32_t)status
                         message:(NSString *)message;
+- (void)failAndRollbackWithCode:(ASIOSStereoPlayoutFailureCode)code
+                         status:(int32_t)status
+                          stage:(ASIOSAudioFailureStage)stage
+                         reason:(ASIOSAudioFailureReason)reason
+                        message:(NSString *)message;
+- (void)failAndRollbackWithCode:(ASIOSStereoPlayoutFailureCode)code
+                         status:(int32_t)status
+                        context:(ASIOSAudioFailureContext)context
+                        message:(NSString *)message;
+- (ASIOSAudioFailureContext)captureFailureContextWithCode:
+    (ASIOSStereoPlayoutFailureCode)code
+                                                   status:(int32_t)status
+                                                    stage:(ASIOSAudioFailureStage)stage
+                                                   reason:(ASIOSAudioFailureReason)reason
+                                                  session:(AVAudioSession *_Nullable)session;
+- (void)retainFailureContext:(ASIOSAudioFailureContext)context;
+- (void)publishFailureCodePreservingContext:(ASIOSStereoPlayoutFailureCode)code
+                                     status:(int32_t)status
+                                    message:(NSString *)message;
+#if DEBUG
+- (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting;
+#endif
 - (OSStatus)stopAndDisposeAudioUnit;
 - (ASOwnedSessionConfigurationFailure)
     activateOwnedSessionAndApplyRoutePreferences:
@@ -3079,6 +3108,8 @@ typedef struct ASLifecycleDiagnostics {
                            microphoneEnabled:(BOOL)microphoneEnabled
                        configurationGeneration:
                            (uint64_t)configurationGeneration
+                               failureContext:
+                                   (ASIOSAudioFailureContext *)failureContext
                                       error:
                                           (NSError *_Nullable *_Nullable)error;
 - (BOOL)deactivateOwnedSessionWithError:(NSError *_Nullable *_Nullable)error;
@@ -3187,6 +3218,8 @@ typedef struct ASLifecycleDiagnostics {
                      status:(int32_t)status
                     message:(NSString *)message;
 - (void)clearLifecycleFailure;
+- (BOOL)copyDiagnostics:(ASIOSStereoPlayoutDiagnostics *)output
+             nonblocking:(BOOL)nonblocking;
 - (BOOL)rebuildAfterExplicitRecovery;
 - (BOOL)rebuildForCurrentPolicy;
 - (BOOL)microphoneShouldBeActive;
@@ -4826,6 +4859,38 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
 
 @end
 
+/// Changes its route facts during the real owned-session failure cleanup, without using HAL.
+@interface ASAudioFailureContextTestSession : NSObject
+@property(nonatomic) double sampleRate;
+@property(nonatomic) NSTimeInterval IOBufferDuration;
+@property(nonatomic) NSInteger inputNumberOfChannels;
+@property(nonatomic) NSInteger outputNumberOfChannels;
+@property(nonatomic, copy) NSString *category;
+@property(nonatomic, copy) NSString *mode;
+@property(nonatomic) AVAudioSessionCategoryOptions categoryOptions;
+@property(nonatomic) NSUInteger activationCount;
+@property(nonatomic) NSUInteger deactivationCount;
+@end
+
+@implementation ASAudioFailureContextTestSession
+- (NSArray<AVAudioSessionPortDescription *> *)availableInputs { return @[]; }
+- (BOOL)setActive:(BOOL)active error:(NSError **)error {
+    if (error != NULL) { *error = nil; }
+    if (active) {
+        self.activationCount += 1;
+    } else {
+        self.deactivationCount += 1;
+        self.sampleRate = 0;
+        self.IOBufferDuration = 0;
+        self.inputNumberOfChannels = 0;
+        self.outputNumberOfChannels = 0;
+        self.category = AVAudioSessionCategoryPlayback;
+        self.categoryOptions = 0;
+    }
+    return YES;
+}
+@end
+
 @interface ASIOSStereoPlayoutRecoveryTestHarness ()
 @property(nonatomic, strong) ASIOSStereoPlayoutAudioDevice *device;
 @property(nonatomic, strong) ASIOSStereoPlayoutRecoveryHarnessDelegate *delegate;
@@ -5484,6 +5549,14 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
         [self.device retireStagedAppAudioPolicyOperationWithTagGeneration:nextTag]];
     [registration invalidate];
     return result;
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting {
+    return [self.device debugRetainedFailureContextForTesting];
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting {
+    return [self.device debugBoundedDiagnosticsReadForTesting];
 }
 
 - (BOOL)debugAudioCategoryObservationRegistrationFencingForTesting {
@@ -6468,6 +6541,9 @@ static OSStatus ASRemoteIOInput(
     atomic_init(&_microphoneApprovalConsumedGeneration, 0);
     atomic_init(&_systemAudioGeneration, 0);
     atomic_init(&_activeAudioConfigurationGeneration, 0);
+    _failureContextLock = OS_UNFAIR_LOCK_INIT;
+    _retainedFailureContext = (ASIOSAudioFailureContext){0};
+    _failureContextEventSequence = 0;
     _microphoneRecordingGenerationCounter = 0;
     _captureRouteProofGenerationCounter = 0;
     _audioConfigurationGenerationCounter = 0;
@@ -7789,6 +7865,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                    stage:ASIOSAudioFailureStageRouteBeginStart
+                                   reason:ASIOSAudioFailureReasonRouteTransactionRejected
                                   message:[NSString stringWithFormat:
                                       @"RemoteIO start was blocked because the expected route transaction was not prepared (phase=%lu). %@ %@",
                                       (unsigned long)state,
@@ -7846,6 +7924,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                    stage:ASIOSAudioFailureStageRouteStartCompleted
+                                   reason:ASIOSAudioFailureReasonRouteTransactionRejected
                                   message:[NSString stringWithFormat:
                                       @"RemoteIO started, but its route transaction could not record the native start-completion boundary (phase=%lu); callbacks remained gated. %@ %@",
                                       (unsigned long)state,
@@ -7867,6 +7947,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                    stage:ASIOSAudioFailureStageRouteCommit
+                                   reason:ASIOSAudioFailureReasonRouteTransactionRejected
                                   message:[NSString stringWithFormat:
                                       @"RemoteIO started, but its expected route transaction did not converge (phase=%lu); callbacks remained gated. %@ %@",
                                       (unsigned long)state,
@@ -7886,6 +7968,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                    stage:ASIOSAudioFailureStageRoutePublication
+                                   reason:ASIOSAudioFailureReasonRouteTransactionRejected
                                   message:[NSString stringWithFormat:
                                       @"RemoteIO route transaction committed, but playout publication was blocked (phase=%lu); callbacks remained gated. %@ %@",
                                       (unsigned long)state,
@@ -7923,6 +8007,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                    stage:ASIOSAudioFailureStageRoutePublication
+                                   reason:ASIOSAudioFailureReasonHostedOwnershipChanged
                                   message:@"Hosted-call RemoteIO start could not publish playout because its route sequence or callback gate changed during native start."];
             return NO;
         }
@@ -10954,6 +11040,158 @@ static OSStatus ASRemoteIOInput(
         && _microphoneAuthorization == authorization
         && admissionRemainedOpen;
 }
+
+- (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting {
+    NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
+    result[@"initiallyAbsent"] = @(self.diagnostics.failureContext.eventSequence == 0);
+    ASAudioFailureContextTestSession *session = [[ASAudioFailureContextTestSession alloc] init];
+    session.sampleRate = 44100;
+    session.IOBufferDuration = 0.02;
+    session.inputNumberOfChannels = 0;
+    session.outputNumberOfChannels = 1;
+    session.category = AVAudioSessionCategoryPlayAndRecord;
+    session.mode = AVAudioSessionModeDefault;
+    session.categoryOptions = ASIPhoneMicrophoneCategoryOptions();
+    _debugFailureContextSession = (AVAudioSession *)session;
+    [self debugMarkHealthyPlayoutForTesting];
+    _wantsRecording = YES;
+    uint64_t configuration = ++_audioConfigurationGenerationCounter;
+    atomic_store_explicit(&_activeAudioConfigurationGeneration, configuration, memory_order_release);
+    uint64_t originalGeneration = atomic_load_explicit(
+        &_systemAudioGeneration, memory_order_acquire);
+    ASIOSAudioFailureContext innerContext = {0};
+    NSError *error = nil;
+    ASOwnedSessionConfigurationFailure failure = [self
+        activateOwnedSessionAndApplyRoutePreferences:(AVAudioSession *)session
+        hostedCallMode:NO microphoneEnabled:YES configurationGeneration:configuration
+        failureContext:&innerContext error:&error];
+    result[@"innerFailure"] = @(failure == ASOwnedSessionConfigurationFailureBuiltInMicrophoneUnavailable);
+    result[@"activationCount"] = @(session.activationCount);
+    result[@"deactivationCount"] = @(session.deactivationCount);
+    result[@"routeChangedDuringInnerCleanup"] = @(session.sampleRate == 0 && session.outputNumberOfChannels == 0);
+    [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureMediaRouteInvariant
+        status:kAudio_ParamError context:innerContext message:@"Injected missing-input boundary."];
+    ASIOSStereoPlayoutDiagnostics failed = self.diagnostics;
+    ASIOSAudioFailureContext saved = failed.failureContext;
+    result[@"innerStage"] = @(saved.stage);
+    result[@"innerReason"] = @(saved.reason);
+    result[@"innerCode"] = @(saved.failureCode);
+    result[@"innerStatus"] = @(saved.status);
+    result[@"innerRate"] = @(saved.sampleRate);
+    result[@"innerDuration"] = @(saved.outputIOBufferDuration);
+    result[@"innerInputChannels"] = @(saved.inputChannelCount);
+    result[@"innerOutputChannels"] = @(saved.outputChannelCount);
+    result[@"innerSessionAvailable"] = @(saved.sessionAvailable);
+    result[@"innerSessionActive"] = @(saved.sessionActive);
+    result[@"innerOwnsActivation"] = @(saved.ownsSessionActivation);
+    result[@"innerInputRequired"] = @(saved.inputRequired);
+    result[@"innerHasOutputRoute"] = @(saved.hasOutputRoute);
+    result[@"innerCategoryRecord"] = @(saved.categoryIsMediaPlayAndRecord);
+    result[@"innerDefaultMode"] = @(saved.modeIsDefault);
+    result[@"innerMicrophoneOptions"] = @(saved.categoryOptionsAreIPhoneMicrophoneRouting);
+    result[@"originalIdentityPreserved"] = @(saved.eventSequence != 0
+        && saved.deviceInstanceGeneration == self.audioCategoryDeviceInstanceGeneration
+        && saved.systemAudioGeneration == originalGeneration
+        && saved.systemAudioGeneration != atomic_load_explicit(
+            &_systemAudioGeneration, memory_order_acquire)
+        && saved.configurationGeneration == configuration);
+    result[@"liveRolledBack"] = @(!failed.playing && !failed.sessionActive
+        && !failed.ownsSessionActivation && !failed.playoutInitialized
+        && !failed.inputBusEnabled && !failed.outputBusEnabled);
+
+    _wantsRecording = NO;
+    [self debugMarkHealthyPlayoutForTesting];
+    ASIOSStereoPlayoutDiagnostics healthy = self.diagnostics;
+    result[@"healthyStateIsSeparate"] = @(healthy.playing && healthy.sessionActive
+        && healthy.failureCode == ASIOSStereoPlayoutFailureNone
+        && healthy.failureContext.eventSequence == saved.eventSequence
+        && healthy.failureContext.sampleRate == 44100
+        && healthy.failureContext.sessionActive);
+
+    session.sampleRate = 48000;
+    session.IOBufferDuration = 0.01;
+    session.inputNumberOfChannels = 1;
+    session.outputNumberOfChannels = 2;
+    [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureAudioUnitInitialization
+        status:-10868 message:@"Injected native initialization return."];
+    ASIOSAudioFailureContext initialization = self.diagnostics.failureContext;
+    result[@"initializationStage"] = @(initialization.stage);
+    result[@"initializationStatus"] = @(initialization.status);
+    result[@"initializationRate"] = @(initialization.sampleRate);
+    result[@"initializationActive"] = @(initialization.sessionActive);
+    [self debugMarkHealthyPlayoutForTesting];
+    [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureAudioUnitStart
+        status:-66635 message:@"Injected native start return."];
+    ASIOSAudioFailureContext start = self.diagnostics.failureContext;
+    result[@"startStage"] = @(start.stage);
+    result[@"startStatus"] = @(start.status);
+    result[@"monotonicEvents"] = @(saved.eventSequence < initialization.eventSequence
+        && initialization.eventSequence < start.eventSequence);
+    [self retainFailureContext:saved];
+    [self retainFailureContext:initialization];
+    result[@"staleRecordRejected"] = @(self.diagnostics.failureContext.eventSequence == start.eventSequence
+        && self.diagnostics.failureContext.status == -66635);
+    [self debugMarkHealthyPlayoutForTesting];
+    result[@"laterHealthyRetainsLastFailure"] = @(self.diagnostics.playing
+        && self.diagnostics.failureCode == ASIOSStereoPlayoutFailureNone
+        && self.diagnostics.failureContext.eventSequence == start.eventSequence);
+    _debugFailureContextSession = nil;
+    return result;
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting {
+    [self debugMarkHealthyPlayoutForTesting];
+    ASIOSStereoPlayoutDiagnostics output = {0};
+    output.playoutCallbackCount = 12345;
+    unsigned char untouched[sizeof(output)];
+    memcpy(untouched, &output, sizeof(output));
+
+    os_unfair_lock_lock(&ASSessionOwnershipLock);
+    BOOL ownershipUnavailable = ![self copyDiagnosticsIfAvailable:&output];
+    os_unfair_lock_unlock(&ASSessionOwnershipLock);
+    BOOL ownershipOutputUntouched = memcmp(untouched, &output, sizeof(output)) == 0;
+
+    os_unfair_lock_lock(&_failureContextLock);
+    BOOL failureUnavailable = ![self copyDiagnosticsIfAvailable:&output];
+    os_unfair_lock_unlock(&_failureContextLock);
+    BOOL failureOutputUntouched = memcmp(untouched, &output, sizeof(output)) == 0;
+
+    uint_fast64_t originalSequence = atomic_load_explicit(
+        &_realtime.publicationSequence, memory_order_acquire);
+    // Model a realtime publisher preempted before its even commit. The production optional
+    // getter must exhaust a fixed number of observations without waiting for that callback.
+    atomic_store_explicit(&_realtime.publicationSequence, originalSequence | 1,
+                          memory_order_release);
+    _debugBoundedDiagnosticsReadAttempts = 0;
+    BOOL publicationUnavailable = ![self copyDiagnosticsIfAvailable:&output];
+    NSUInteger boundedAttempts = _debugBoundedDiagnosticsReadAttempts;
+    BOOL publicationOutputUntouched = memcmp(untouched, &output, sizeof(output)) == 0;
+    atomic_store_explicit(&_realtime.publicationSequence, originalSequence,
+                          memory_order_release);
+
+    _debugAdvanceGenerationDuringBoundedDiagnosticsRead = YES;
+    BOOL generationUnavailable = ![self copyDiagnosticsIfAvailable:&output];
+    BOOL generationOutputUntouched = memcmp(untouched, &output, sizeof(output)) == 0;
+
+    _debugBoundedDiagnosticsReadAttempts = 0;
+    BOOL healthyReadAccepted = [self copyDiagnosticsIfAvailable:&output];
+    return @{
+        @"ownershipUnavailable": @(ownershipUnavailable),
+        @"ownershipOutputUntouched": @(ownershipOutputUntouched),
+        @"failureUnavailable": @(failureUnavailable),
+        @"failureOutputUntouched": @(failureOutputUntouched),
+        @"publicationUnavailable": @(publicationUnavailable),
+        @"publicationOutputUntouched": @(publicationOutputUntouched),
+        @"generationUnavailable": @(generationUnavailable),
+        @"generationOutputUntouched": @(generationOutputUntouched),
+        @"boundedAttempts": @(boundedAttempts),
+        @"healthyReadAccepted": @(healthyReadAccepted),
+        @"healthyAttempts": @(_debugBoundedDiagnosticsReadAttempts),
+        @"healthyPlaying": @(output.playing),
+        @"healthySessionActive": @(output.sessionActive),
+        @"healthyCallbackCount": @(output.playoutCallbackCount),
+    };
+}
 #endif
 
 - (BOOL)retryPlayoutThroughAudioDeviceDelegate:
@@ -10979,6 +11217,10 @@ static OSStatus ASRemoteIOInput(
         [self failAndRollbackWithCode:
             ASIOSStereoPlayoutFailureSessionConfiguration
                                status:kAudio_ParamError
+                                stage:ASIOSAudioFailureStageRetry
+                               reason:supportsExactRetry
+            ? ASIOSAudioFailureReasonRetryVerificationRejected
+            : ASIOSAudioFailureReasonRetryHookUnavailable
                               message:supportsExactRetry
             ? @"The native audio module could not verify authorized playout retry."
             : @"The native audio module does not support exact-device authorized playout retry."];
@@ -11682,8 +11924,39 @@ static OSStatus ASRemoteIOInput(
 }
 
 - (ASIOSStereoPlayoutDiagnostics)diagnostics {
+    ASIOSStereoPlayoutDiagnostics value = {0};
+    (void)[self copyDiagnostics:&value nonblocking:NO];
+    return value;
+}
+
+- (BOOL)copyDiagnosticsIfAvailable:(ASIOSStereoPlayoutDiagnostics *)output {
+    if (output == NULL) { return NO; }
+    return [self copyDiagnostics:output nonblocking:YES];
+}
+
+- (BOOL)copyDiagnostics:(ASIOSStereoPlayoutDiagnostics *)output
+             nonblocking:(BOOL)nonblocking {
+    uint64_t systemGenerationBefore = atomic_load_explicit(
+        &_systemAudioGeneration, memory_order_acquire);
+    uint64_t configurationGenerationBefore = atomic_load_explicit(
+        &_activeAudioConfigurationGeneration, memory_order_acquire);
+    BOOL ownsSessionActivation;
+    if (nonblocking) {
+        if (!os_unfair_lock_trylock(&ASSessionOwnershipLock)) { return NO; }
+#if DEBUG
+        ownsSessionActivation = _debugRecoveryHarnessMode
+            ? _debugOwnsSessionActivation
+            : (_sessionOwnershipToken != 0
+                && ASCurrentSessionOwnershipToken == _sessionOwnershipToken);
+#else
+        ownsSessionActivation = _sessionOwnershipToken != 0
+            && ASCurrentSessionOwnershipToken == _sessionOwnershipToken;
+#endif
+        os_unfair_lock_unlock(&ASSessionOwnershipLock);
+    } else {
+        ownsSessionActivation = [self ownsCurrentSessionActivation];
+    }
     AVAudioSession *session = [self currentAudioSession];
-    BOOL ownsSessionActivation = [self ownsCurrentSessionActivation];
     BOOL sessionActive = atomic_load_explicit(
         &_lifecycle.sessionActive,
         memory_order_relaxed
@@ -11789,10 +12062,27 @@ static OSStatus ASRemoteIOInput(
         &_lifecycle.lastLifecycleStatus,
         memory_order_relaxed
     );
+    if (nonblocking) {
+        if (!os_unfair_lock_trylock(&_failureContextLock)) { return NO; }
+    } else {
+        os_unfair_lock_lock(&_failureContextLock);
+    }
+    diagnostics.failureContext = _retainedFailureContext;
+    os_unfair_lock_unlock(&_failureContextLock);
 
     // Keep all callback-produced fields from one even publication epoch. In particular, a new
     // maximum gap can never be observed without the violation count written by that same callback.
+    NSUInteger readAttempts = 0;
     for (;;) {
+        // Optional readers never spin waiting for a preempted realtime publisher. A failed
+        // attempt returns no snapshot; callers must retain and age their prior observation.
+        if (nonblocking && readAttempts == 8) { return NO; }
+        if (nonblocking) {
+            readAttempts += 1;
+#if DEBUG
+            _debugBoundedDiagnosticsReadAttempts = readAttempts;
+#endif
+        }
         uint_fast64_t sequenceBefore = atomic_load_explicit(
             &_realtime.publicationSequence,
             memory_order_acquire
@@ -12031,7 +12321,22 @@ static OSStatus ASRemoteIOInput(
         &_lifecycle.hostedCallAuthorizationGeneration,
         memory_order_relaxed
     );
-    return diagnostics;
+#if DEBUG
+    if (nonblocking && _debugRecoveryHarnessMode
+        && _debugAdvanceGenerationDuringBoundedDiagnosticsRead) {
+        _debugAdvanceGenerationDuringBoundedDiagnosticsRead = NO;
+        [self advanceSystemAudioGeneration];
+    }
+#endif
+    if (nonblocking
+        && (systemGenerationBefore != atomic_load_explicit(
+                &_systemAudioGeneration, memory_order_acquire)
+            || configurationGenerationBefore != atomic_load_explicit(
+                &_activeAudioConfigurationGeneration, memory_order_acquire))) {
+        return NO;
+    }
+    *output = diagnostics;
+    return YES;
 }
 
 - (void)clearCurrentMicrophoneRecordingGeneration {
@@ -12977,6 +13282,8 @@ static OSStatus ASRemoteIOInput(
         [self failAndRollbackWithCode:
             ASIOSStereoPlayoutFailureSessionConfiguration
                                status:kAudio_ParamError
+                                stage:ASIOSAudioFailureStageSessionConfiguration
+                               reason:ASIOSAudioFailureReasonSessionUnavailable
                               message:@"No native audio session is available for RemoteIO configuration."];
         return NO;
     }
@@ -13054,6 +13361,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionConfiguration
                                    status:kAudio_ParamError
+                                    stage:ASIOSAudioFailureStageSessionConfiguration
+                                   reason:ASIOSAudioFailureReasonRouteTransactionRejected
                                   message:[NSString stringWithFormat:
                                       @"The iPhone microphone audio-session transaction could not be armed. %@",
                                       routeSnapshot]];
@@ -13119,6 +13428,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionPreference
                                    status:(int32_t)error.code
+                                    stage:ASIOSAudioFailureStageSessionPreferences
+                                   reason:ASIOSAudioFailureReasonSampleRateRequest
                                   message:[NSString stringWithFormat:
                                       @"Preferred sample-rate request failed: %@. %@",
                                       error.localizedDescription ?: @"unknown error",
@@ -13131,6 +13442,8 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionPreference
                                    status:(int32_t)error.code
+                                    stage:ASIOSAudioFailureStageSessionPreferences
+                                   reason:ASIOSAudioFailureReasonBufferDurationRequest
                                   message:[NSString stringWithFormat:
                                       @"Preferred IO-buffer-duration request failed: %@. %@",
                                       error.localizedDescription ?: @"unknown error",
@@ -13139,12 +13452,14 @@ static OSStatus ASRemoteIOInput(
         }
     }
     error = nil;
+    ASIOSAudioFailureContext sessionFailureContext = {0};
     ASOwnedSessionConfigurationFailure sessionFailure =
         [self activateOwnedSessionAndApplyRoutePreferences:session
                                             hostedCallMode:hostedCallMode
                                           microphoneEnabled:microphoneEnabled
                                       configurationGeneration:
                                           configurationGeneration
+                                               failureContext:&sessionFailureContext
                                                      error:&error];
     switch (sessionFailure) {
         case ASOwnedSessionConfigurationFailureNone:
@@ -13153,6 +13468,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionActivation
                                    status:(int32_t)error.code
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"Media playback audio-session activation failed: %@. %@",
                                       error.localizedDescription ?: @"unknown error",
@@ -13162,6 +13478,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"The active route exposes no built-in iPhone microphone. %@",
                                       ASAudioSessionDiagnosticDescription(session)]];
@@ -13170,6 +13487,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionPreference
                                    status:(int32_t)error.code
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"Preferred built-in iPhone microphone request failed: %@. %@",
                                       error.localizedDescription ?: @"unknown error",
@@ -13179,6 +13497,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"The built-in iPhone microphone route did not converge before RemoteIO creation. %@",
                                       ASAudioSessionDiagnosticDescription(session)]];
@@ -13187,12 +13506,14 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionActivation
                                    status:kAudio_ParamError
+                                  context:sessionFailureContext
                                   message:@"Channel preferences were rejected because this peer does not own an active audio session."];
             return NO;
         case ASOwnedSessionConfigurationFailureOutputUnavailable:
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"The active route cannot provide stereo output before RemoteIO creation. %@",
                                       ASAudioSessionDiagnosticDescription(session)]];
@@ -13201,6 +13522,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionPreference
                                    status:(int32_t)error.code
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"Preferred stereo-output request failed: %@. %@",
                                       error.localizedDescription ?: @"unknown error",
@@ -13210,6 +13532,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureMediaRouteInvariant
                                    status:kAudio_ParamError
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"The active route cannot provide mono iPhone microphone input before RemoteIO creation. %@",
                                       ASAudioSessionDiagnosticDescription(session)]];
@@ -13218,6 +13541,7 @@ static OSStatus ASRemoteIOInput(
             [self failAndRollbackWithCode:
                 ASIOSStereoPlayoutFailureSessionPreference
                                    status:(int32_t)error.code
+                                  context:sessionFailureContext
                                   message:[NSString stringWithFormat:
                                       @"Preferred mono-input request failed: %@. %@",
                                       error.localizedDescription ?: @"unknown error",
@@ -13268,6 +13592,8 @@ static OSStatus ASRemoteIOInput(
         || !hardwareRouteIsAcceptable) {
         [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureMediaRouteInvariant
                                status:kAudio_ParamError
+                                stage:ASIOSAudioFailureStageRouteValidation
+                               reason:ASIOSAudioFailureReasonPolicyMismatch
                               message:[NSString stringWithFormat:
                                   @"The active route cannot satisfy the %@ output policy "
                                    @"(route=%@). %@",
@@ -13568,6 +13894,8 @@ static OSStatus ASRemoteIOInput(
         [self failAndRollbackWithCode:
             ASIOSStereoPlayoutFailureMediaRouteInvariant
                                status:kAudio_ParamError
+                                stage:ASIOSAudioFailureStageRoutePublication
+                               reason:ASIOSAudioFailureReasonPolicyMismatch
                               message:[NSString stringWithFormat:
                                   @"Audio-session ownership or route changed before RemoteIO publication. %@",
                                   ASAudioSessionDiagnosticDescription(session)]];
@@ -13592,6 +13920,8 @@ static OSStatus ASRemoteIOInput(
         [self failAndRollbackWithCode:
             ASIOSStereoPlayoutFailureMediaRouteInvariant
                                status:kAudio_ParamError
+                                stage:ASIOSAudioFailureStageRoutePreparation
+                               reason:ASIOSAudioFailureReasonRouteTransactionRejected
                               message:[NSString stringWithFormat:
                                   @"The audio-session route transaction did not reach a provenance-bound state before RemoteIO start preparation. %@",
                                   routeSnapshot]];
@@ -13610,7 +13940,10 @@ static OSStatus ASRemoteIOInput(
                            microphoneEnabled:(BOOL)microphoneEnabled
                        configurationGeneration:
                            (uint64_t)configurationGeneration
+                               failureContext:
+                                   (ASIOSAudioFailureContext *)failureContext
                                       error:(NSError **)error {
+    *failureContext = (ASIOSAudioFailureContext){0};
     NSError *transactionError = nil;
     ASOwnedSessionConfigurationFailure failure =
         ASOwnedSessionConfigurationFailureNone;
@@ -13763,6 +14096,51 @@ static OSStatus ASRemoteIOInput(
     }
 
     if (failure != ASOwnedSessionConfigurationFailureNone) {
+        ASIOSStereoPlayoutFailureCode code = ASIOSStereoPlayoutFailureMediaRouteInvariant;
+        ASIOSAudioFailureReason reason = ASIOSAudioFailureReasonUnspecified;
+        int32_t status = kAudio_ParamError;
+        switch (failure) {
+            case ASOwnedSessionConfigurationFailureActivation:
+                code = ASIOSStereoPlayoutFailureSessionActivation;
+                reason = ASIOSAudioFailureReasonActivationRejected;
+                status = (int32_t)transactionError.code;
+                break;
+            case ASOwnedSessionConfigurationFailureBuiltInMicrophoneUnavailable:
+                reason = ASIOSAudioFailureReasonBuiltInInputUnavailable;
+                break;
+            case ASOwnedSessionConfigurationFailurePreferredInputRequest:
+                code = ASIOSStereoPlayoutFailureSessionPreference;
+                reason = ASIOSAudioFailureReasonPreferredInputRequest;
+                status = (int32_t)transactionError.code;
+                break;
+            case ASOwnedSessionConfigurationFailurePreferredInputDidNotConverge:
+                reason = ASIOSAudioFailureReasonPreferredInputConvergence;
+                break;
+            case ASOwnedSessionConfigurationFailureSessionInactive:
+                code = ASIOSStereoPlayoutFailureSessionActivation;
+                reason = ASIOSAudioFailureReasonSessionOwnershipLost;
+                break;
+            case ASOwnedSessionConfigurationFailureOutputUnavailable:
+                reason = ASIOSAudioFailureReasonOutputUnavailable;
+                break;
+            case ASOwnedSessionConfigurationFailureOutputRequest:
+                code = ASIOSStereoPlayoutFailureSessionPreference;
+                reason = ASIOSAudioFailureReasonOutputChannelRequest;
+                status = (int32_t)transactionError.code;
+                break;
+            case ASOwnedSessionConfigurationFailureInputUnavailable:
+                reason = ASIOSAudioFailureReasonInputUnavailable;
+                break;
+            case ASOwnedSessionConfigurationFailureInputRequest:
+                code = ASIOSStereoPlayoutFailureSessionPreference;
+                reason = ASIOSAudioFailureReasonInputChannelRequest;
+                status = (int32_t)transactionError.code;
+                break;
+            case ASOwnedSessionConfigurationFailureNone:
+                break;
+        }
+        *failureContext = [self captureFailureContextWithCode:code status:status
+            stage:ASIOSAudioFailureStageSessionActivation reason:reason session:session];
         [self clearExpectedMicrophoneRouteChange];
         os_unfair_lock_lock(&ASSessionOwnershipLock);
         if (ownershipToken != 0
@@ -16176,6 +16554,143 @@ static OSStatus ASRemoteIOInput(
 - (void)failAndRollbackWithCode:(ASIOSStereoPlayoutFailureCode)code
                          status:(int32_t)status
                         message:(NSString *)message {
+    ASIOSAudioFailureStage stage = ASIOSAudioFailureStageAudioUnitConfiguration;
+    switch (code) {
+        case ASIOSStereoPlayoutFailureNone:
+            stage = ASIOSAudioFailureStageNone;
+            break;
+        case ASIOSStereoPlayoutFailureSessionConfiguration:
+            stage = ASIOSAudioFailureStageSessionConfiguration;
+            break;
+        case ASIOSStereoPlayoutFailureSessionPreference:
+            stage = ASIOSAudioFailureStageSessionPreferences;
+            break;
+        case ASIOSStereoPlayoutFailureSessionActivation:
+            stage = ASIOSAudioFailureStageSessionActivation;
+            break;
+        case ASIOSStereoPlayoutFailureMediaRouteInvariant:
+            stage = ASIOSAudioFailureStageRouteValidation;
+            break;
+        case ASIOSStereoPlayoutFailureAudioComponentUnavailable:
+        case ASIOSStereoPlayoutFailureAudioUnitCreation:
+            stage = ASIOSAudioFailureStageAudioUnitCreation;
+            break;
+        case ASIOSStereoPlayoutFailureAudioUnitInitialization:
+            stage = ASIOSAudioFailureStageAudioUnitInitialization;
+            break;
+        case ASIOSStereoPlayoutFailureAudioUnitStart:
+            stage = ASIOSAudioFailureStageAudioUnitStart;
+            break;
+        case ASIOSStereoPlayoutFailureAudioUnitStop:
+        case ASIOSStereoPlayoutFailureSessionDeactivation:
+            stage = ASIOSAudioFailureStageTeardown;
+            break;
+        case ASIOSStereoPlayoutFailureInterruption:
+        case ASIOSStereoPlayoutFailureRouteChangeRecoveryRequired:
+        case ASIOSStereoPlayoutFailureRouteRequiresExplicitResume:
+        case ASIOSStereoPlayoutFailureUnexpectedCategoryChange:
+        case ASIOSStereoPlayoutFailureMediaServicesReset:
+            stage = ASIOSAudioFailureStageSystemEvent;
+            break;
+        default:
+            break;
+    }
+    [self failAndRollbackWithCode:code
+                          status:status
+                           stage:stage
+                          reason:ASIOSAudioFailureReasonNativeOperationFailed
+                         message:message];
+}
+
+- (ASIOSAudioFailureContext)captureFailureContextWithCode:
+    (ASIOSStereoPlayoutFailureCode)code
+                                                   status:(int32_t)status
+                                                    stage:(ASIOSAudioFailureStage)stage
+                                                   reason:(ASIOSAudioFailureReason)reason
+                                                  session:(AVAudioSession *)session {
+#if DEBUG
+    if (_debugRecoveryHarnessMode && _debugFailureContextSession != nil) {
+        session = _debugFailureContextSession;
+    }
+#endif
+    ASIOSAudioFailureContext context = {0};
+    context.stage = stage;
+    context.reason = reason;
+    context.failureCode = (int32_t)code;
+    context.status = status;
+    context.systemAudioGeneration = atomic_load_explicit(
+        &_systemAudioGeneration, memory_order_acquire);
+    context.configurationGeneration = atomic_load_explicit(
+        &_activeAudioConfigurationGeneration, memory_order_acquire);
+    os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+    context.deviceInstanceGeneration = _audioCategoryDeviceInstanceGeneration;
+    context.appOperationTagGeneration = _activeAppAudioPolicyTagGeneration;
+    os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+    context.inputRequired = _wantsRecording;
+    context.hostedCall = atomic_load_explicit(&_lifecycle.hostedCallMode,
+                                             memory_order_acquire);
+    context.sessionActive = _sessionActive;
+    context.ownsSessionActivation = [self ownsCurrentSessionActivation];
+    context.sessionAvailable = session != nil;
+    if (session != nil) {
+        double rate = session.sampleRate;
+        double duration = session.IOBufferDuration;
+        context.sampleRate = isfinite(rate) && rate >= 0 && rate <= 384000 ? rate : 0;
+        context.outputIOBufferDuration =
+            isfinite(duration) && duration >= 0 && duration <= 10 ? duration : 0;
+        context.inputChannelCount = (int32_t)MAX(0, MIN(64, session.inputNumberOfChannels));
+        context.outputChannelCount = (int32_t)MAX(0, MIN(64, session.outputNumberOfChannels));
+        context.hasOutputRoute = [self hasOutputRouteForSession:session];
+        context.categoryIsMediaPlayback =
+            [session.category isEqualToString:AVAudioSessionCategoryPlayback];
+        context.categoryIsMediaPlayAndRecord =
+            [session.category isEqualToString:AVAudioSessionCategoryPlayAndRecord];
+        context.modeIsDefault = [session.mode isEqualToString:AVAudioSessionModeDefault];
+        context.categoryOptionsAreEmpty = session.categoryOptions == 0;
+        context.categoryOptionsAreIPhoneMicrophoneRouting =
+            session.categoryOptions == ASIPhoneMicrophoneCategoryOptions();
+    }
+    os_unfair_lock_lock(&_failureContextLock);
+    // Saturation fails closed: never reuse a sequence that could look newer to a consumer.
+    if (_failureContextEventSequence != UINT64_MAX) {
+        context.eventSequence = ++_failureContextEventSequence;
+    }
+    os_unfair_lock_unlock(&_failureContextLock);
+    return context;
+}
+
+- (void)retainFailureContext:(ASIOSAudioFailureContext)context {
+    if (context.eventSequence == 0 || context.deviceInstanceGeneration == 0) {
+        return;
+    }
+    if (context.failureCode != ASIOSStereoPlayoutFailureRouteRequiresExplicitResume
+        && atomic_load_explicit(&_lifecycle.failureCode, memory_order_acquire)
+            == ASIOSStereoPlayoutFailureRouteRequiresExplicitResume
+        && atomic_load_explicit(&_lifecycle.explicitResumeRequired, memory_order_acquire)) {
+        return;
+    }
+    os_unfair_lock_lock(&_failureContextLock);
+    if (context.eventSequence > _retainedFailureContext.eventSequence) {
+        _retainedFailureContext = context;
+    }
+    os_unfair_lock_unlock(&_failureContextLock);
+}
+
+- (void)failAndRollbackWithCode:(ASIOSStereoPlayoutFailureCode)code
+                         status:(int32_t)status
+                          stage:(ASIOSAudioFailureStage)stage
+                         reason:(ASIOSAudioFailureReason)reason
+                        message:(NSString *)message {
+    ASIOSAudioFailureContext context = [self captureFailureContextWithCode:code
+        status:status stage:stage reason:reason session:[self currentAudioSession]];
+    [self failAndRollbackWithCode:code status:status context:context message:message];
+}
+
+- (void)failAndRollbackWithCode:(ASIOSStereoPlayoutFailureCode)code
+                         status:(int32_t)status
+                        context:(ASIOSAudioFailureContext)context
+                        message:(NSString *)message {
+    [self retainFailureContext:context];
     BOOL retiringHostedCallPolicy = _hostedCallAuthorization != nil;
     [self advanceSystemAudioGeneration];
     [self revokeHostedCallAuthorization];
@@ -16200,12 +16715,26 @@ static OSStatus ASRemoteIOInput(
             @" Audio-session rollback also failed: %@.",
             deactivationError.localizedDescription ?: @"unknown error"];
     }
-    [self publishFailureCode:code status:status message:detail];
+    [self publishFailureCodePreservingContext:code status:status message:detail];
 }
 
 - (void)publishFailureCode:(ASIOSStereoPlayoutFailureCode)code
                      status:(int32_t)status
                     message:(NSString *)message {
+    ASIOSAudioFailureStage stage =
+        code == ASIOSStereoPlayoutFailureAudioUnitStop
+            || code == ASIOSStereoPlayoutFailureSessionDeactivation
+        ? ASIOSAudioFailureStageTeardown : ASIOSAudioFailureStageSystemEvent;
+    ASIOSAudioFailureContext context = [self captureFailureContextWithCode:code
+        status:status stage:stage reason:ASIOSAudioFailureReasonNativeOperationFailed
+        session:[self currentAudioSession]];
+    [self retainFailureContext:context];
+    [self publishFailureCodePreservingContext:code status:status message:message];
+}
+
+- (void)publishFailureCodePreservingContext:(ASIOSStereoPlayoutFailureCode)code
+                                     status:(int32_t)status
+                                    message:(NSString *)message {
     ASIOSStereoPlayoutFailureCode currentCode =
         (ASIOSStereoPlayoutFailureCode)atomic_load_explicit(
             &_lifecycle.failureCode,

@@ -2317,6 +2317,114 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         await peer.close()
     }
 
+    func testAudioTelemetryRejectsSampleCrossingRecoveryStageWithoutPolicyChange() async throws {
+        let fixture = makeFixture()
+        let viewModel = WorldwideSessionViewModel(audioLifecycle: fixture.controller)
+        let peer = try makeAudioRacePeer()
+        viewModel.debugInstallIOSPlayoutPeerForRaceTests(peer)
+        _ = viewModel.debugStartIOSPlayoutProofAttemptForTests(requestRecovery: true, expectedPeer: peer)
+        viewModel.debugSetAudioDiagnosticsBaselineStageForTests(true)
+        let policy = viewModel.debugAudioPolicyGeneration
+        viewModel.debugInstallAudioClientDiagnosticsReader { _ in
+            viewModel.debugSetAudioDiagnosticsBaselineStageForTests(false)
+            var native = WebRTCAudioClientNativeSnapshot()
+            native.failureCode = 14
+            return native
+        }
+        await viewModel.debugCaptureAudioDiagnosticsForTests(from: peer, statistics: .init())
+        let heartbeat = try XCTUnwrap(viewModel.debugAudioDiagnosticsHeartbeatForTests())
+        XCTAssertEqual(viewModel.debugAudioPolicyGeneration, policy)
+        XCTAssertNil(heartbeat.snapshot.native)
+        XCTAssertFalse(heartbeat.events.contains { $0.kind == .failure && $0.failureCode == 14 })
+        viewModel.disconnect()
+        await peer.close()
+        _ = await viewModel.admitFreshConnectionPreparation()
+    }
+
+    func testAudioTelemetrySamplingIsSingleFlightAndDoesNotBlockStatisticsEvents() async throws {
+        let fixture = makeFixture()
+        let viewModel = WorldwideSessionViewModel(audioLifecycle: fixture.controller)
+        let peer = try makeAudioRacePeer()
+        let gate = AudioNonCooperativeGate<WebRTCIOSPlayoutDiagnostics>()
+        let started = expectation(description: "optional native reader started")
+        var reads = 0
+        viewModel.debugInstallAudioClientDiagnosticsReader { _ in
+            reads += 1
+            if reads == 1 { started.fulfill() }
+            return WebRTCAudioClientNativeSnapshot(diagnostics: await gate.wait())
+        }
+        viewModel.debugInstallIOSPlayoutPeerForRaceTests(peer)
+        viewModel.debugScheduleAudioDiagnosticsSampleForTests(from: peer)
+        await fulfillment(of: [started], timeout: 2)
+        // The held native read must not be awaited by the ordered peer-event handler.
+        let generation = try XCTUnwrap(viewModel.debugAudioDiagnosticsHeartbeatForTests()).sessionID
+        let handled = expectation(description: "statistics event completed while read held")
+        let handling = Task { @MainActor in
+            await viewModel.debugDriveIOSHostedCallStatisticsForTests(
+                .init(collectionSequence: 1, inboundAudio: .init(packets: 11)),
+                from: peer, generation: generation
+            )
+            handled.fulfill()
+        }
+        await fulfillment(of: [handled], timeout: 2)
+        for _ in 0..<10 { viewModel.debugScheduleAudioDiagnosticsSampleForTests(from: peer) }
+        XCTAssertEqual(reads, 1)
+        // Retiring the session must fence the still-held sample rather than publish it later.
+        viewModel.disconnect()
+        await gate.open(healthyIOSPlayoutDiagnostics())
+        await handling.value
+        await viewModel.debugWaitForAudioDiagnosticsSampleForTests()
+        let heartbeat = try XCTUnwrap(viewModel.debugAudioDiagnosticsHeartbeatForTests())
+        XCTAssertNil(heartbeat.snapshot.native)
+        await peer.close()
+        _ = await viewModel.admitFreshConnectionPreparation()
+    }
+
+    func testAudioTelemetryCollectsNativeFailureWithoutVerifiedPlaybackOrVisibleScreen() async throws {
+        let fixture = makeFixture()
+        let viewModel = WorldwideSessionViewModel(audioLifecycle: fixture.controller)
+        let peer = try makeAudioRacePeer()
+        viewModel.debugInstallIOSPlayoutPeerForRaceTests(peer)
+        viewModel.debugInstallAudioClientDiagnosticsReader { _ in
+            WebRTCAudioClientNativeSnapshot(diagnostics:
+                iosPlayoutDiagnostics(callbacks: 0, frames: 0, failures: 1,
+                                      failureCode: 14, lastLifecycleStatus: -50, playing: false))
+        }
+        XCTAssertFalse(viewModel.isRemoteAudioPlaying)
+        await viewModel.debugCaptureAudioDiagnosticsForTests(
+            from: peer,
+            statistics: WebRTCStatisticsSnapshot(inboundAudio: WebRTCAudioStatistics(bytes: 200, packets: 10))
+        )
+        let heartbeat = try XCTUnwrap(viewModel.debugAudioDiagnosticsHeartbeatForTests())
+        XCTAssertEqual(heartbeat.snapshot.native?.failureCode, 14)
+        XCTAssertEqual(heartbeat.snapshot.native?.lastLifecycleStatus, -50)
+        XCTAssertEqual(heartbeat.snapshot.inboundAudioPackets, 10)
+        XCTAssertEqual(heartbeat.failureSnapshot?.failurePhase, .start)
+        XCTAssertFalse(viewModel.isRemoteAudioPlaying)
+        viewModel.disconnect()
+        await peer.close()
+        _ = await viewModel.admitFreshConnectionPreparation()
+    }
+
+    func testAudioTelemetryRejectsNativeReadThatCrossesAudioPolicyBoundary() async throws {
+        let fixture = makeFixture()
+        let viewModel = WorldwideSessionViewModel(audioLifecycle: fixture.controller)
+        let peer = try makeAudioRacePeer()
+        viewModel.debugInstallIOSPlayoutPeerForRaceTests(peer)
+        viewModel.debugInstallAudioClientDiagnosticsReader { _ in
+            viewModel.debugRotateAudioPolicyForTests()
+            return WebRTCAudioClientNativeSnapshot(diagnostics: healthyIOSPlayoutDiagnostics())
+        }
+        await viewModel.debugCaptureAudioDiagnosticsForTests(from: peer, statistics: WebRTCStatisticsSnapshot())
+        let heartbeat = try XCTUnwrap(viewModel.debugAudioDiagnosticsHeartbeatForTests())
+        XCTAssertNil(heartbeat.snapshot.native)
+        XCTAssertNil(heartbeat.snapshot.nativeObservationAgeMilliseconds)
+        XCTAssertEqual(heartbeat.snapshot.audioPolicyID, viewModel.debugAudioPolicyGeneration)
+        viewModel.disconnect()
+        await peer.close()
+        _ = await viewModel.admitFreshConnectionPreparation()
+    }
+
     func testExactFailedRecoveryReceiptPreservesDiagnosticBeforePublicationAndRejectsRetiredReceipt()
         async throws {
         let authority = AudioTransactionAuthority()
@@ -23014,6 +23122,278 @@ private final class AudioSessionEventsStub: AudioSessionEventMonitoring {
                 operationID: operationID
             )
         )
+    }
+}
+
+final class IOSAudioDiagnosticsJournalTests: XCTestCase {
+    private let second: UInt64 = 1_000_000_000
+
+    func testLateHistoricalContextSurvivesLaterAttemptWithoutBlockingLiveCauseEnrichment() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        journal.observeNative(.init(), policyID: policy, at: second * 2)
+        journal.fail(phase: .unknown, at: second * 3)
+        var native = WebRTCAudioClientNativeSnapshot()
+        var old = WebRTCAudioClientFailureContext()
+        old.eventSequence = 1
+        old.failureCode = 13
+        old.sampleRate = 44_100
+        native.failureContext = old
+        journal.observeNative(native, policyID: policy, at: second * 4)
+        var retained = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 5)).failureSnapshot
+        XCTAssertEqual(retained?.native?.failureCode, 0)
+        XCTAssertEqual(retained?.native?.failureContext?.sampleRate, 44_100)
+        // The historical context is not itself evidence that the earlier live read failed.
+        native.failureCode = 14
+        var actual = old
+        actual.eventSequence = 2
+        actual.failureCode = 14
+        actual.sampleRate = 48_000
+        native.failureContext = actual
+        journal.observeNative(native, policyID: policy, at: second * 6)
+        retained = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 7)).failureSnapshot
+        XCTAssertEqual(retained?.audioPolicyID, policy)
+        XCTAssertEqual(retained?.native?.failureCode, 14)
+        XCTAssertEqual(retained?.native?.failureContext?.eventSequence, 2)
+        journal.beginProof(recovery: true, at: second * 8)
+        actual.eventSequence = 3
+        actual.failureCode = 13
+        native.failureCode = 13
+        native.failureContext = actual
+        journal.observeNative(native, policyID: policy, at: second * 9)
+        retained = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 10)).failureSnapshot
+        XCTAssertEqual(retained?.native?.failureContext?.eventSequence, 2)
+        XCTAssertEqual(retained?.native?.failureContext?.sampleRate, 48_000)
+    }
+
+    func testQueuedStatisticsKeepCollectionAgeAndRepeatedSequenceCannotRefreshIt() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        journal.reset(sessionID: UUID(), policyID: UUID(), at: second)
+        let wall = Date(timeIntervalSince1970: 1_000)
+        let delayed = WebRTCStatisticsSnapshot(collectedAt: wall.addingTimeInterval(-3),
+            collectionSequence: 1, inboundAudio: .init(bytes: 200, packets: 10))
+        journal.observeStatistics(delayed, at: second * 10, wallNow: wall)
+        let replay = WebRTCStatisticsSnapshot(collectedAt: wall.addingTimeInterval(1),
+            collectionSequence: 1, inboundAudio: .init(bytes: 400, packets: 20))
+        journal.observeStatistics(replay, at: second * 11, wallNow: wall.addingTimeInterval(1))
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 12))
+        XCTAssertEqual(heartbeat.snapshot.inboundAudioPackets, 10)
+        XCTAssertEqual(heartbeat.snapshot.inboundObservationAgeMilliseconds, 5_000)
+    }
+
+    func testFutureDatedStatisticsHaveUnknownAgeNotFreshEvidence() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        journal.reset(sessionID: UUID(), policyID: UUID(), at: second)
+        let wall = Date(timeIntervalSince1970: 1_000)
+        journal.observeStatistics(.init(collectedAt: wall.addingTimeInterval(1),
+            collectionSequence: 1, inboundAudio: .init(packets: 10)), at: second * 10, wallNow: wall)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 12))
+        XCTAssertEqual(heartbeat.snapshot.inboundAudioPackets, 10)
+        XCTAssertNil(heartbeat.snapshot.inboundObservationAgeMilliseconds)
+    }
+
+    func testFirstControllerFailureCanGainNativeCauseAfterEarlierHealthyRead() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        journal.observeNative(.init(), policyID: policy, at: second * 2)
+        journal.playbackChanged(.init(stateText: "Failed", isRemoteAudioAvailable: true,
+            isPlaying: false, requiresExplicitResume: true, errorText: "Failure",
+            diagnosticText: nil), at: second * 3)
+        var native = WebRTCAudioClientNativeSnapshot()
+        native.failureCode = 14
+        native.lastLifecycleStatus = -50
+        journal.observeNative(native, policyID: policy, at: second * 4)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 5))
+        XCTAssertEqual(heartbeat.failureSnapshot?.audioPolicyID, policy)
+        XCTAssertEqual(heartbeat.failureSnapshot?.recoveryAttempt, 0)
+        XCTAssertEqual(heartbeat.failureSnapshot?.native?.failureCode, 14)
+        XCTAssertEqual(heartbeat.failureSnapshot?.native?.lastLifecycleStatus, -50)
+        XCTAssertEqual(heartbeat.failureSnapshot?.nativeObservationAgeMilliseconds, 1_000)
+        XCTAssertEqual(heartbeat.failureSnapshot?.failurePhase, .start)
+    }
+
+    func testPolicyRotationAndBaselineDoNotFailNewAttemptWithPredecessorCause() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let old = UUID(), current = UUID()
+        journal.reset(sessionID: UUID(), policyID: old, at: second)
+        var native = WebRTCAudioClientNativeSnapshot()
+        native.failureCode = 14
+        var context = WebRTCAudioClientFailureContext()
+        context.eventSequence = 1
+        context.failureCode = 14
+        native.failureContext = context
+        journal.observeNative(native, policyID: old, at: second * 2)
+        journal.authorityFailure(.rejected(.blockerRequired), at: second * 3)
+        journal.policyChanged(current, at: second * 4)
+        journal.beginProof(recovery: true, at: second * 5)
+        journal.observeNative(native, policyID: current, classifyFailure: false, at: second * 6)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 7))
+        XCTAssertEqual(heartbeat.snapshot.recoveryAttempt, 1)
+        XCTAssertEqual(heartbeat.snapshot.retryState, .executing)
+        XCTAssertEqual(heartbeat.snapshot.proofStage, .awaitingAuthorization)
+        XCTAssertEqual(heartbeat.snapshot.failurePhase, .none)
+        XCTAssertNil(heartbeat.snapshot.authorityFailureCode)
+        XCTAssertFalse(heartbeat.events.contains { $0.kind == .failure && $0.recoveryAttempt == 1 })
+        XCTAssertEqual(heartbeat.failureSnapshot?.audioPolicyID, old)
+    }
+
+    func testHistoricalFailureFirstSeenAfterClearDoesNotUndoHealthyPlayback() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        journal.playbackChanged(.init(stateText: "Playing", isRemoteAudioAvailable: true,
+            isPlaying: true, requiresExplicitResume: false, errorText: nil,
+            diagnosticText: nil), at: second * 2)
+        var native = WebRTCAudioClientNativeSnapshot()
+        native.playing = true
+        var context = WebRTCAudioClientFailureContext()
+        context.eventSequence = 1
+        context.failureCode = 14
+        context.status = -50
+        native.failureContext = context
+        journal.observeNative(native, policyID: policy, at: second * 3)
+        journal.observeNative(native, policyID: policy, at: second * 4)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 5))
+        XCTAssertEqual(heartbeat.snapshot.playbackState, .playing)
+        XCTAssertEqual(heartbeat.snapshot.proofStage, .complete)
+        XCTAssertEqual(heartbeat.snapshot.failurePhase, .none)
+        XCTAssertNil(heartbeat.failureSnapshot?.audioPolicyID)
+        XCTAssertEqual(heartbeat.failureSnapshot?.native?.failureContext?.status, -50)
+        let failures = heartbeat.events.filter { $0.kind == .failure }
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertNil(failures.first?.audioPolicyID)
+        XCTAssertEqual(failures.first?.failureCode, 14)
+        XCTAssertEqual(failures.first?.status, -50)
+        XCTAssertTrue(heartbeat.isValid)
+    }
+
+    func testFirstFailureSurvivesCleanupRetriesAndRepeatedHeartbeats() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        var failure = WebRTCAudioClientNativeSnapshot()
+        failure.failureCode = 14
+        failure.lastLifecycleStatus = -50
+        failure.sampleRate = 44_100
+        failure.outputChannelCount = 1
+        journal.observeNative(failure, policyID: policy, at: second * 2)
+        journal.nativeReceipt(accepted: false, targetMatched: false, at: second * 2)
+        journal.retryRequested(at: second * 3)
+        journal.observeNative(WebRTCAudioClientNativeSnapshot(), policyID: policy, at: second * 4)
+        let first = try XCTUnwrap(journal.heartbeat(build: .init(buildNumber: 66), at: second * 5))
+        let next = try XCTUnwrap(journal.heartbeat(build: .init(buildNumber: 66), at: second * 6))
+        XCTAssertEqual(first.failureSnapshot?.native?.failureCode, 14)
+        XCTAssertEqual(first.failureSnapshot?.native?.lastLifecycleStatus, -50)
+        XCTAssertEqual(first.failureSnapshot?.native?.sampleRate, 44_100)
+        XCTAssertEqual(first.failureSnapshot?.native?.outputChannelCount, 1)
+        XCTAssertEqual(next.failureSnapshot?.native, first.failureSnapshot?.native)
+        XCTAssertEqual(next.events, first.events)
+        XCTAssertGreaterThan(next.sequence, first.sequence)
+        XCTAssertEqual(first.snapshot.native?.failureCode, 0)
+        XCTAssertEqual(next.failureSnapshot?.nativeObservationAgeMilliseconds, 4_000)
+    }
+
+    func testPolicyRotationCannotImportOldNativeState() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let old = UUID(), current = UUID()
+        journal.reset(sessionID: UUID(), policyID: old, at: second)
+        journal.policyChanged(current, at: second * 2)
+        var stale = WebRTCAudioClientNativeSnapshot()
+        stale.playing = true
+        stale.playoutFrameCount = 999
+        journal.observeNative(stale, policyID: old, at: second * 3)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 4))
+        XCTAssertNil(heartbeat.snapshot.native)
+        XCTAssertNil(heartbeat.snapshot.nativeObservationAgeMilliseconds)
+        XCTAssertEqual(heartbeat.snapshot.audioPolicyID, current)
+    }
+
+    func testStalledObservationsAgeWhileHeartbeatRemainsLive() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        journal.observeNative(WebRTCAudioClientNativeSnapshot(), policyID: policy, at: second * 2)
+        journal.observeInbound(WebRTCAudioStatistics(bytes: 100, packets: 2,
+                              totalAudioEnergy: 0.5, totalSamplesDuration: 1), at: second * 3)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 9))
+        XCTAssertEqual(heartbeat.snapshot.nativeObservationAgeMilliseconds, 7_000)
+        XCTAssertEqual(heartbeat.snapshot.inboundObservationAgeMilliseconds, 6_000)
+        XCTAssertEqual(heartbeat.observedElapsedMilliseconds, 8_000)
+        XCTAssertEqual(heartbeat.snapshot.inboundAudioTotalEnergy, 0.5)
+        XCTAssertEqual(heartbeat.snapshot.inboundAudioSamplesDuration, 1)
+    }
+
+    func testHistoryStorageIsBoundedAndRetainedFailureIsNotEvicted() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        var native = WebRTCAudioClientNativeSnapshot()
+        native.failureCode = 13
+        journal.observeNative(native, policyID: policy, at: second)
+        for tick in 2...100 {
+            journal.retryRequested(at: second * UInt64(tick))
+        }
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 101))
+        XCTAssertEqual(heartbeat.events.count, WebRTCAudioClientDiagnosticsHeartbeat.maximumEvents)
+        XCTAssertEqual(heartbeat.failureSnapshot?.native?.failureCode, 13)
+        XCTAssertTrue(heartbeat.isValid)
+        XCTAssertLessThan(try JSONEncoder().encode(heartbeat).count, 4_096)
+    }
+
+    func testNewSessionClearsOldFailureCountersAndHistory() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let oldSession = UUID(), newSession = UUID(), policy = UUID()
+        journal.reset(sessionID: oldSession, policyID: policy, at: second)
+        journal.fail(phase: .initialization, at: second * 2)
+        journal.retryRequested(at: second * 3)
+        journal.reset(sessionID: newSession, policyID: UUID(), at: second * 4)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 5))
+        XCTAssertEqual(heartbeat.sessionID, newSession)
+        XCTAssertEqual(heartbeat.sequence, 1)
+        XCTAssertNil(heartbeat.failureSnapshot)
+        XCTAssertNil(heartbeat.snapshot.native)
+        XCTAssertEqual(heartbeat.events.map(\.kind), [.sessionStarted])
+        XCTAssertEqual(heartbeat.events.first?.sequence, 1)
+    }
+
+    func testAuthorityRejectionAndNativeAcceptanceRemainDistinctFromPlaybackProof() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        journal.reset(sessionID: UUID(), policyID: UUID(), at: second)
+        journal.beginProof(recovery: true, at: second * 2)
+        journal.nativeReceipt(accepted: true, targetMatched: true, at: second * 3)
+        var heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 4))
+        XCTAssertEqual(heartbeat.snapshot.proofStage, .awaitingEvidence)
+        XCTAssertEqual(heartbeat.snapshot.retryState, .accepted)
+        XCTAssertNotEqual(heartbeat.snapshot.playbackState, .playing)
+        journal.authorityFailure(.rejected(.blockerRequired), at: second * 5)
+        heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 6))
+        XCTAssertEqual(heartbeat.snapshot.authorityFailureCode, 10)
+        XCTAssertEqual(heartbeat.snapshot.authorization, .rejected)
+        XCTAssertEqual(heartbeat.failureSnapshot?.failurePhase, .authorization)
+    }
+
+    func testUnknownAndInvalidEnergyAreNotInventedAsZeroProgress() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        journal.reset(sessionID: UUID(), policyID: UUID(), at: second)
+        journal.observeInbound(WebRTCAudioStatistics(totalAudioEnergy: .nan,
+                              totalSamplesDuration: -.infinity), at: second)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: second * 2))
+        XCTAssertNil(heartbeat.snapshot.inboundAudioPackets)
+        XCTAssertNil(heartbeat.snapshot.inboundAudioTotalEnergy)
+        XCTAssertNil(heartbeat.snapshot.inboundAudioSamplesDuration)
+        XCTAssertNil(heartbeat.snapshot.nativeObservationAgeMilliseconds)
+        XCTAssertTrue(heartbeat.isValid)
+    }
+
+    func testAuthorityCodebookIsStableAndIgnoresNonFailures() {
+        XCTAssertEqual(IOSAudioDiagnosticsJournal.authorityFailureCode(.rejected(.staleRevision)), 1)
+        XCTAssertEqual(IOSAudioDiagnosticsJournal.authorityFailureCode(.rejected(.targetMismatch)), 6)
+        XCTAssertEqual(IOSAudioDiagnosticsJournal.authorityFailureCode(.runtimeFailure(.poisoned)), 104)
+        XCTAssertEqual(IOSAudioDiagnosticsJournal.authorityFailureCode(.failedClosed(nil)), 201)
+        XCTAssertNil(IOSAudioDiagnosticsJournal.authorityFailureCode(.ignored(reason: .exactDuplicate,
+                         operation: nil, blocker: nil)))
     }
 }
 

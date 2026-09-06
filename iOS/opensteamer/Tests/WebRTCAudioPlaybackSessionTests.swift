@@ -143,6 +143,64 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(try retryValue("nativeFailurePreserved", in: result).boolValue)
     }
 
+    func testNativeFailureContextRetainsRouteFactsBeforeInnerRollback() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRetainedFailureContextForTesting()
+        for key in [
+            "initiallyAbsent", "innerFailure", "routeChangedDuringInnerCleanup",
+            "innerSessionAvailable", "innerSessionActive", "innerOwnsActivation",
+            "innerInputRequired", "innerHasOutputRoute", "innerCategoryRecord",
+            "innerDefaultMode", "innerMicrophoneOptions", "originalIdentityPreserved",
+            "liveRolledBack", "healthyStateIsSeparate",
+        ] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+        XCTAssertEqual(try retryValue("activationCount", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("deactivationCount", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("innerStage", in: result).intValue, 3)
+        XCTAssertEqual(try retryValue("innerReason", in: result).intValue, 2)
+        XCTAssertEqual(try retryValue("innerCode", in: result).intValue, 4)
+        XCTAssertEqual(try retryValue("innerStatus", in: result).intValue, Int(kAudio_ParamError))
+        XCTAssertEqual(try retryValue("innerRate", in: result).doubleValue, 44100)
+        XCTAssertEqual(try retryValue("innerDuration", in: result).doubleValue, 0.02)
+        XCTAssertEqual(try retryValue("innerInputChannels", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("innerOutputChannels", in: result).intValue, 1)
+    }
+
+    func testNativeFailureContextSeparatesInitStartAndRejectsOlderEvents() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRetainedFailureContextForTesting()
+        XCTAssertEqual(try retryValue("initializationStage", in: result).intValue, 7)
+        XCTAssertEqual(try retryValue("initializationStatus", in: result).intValue, -10868)
+        XCTAssertEqual(try retryValue("initializationRate", in: result).doubleValue, 48000)
+        XCTAssertTrue(try retryValue("initializationActive", in: result).boolValue)
+        XCTAssertEqual(try retryValue("startStage", in: result).intValue, 10)
+        XCTAssertEqual(try retryValue("startStatus", in: result).intValue, -66635)
+        for key in ["monotonicEvents", "staleRecordRejected", "laterHealthyRetainsLastFailure"] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+    }
+
+    func testOptionalNativeDiagnosticsRejectsContentionWithoutPartialSnapshot() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugBoundedDiagnosticsReadForTesting()
+        for key in [
+            "ownershipUnavailable", "ownershipOutputUntouched",
+            "failureUnavailable", "failureOutputUntouched",
+            "publicationUnavailable", "publicationOutputUntouched",
+            "generationUnavailable", "generationOutputUntouched",
+            "healthyReadAccepted", "healthyPlaying", "healthySessionActive",
+        ] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, key)
+        }
+        XCTAssertEqual(try retryValue("boundedAttempts", in: result).intValue, 8)
+        XCTAssertEqual(try retryValue("healthyAttempts", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("healthyCallbackCount", in: result).uint64Value, 0)
+    }
+
     func testExactRecoveryRevokedWhileQueuedNeverInvokesVendorHook() throws {
         let result = try assertExactRetryFailure(.revokedWhileQueued)
         XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)

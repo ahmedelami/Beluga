@@ -1918,19 +1918,19 @@ CASE=$(new_case testflight-vendor-missing-contract)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
   $'&& verify_pinned_vendor_archive \\\n      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"' \
   '&& true # unverified vendor archive'
-require_rejection "$CASE" 'side-by-side TestFlight required vendor artifact verification'
+require_rejection "$CASE" 'side-by-side TestFlight package contract requires exact vendor bytes'
 
 CASE=$(new_case testflight-vendor-digest)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
   '"$(sha256_file "${archive_path}")" == "${expected_sha256}"' \
   '-n "${expected_sha256}"'
-require_rejection "$CASE" 'side-by-side TestFlight vendor digest cannot be bypassed'
+require_rejection "$CASE" 'side-by-side TestFlight one exact vendor digest verification'
 
 CASE=$(new_case testflight-vendor-mutation-fence)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
   '"$(vendor_archive_identity "${archive_path}")" == "${identity}"' \
   '-n "${identity}"'
-require_rejection "$CASE" 'side-by-side TestFlight vendor hash must be identity-fenced'
+require_rejection "$CASE" 'side-by-side TestFlight vendor hash identity fence'
 
 CASE=$(new_case testflight-cache-enrollment-package-manifest-pin)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \

@@ -793,6 +793,12 @@ actor WorldwideScreenService {
     private var signalingTask: Task<Void, Never>?
     private var peerEventTask: Task<Void, Never>?
     private var screenClientDiagnosticsEventTask: Task<Void, Never>?
+    private var audioClientDiagnosticsEventTask: Task<Void, Never>?
+    private var audioClientDiagnosticsFreshnessTask: Task<Void, Never>?
+    private var audioClientDiagnostics = WorldwideAudioClientDiagnosticsSink(
+        hostPID: ProcessInfo.processInfo.processIdentifier
+    )
+    private let audioClientDiagnosticsReportWriter = WorldwideAudioClientDiagnosticsReportWriter()
     private var screenVideoAdaptationTask: Task<Void, Never>?
     private var screenVideoAdaptationFastStatisticsAreAvailable = false
     private var screenVideoAdaptationPolicyRevision: UInt64 = 0
@@ -1238,6 +1244,12 @@ actor WorldwideScreenService {
         peerEventTask = nil
         screenClientDiagnosticsEventTask?.cancel()
         screenClientDiagnosticsEventTask = nil
+        audioClientDiagnosticsEventTask?.cancel()
+        audioClientDiagnosticsEventTask = nil
+        audioClientDiagnosticsFreshnessTask?.cancel()
+        audioClientDiagnosticsFreshnessTask = nil
+        audioClientDiagnostics.markUnavailable(.stopped)
+        logAudioClientDiagnosticsIfDue()
         screenVideoAdaptationTask?.cancel()
         screenVideoAdaptationTask = nil
         screenVideoAdaptationFastStatisticsAreAvailable = false
@@ -1504,6 +1516,7 @@ actor WorldwideScreenService {
             }
         )
         self.peer = peer
+        audioClientDiagnostics.bind(peerGeneration: generation)
         iPhoneMicrophoneForwarding.replacePeer(
             peer: peer,
             peerGeneration: generation
@@ -1511,6 +1524,7 @@ actor WorldwideScreenService {
         recoveryCoordinator = coordinator
         let events = peer.events
         let screenClientDiagnosticsEvents = peer.screenClientDiagnosticsEvents
+        let audioClientDiagnosticsEvents = peer.audioClientDiagnosticsEvents
         peerEventTask = Task { [weak self] in
             await self?.consumePeerEvents(
                 events,
@@ -1524,6 +1538,28 @@ actor WorldwideScreenService {
                 sourcePeer: peer,
                 sourcePeerGeneration: generation
             )
+        }
+        audioClientDiagnosticsEventTask = Task { [weak self] in
+            for await event in audioClientDiagnosticsEvents {
+                guard !Task.isCancelled else { return }
+                await self?.handleAudioClientDiagnosticsEvent(
+                    event, sourcePeer: peer, sourcePeerGeneration: generation
+                )
+            }
+            guard !Task.isCancelled else { return }
+            await self?.audioClientDiagnosticsStreamEnded(
+                sourcePeer: peer, sourcePeerGeneration: generation
+            )
+        }
+        audioClientDiagnosticsFreshnessTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                let negotiated = await peer.audioClientDiagnosticsIsNegotiated()
+                guard !Task.isCancelled else { return }
+                await self?.tickAudioClientDiagnostics(
+                    negotiated: negotiated, sourcePeer: peer, sourcePeerGeneration: generation
+                )
+            }
         }
         try await peer.startStatistics(
             interval: Self.screenVideoAdaptationFallbackStatisticsInterval
@@ -1599,6 +1635,67 @@ actor WorldwideScreenService {
                 logger.info("Worldwide screen client diagnostics unavailable: \(message)")
             }
         }
+    }
+
+    // MARK: - Best-effort client audio evidence
+
+    private func handleAudioClientDiagnosticsEvent(
+        _ event: WebRTCAudioClientDiagnosticsEvent,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard !isStopped, peer === sourcePeer, peerGeneration == sourcePeerGeneration else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        switch event {
+        case .heartbeat(let value):
+            guard value.isValid else { return }
+            _ = audioClientDiagnostics.receive(value, peerGeneration: sourcePeerGeneration, now: now)
+        case .laneFailure:
+            // Lane failures carry no negotiation authority. A queued old failure cannot replace
+            // a current valid sample; revocation/freshness is checked independently below.
+            if case .fresh = audioClientDiagnostics.latest(now: now).status { break }
+            audioClientDiagnostics.markUnavailable(.laneUnavailable)
+        }
+        logAudioClientDiagnosticsIfDue()
+    }
+
+    private func audioClientDiagnosticsStreamEnded(
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard !isStopped, peer === sourcePeer, peerGeneration == sourcePeerGeneration else { return }
+        audioClientDiagnostics.markUnavailable(.streamEnded)
+        logAudioClientDiagnosticsIfDue()
+    }
+
+    private func tickAudioClientDiagnostics(
+        negotiated: Bool,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard !isStopped, peer === sourcePeer, peerGeneration == sourcePeerGeneration else { return }
+        audioClientDiagnostics.observeNegotiated(negotiated)
+        logAudioClientDiagnosticsIfDue()
+    }
+
+    private func logAudioClientDiagnosticsIfDue() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let latest = audioClientDiagnostics.latest(now: now)
+        let terminal: Bool
+        switch latest.status {
+        case .unavailable, .stale: terminal = true
+        case .fresh: terminal = false
+        }
+        audioClientDiagnosticsReportWriter.submit(
+            .init(latest: latest, uptime: now, date: Date()), terminal: terminal
+        )
+        if let message = audioClientDiagnostics.logMessageIfDue(now: now) {
+            logger.info(message + " reportStorage=\(audioClientDiagnosticsReportWriter.storageStatus.rawValue)")
+        }
+    }
+
+    var latestAudioClientDiagnostics: WorldwideAudioClientDiagnosticsSink.Latest {
+        audioClientDiagnostics.latest(now: ProcessInfo.processInfo.systemUptime)
     }
 
     // MARK: - System Now Playing

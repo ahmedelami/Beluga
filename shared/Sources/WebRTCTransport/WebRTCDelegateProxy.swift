@@ -45,6 +45,7 @@ enum NativeScreenDiagnosticsEvent: Sendable {
 /// Native delegates arrive on WebRTC queues; only channel ownership and synchronous authorization
 /// revocation live here. Higher-level protocol state is consumed by `WebRTCPeer`'s actor.
 final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
+    let audioDiagnosticsLane = AudioClientDiagnosticsLane()
     let events: AsyncStream<NativePeerEvent>
     let screenDiagnosticsEvents: AsyncStream<NativeScreenDiagnosticsEvent>
 
@@ -79,6 +80,11 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
     }
 
     func installDataChannel(_ channel: LKRTCDataChannel) {
+        if channel.label as String == AudioClientDiagnosticsLane.label,
+           channel.protocol as String == AudioClientDiagnosticsLane.channelProtocol {
+            audioDiagnosticsLane.install(channel)
+            return
+        }
         if channel.label as String == WebRTCWireConstants.screenDiagnosticsChannelLabel,
            channel.protocol as String == WebRTCWireConstants.screenDiagnosticsProtocol {
             installScreenDiagnosticsChannel(channel)
@@ -349,6 +355,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
         resources.screenDiagnosticsChannel?.close()
         screenDiagnosticsContinuation.finish()
         continuation.finish()
+        audioDiagnosticsLane.close()
     }
 
     private func emit(_ event: NativePeerEvent) {
@@ -437,6 +444,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
         resources.screenDiagnosticsChannel?.delegate = nil
         resources.screenDiagnosticsChannel?.close()
         continuation.finish()
+        audioDiagnosticsLane.close()
     }
 
     private func nativeTransportIsHealthyLocked() -> Bool {

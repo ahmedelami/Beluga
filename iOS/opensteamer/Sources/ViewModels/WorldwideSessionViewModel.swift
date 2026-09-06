@@ -6,6 +6,339 @@ import RemoteSessionCore
 import UIKit
 import WebRTCTransport
 
+/// Session-local evidence only. A successful send never consumes the retained failure/history.
+struct IOSAudioDiagnosticsJournal {
+    private(set) var sessionID = UUID()
+    private(set) var snapshot = WebRTCAudioClientSnapshot()
+    private(set) var failureSnapshot: WebRTCAudioClientSnapshot?
+    private(set) var events: [WebRTCAudioClientEvent] = []
+    private var nextSequence: UInt64 = 1
+    private var nextEventSequence: UInt64 = 1
+    private var startedAt: UInt64 = 0
+    private var nativeObservedAt: UInt64?
+    private var inboundObservedAt: UInt64?
+    private var failureObservedAt: UInt64?
+    private var highestNativeFailureSequence: UInt64 = 0
+    private var lastStatisticsSequence: UInt64?
+    private var lastStatisticsCollectedAt: Date?
+
+    mutating func reset(sessionID: UUID, policyID: UUID, at now: UInt64) {
+        self = Self()
+        self.sessionID = sessionID
+        startedAt = now
+        snapshot.audioPolicyID = policyID
+        record(.sessionStarted, at: now)
+    }
+
+    mutating func policyChanged(_ policyID: UUID, at now: UInt64) {
+        guard snapshot.audioPolicyID != policyID else { return }
+        snapshot.audioPolicyID = policyID
+        snapshot.native = nil
+        nativeObservedAt = nil
+        snapshot.targetMatched = nil
+        snapshot.authorization = .unknown
+        snapshot.authorityFailureCode = nil
+        snapshot.proofStage = .awaitingAuthorization
+        snapshot.failurePhase = .none
+        record(.policyChanged, at: now)
+    }
+
+    mutating func playbackChanged(_ state: WorldwideAudioLifecycleSnapshot, at now: UInt64) {
+        let next: WebRTCAudioClientPlaybackState = state.isPlaying ? .playing
+            : state.errorText != nil ? .failed
+            : state.requiresExplicitResume ? .paused
+            : state.isRemoteAudioAvailable ? .awaitingEvidence : .unavailable
+        guard next != snapshot.playbackState else { return }
+        snapshot.playbackState = next
+        if next == .playing {
+            snapshot.proofStage = .complete
+            snapshot.failurePhase = .none
+            record(.recovered, at: now)
+        } else if next == .failed {
+            fail(phase: snapshot.failurePhase == .none ? .unknown : snapshot.failurePhase, at: now)
+        }
+    }
+
+    mutating func policyFacts(peerConnected: Bool, iceConnected: Bool, controlOpen: Bool,
+                              applicationActive: Bool, remoteTrackAvailable: Bool,
+                              microphoneIntent: Bool, microphonePermissionGranted: Bool,
+                              microphoneBlockedByCall: Bool) {
+        snapshot.peerConnected = peerConnected
+        snapshot.iceConnected = iceConnected
+        snapshot.controlOpen = controlOpen
+        snapshot.applicationActive = applicationActive
+        snapshot.remoteTrackAvailable = remoteTrackAvailable
+        snapshot.microphoneIntent = microphoneIntent
+        snapshot.microphonePermissionGranted = microphonePermissionGranted
+        snapshot.microphoneBlockedByCall = microphoneBlockedByCall
+    }
+
+    mutating func retryRequested(at now: UInt64) {
+        snapshot.retryState = .requested
+        record(.retryRequested, at: now)
+    }
+
+    mutating func beginProof(recovery: Bool, at now: UInt64) {
+        if recovery {
+            guard snapshot.recoveryAttempt < UInt64.max else { return }
+            snapshot.recoveryAttempt += 1
+            snapshot.retryState = .executing
+        }
+        snapshot.targetMatched = nil
+        snapshot.authorityFailureCode = nil
+        snapshot.proofStage = recovery ? .awaitingAuthorization : .awaitingEvidence
+        snapshot.failurePhase = .none
+    }
+
+    mutating func observeNative(
+        _ native: WebRTCAudioClientNativeSnapshot,
+        policyID: UUID,
+        classifyFailure: Bool = true,
+        at now: UInt64
+    ) {
+        guard snapshot.audioPolicyID == policyID else { return }
+        let previous = snapshot.native
+        snapshot.native = native
+        nativeObservedAt = now
+        let newContext = native.failureContext.flatMap {
+            $0.eventSequence > highestNativeFailureSequence ? $0 : nil
+        }
+        if let newContext { highestNativeFailureSequence = newContext.eventSequence }
+        if classifyFailure, native.failureCode != 0,
+           previous?.failureCode != native.failureCode
+                || previous?.lastLifecycleStatus != native.lastLifecycleStatus
+                || previous?.failureContext?.eventSequence != native.failureContext?.eventSequence {
+            fail(phase: Self.failurePhase(native.failureCode), at: now)
+        } else if let newContext, newContext.failureCode != 0 {
+            // This was captured before rollback, possibly before this policy/attempt existed.
+            // Preserve the cause without labelling a healthy or not-yet-executed attempt failed.
+            var historical = WebRTCAudioClientSnapshot()
+            historical.native = native
+            historical.nativeObservationAgeMilliseconds = 0
+            historical.failurePhase = Self.failurePhase(newContext.failureCode)
+            historical.proofStage = .failed
+            if failureSnapshot == nil {
+                failureSnapshot = historical
+                failureObservedAt = now
+            } else if failureSnapshot?.native?.failureContext == nil {
+                // The POD is explicitly historical, not proof of the retained policy's cause.
+                // Keep its original generations even if a later native failure replaces current.
+                var retained = agedFailureSnapshot(at: now)
+                if retained?.native == nil {
+                    retained?.native = native
+                    retained?.nativeObservationAgeMilliseconds = 0
+                } else {
+                    retained?.native?.failureContext = newContext
+                }
+                failureSnapshot = retained
+                failureObservedAt = now
+            }
+            record(.failure, evidence: historical, at: now)
+        }
+    }
+
+    mutating func observeInbound(_ audio: WebRTCAudioStatistics?, at now: UInt64) {
+        snapshot.inboundAudioPackets = audio?.packets
+        snapshot.inboundAudioBytes = audio?.bytes
+        snapshot.inboundAudioPacketsLost = audio?.packetsLost
+        snapshot.inboundAudioConcealedSamples = audio?.concealedSamples
+        snapshot.inboundAudioTotalEnergy = audio?.totalAudioEnergy.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        }
+        snapshot.inboundAudioSamplesDuration = audio?.totalSamplesDuration.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        }
+        inboundObservedAt = audio == nil ? nil : now
+    }
+
+    mutating func observeStatistics(_ statistics: WebRTCStatisticsSnapshot,
+                                   at now: UInt64, wallNow: Date) {
+        if let sequence = statistics.collectionSequence {
+            guard lastStatisticsSequence.map({ sequence > $0 }) ?? true else { return }
+            lastStatisticsSequence = sequence
+        } else {
+            guard lastStatisticsSequence == nil,
+                  lastStatisticsCollectedAt.map({ statistics.collectedAt > $0 }) ?? true else { return }
+        }
+        lastStatisticsCollectedAt = statistics.collectedAt
+        observeInbound(statistics.inboundAudio, at: now)
+        let seconds = wallNow.timeIntervalSince(statistics.collectedAt)
+        guard statistics.inboundAudio != nil, seconds.isFinite, seconds >= 0,
+              seconds <= 86_400 else {
+            inboundObservedAt = nil
+            return
+        }
+        let age = UInt64((seconds * 1_000_000_000).rounded(.up))
+        inboundObservedAt = age <= now ? now - age : nil
+    }
+
+    mutating func nativeReceipt(accepted: Bool, targetMatched: Bool, at now: UInt64) {
+        snapshot.targetMatched = targetMatched
+        snapshot.retryState = accepted && targetMatched ? .accepted : .rejected
+        snapshot.authorization = accepted ? .valid : .rejected
+        if accepted { snapshot.authorityFailureCode = nil }
+        snapshot.proofStage = accepted && targetMatched ? .awaitingEvidence : .failed
+        record(.nativeReceipt, at: now)
+        if !accepted || !targetMatched {
+            fail(phase: snapshot.native.map { Self.failurePhase($0.failureCode) }
+                .flatMap { $0 == .none ? nil : $0 } ?? .authorization, at: now)
+        }
+    }
+
+    mutating func fail(phase: WebRTCAudioClientFailurePhase, at now: UInt64) {
+        snapshot.failurePhase = phase
+        snapshot.proofStage = .failed
+        if snapshot.retryState == .executing { snapshot.retryState = .failed }
+        if failureSnapshot == nil {
+            failureSnapshot = agedSnapshot(at: now)
+            failureObservedAt = now
+        } else if failureSnapshot?.audioPolicyID == snapshot.audioPolicyID,
+                  failureSnapshot?.recoveryAttempt == snapshot.recoveryAttempt,
+                  !Self.hasNativeFailure(failureSnapshot?.native),
+                  Self.hasNativeFailure(snapshot.native) {
+            // A controller failure can arrive between a healthy native read and the failed read.
+            // Enrich its missing native cause, preserving the first failure's identity/outcomes.
+            var retained = agedFailureSnapshot(at: now)
+            retained?.native = snapshot.native
+            retained?.nativeObservationAgeMilliseconds = Self.age(since: nativeObservedAt, at: now)
+            if retained?.failurePhase == .unknown { retained?.failurePhase = phase }
+            failureSnapshot = retained
+            failureObservedAt = now
+        }
+        record(.failure, at: now)
+    }
+
+    mutating func authorityFailure(_ decision: AudioTransactionDecision, at now: UInt64) {
+        guard let code = Self.authorityFailureCode(decision) else { return }
+        snapshot.authorityFailureCode = code
+        snapshot.authorization = .rejected
+        fail(phase: .authorization, at: now)
+    }
+
+    // Stable diagnostic codebook: reducer rejection 1...12, runtime 101...105,
+    // failed-closed 201. Unknown ABI values never become arbitrary wire strings.
+    static func authorityFailureCode(_ decision: AudioTransactionDecision) -> UInt16? {
+        switch decision {
+        case .rejected(let reason):
+            switch reason {
+            case .staleRevision: 1
+            case .staleAuthority: 2
+            case .staleOperation: 3
+            case .duplicate: 4
+            case .invalidInput: 5
+            case .targetMismatch: 6
+            case .blockerNotAllowed: 7
+            case .noCurrentOperation: 8
+            case .capacityExceeded: 9
+            case .blockerRequired: 10
+            case .counterExhausted: 11
+            case .unknown: 12
+            }
+        case .runtimeFailure(let reason):
+            switch reason {
+            case .unavailable: 101
+            case .abiMismatch: 102
+            case .nullPointer: 103
+            case .poisoned: 104
+            case .unknown: 105
+            }
+        case .failedClosed: 201
+        default: nil
+        }
+    }
+
+    mutating func record(_ kind: WebRTCAudioClientEventKind,
+                         evidence: WebRTCAudioClientSnapshot? = nil, at now: UInt64) {
+        guard nextEventSequence < UInt64.max else { return }
+        let historicalFailure = kind == .failure && evidence != nil
+        let evidence = evidence ?? snapshot
+        let event = WebRTCAudioClientEvent(
+            sequence: nextEventSequence,
+            elapsedMilliseconds: elapsed(now),
+            audioPolicyID: evidence.audioPolicyID,
+            recoveryAttempt: evidence.recoveryAttempt,
+            kind: kind,
+            failurePhase: evidence.failurePhase,
+            failureCode: historicalFailure
+                ? evidence.native?.failureContext?.failureCode ?? 0
+                : evidence.native?.failureCode ?? 0,
+            status: historicalFailure
+                ? evidence.native?.failureContext?.status ?? evidence.native?.lastLifecycleStatus ?? 0
+                : evidence.native?.lastLifecycleStatus ?? 0,
+            retryState: evidence.retryState,
+            authorization: evidence.authorization,
+            targetMatched: evidence.targetMatched,
+            authorityFailureCode: evidence.authorityFailureCode
+        )
+        nextEventSequence += 1
+        events.append(event)
+        if events.count > WebRTCAudioClientDiagnosticsHeartbeat.maximumEvents {
+            events.removeFirst(events.count - WebRTCAudioClientDiagnosticsHeartbeat.maximumEvents)
+        }
+    }
+
+    mutating func heartbeat(build: WebRTCAudioClientBuild, at now: UInt64)
+        -> WebRTCAudioClientDiagnosticsHeartbeat? {
+        guard nextSequence < UInt64.max else { return nil }
+        defer { nextSequence += 1 }
+        return WebRTCAudioClientDiagnosticsHeartbeat(
+            sequence: nextSequence, sessionID: sessionID, build: build,
+            snapshot: agedSnapshot(at: now), failureSnapshot: agedFailureSnapshot(at: now),
+            events: events, observedElapsedMilliseconds: elapsed(now)
+        )
+    }
+
+    private static func hasNativeFailure(_ native: WebRTCAudioClientNativeSnapshot?) -> Bool {
+        // A retained historical context is not evidence that this live observation failed.
+        (native?.failureCode ?? 0) != 0
+    }
+
+    private func agedFailureSnapshot(at now: UInt64) -> WebRTCAudioClientSnapshot? {
+        var retained = failureSnapshot
+        if let failureObservedAt {
+            let age = Self.age(since: failureObservedAt, at: now) ?? 0
+            let nativeAge = retained?.nativeObservationAgeMilliseconds.map {
+                min(86_400_000, $0 + age)
+            }
+            let inboundAge = retained?.inboundObservationAgeMilliseconds.map {
+                min(86_400_000, $0 + age)
+            }
+            retained?.nativeObservationAgeMilliseconds = nativeAge
+            retained?.inboundObservationAgeMilliseconds = inboundAge
+        }
+        return retained
+    }
+
+    private func agedSnapshot(at now: UInt64) -> WebRTCAudioClientSnapshot {
+        var result = snapshot
+        result.nativeObservationAgeMilliseconds = Self.age(since: nativeObservedAt, at: now)
+        result.inboundObservationAgeMilliseconds = Self.age(since: inboundObservedAt, at: now)
+        return result
+    }
+
+    private func elapsed(_ now: UInt64) -> UInt64 {
+        now >= startedAt ? (now - startedAt) / 1_000_000 : 0
+    }
+
+    private static func age(since time: UInt64?, at now: UInt64) -> UInt64? {
+        guard let time, now >= time else { return nil }
+        return min(86_400_000, (now - time) / 1_000_000)
+    }
+
+    static func failurePhase(_ code: Int32) -> WebRTCAudioClientFailurePhase {
+        switch code {
+        case 0: .none
+        case 1...3, 16, 17, 20, 21: .session
+        case 4, 18, 19: .route
+        case 5...11, 13, 22...24: .initialization
+        case 14: .start
+        case 12, 25: .render
+        case 15: .retirement
+        default: .unknown
+        }
+    }
+}
+
 /// Capability-like token that binds one screen presentation to one media-session generation.
 /// Views must present this exact lease on show, input, and teardown calls; a raw request ID is not
 /// sufficient because IDs may be reused by a replacement peer.
@@ -926,6 +1259,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var peer: WebRTCPeer? {
         didSet {
             guard oldValue !== peer else { return }
+            startAudioClientDiagnostics(for: peer)
             remoteMediaControlsNegotiated = false
             clearRemoteMediaPresentation()
             cancelScreenMediaViewerSuspension(
@@ -1045,6 +1379,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var audioPolicyGeneration = UUID() {
         didSet {
             if oldValue != audioPolicyGeneration {
+                audioDiagnostics.policyChanged(audioPolicyGeneration, at: Self.audioDiagnosticsNow())
                 invalidateRawMicrophoneOracle()
                 retireIOSHostedCallPlayoutAttempt()
             }
@@ -1112,6 +1447,13 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var sessionGeneration = UUID() {
         didSet {
             if oldValue != sessionGeneration {
+                audioClientDiagnosticsTask?.cancel()
+                audioClientDiagnosticsTask = nil
+                audioDiagnosticsSampleTask?.cancel()
+                audioDiagnostics.reset(
+                    sessionID: sessionGeneration, policyID: audioPolicyGeneration,
+                    at: Self.audioDiagnosticsNow()
+                )
                 cancelFocusedWindowResize()
                 advanceScreenLivenessGeneration(clearRenderObservation: true)
                 beginMacHostedCallNegotiationBoundary()
@@ -1160,6 +1502,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         WebRTCVideoRenderObservation?
     private var latestScreenVideoPresentationUptimeNanoseconds: UInt64?
     private var nextScreenClientDiagnosticsSequence: UInt64 = 1
+    private var audioDiagnostics = IOSAudioDiagnosticsJournal()
+    private var audioClientDiagnosticsTask: Task<Void, Never>?
+    private var audioDiagnosticsSampleTask: Task<Void, Never>?
+    private var audioDiagnosticsSampleID: UUID?
+    private var audioDiagnosticsLastSentAt: UInt64?
+    private var audioDiagnosticsLastEventSequence: UInt64 = 0
+    private var audioDiagnosticsFastUntil: UInt64 = 0
     private var screenMediaViewerAttempt: WorldwideScreenMediaViewerAttempt?
     private var screenMediaCoveredHideTask: Task<Void, Never>?
     private var screenMediaMarkerPresentationTask: Task<Void, Never>?
@@ -1215,6 +1564,9 @@ final class WorldwideSessionViewModel: ObservableObject {
         (@MainActor () -> Void)?
     private var debugIOSPlayoutDiagnosticsReader: (
         @MainActor (WebRTCPeer) async -> WebRTCIOSPlayoutDiagnostics?
+    )?
+    private var debugAudioClientDiagnosticsReader: (
+        @MainActor (WebRTCPeer) async -> WebRTCAudioClientNativeSnapshot?
     )?
     private var debugIOSPlayoutRecoveryRequester: (
         @MainActor (WebRTCPeer, WebRTCIOSPlayoutRecoveryAuthorization) async -> Void
@@ -1296,7 +1648,19 @@ final class WorldwideSessionViewModel: ObservableObject {
             audioRequiresExplicitResume = snapshot.requiresExplicitResume
             audioError = snapshot.errorText
             audioDiagnostic = snapshot.diagnosticText
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.playbackChanged(snapshot, at: Self.audioDiagnosticsNow())
             reconcileIPhoneMicrophone(for: snapshot)
+        }
+        audioLifecycle.onDiagnosticsAuthorityFailure = { [weak self] decision in
+            guard let self else { return }
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.authorityFailure(decision, at: Self.audioDiagnosticsNow())
+        }
+        audioLifecycle.onDiagnosticsBoundary = { [weak self] kind in
+            guard let self else { return }
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.record(kind, at: Self.audioDiagnosticsNow())
         }
         #if DEBUG
         // Production recovery is dispatched only through the transaction callback installed after
@@ -1374,6 +1738,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     deinit {
+        audioClientDiagnosticsTask?.cancel()
+        audioDiagnosticsSampleTask?.cancel()
         let remoteMediaCommandOwner = remoteMediaCommandOwner
         audioTransactionEventTask?.cancel()
         remoteMediaRefreshTask?.cancel()
@@ -1901,6 +2267,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     func resumeAudioPlayback() {
+        audioDiagnostics.retryRequested(at: Self.audioDiagnosticsNow())
         ordinaryPlayoutLivenessTracker.reset()
         ordinaryPlayoutAutomaticRecoveryConsumedSessionGeneration = nil
         ordinaryPlayoutAutomaticFailureWasPublished = false
@@ -3336,6 +3703,133 @@ final class WorldwideSessionViewModel: ObservableObject {
                 renderObservation: renderObservation
             )
         )
+    }
+
+    private static func audioDiagnosticsNow() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private static var audioDiagnosticsBuild: WebRTCAudioClientBuild {
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "").split(separator: ".").map { UInt16($0) }
+        return WebRTCAudioClientBuild(
+            versionMajor: version.indices.contains(0) ? version[0] ?? 0 : 0,
+            versionMinor: version.indices.contains(1) ? version[1] ?? 0 : 0,
+            versionPatch: version.indices.contains(2) ? version[2] ?? 0 : 0,
+            buildNumber: UInt32(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
+                as? String ?? "") ?? 0
+        )
+    }
+
+    private func startAudioClientDiagnostics(for sourcePeer: WebRTCPeer?) {
+        audioClientDiagnosticsTask?.cancel()
+        audioClientDiagnosticsTask = nil
+        // Keep the one in-flight slot until its reader actually returns, even across reconnects.
+        audioDiagnosticsSampleTask?.cancel()
+        audioDiagnosticsLastSentAt = nil
+        audioDiagnosticsLastEventSequence = 0
+        audioDiagnosticsFastUntil = 0
+        guard let sourcePeer else { return }
+        let generation = sessionGeneration
+        audioDiagnostics.reset(
+            sessionID: generation, policyID: audioPolicyGeneration,
+            at: Self.audioDiagnosticsNow()
+        )
+        // No dependency on Show, playout readiness, or a successful statistics read. A failed
+        // native path must still report its last evidence with an increasing observation age.
+        audioClientDiagnosticsTask = Task { [weak self, weak sourcePeer] in
+            while !Task.isCancelled {
+                guard let sourcePeer else { return }
+                self?.scheduleAudioDiagnosticsSample(from: sourcePeer, generation: generation)
+                await self?.sendAudioClientDiagnostics(through: sourcePeer, generation: generation)
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            }
+        }
+    }
+
+    private func sendAudioClientDiagnostics(through sourcePeer: WebRTCPeer, generation: UUID) async {
+        guard !Task.isCancelled, peer === sourcePeer, sessionGeneration == generation else { return }
+        let now = Self.audioDiagnosticsNow()
+        if let latestEvent = audioDiagnostics.events.last,
+           latestEvent.sequence != audioDiagnosticsLastEventSequence {
+            audioDiagnosticsLastEventSequence = latestEvent.sequence
+            audioDiagnosticsFastUntil = now.addingReportingOverflow(30_000_000_000).partialValue
+        }
+        let interval: UInt64 = now <= audioDiagnosticsFastUntil ? 1_000_000_000 : 5_000_000_000
+        if let last = audioDiagnosticsLastSentAt, now >= last, now - last < interval { return }
+        guard let context = await sourcePeer.audioClientDiagnosticsContext() else { return }
+        guard !Task.isCancelled, context.isValid,
+              peer === sourcePeer, sessionGeneration == generation else { return }
+        updateAudioDiagnosticsPolicyFacts()
+        guard let heartbeat = audioDiagnostics.heartbeat(
+            build: Self.audioDiagnosticsBuild, at: Self.audioDiagnosticsNow()
+        ) else { return }
+        audioDiagnosticsLastSentAt = now
+        do {
+            try await sourcePeer.sendAudioClientDiagnosticsHeartbeat(heartbeat, context: context)
+        } catch {
+            // Best-effort telemetry neither changes media policy nor schedules a retry backlog.
+        }
+    }
+
+    private func updateAudioDiagnosticsPolicyFacts() {
+        audioDiagnostics.policyFacts(
+            peerConnected: isPeerConnected, iceConnected: iceIsConnected,
+            controlOpen: isControlChannelReady, applicationActive: applicationIsActive,
+            remoteTrackAvailable: remoteAudioTrack != nil, microphoneIntent: microphoneIntentEnabled,
+            microphonePermissionGranted: microphonePermissionGranted,
+            microphoneBlockedByCall: microphoneIsBlockedByCall
+        )
+    }
+
+    private func scheduleAudioDiagnosticsSample(from sourcePeer: WebRTCPeer, generation: UUID) {
+        guard audioDiagnosticsSampleTask == nil, peer === sourcePeer,
+              generation == sessionGeneration else { return }
+        let sampleID = UUID()
+        audioDiagnosticsSampleID = sampleID
+        audioDiagnosticsSampleTask = Task { [weak self, weak sourcePeer] in
+            guard let self else { return }
+            defer {
+                if audioDiagnosticsSampleID == sampleID {
+                    audioDiagnosticsSampleTask = nil
+                    audioDiagnosticsSampleID = nil
+                }
+            }
+            guard let sourcePeer else { return }
+            await captureAudioClientDiagnostics(from: sourcePeer, generation: generation)
+        }
+    }
+
+    private func captureAudioClientDiagnostics(
+        from sourcePeer: WebRTCPeer,
+        generation: UUID
+    ) async {
+        guard !Task.isCancelled, generation == sessionGeneration, peer === sourcePeer else { return }
+        updateAudioDiagnosticsPolicyFacts()
+        let policyID = audioPolicyGeneration
+        let attemptID = iosPlayoutProofAttempt?.proofAttemptID
+        let attemptStage = iosPlayoutProofAttempt?.stage
+        let diagnostics = await readAudioClientNativeSnapshot(from: sourcePeer)
+        guard !Task.isCancelled, generation == sessionGeneration, peer === sourcePeer,
+              policyID == audioPolicyGeneration,
+              attemptID == iosPlayoutProofAttempt?.proofAttemptID,
+              attemptStage == iosPlayoutProofAttempt?.stage, let diagnostics else { return }
+        audioDiagnostics.observeNative(
+            diagnostics,
+            policyID: policyID,
+            classifyFailure: attemptStage != .awaitingRecoveryBaseline,
+            at: Self.audioDiagnosticsNow()
+        )
+    }
+
+    private func readAudioClientNativeSnapshot(from sourcePeer: WebRTCPeer) async
+        -> WebRTCAudioClientNativeSnapshot? {
+        #if DEBUG
+        if let debugAudioClientDiagnosticsReader {
+            return await debugAudioClientDiagnosticsReader(sourcePeer)
+        }
+        #endif
+        return await sourcePeer.iOSAudioClientDiagnostics()
     }
 
     private func sendScreenClientDiagnosticsHeartbeat(
@@ -6373,6 +6867,9 @@ final class WorldwideSessionViewModel: ObservableObject {
               peer === sourcePeer else { return }
 
         statistics = snapshot
+        audioDiagnostics.observeStatistics(snapshot, at: Self.audioDiagnosticsNow(), wallNow: Date())
+        // Optional native telemetry must never suspend the sequential peer-event consumer.
+        scheduleAudioDiagnosticsSample(from: sourcePeer, generation: generation)
         refreshScreenLivenessDiagnostic()
         await sendScreenClientDiagnosticsHeartbeat(
             through: sourcePeer,
@@ -7311,6 +7808,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             stage: requiresRecovery ? .awaitingRecoveryBaseline : .awaitingInitialFloor
         )
         iosPlayoutProofAttempt = attempt
+        audioDiagnostics.beginProof(recovery: requiresRecovery, at: Self.audioDiagnosticsNow())
         if pendingMicrophoneRecoveryIsCurrent {
             microphoneAdmissionRecoveryProofAttemptID =
                 attempt.proofAttemptID
@@ -7482,6 +7980,13 @@ final class WorldwideSessionViewModel: ObservableObject {
               iosPlayoutProofAttemptIsOwned(attempt),
               attempt.expectedPeer === proofPeer else { return nil }
         if let diagnostics {
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.observeNative(
+                WebRTCAudioClientNativeSnapshot(diagnostics: diagnostics),
+                policyID: attempt.audioPolicyGeneration,
+                classifyFailure: attempt.stage != .awaitingRecoveryBaseline,
+                at: Self.audioDiagnosticsNow()
+            )
             publishIOSPlayoutOracle(
                 diagnostics,
                 from: proofPeer,
@@ -9023,6 +9528,7 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     private func failIOSPlayoutProofTimeout(_ attempt: IOSPlayoutProofAttempt) {
         guard iosPlayoutProofAttemptIsOwned(attempt) else { return }
+        audioDiagnostics.fail(phase: .evidence, at: Self.audioDiagnosticsNow())
         failPendingMicrophoneAdmissionRecoveryIfOwned(
             by: attempt,
             message:
@@ -9066,6 +9572,15 @@ final class WorldwideSessionViewModel: ObservableObject {
                     return false
                 }
                 if !attempt.nativeRecoveryReceiptWasConsumed {
+                    audioDiagnostics.observeNative(
+                        WebRTCAudioClientNativeSnapshot(diagnostics: diagnostics),
+                        policyID: attempt.audioPolicyGeneration, at: Self.audioDiagnosticsNow()
+                    )
+                    audioDiagnostics.nativeReceipt(
+                        accepted: terminalReceipt.outcome == .accepted,
+                        targetMatched: terminalReceipt.policyMatchesRequestedTarget,
+                        at: Self.audioDiagnosticsNow()
+                    )
                     audioLifecycle.consumeIOSPlayoutRecoveryReceipt(
                         terminalReceipt,
                         diagnostic: [
@@ -9304,6 +9819,15 @@ final class WorldwideSessionViewModel: ObservableObject {
         diagnosticOverride: String? = nil
     ) -> Bool {
         guard iosPlayoutProofAttemptIsOwned(attempt) else { return false }
+        audioDiagnostics.observeNative(
+            WebRTCAudioClientNativeSnapshot(diagnostics: diagnostics),
+            policyID: attempt.audioPolicyGeneration, at: Self.audioDiagnosticsNow()
+        )
+        audioDiagnostics.fail(
+            phase: diagnostics.failureCode == 0 ? .evidence
+                : IOSAudioDiagnosticsJournal.failurePhase(Int32(clamping: diagnostics.failureCode)),
+            at: Self.audioDiagnosticsNow()
+        )
         let message = Self.iOSPlayoutFailureMessage(
             inputPolicyMatches: iOSPlayoutInputPolicyMatches(diagnostics),
             diagnostics: diagnostics
@@ -10320,6 +10844,12 @@ final class WorldwideSessionViewModel: ObservableObject {
         debugIOSPlayoutDiagnosticsReader = reader
     }
 
+    func debugInstallAudioClientDiagnosticsReader(
+        _ reader: @escaping @MainActor (WebRTCPeer) async -> WebRTCAudioClientNativeSnapshot?
+    ) {
+        debugAudioClientDiagnosticsReader = reader
+    }
+
     func debugInstallIOSPlayoutRecoveryRequester(
         _ requester: @escaping @MainActor (
             WebRTCPeer,
@@ -10489,6 +11019,32 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     var debugAudioPolicyGeneration: UUID {
         audioPolicyGeneration
+    }
+
+    func debugAudioDiagnosticsHeartbeatForTests(at now: UInt64? = nil)
+        -> WebRTCAudioClientDiagnosticsHeartbeat? {
+        audioDiagnostics.heartbeat(build: Self.audioDiagnosticsBuild, at: now ?? Self.audioDiagnosticsNow())
+    }
+
+    func debugCaptureAudioDiagnosticsForTests(from sourcePeer: WebRTCPeer,
+                                             statistics: WebRTCStatisticsSnapshot) async {
+        audioDiagnostics.observeStatistics(statistics, at: Self.audioDiagnosticsNow(), wallNow: Date())
+        await captureAudioClientDiagnostics(
+            from: sourcePeer, generation: sessionGeneration
+        )
+    }
+
+    func debugScheduleAudioDiagnosticsSampleForTests(from sourcePeer: WebRTCPeer) {
+        scheduleAudioDiagnosticsSample(from: sourcePeer, generation: sessionGeneration)
+    }
+
+    func debugWaitForAudioDiagnosticsSampleForTests() async {
+        await audioDiagnosticsSampleTask?.value
+    }
+
+    func debugSetAudioDiagnosticsBaselineStageForTests(_ isBaseline: Bool) {
+        precondition(iosPlayoutProofAttempt != nil)
+        iosPlayoutProofAttempt?.stage = isBaseline ? .awaitingRecoveryBaseline : .awaitingRecoveryAuthorization
     }
 
     func debugRotateAudioPolicyForTests() {
@@ -11665,6 +12221,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         _ state: String,
         requiresProof: Bool = false
     ) {
+        audioDiagnostics.record(.transportChanged, at: Self.audioDiagnosticsNow())
         if screenMediaViewerAttempt?.phase == .resumed {
             // A completed resume may still carry an RTP freshness floor. Keep that non-covering
             // fence with the retained drawable so transport recovery cannot reinstall black or

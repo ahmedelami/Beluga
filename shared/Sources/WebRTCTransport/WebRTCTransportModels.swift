@@ -18,19 +18,23 @@ public struct WebRTCTransportConfiguration: Sendable {
     /// Explicit local opt-in for the versioned Mac Now Playing control protocol.
     /// Both peers must independently enable and negotiate it before any wire message is sent.
     public let supportsRemoteMediaControls: Bool
+    /// Optional, content-free telemetry to the authenticated peer only; requires exact SDP echo.
+    public let supportsAudioClientDiagnostics: Bool
 
     public init(
         role: RemotePeerRole,
         iceServers: [RemoteICEServer],
         icePolicy: WebRTCICEPolicy = .directPreferred,
         maximumVideoBitrate: Int? = nil,
-        supportsRemoteMediaControls: Bool = false
+        supportsRemoteMediaControls: Bool = false,
+        supportsAudioClientDiagnostics: Bool = true
     ) {
         self.role = role
         self.iceServers = iceServers
         self.icePolicy = icePolicy
         self.maximumVideoBitrate = maximumVideoBitrate
         self.supportsRemoteMediaControls = supportsRemoteMediaControls
+        self.supportsAudioClientDiagnostics = supportsAudioClientDiagnostics
     }
 }
 
