@@ -22352,6 +22352,28 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         XCTAssertFalse(paused.authorization.isValid)
     }
 
+    func testGenericNativePlaybackIsNonLiveWithoutInventedTimelineOrCommands() {
+        let coordinator = BackgroundPlaybackCoordinator.shared
+        let owner = coordinator.claimRemoteMediaCommandSender { _ in }
+        coordinator.setRemoteMediaTransportReady(true, owner: owner)
+        defer {
+            coordinator.releaseRemoteMediaCommandSender(owner: owner)
+            coordinator.clear()
+        }
+        for playing in [true, false] {
+            coordinator.publishLiveStream(serverName: "private host name", isPlaying: playing)
+            let center = MPNowPlayingInfoCenter.default()
+            XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+            XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+            XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
+            XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
+            XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyExternalContentIdentifier])
+            XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, playing ? 1 : 0)
+            XCTAssertEqual(center.playbackState, playing ? .playing : .paused)
+            assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+        }
+    }
+
     func testNativeMetadataReplacementAndLocalAudioPauseRemainIndependent() {
         let coordinator = BackgroundPlaybackCoordinator.shared
         let owner = coordinator.claimRemoteMediaCommandSender { _ in }
@@ -22359,6 +22381,8 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
             coordinator.releaseRemoteMediaCommandSender(owner: owner)
             coordinator.clear()
         }
+        coordinator.publishLiveStream(serverName: "private host name", isPlaying: true)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         let negotiation = WebRTCRemoteMediaAuthorization()
         let first = WebRTCRemoteMediaItem(
             contextID: "first", sourceName: "Music", title: "First",
@@ -22372,9 +22396,13 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         coordinator.publishLiveStream(serverName: "private host name", isPlaying: false)
         let center = MPNowPlayingInfoCenter.default()
         XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "First")
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration] as? Double, 120)
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double, 12)
         // These controls reflect Mac playback, never authorize local Resume Audio.
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1)
-        XCTAssertTrue(MPRemoteCommandCenter.shared().pauseCommand.isEnabled)
+        XCTAssertEqual(center.playbackState, .playing)
+        assertNativeMediaControls(play: true, pause: true, next: true, previous: true)
         let replacement = WebRTCRemoteMediaItem(
             contextID: "second", sourceName: "Browser", title: "Second",
             playbackState: .paused, playbackRate: 0,
@@ -22385,11 +22413,79 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Second")
         XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyAlbumTitle])
         XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
+        XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0)
-        XCTAssertFalse(MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled)
+        XCTAssertEqual(center.playbackState, .paused)
+        assertNativeMediaControls(play: true, pause: false, next: false, previous: false)
         coordinator.clearRemoteMedia(owner: owner)
         XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
-        XCTAssertFalse(MPRemoteCommandCenter.shared().playCommand.isEnabled)
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
+        XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
+        assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+    }
+
+    func testNativeRecoveryAndOwnerReplacementCannotRestoreLiveOrStaleControls() {
+        let coordinator = BackgroundPlaybackCoordinator.shared
+        let oldOwner = coordinator.claimRemoteMediaCommandSender { _ in }
+        coordinator.publishLiveStream(serverName: nil, isPlaying: true)
+        let oldState = makeReceivedState(item: makeRemoteMediaItem(contextID: "old-owner"))
+        coordinator.publishRemoteMedia(oldState, owner: oldOwner)
+        coordinator.setRemoteMediaTransportReady(true, owner: oldOwner)
+        assertNativeMediaControls(play: true, pause: true, next: true, previous: true)
+
+        coordinator.setRemoteMediaTransportReady(false, owner: oldOwner)
+        assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        coordinator.clearRemoteMedia(owner: oldOwner)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+
+        let currentOwner = coordinator.claimRemoteMediaCommandSender { _ in }
+        defer {
+            coordinator.releaseRemoteMediaCommandSender(owner: currentOwner)
+            coordinator.clear()
+        }
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        let current = WebRTCRemoteMediaItem(
+            contextID: "current-owner", sourceName: "Music", title: "Current",
+            playbackState: .paused, playbackRate: 0,
+            capabilities: .init(canPlay: true, canPause: false, canSkipForward: false, canSkipBackward: true)
+        )
+        coordinator.publishRemoteMedia(makeReceivedState(item: current, negotiation: negotiation), owner: currentOwner)
+        coordinator.setRemoteMediaTransportReady(true, owner: currentOwner)
+        coordinator.publishRemoteMedia(oldState, owner: oldOwner)
+        coordinator.setRemoteMediaTransportReady(true, owner: oldOwner)
+        coordinator.clearRemoteMedia(owner: oldOwner)
+        coordinator.releaseRemoteMediaCommandSender(owner: oldOwner)
+        coordinator.publishLiveStream(serverName: nil, isPlaying: true)
+        let center = MPNowPlayingInfoCenter.default()
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Current")
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0)
+        XCTAssertEqual(center.playbackState, .paused)
+        XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
+        assertNativeMediaControls(play: true, pause: false, next: false, previous: true)
+
+        coordinator.publishRemoteMedia(makeReceivedState(item: nil, revision: 2, negotiation: negotiation), owner: currentOwner)
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
+        XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
+        assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+    }
+
+    private func assertNativeMediaControls(
+        play: Bool, pause: Bool, next: Bool, previous: Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let center = MPRemoteCommandCenter.shared()
+        XCTAssertEqual(
+            [center.playCommand.isEnabled, center.pauseCommand.isEnabled,
+             center.nextTrackCommand.isEnabled, center.previousTrackCommand.isEnabled],
+            [play, pause, next, previous], file: file, line: line
+        )
     }
 
     func testPausedCommandBackpressureDoesNotDisableControlsOrReplayPress() async throws {

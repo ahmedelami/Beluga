@@ -188,7 +188,7 @@ final class BackgroundPlaybackCoordinator {
     func publishLiveStream(serverName: String?, isPlaying: Bool) {
         genericPlayback = (serverName, isPlaying)
         guard remoteMediaUpdate?.item == nil else { return }
-        publishGenericLiveStream(serverName: serverName, isPlaying: isPlaying)
+        publishGenericPlayback(serverName: serverName, isPlaying: isPlaying)
     }
 
     func claimRemoteMediaCommandSender(
@@ -202,7 +202,7 @@ final class BackgroundPlaybackCoordinator {
         commandGate.claim(owner: owner, sender: sender)
         updateNativeCommandAvailability()
         if let genericPlayback {
-            publishGenericLiveStream(
+            publishGenericPlayback(
                 serverName: genericPlayback.serverName,
                 isPlaying: genericPlayback.isPlaying
             )
@@ -223,7 +223,7 @@ final class BackgroundPlaybackCoordinator {
         _ = commandGate.release(owner: owner)
         updateNativeCommandAvailability()
         if let genericPlayback {
-            publishGenericLiveStream(
+            publishGenericPlayback(
                 serverName: genericPlayback.serverName,
                 isPlaying: genericPlayback.isPlaying
             )
@@ -258,7 +258,7 @@ final class BackgroundPlaybackCoordinator {
 
         guard let item = update.item else {
             if let genericPlayback {
-                publishGenericLiveStream(
+                publishGenericPlayback(
                     serverName: genericPlayback.serverName,
                     isPlaying: genericPlayback.isPlaying
                 )
@@ -297,7 +297,7 @@ final class BackgroundPlaybackCoordinator {
         updateCommandGate()
         updateNativeCommandAvailability()
         if let genericPlayback {
-            publishGenericLiveStream(
+            publishGenericPlayback(
                 serverName: genericPlayback.serverName,
                 isPlaying: genericPlayback.isPlaying
             )
@@ -306,7 +306,7 @@ final class BackgroundPlaybackCoordinator {
         }
     }
 
-    private func publishGenericLiveStream(serverName: String?, isPlaying: Bool) {
+    private func publishGenericPlayback(serverName: String?, isPlaying: Bool) {
         // Lock-screen metadata is visible outside the unlocked app. Keep it deliberately generic
         // rather than exposing the paired Mac's user-assigned name.
         _ = serverName
@@ -314,7 +314,8 @@ final class BackgroundPlaybackCoordinator {
             MPMediaItemPropertyTitle: "opensteamer",
             MPMediaItemPropertyArtist: "Connected Mac",
             MPMediaItemPropertyAlbumTitle: "Mac audio stream",
-            MPNowPlayingInfoPropertyIsLiveStream: true,
+            // Missing Mac item metadata does not identify a live broadcast.
+            MPNowPlayingInfoPropertyIsLiveStream: false,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
         ]
         MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused

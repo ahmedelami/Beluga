@@ -95,6 +95,11 @@ artist, elapsed-time, and duration metadata. Only commands supported by that sou
 enabled. Changing the active player or media item replaces the old context; queued controls
 must not operate on a replacement item or survive a connection recovery boundary.
 
+When no current item is available, the generic `opensteamer` card does not label the
+connection as a live broadcast or invent a media duration, elapsed time, or commands.
+It remains separate from source-backed controls; missing Mac metadata does not prove
+the content is live or that a player supports Next/Previous.
+
 These commands control playback on the Mac, not the iPhone's local audio-route policy.
 An iPhone interruption or headphone-loss privacy mute is not cleared by pressing Play.
 The displayed playback state describes the Mac source and can therefore remain Playing
@@ -145,7 +150,7 @@ The authoritative values for the maintainer build are:
 | Configuration field | Checked-in value |
 | --- | --- |
 | Protected legacy Release bundle | <code>com.elamin.AudioStreamer</code>, build `36` |
-| Side-by-side TestFlight bundle | <code>com.elamin.opensteamer</code>, build `69` |
+| Side-by-side TestFlight bundle | <code>com.elamin.opensteamer</code>, build `70` |
 | Development team | `MSMG8CJLB3` |
 | Marketing version | `0.1.0` |
 | Release rendezvous | `OPENSTEAMER_RENDEZVOUS_URL` uses the production WSS Worker origin declared in [`project.yml`](iOS/opensteamer/project.yml) |
