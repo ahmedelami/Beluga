@@ -705,10 +705,13 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
     (ASIOSAudioCategoryReceiptTestScenario)scenario
     NS_SWIFT_NAME(debugAudioCategoryReceiptForTesting(_:));
 - (BOOL)debugAppAudioPolicyOperationTagFencingForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugConfigurationGenerationRecoveryForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugOutputOnlyPolicyRepairForTesting;
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting;
 - (BOOL)debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugPlayoutRetryFailureForTesting:
     (ASIOSPlayoutRetryFailureTestScenario)scenario

@@ -41,6 +41,14 @@ iPhone build is reported as unavailable, not as silent or healthy. Current nativ
 evidence expires independently of the heartbeat. Progress comparisons require
 advancing observation times within the same policy/native generation.
 
+In the v1 retained native cause, `inputRequired` is the native recording request
+(`_wantsRecording`), not permission or effective input authorization. WebRTC can
+request recording while the microphone is unauthorized; use the separate current
+permission, input-bus and route-proof fields to assess admission. Likewise,
+`routeSharingPolicyIsDefault == false` does not identify which non-default policy
+iOS reports. The retained cause has no raw sharing-policy enum, so do not infer
+long-form routing from that boolean alone.
+
 `renderingNonzero` means nonzero PCM reached the app's native render boundary.
 It does **not** prove output through the later iOS mixer, hardware, speaker or
 headphones. Similarly, inbound RTP progress alone does not prove decoded playback.

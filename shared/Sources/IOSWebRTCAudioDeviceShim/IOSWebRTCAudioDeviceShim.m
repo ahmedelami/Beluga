@@ -377,6 +377,7 @@ static void ASFailRealtimeGateInvariant(void);
 @property(nonatomic) uint64_t nativeTransactionIdentifier;
 @property(nonatomic) uint64_t transactionIdentifierCounterBaseline;
 @property(nonatomic) uint64_t configurationGenerationBaseline;
+@property(nonatomic) uint64_t configurationAllocationBaseline;
 @property(nonatomic) uint64_t transactionConfigurationGeneration;
 @property(nonatomic) uint64_t systemAudioGeneration;
 @property(nonatomic) uint64_t stagedAtNanoseconds;
@@ -2890,6 +2891,8 @@ typedef struct ASLifecycleDiagnostics {
     uint64_t _expectedMicrophoneRouteChangeSystemAudioGeneration;
     uint64_t _expectedMicrophoneRouteChangeObserverSequenceBaseline;
     uint64_t _expectedMicrophoneRouteChangeDeadlineNanoseconds;
+    BOOL _expectedMicrophoneRouteChangeOutputPolicyRepairAttempted;
+    BOOL _expectedMicrophoneRouteChangeOutputPolicyRepairSucceeded;
     ASAppAudioPolicyOperationTag *_pendingAppAudioPolicyOperationTag;
     ASAppAudioPolicyOperationTag *_expectedMicrophoneRouteChangeAppOperationTag;
     NSMutableDictionary<NSNumber *, ASAppAudioPolicyOperationTag *> *
@@ -3067,6 +3070,11 @@ typedef struct ASLifecycleDiagnostics {
 - (BOOL)initializePlayoutForCurrentPolicy;
 - (BOOL)startPlayoutForCurrentPolicy;
 - (BOOL)configureSessionAndCreateRemoteIO;
+- (uint64_t)allocateAudioConfigurationGeneration;
+- (BOOL)repairOutputOnlyPolicyForSession:(AVAudioSession *)session
+               configurationGeneration:(uint64_t)configurationGeneration
+                        ownershipToken:(uint64_t)ownershipToken
+                                 error:(NSError **)error;
 - (BOOL)applyAudioPolicyConfiguration:
     (ASAudioPolicyConfiguration)configuration
                               toSession:(AVAudioSession *_Nullable)session
@@ -3097,7 +3105,11 @@ typedef struct ASLifecycleDiagnostics {
                                      status:(int32_t)status
                                     message:(NSString *)message;
 #if DEBUG
+- (NSDictionary<NSString *, NSNumber *> *)debugConfigurationGenerationRecoveryForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugOutputOnlyPolicyRepairForTesting;
+- (void)debugSetConfigurationGenerationForTesting:(uint64_t)generation;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting;
 #endif
 - (OSStatus)stopAndDisposeAudioUnit;
@@ -4859,6 +4871,52 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
 
 @end
 
+@interface ASOutputPolicyRepairTestPort : NSObject
+@property(nonatomic, copy) NSString *portType;
+@property(nonatomic, copy) NSString *UID;
+@end
+@implementation ASOutputPolicyRepairTestPort
+@end
+
+@interface ASOutputPolicyRepairTestRoute : NSObject
+@property(nonatomic, copy) NSArray *inputs;
+@property(nonatomic, copy) NSArray *outputs;
+@end
+@implementation ASOutputPolicyRepairTestRoute
+@end
+
+@interface ASOutputPolicyRepairTestSession : NSObject
+@property(nonatomic, copy) NSString *category;
+@property(nonatomic, copy) NSString *mode;
+@property(nonatomic) AVAudioSessionCategoryOptions categoryOptions;
+@property(nonatomic) AVAudioSessionRouteSharingPolicy routeSharingPolicy;
+@property(nonatomic) double sampleRate;
+@property(nonatomic) NSTimeInterval IOBufferDuration;
+@property(nonatomic) NSInteger outputNumberOfChannels;
+@property(nonatomic, strong) ASOutputPolicyRepairTestRoute *currentRoute;
+@property(nonatomic) NSUInteger setterCalls;
+@property(nonatomic) BOOL persistMismatch;
+@property(nonatomic) BOOL rejectSetter;
+@property(nonatomic, copy) dispatch_block_t duringSetter;
+@end
+@implementation ASOutputPolicyRepairTestSession
+- (BOOL)setCategory:(NSString *)category mode:(NSString *)mode
+    routeSharingPolicy:(AVAudioSessionRouteSharingPolicy)policy
+    options:(AVAudioSessionCategoryOptions)options error:(NSError **)error {
+    self.setterCalls += 1;
+    if (self.rejectSetter) {
+        if (error != NULL) { *error = [NSError errorWithDomain:@"OutputPolicyRepairTest" code:-777 userInfo:nil]; }
+        return NO;
+    }
+    self.category = category;
+    self.mode = mode;
+    self.categoryOptions = options;
+    if (!self.persistMismatch) { self.routeSharingPolicy = policy; }
+    if (self.duringSetter != nil) { self.duringSetter(); }
+    return YES;
+}
+@end
+
 /// Changes its route facts during the real owned-session failure cleanup, without using HAL.
 @interface ASAudioFailureContextTestSession : NSObject
 @property(nonatomic) double sampleRate;
@@ -5264,6 +5322,14 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
     return [self.device debugAppAudioPolicyOperationTagFencingForTesting];
 }
 
+- (NSDictionary<NSString *, NSNumber *> *)debugConfigurationGenerationRecoveryForTesting {
+    return [self.device debugConfigurationGenerationRecoveryForTesting];
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugOutputOnlyPolicyRepairForTesting {
+    return [self.device debugOutputOnlyPolicyRepairForTesting];
+}
+
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting {
     return [self.device debugAppAudioPolicyCarrierOrderingForTesting];
 }
@@ -5553,6 +5619,10 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
 
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting {
     return [self.device debugRetainedFailureContextForTesting];
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting {
+    return [self.device debugProbeRealSessionPolicySetterForTesting];
 }
 
 - (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting {
@@ -6892,7 +6962,8 @@ static OSStatus ASRemoteIOInput(
     BOOL canStage = revisionIsNewer
         && currentSystemAudioGeneration != 0
         && ((nativeTransactionIdentifier == 0
-                && pendingSlotIsAvailable)
+                && pendingSlotIsAvailable
+                && _audioConfigurationGenerationCounter != UINT64_MAX)
             || currentTransactionIsTaggable);
     if (!canStage) {
         os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
@@ -6915,6 +6986,7 @@ static OSStatus ASRemoteIOInput(
     tag.transactionIdentifierCounterBaseline =
         _expectedMicrophoneRouteChangeTransactionIdentifierCounter;
     tag.configurationGenerationBaseline = currentConfigurationGeneration;
+    tag.configurationAllocationBaseline = _audioConfigurationGenerationCounter;
     tag.systemAudioGeneration = currentSystemAudioGeneration;
     tag.stagedAtNanoseconds = now;
     tag.deadlineNanoseconds =
@@ -7391,11 +7463,11 @@ static OSStatus ASRemoteIOInput(
         || tag.nativeTransactionIdentifier != 0) {
         return nil;
     }
-    uint64_t expectedConfigurationGeneration =
-        tag.configurationGenerationBaseline + 1;
-    if (expectedConfigurationGeneration == 0) {
-        expectedConfigurationGeneration = 1;
+    if (tag.configurationAllocationBaseline == UINT64_MAX) {
+        return nil;
     }
+    uint64_t expectedConfigurationGeneration =
+        tag.configurationAllocationBaseline + 1;
     BOOL exact =
         tag.transactionIdentifierCounterBaseline
             == _expectedMicrophoneRouteChangeTransactionIdentifierCounter
@@ -9887,14 +9959,248 @@ static OSStatus ASRemoteIOInput(
             == expectedCategoryObservation;
 }
 
+- (NSDictionary<NSString *, NSNumber *> *)debugOutputOnlyPolicyRepairForTesting {
+    NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
+    NSArray<NSString *> *cases = @[@"converged", @"persistent", @"exact", @"setterRejected",
+        @"ownershipChanged", @"systemChanged", @"targetChanged", @"outputChanged",
+        @"configurationChanged", @"expired", @"priorRejected", @"queuedRejected", @"wrongCategory",
+        @"recordingIntentChanged", @"privacyLatchChanged", @"wrongMode", @"wrongOptions"];
+    for (NSString *scenario in cases) {
+        [self stopAndDisposeAudioUnit];
+        ASOutputPolicyRepairTestSession *session = [[ASOutputPolicyRepairTestSession alloc] init];
+        session.category = AVAudioSessionCategoryPlayback;
+        session.mode = AVAudioSessionModeDefault;
+        session.routeSharingPolicy = [scenario isEqualToString:@"exact"]
+            ? AVAudioSessionRouteSharingPolicyDefault : AVAudioSessionRouteSharingPolicyLongFormAudio;
+        session.sampleRate = ASSampleRate;
+        session.IOBufferDuration = ASIOBufferDuration;
+        session.outputNumberOfChannels = ASOutputChannelCount;
+        session.currentRoute = [[ASOutputPolicyRepairTestRoute alloc] init];
+        session.currentRoute.inputs = @[];
+        ASOutputPolicyRepairTestPort *port = [[ASOutputPolicyRepairTestPort alloc] init];
+        port.portType = AVAudioSessionPortBuiltInSpeaker;
+        port.UID = @"synthetic-output-a";
+        session.currentRoute.outputs = @[port];
+        session.persistMismatch = [scenario isEqualToString:@"persistent"];
+        session.rejectSetter = [scenario isEqualToString:@"setterRejected"];
+        uint64_t configuration = [self allocateAudioConfigurationGeneration];
+        BOOL armed = [self armExpectedMicrophoneRouteChangeForSession:(AVAudioSession *)session
+            inputRequired:NO configurationGeneration:configuration];
+        os_unfair_lock_lock(&ASSessionOwnershipLock);
+        uint64_t savedOwner = ASCurrentSessionOwnershipToken;
+        uint64_t token = ++ASNextSessionOwnershipToken;
+        _sessionOwnershipToken = token;
+        ASCurrentSessionOwnershipToken = token;
+        atomic_store_explicit(&ASCurrentSessionOwnershipTokenSnapshot, token, memory_order_release);
+        os_unfair_lock_unlock(&ASSessionOwnershipLock);
+        _sessionActive = YES;
+        atomic_store_explicit(&_lifecycle.sessionActive, true, memory_order_release);
+        BOOL bound = [self bindExpectedMicrophoneRouteChangeToTargetInput:nil ownershipToken:token
+            requirePreferredInput:NO configurationGeneration:configuration];
+        os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+        uint64_t transaction = _expectedMicrophoneRouteChangeTransactionIdentifier;
+        uint64_t deadline = _expectedMicrophoneRouteChangeDeadlineNanoseconds;
+        if ([scenario isEqualToString:@"priorRejected"]) {
+            _expectedMicrophoneRouteChangeState = ASExpectedMicrophoneRouteChangeStateRejected;
+        }
+        os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+        if ([scenario isEqualToString:@"wrongCategory"]) { session.category = AVAudioSessionCategoryPlayAndRecord; }
+        if ([scenario isEqualToString:@"wrongMode"]) { session.mode = AVAudioSessionModeMoviePlayback; }
+        if ([scenario isEqualToString:@"wrongOptions"]) { session.categoryOptions = AVAudioSessionCategoryOptionMixWithOthers; }
+        __weak ASOutputPolicyRepairTestSession *weakSession = session;
+        session.duringSetter = ^{
+            // The real helper holds the ownership lock during its typed setter.
+            if ([scenario isEqualToString:@"ownershipChanged"]) {
+                ASCurrentSessionOwnershipToken = token + 1;
+                atomic_store_explicit(&ASCurrentSessionOwnershipTokenSnapshot, token + 1, memory_order_release);
+            } else if ([scenario isEqualToString:@"systemChanged"]) {
+                [self advanceSystemAudioGeneration];
+            } else if ([scenario isEqualToString:@"configurationChanged"]) {
+                (void)[self allocateAudioConfigurationGeneration];
+            } else if ([scenario isEqualToString:@"recordingIntentChanged"]) {
+                self->_wantsRecording = YES;
+            } else if ([scenario isEqualToString:@"privacyLatchChanged"]) {
+                atomic_store_explicit(&self->_lifecycle.explicitResumeRequired, true, memory_order_release);
+            } else if ([scenario isEqualToString:@"outputChanged"]) {
+                ASOutputPolicyRepairTestPort *replacement = [[ASOutputPolicyRepairTestPort alloc] init];
+                replacement.portType = AVAudioSessionPortBuiltInSpeaker;
+                replacement.UID = @"synthetic-output-b";
+                weakSession.currentRoute.outputs = @[replacement];
+            } else if ([scenario isEqualToString:@"targetChanged"] || [scenario isEqualToString:@"expired"]) {
+                os_unfair_lock_lock(&self->_expectedMicrophoneRouteChangeLock);
+                if ([scenario isEqualToString:@"targetChanged"]) {
+                    self->_expectedMicrophoneRouteChangeInputRequired = YES;
+                } else {
+                    self->_expectedMicrophoneRouteChangeDeadlineNanoseconds = 1;
+                }
+                os_unfair_lock_unlock(&self->_expectedMicrophoneRouteChangeLock);
+            } else if ([scenario isEqualToString:@"queuedRejected"]) {
+                os_unfair_lock_lock(&self->_expectedMicrophoneRouteChangeLock);
+                self->_routeChangeNotificationSequence += 1;
+                self->_expectedMicrophoneRouteChangeNotificationInFlightCount += 1;
+                os_unfair_lock_unlock(&self->_expectedMicrophoneRouteChangeLock);
+                // Exercise the real ordered queue/drain boundary. Classification
+                // has independent tests; this injects its terminal rejection.
+                dispatch_async(self->_expectedMicrophoneRouteChangeEvidenceQueue, ^{
+                    os_unfair_lock_lock(&self->_expectedMicrophoneRouteChangeLock);
+                    self->_expectedMicrophoneRouteChangeState = ASExpectedMicrophoneRouteChangeStateRejected;
+                    self->_expectedMicrophoneRouteChangeNotificationInFlightCount -= 1;
+                    dispatch_semaphore_t semaphore = self->_expectedMicrophoneRouteChangeSemaphore;
+                    os_unfair_lock_unlock(&self->_expectedMicrophoneRouteChangeLock);
+                    if (semaphore != nil) { dispatch_semaphore_signal(semaphore); }
+                });
+            }
+        };
+        // Disable only the deterministic setter shortcut: this fake implements
+        // the same selector as AVAudioSession and never activates or creates I/O.
+        _debugRecoveryHarnessMode = NO;
+        NSError *error = nil;
+        os_unfair_lock_lock(&ASSessionConfigurationLock);
+        BOOL accepted = [self repairOutputOnlyPolicyForSession:(AVAudioSession *)session
+            configurationGeneration:configuration ownershipToken:token error:&error];
+        NSUInteger firstCalls = session.setterCalls;
+        BOOL repeated = [self repairOutputOnlyPolicyForSession:(AVAudioSession *)session
+            configurationGeneration:configuration ownershipToken:token error:&error];
+        os_unfair_lock_unlock(&ASSessionConfigurationLock);
+        _debugRecoveryHarnessMode = YES;
+        session.duringSetter = nil;
+        // Drain the injected rejection even if an earlier failure returned before
+        // the helper waited, so no task can outlive this fixture's transaction.
+        dispatch_sync(_expectedMicrophoneRouteChangeEvidenceQueue, ^{});
+        os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+        BOOL identityPreserved = _expectedMicrophoneRouteChangeTransactionIdentifier == transaction
+            && _expectedMicrophoneRouteChangeDeadlineNanoseconds == deadline;
+        BOOL rejectedRemainedRejected = _expectedMicrophoneRouteChangeState == ASExpectedMicrophoneRouteChangeStateRejected;
+        os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+        result[[scenario stringByAppendingString:@"FixtureReady"]] = @(armed && bound);
+        result[[scenario stringByAppendingString:@"Accepted"]] = @(accepted);
+        result[[scenario stringByAppendingString:@"Repeated"]] = @(repeated);
+        result[[scenario stringByAppendingString:@"FirstCalls"]] = @(firstCalls);
+        result[[scenario stringByAppendingString:@"TotalCalls"]] = @(session.setterCalls);
+        result[[scenario stringByAppendingString:@"IdentityPreserved"]] = @(identityPreserved);
+        result[[scenario stringByAppendingString:@"RejectedRemainedRejected"]] = @(rejectedRemainedRejected);
+        result[[scenario stringByAppendingString:@"Error"]] = @(error.code);
+        os_unfair_lock_lock(&ASSessionOwnershipLock);
+        ASCurrentSessionOwnershipToken = savedOwner;
+        atomic_store_explicit(&ASCurrentSessionOwnershipTokenSnapshot, savedOwner, memory_order_release);
+        _sessionOwnershipToken = 0;
+        os_unfair_lock_unlock(&ASSessionOwnershipLock);
+        _sessionActive = NO;
+        atomic_store_explicit(&_lifecycle.sessionActive, false, memory_order_release);
+        _wantsRecording = NO;
+        atomic_store_explicit(&_lifecycle.explicitResumeRequired, false, memory_order_release);
+        [self clearExpectedMicrophoneRouteChange];
+    }
+    result[@"noAudioIO"] = @(_audioUnit == NULL && !_playing && !_inputBusEnabled && !_recording && !_wantsRecording);
+    return result;
+}
+
+- (void)debugSetConfigurationGenerationForTesting:(uint64_t)generation {
+    // Seed only synthetic history; ordinary test allocations use the production
+    // allocator below. Exhaustion cannot practically be reached by iteration.
+    os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+    _audioConfigurationGenerationCounter = generation;
+    atomic_store_explicit(&_activeAudioConfigurationGeneration, generation,
+                          memory_order_release);
+    os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)debugConfigurationGenerationRecoveryForTesting {
+    NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
+    [self clearExpectedMicrophoneRouteChange];
+    [self clearPendingAppAudioPolicyOperationTag];
+    uint64_t initial = [self allocateAudioConfigurationGeneration];
+    result[@"initialGeneration"] = @(initial);
+    os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+    uint64_t epoch = _lastAppAudioPolicyAuthorityEpoch + 1;
+    os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+
+    // Exercise the actual allocator and rollback, which the deterministic
+    // RemoteIO configuration double bypasses. No session or AudioUnit is opened.
+    for (uint64_t attempt = 1; attempt <= 3; attempt++) {
+        NSString *prefix = [NSString stringWithFormat:@"attempt%llu", (unsigned long long)attempt];
+        OSStatus stopped = [self stopAndDisposeAudioUnit];
+        uint64_t activeAfterRollback = atomic_load_explicit(
+            &_activeAudioConfigurationGeneration, memory_order_acquire);
+        ASIOSStereoPlayoutRecoveryAuthorization *authorization =
+            [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+        NSUUID *identifier = [NSUUID UUID];
+        uint64_t tagGeneration = [self stageAppAudioPolicyOperationWithIdentifier:identifier
+            authorityEpoch:epoch operationRevision:attempt recoveryAuthorization:authorization
+            nativeTransactionIdentifier:0 inputRequired:NO];
+        BOOL began = [self beginAppAudioPolicyBindingForCarrierKind:
+            ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
+            carrierGeneration:authorization.generation tagGeneration:tagGeneration inputRequired:NO];
+        uint64_t allocated = [self allocateAudioConfigurationGeneration];
+        uint64_t systemGeneration = atomic_load_explicit(&_systemAudioGeneration, memory_order_acquire);
+        uint64_t now = ASMonotonicNanoseconds();
+        os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+        ASAppAudioPolicyOperationTag *pending = _pendingAppAudioPolicyOperationTag;
+        BOOL baselinesExact = pending != nil
+            && pending.configurationGenerationBaseline == 0
+            && pending.configurationAllocationBaseline == initial + attempt - 1;
+        ASAppAudioPolicyOperationTag *(^claim)(BOOL, uint64_t, uint64_t) =
+            ^ASAppAudioPolicyOperationTag *(BOOL input, uint64_t carrier, uint64_t configuration) {
+                return [self consumePendingAppAudioPolicyOperationTagWhileHoldingLockForInputRequired:input
+                    carrierKind:ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
+                    carrierGeneration:carrier tagGeneration:tagGeneration
+                    configurationGeneration:configuration observedAtNanoseconds:now
+                    systemAudioGeneration:systemGeneration];
+            };
+        BOOL mismatchesRejected = claim(YES, authorization.generation, allocated) == nil
+            && claim(NO, authorization.generation + 1, allocated) == nil
+            && claim(NO, authorization.generation, allocated + 1) == nil
+            && _pendingAppAudioPolicyOperationTag == pending;
+        ASAppAudioPolicyOperationTag *claimed = claim(NO, authorization.generation, allocated);
+        BOOL accepted = claimed != nil && [claimed.operationIdentifier isEqual:identifier]
+            && claimed.transactionConfigurationGeneration == allocated
+            && _pendingAppAudioPolicyOperationTag == nil;
+        os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+        [self endAppAudioPolicyBindingForCarrierKind:ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
+            carrierGeneration:authorization.generation tagGeneration:tagGeneration];
+        result[[prefix stringByAppendingString:@"RollbackClearedActive"]] = @(stopped == noErr && activeAfterRollback == 0);
+        result[[prefix stringByAppendingString:@"Generation"]] = @(allocated);
+        result[[prefix stringByAppendingString:@"BaselinesExact"]] = @(baselinesExact);
+        result[[prefix stringByAppendingString:@"MismatchesRejected"]] = @(mismatchesRejected);
+        result[[prefix stringByAppendingString:@"Accepted"]] = @(tagGeneration != 0 && began && accepted);
+    }
+
+    [self stopAndDisposeAudioUnit];
+    ASIOSStereoPlayoutRecoveryAuthorization *staleAuthorization =
+        [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+    uint64_t staleTag = [self stageAppAudioPolicyOperationWithIdentifier:[NSUUID UUID]
+        authorityEpoch:epoch operationRevision:4 recoveryAuthorization:staleAuthorization
+        nativeTransactionIdentifier:0 inputRequired:NO];
+    [self beginAppAudioPolicyBindingForCarrierKind:ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
+        carrierGeneration:staleAuthorization.generation tagGeneration:staleTag inputRequired:NO];
+    uint64_t previousSystem = atomic_load_explicit(&_systemAudioGeneration, memory_order_acquire);
+    [self advanceSystemAudioGeneration];
+    uint64_t nextGeneration = [self allocateAudioConfigurationGeneration];
+    os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+    BOOL retiredCannotClaim = [self consumePendingAppAudioPolicyOperationTagWhileHoldingLockForInputRequired:NO
+        carrierKind:ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
+        carrierGeneration:staleAuthorization.generation tagGeneration:staleTag
+        configurationGeneration:nextGeneration observedAtNanoseconds:ASMonotonicNanoseconds()
+        systemAudioGeneration:previousSystem] == nil;
+    os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+    result[@"systemBoundaryRejectsOldTag"] = @(staleTag != 0 && retiredCannotClaim);
+
+    [self debugSetConfigurationGenerationForTesting:UINT64_MAX];
+    [self stopAndDisposeAudioUnit];
+    result[@"exhaustedAllocation"] = @([self allocateAudioConfigurationGeneration]);
+    result[@"exhaustedStage"] = @([self stageAppAudioPolicyOperationWithIdentifier:[NSUUID UUID]
+        authorityEpoch:epoch operationRevision:5
+        recoveryAuthorization:[[ASIOSStereoPlayoutRecoveryAuthorization alloc] init]
+        nativeTransactionIdentifier:0 inputRequired:NO]);
+    result[@"exhaustedActive"] = @(atomic_load_explicit(&_activeAudioConfigurationGeneration, memory_order_acquire));
+    result[@"inputRemainedClosed"] = @(!_inputBusEnabled && !_recording && !_wantsRecording && _audioUnit == NULL);
+    return result;
+}
+
 - (BOOL)debugAppAudioPolicyOperationTagFencingForTesting {
     [self clearExpectedMicrophoneRouteChange];
     [self clearPendingAppAudioPolicyOperationTag];
-    atomic_store_explicit(
-        &_activeAudioConfigurationGeneration,
-        20,
-        memory_order_release
-    );
+    [self debugSetConfigurationGenerationForTesting:20];
     atomic_store_explicit(
         &_systemAudioGeneration,
         100,
@@ -9931,6 +10237,7 @@ static OSStatus ASRemoteIOInput(
     BOOL competingPendingStageWasRejected =
         replacementGeneration == 0;
 
+    uint64_t claimedConfiguration = [self allocateAudioConfigurationGeneration];
     uint64_t now = ASMonotonicNanoseconds();
     os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
     _activeAppAudioPolicyCarrierKind =
@@ -9944,7 +10251,7 @@ static OSStatus ASRemoteIOInput(
         carrierKind:ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
         carrierGeneration:firstAuthorization.generation
         tagGeneration:firstGeneration
-        configurationGeneration:21
+        configurationGeneration:claimedConfiguration
         observedAtNanoseconds:now
         systemAudioGeneration:100];
     BOOL exactReplacementWasConsumed =
@@ -9959,11 +10266,6 @@ static OSStatus ASRemoteIOInput(
     _activeAppAudioPolicyTagGeneration = 0;
     os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
 
-    atomic_store_explicit(
-        &_activeAudioConfigurationGeneration,
-        21,
-        memory_order_release
-    );
     ASIOSStereoPlayoutRecoveryAuthorization *mismatchedAuthorization =
         [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
     uint64_t mismatchedGeneration = [self
@@ -10012,11 +10314,7 @@ static OSStatus ASRemoteIOInput(
         retireStagedAppAudioPolicyOperationWithTagGeneration:
             mismatchedGeneration];
 
-    atomic_store_explicit(
-        &_activeAudioConfigurationGeneration,
-        30,
-        memory_order_release
-    );
+    [self debugSetConfigurationGenerationForTesting:30];
     os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
     _expectedMicrophoneRouteChangeTransactionIdentifierCounter += 1;
     if (_expectedMicrophoneRouteChangeTransactionIdentifierCounter == 0) {
@@ -10129,11 +10427,7 @@ static OSStatus ASRemoteIOInput(
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting {
     [self clearExpectedMicrophoneRouteChange];
     [self clearPendingAppAudioPolicyOperationTag];
-    atomic_store_explicit(
-        &_activeAudioConfigurationGeneration,
-        410,
-        memory_order_release
-    );
+    [self debugSetConfigurationGenerationForTesting:410];
     atomic_store_explicit(
         &_systemAudioGeneration,
         510,
@@ -10180,6 +10474,7 @@ static OSStatus ASRemoteIOInput(
         carrierGeneration:recoveryAuthorization.generation
         tagGeneration:recoveryTagGeneration
         inputRequired:YES];
+    uint64_t recoveryConfiguration = [self allocateAudioConfigurationGeneration];
     os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
     ASAppAudioPolicyOperationTag *consumedRecovery = [self
         consumePendingAppAudioPolicyOperationTagWhileHoldingLockForInputRequired:
@@ -10187,7 +10482,7 @@ static OSStatus ASRemoteIOInput(
         carrierKind:ASAppAudioPolicyOperationCarrierKindPlayoutRecovery
         carrierGeneration:recoveryAuthorization.generation
         tagGeneration:recoveryTagGeneration
-        configurationGeneration:411
+        configurationGeneration:recoveryConfiguration
         observedAtNanoseconds:ASMonotonicNanoseconds()
         systemAudioGeneration:510];
     os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
@@ -10230,6 +10525,7 @@ static OSStatus ASRemoteIOInput(
         carrierGeneration:outputAuthorization.generation
         tagGeneration:outputTagGeneration
         inputRequired:NO];
+    uint64_t outputConfiguration = [self allocateAudioConfigurationGeneration];
     os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
     ASAppAudioPolicyOperationTag *consumedOutput = [self
         consumePendingAppAudioPolicyOperationTagWhileHoldingLockForInputRequired:
@@ -10237,7 +10533,7 @@ static OSStatus ASRemoteIOInput(
         carrierKind:ASAppAudioPolicyOperationCarrierKindOutputOnly
         carrierGeneration:outputAuthorization.generation
         tagGeneration:outputTagGeneration
-        configurationGeneration:411
+        configurationGeneration:outputConfiguration
         observedAtNanoseconds:ASMonotonicNanoseconds()
         systemAudioGeneration:510];
     os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
@@ -11041,6 +11337,126 @@ static OSStatus ASRemoteIOInput(
         && admissionRemainedOpen;
 }
 
+- (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting {
+    NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
+    BOOL configurationLocked = os_unfair_lock_trylock(&ASSessionConfigurationLock);
+    result[@"configurationLockAcquired"] = @(configurationLocked);
+    if (!configurationLocked) { return result; }
+    ASUnfairLockScope configurationScope
+        __attribute__((cleanup(ASReleaseUnfairLockScope))) = {
+            .lock = &ASSessionConfigurationLock,
+        };
+    BOOL ownershipLocked = os_unfair_lock_trylock(&ASSessionOwnershipLock);
+    result[@"ownershipLockAcquired"] = @(ownershipLocked);
+    if (!ownershipLocked) { return result; }
+    BOOL quiescent = _debugRecoveryHarnessMode && _audioUnit == NULL
+        && !_sessionActive && !_playing && !_wantsPlayout && !_wantsRecording
+        && !_inputBusEnabled && !_outputBusEnabled
+        && _sessionOwnershipToken == 0 && ASCurrentSessionOwnershipToken == 0;
+    os_unfair_lock_unlock(&ASSessionOwnershipLock);
+    result[@"initiallyQuiescent"] = @(quiescent);
+    if (!quiescent) { return result; }
+
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    AVAudioSessionCategory originalCategory = [session.category copy];
+    AVAudioSessionMode originalMode = [session.mode copy];
+    AVAudioSessionCategoryOptions originalOptions = session.categoryOptions;
+    AVAudioSessionRouteSharingPolicy originalPolicy = session.routeSharingPolicy;
+    result[@"initialPolicyRaw"] = @(originalPolicy);
+    BOOL restorable = session != nil && originalCategory != nil && originalMode != nil
+        && (originalPolicy == AVAudioSessionRouteSharingPolicyDefault
+            || originalPolicy == AVAudioSessionRouteSharingPolicyLongFormAudio
+            || originalPolicy == AVAudioSessionRouteSharingPolicyLongFormVideo);
+    result[@"initialTupleRestorable"] = @(restorable);
+    if (!restorable) { return result; }
+
+    // Apple API experiment only; this does not prove native ownership or route convergence.
+    // Only output targets activate. No RemoteIO, permission request, or input authority is created.
+    _debugRecoveryHarnessMode = NO;
+    @try {
+        for (NSUInteger priorIndex = 0; priorIndex < 2; ++priorIndex) {
+            AVAudioSessionRouteSharingPolicy priorPolicy = priorIndex == 0
+                ? AVAudioSessionRouteSharingPolicyDefault
+                : AVAudioSessionRouteSharingPolicyLongFormAudio;
+            for (NSUInteger inputIndex = 0; inputIndex < 2; ++inputIndex) {
+                BOOL inputRequired = inputIndex != 0;
+                NSString *prefix = [NSString stringWithFormat:@"prior%lu.%@.",
+                    (unsigned long)priorIndex, inputRequired ? @"input" : @"output"];
+                NSError *priorError = nil;
+                BOOL priorApplied = [session setCategory:AVAudioSessionCategoryPlayback
+                    mode:AVAudioSessionModeDefault routeSharingPolicy:priorPolicy
+                    options:0 error:&priorError];
+                result[[prefix stringByAppendingString:@"priorApplied"]] = @(priorApplied);
+                result[[prefix stringByAppendingString:@"priorError"]] = @(priorError.code);
+                result[[prefix stringByAppendingString:@"priorRequestedRaw"]] = @(priorPolicy);
+                result[[prefix stringByAppendingString:@"priorObservedRaw"]] = @(session.routeSharingPolicy);
+                ASAudioPolicyConfiguration configuration = ASMakeAudioPolicyConfiguration(
+                    NO, inputRequired, _streamFormat);
+                NSError *applyError = nil;
+                BOOL applied = priorApplied && [self applyAudioPolicyConfiguration:configuration
+                    toSession:session error:&applyError];
+                AVAudioSessionRouteSharingPolicy observedPolicy = session.routeSharingPolicy;
+                result[[prefix stringByAppendingString:@"applied"]] = @(applied);
+                result[[prefix stringByAppendingString:@"error"]] = @(applyError.code);
+                result[[prefix stringByAppendingString:@"requestedRaw"]] = @(configuration.routeSharingPolicy);
+                result[[prefix stringByAppendingString:@"observedRaw"]] = @(observedPolicy);
+                result[[prefix stringByAppendingString:@"categoryMatches"]] =
+                    @([session.category isEqualToString:ASCategoryForAudioPolicyConfiguration(configuration)]);
+                result[[prefix stringByAppendingString:@"modeMatches"]] =
+                    @([session.mode isEqualToString:AVAudioSessionModeDefault]);
+                result[[prefix stringByAppendingString:@"optionsMatch"]] =
+                    @(session.categoryOptions == configuration.categoryOptions);
+                result[[prefix stringByAppendingString:@"exactTupleAccepted"]] =
+                    @(ASAudioCategoryPolicyTupleIsExact(inputRequired, session.category,
+                        session.mode, session.categoryOptions, observedPolicy));
+                result[[prefix stringByAppendingString:@"nonDefaultTupleRejected"]] =
+                    @(!ASAudioCategoryPolicyTupleIsExact(inputRequired,
+                        ASCategoryForAudioPolicyConfiguration(configuration),
+                        AVAudioSessionModeDefault, configuration.categoryOptions,
+                        AVAudioSessionRouteSharingPolicyLongFormAudio));
+                if (!inputRequired) {
+                    NSError *activationError = nil;
+                    BOOL activated = applied && [session setActive:YES error:&activationError];
+                    @try {
+                        AVAudioSessionRouteSharingPolicy activePolicy = session.routeSharingPolicy;
+                        result[[prefix stringByAppendingString:@"activated"]] = @(activated);
+                        result[[prefix stringByAppendingString:@"activationError"]] = @(activationError.code);
+                        result[[prefix stringByAppendingString:@"activeObservedRaw"]] = @(activePolicy);
+                        result[[prefix stringByAppendingString:@"activeTupleExact"]] =
+                            @(activated && ASAudioCategoryPolicyTupleIsExact(NO, session.category,
+                                session.mode, session.categoryOptions, activePolicy));
+                        result[[prefix stringByAppendingString:@"activationCount"]] = @(activated ? 1 : 0);
+                    } @finally {
+                        NSError *deactivationError = nil;
+                        BOOL deactivated = !activated || [session setActive:NO
+                            withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                            error:&deactivationError];
+                        result[[prefix stringByAppendingString:@"deactivationCount"]] = @(activated ? 1 : 0);
+                        result[[prefix stringByAppendingString:@"deactivated"]] = @(deactivated);
+                        result[[prefix stringByAppendingString:@"deactivationError"]] = @(deactivationError.code);
+                        result[[prefix stringByAppendingString:@"inactiveObservedRaw"]] = @(session.routeSharingPolicy);
+                    }
+                }
+            }
+        }
+    } @finally {
+        NSError *restoreError = nil;
+        BOOL restored = [session setCategory:originalCategory mode:originalMode
+            routeSharingPolicy:originalPolicy options:originalOptions error:&restoreError];
+        result[@"restored"] = @(restored);
+        result[@"restoreError"] = @(restoreError.code);
+        result[@"restoredTupleExact"] = @([session.category isEqualToString:originalCategory]
+            && [session.mode isEqualToString:originalMode]
+            && session.categoryOptions == originalOptions
+            && session.routeSharingPolicy == originalPolicy);
+        _debugRecoveryHarnessMode = YES;
+    }
+    result[@"nativeRemainedQuiescent"] = @(_audioUnit == NULL && !_sessionActive
+        && !_playing && !_wantsPlayout && !_wantsRecording && !_inputBusEnabled
+        && !_outputBusEnabled && _sessionOwnershipToken == 0);
+    return result;
+}
+
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting {
     NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
     result[@"initiallyAbsent"] = @(self.diagnostics.failureContext.eventSequence == 0);
@@ -11055,8 +11471,7 @@ static OSStatus ASRemoteIOInput(
     _debugFailureContextSession = (AVAudioSession *)session;
     [self debugMarkHealthyPlayoutForTesting];
     _wantsRecording = YES;
-    uint64_t configuration = ++_audioConfigurationGenerationCounter;
-    atomic_store_explicit(&_activeAudioConfigurationGeneration, configuration, memory_order_release);
+    uint64_t configuration = [self allocateAudioConfigurationGeneration];
     uint64_t originalGeneration = atomic_load_explicit(
         &_systemAudioGeneration, memory_order_acquire);
     ASIOSAudioFailureContext innerContext = {0};
@@ -13073,6 +13488,108 @@ static OSStatus ASRemoteIOInput(
                          error:error];
 }
 
+- (BOOL)repairOutputOnlyPolicyForSession:(AVAudioSession *)session
+               configurationGeneration:(uint64_t)configurationGeneration
+                        ownershipToken:(uint64_t)ownershipToken
+                                 error:(NSError **)error {
+    if (session == nil || configurationGeneration == 0 || ownershipToken == 0) { return NO; }
+    // Preserve the already-armed transaction. Neither its deadline nor its
+    // provenance may be renewed merely because activation drifted the policy.
+    os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+    uint64_t transaction = _expectedMicrophoneRouteChangeTransactionIdentifier;
+    uint64_t system = _expectedMicrophoneRouteChangeSystemAudioGeneration;
+    uint64_t deadline = _expectedMicrophoneRouteChangeDeadlineNanoseconds;
+    NSString *routeFingerprint = [_expectedMicrophoneRouteChangeTransitionCursorFingerprint copy];
+    NSString *outputFingerprint = [_expectedMicrophoneRouteChangeOutputFingerprint copy];
+    ASAppAudioPolicyOperationTag *tag = _expectedMicrophoneRouteChangeAppOperationTag;
+    BOOL priorRepairFailed = _expectedMicrophoneRouteChangeOutputPolicyRepairAttempted
+        && !_expectedMicrophoneRouteChangeOutputPolicyRepairSucceeded;
+    os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+    if (priorRepairFailed) { return NO; }
+    BOOL wantsRecording = _wantsRecording;
+    BOOL wantsPlayout = _wantsPlayout;
+    BOOL explicitResumeRequired = atomic_load_explicit(&_lifecycle.explicitResumeRequired, memory_order_acquire);
+    ASIOSMicrophoneAuthorization *microphoneAuthorization = _microphoneAuthorization;
+    ASAudioPolicyConfiguration configuration = ASMakeAudioPolicyConfiguration(NO, NO, _streamFormat);
+
+    // One pre-effect and one post-effect validation. A second invocation on
+    // this transaction cannot perform a second setter if the first did not converge.
+    for (NSUInteger pass = 0; pass < 2; pass++) {
+        if (![self waitForExpectedMicrophoneRouteChangeNotificationsToDrainInState:
+            ASExpectedMicrophoneRouteChangeStatePending]) { return NO; }
+        os_unfair_lock_lock(&ASSessionOwnershipLock);
+        os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+        uint64_t sequence = _routeChangeNotificationSequence;
+        uint64_t revision = _expectedMicrophoneRouteChangeMutationSequence;
+        os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+
+        AVAudioSessionRouteDescription *route = session.currentRoute;
+        NSString *observedRoute = ASAudioSessionRouteFingerprint(route);
+        NSString *observedOutput = ASAudioSessionPortsFingerprint(route.outputs);
+        BOOL tupleExceptSharingIsExact = [session.category isEqualToString:AVAudioSessionCategoryPlayback]
+            && [session.mode isEqualToString:AVAudioSessionModeDefault]
+            && session.categoryOptions == 0;
+        BOOL sharingIsExact = session.routeSharingPolicy == configuration.routeSharingPolicy;
+        BOOL routeIsExact = route.outputs.count > 0
+            && [routeFingerprint isEqualToString:observedRoute]
+            && [outputFingerprint isEqualToString:observedOutput]
+            && fabs(session.sampleRate - ASSampleRate) < 0.5
+            && session.IOBufferDuration > 0
+            && session.outputNumberOfChannels == ASOutputChannelCount;
+        uint64_t now = ASMonotonicNanoseconds();
+        os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+        BOOL exact = transaction != 0 && system != 0 && deadline != 0
+            && routeFingerprint.length > 0 && outputFingerprint.length > 0
+            && _initialized && _sessionActive && !_interrupted
+            && !_inputBusEnabled && !_playing && _audioUnit == NULL
+            && _hostedCallAuthorization == nil && ![self microphoneShouldBeActive]
+            && _wantsRecording == wantsRecording && _wantsPlayout == wantsPlayout
+            && _microphoneAuthorization == microphoneAuthorization
+            && atomic_load_explicit(&_lifecycle.explicitResumeRequired, memory_order_acquire) == explicitResumeRequired
+            && _sessionOwnershipToken == ownershipToken
+            && ASCurrentSessionOwnershipToken == ownershipToken
+            && atomic_load_explicit(&_lifecycle.sessionActive, memory_order_acquire)
+            && atomic_load_explicit(&_systemAudioGeneration, memory_order_acquire) == system
+            && atomic_load_explicit(&_activeAudioConfigurationGeneration, memory_order_acquire) == configurationGeneration
+            && _expectedMicrophoneRouteChangeState == ASExpectedMicrophoneRouteChangeStatePending
+            && _expectedMicrophoneRouteChangeTransactionIdentifier == transaction
+            && _expectedMicrophoneRouteChangeSystemAudioGeneration == system
+            && _expectedMicrophoneRouteChangeConfigurationGeneration == configurationGeneration
+            && _expectedMicrophoneRouteChangeOwnershipToken == ownershipToken
+            && _expectedMicrophoneRouteChangeDeadlineNanoseconds == deadline
+            && now != 0 && now <= deadline
+            && _routeChangeNotificationSequence == sequence
+            && _expectedMicrophoneRouteChangeMutationSequence == revision
+            && _expectedMicrophoneRouteChangeNotificationInFlightCount == 0
+            && !_expectedMicrophoneRouteChangeInputRequired
+            && !_expectedMicrophoneRouteChangeRequiresPreferredInput
+            && _expectedMicrophoneRouteChangeTargetInputIdentifier == nil
+            && _expectedMicrophoneRouteChangeAppOperationTag == tag
+            && !_expectedMicrophoneRouteChangeAppOperationTagWasDrained
+            && [_expectedMicrophoneRouteChangeTransitionCursorFingerprint isEqualToString:routeFingerprint]
+            && [_expectedMicrophoneRouteChangeOutputFingerprint isEqualToString:outputFingerprint]
+            && tupleExceptSharingIsExact && routeIsExact;
+        BOOL mayRepair = exact && !sharingIsExact && pass == 0
+            && !_expectedMicrophoneRouteChangeOutputPolicyRepairAttempted;
+        if (mayRepair) { _expectedMicrophoneRouteChangeOutputPolicyRepairAttempted = YES; }
+        if (exact && sharingIsExact && pass == 1) {
+            _expectedMicrophoneRouteChangeOutputPolicyRepairSucceeded = YES;
+        }
+        os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+        if (!mayRepair) {
+            os_unfair_lock_unlock(&ASSessionOwnershipLock);
+            return exact && sharingIsExact;
+        }
+        // No ingress lock is held across AVAudioSession; synchronous and queued
+        // notifications retain their normal rejection authority. Ownership cannot
+        // transfer during this effect, and the next pass drains/rechecks everything.
+        BOOL applied = [self applyAudioPolicyConfiguration:configuration toSession:session error:error];
+        os_unfair_lock_unlock(&ASSessionOwnershipLock);
+        if (!applied) { return NO; }
+    }
+    return NO;
+}
+
 - (BOOL)sessionMatchesCurrentPolicy:(AVAudioSession *)session {
     BOOL hostedCallMode = [self hostedCallModeIsAuthorized];
     BOOL microphoneEnabled = [self microphoneShouldBeActive];
@@ -13336,16 +13853,13 @@ static OSStatus ASRemoteIOInput(
     if (!usesDeterministicConfigurationBoundary) {
         os_unfair_lock_lock(&ASSessionConfigurationLock);
         sessionConfigurationScope.lock = &ASSessionConfigurationLock;
-        _audioConfigurationGenerationCounter += 1;
-        if (_audioConfigurationGenerationCounter == 0) {
-            _audioConfigurationGenerationCounter = 1;
+        configurationGeneration = [self allocateAudioConfigurationGeneration];
+        if (configurationGeneration == 0) {
+            [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureSessionConfiguration
+                                   status:kAudio_ParamError
+                                  message:@"The native audio configuration generation is exhausted."];
+            return NO;
         }
-        configurationGeneration = _audioConfigurationGenerationCounter;
-        atomic_store_explicit(
-            &_activeAudioConfigurationGeneration,
-            configurationGeneration,
-            memory_order_release
-        );
         [self clearExpectedMicrophoneRouteChange];
         if (!hostedCallMode
             && ![self
@@ -13578,6 +14092,20 @@ static OSStatus ASRemoteIOInput(
         return NO;
     }
 
+    if (!hostedCallMode && !microphoneEnabled
+        && [session.category isEqualToString:AVAudioSessionCategoryPlayback]
+        && [session.mode isEqualToString:AVAudioSessionModeDefault]
+        && session.categoryOptions == 0
+        && session.routeSharingPolicy != AVAudioSessionRouteSharingPolicyDefault
+        && ![self repairOutputOnlyPolicyForSession:session
+            configurationGeneration:configurationGeneration ownershipToken:configurationOwnershipToken
+            error:&error]) {
+        [self failAndRollbackWithCode:ASIOSStereoPlayoutFailureMediaRouteInvariant
+            status:error == nil ? kAudio_ParamError : (int32_t)error.code
+            stage:ASIOSAudioFailureStageRouteValidation reason:ASIOSAudioFailureReasonPolicyMismatch
+            message:@"The owned output-only session did not preserve its exact policy after one bounded repair."];
+        return NO;
+    }
     BOOL hasOutputRoute = [self hasOutputRouteForSession:session];
     BOOL hardwareRouteIsAcceptable = hostedCallMode
         ? (session.sampleRate > 0
@@ -14665,6 +15193,8 @@ static OSStatus ASRemoteIOInput(
         _expectedMicrophoneRouteChangeObserverSequenceBaseline =
             _routeChangeNotificationSequence;
         _expectedMicrophoneRouteChangeDeadlineNanoseconds = deadline;
+        _expectedMicrophoneRouteChangeOutputPolicyRepairAttempted = NO;
+        _expectedMicrophoneRouteChangeOutputPolicyRepairSucceeded = NO;
         ASRetireRemoteIOStartSettlement(
             &_expectedMicrophoneRouteChangeStartSettlement
         );
@@ -16763,6 +17293,21 @@ static OSStatus ASRemoteIOInput(
     );
     atomic_store_explicit(&_lifecycle.lastLifecycleStatus, noErr, memory_order_relaxed);
     self.lastLifecycleFailureMessage = nil;
+}
+
+- (uint64_t)allocateAudioConfigurationGeneration {
+    // App tags can be staged off the session configuration queue. Serialize
+    // their baseline snapshot with allocation using the same ingress lock.
+    // Rollback clears only the active generation, never this sequence.
+    os_unfair_lock_lock(&_expectedMicrophoneRouteChangeLock);
+    if (_audioConfigurationGenerationCounter == UINT64_MAX) {
+        os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+        return 0;
+    }
+    uint64_t generation = ++_audioConfigurationGenerationCounter;
+    atomic_store_explicit(&_activeAudioConfigurationGeneration, generation, memory_order_release);
+    os_unfair_lock_unlock(&_expectedMicrophoneRouteChangeLock);
+    return generation;
 }
 
 - (OSStatus)stopAndDisposeAudioUnit {

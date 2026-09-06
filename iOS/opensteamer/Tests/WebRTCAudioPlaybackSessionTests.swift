@@ -82,6 +82,58 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         #endif
     }
 
+    func testOutputOnlyPolicyRepairIsOneShotAndKeepsExactTransactionFences() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugOutputOnlyPolicyRepairForTesting()
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+        let scenarios = ["converged", "persistent", "exact", "setterRejected", "ownershipChanged",
+                         "systemChanged", "targetChanged", "outputChanged", "configurationChanged",
+                         "expired", "priorRejected", "queuedRejected", "wrongCategory",
+                         "recordingIntentChanged", "privacyLatchChanged", "wrongMode", "wrongOptions"]
+        for scenario in scenarios {
+            let succeeds = scenario == "converged" || scenario == "exact"
+            let calls = ["exact", "priorRejected", "wrongCategory", "wrongMode", "wrongOptions"].contains(scenario) ? 0 : 1
+            XCTAssertTrue(try value(scenario + "FixtureReady").boolValue, scenario)
+            XCTAssertEqual(try value(scenario + "Accepted").boolValue, succeeds, scenario)
+            XCTAssertEqual(try value(scenario + "Repeated").boolValue, succeeds, scenario)
+            XCTAssertEqual(try value(scenario + "FirstCalls").intValue, calls, scenario)
+            XCTAssertEqual(try value(scenario + "TotalCalls").intValue, calls, "No second setter: \(scenario)")
+            if scenario != "systemChanged" && scenario != "expired" {
+                XCTAssertTrue(try value(scenario + "IdentityPreserved").boolValue, scenario)
+            }
+        }
+        XCTAssertTrue(try value("priorRejectedRejectedRemainedRejected").boolValue)
+        XCTAssertTrue(try value("queuedRejectedRejectedRemainedRejected").boolValue)
+        XCTAssertEqual(try value("setterRejectedError").intValue, -777)
+        XCTAssertTrue(try value("noAudioIO").boolValue)
+    }
+
+    func testConfigurationGenerationRecoveryUsesMonotonicAllocationAfterRollback() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugConfigurationGenerationRecoveryForTesting()
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+        XCTAssertEqual(try value("initialGeneration").uint64Value, 1)
+        for attempt in 1...3 {
+            let prefix = "attempt\(attempt)"
+            XCTAssertTrue(try value(prefix + "RollbackClearedActive").boolValue)
+            XCTAssertEqual(try value(prefix + "Generation").uint64Value, UInt64(attempt + 1))
+            XCTAssertTrue(try value(prefix + "BaselinesExact").boolValue)
+            XCTAssertTrue(try value(prefix + "MismatchesRejected").boolValue)
+            XCTAssertTrue(try value(prefix + "Accepted").boolValue, "\(result)")
+        }
+        XCTAssertTrue(try value("systemBoundaryRejectsOldTag").boolValue)
+        XCTAssertEqual(try value("exhaustedAllocation").uint64Value, 0)
+        XCTAssertEqual(try value("exhaustedStage").uint64Value, 0)
+        XCTAssertEqual(try value("exhaustedActive").uint64Value, 0)
+        XCTAssertTrue(try value("inputRemainedClosed").boolValue)
+    }
+
     func testExactRecoveryReconfiguresAfterInitialPlayoutFailureBeforeStart() throws {
         let harness = WebRTCIOSPlayoutRecoveryTestHarness()
         defer { _ = harness.debugTerminateForTesting() }
@@ -141,6 +193,56 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertGreaterThan(try retryValue("configurationDelta", in: result).intValue, 0)
         XCTAssertGreaterThan(try retryValue("failureCode", in: result).intValue, 1)
         XCTAssertTrue(try retryValue("nativeFailurePreserved", in: result).boolValue)
+    }
+
+    func testRealSessionPolicyAPIKeepsExactDefaultThroughOutputActivationWithoutAudioIO() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugProbeRealSessionPolicySetterForTesting()
+        let attachment = XCTAttachment(
+            data: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
+            uniformTypeIdentifier: "public.json"
+        )
+        attachment.name = "real-session-policy-api-output-activation-scalars"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        for key in ["configurationLockAcquired", "ownershipLockAcquired", "initiallyQuiescent",
+                    "initialTupleRestorable", "restored", "restoredTupleExact", "nativeRemainedQuiescent"] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+        XCTAssertEqual(try retryValue("restoreError", in: result).intValue, 0)
+        for prior in 0...1 {
+            for target in ["output", "input"] {
+                let prefix = "prior\(prior).\(target)."
+                for key in ["priorApplied", "applied", "categoryMatches", "modeMatches", "optionsMatch",
+                            "exactTupleAccepted", "nonDefaultTupleRejected"] {
+                    XCTAssertTrue(try retryValue(prefix + key, in: result).boolValue,
+                                  "\(prefix + key): \(result)")
+                }
+                for key in ["priorError", "error", "requestedRaw", "observedRaw"] {
+                    XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 0,
+                                   "\(prefix + key): \(result)")
+                }
+                XCTAssertEqual(try retryValue(prefix + "priorRequestedRaw", in: result).intValue, prior)
+                XCTAssertEqual(try retryValue(prefix + "priorObservedRaw", in: result).intValue, prior,
+                               "\(prefix): \(result)")
+                if target == "output" {
+                    for key in ["activated", "activeTupleExact", "deactivated"] {
+                        XCTAssertTrue(try retryValue(prefix + key, in: result).boolValue,
+                                      "\(prefix + key): \(result)")
+                    }
+                    for key in ["activationError", "activeObservedRaw", "deactivationError", "inactiveObservedRaw"] {
+                        XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 0,
+                                       "\(prefix + key): \(result)")
+                    }
+                    XCTAssertEqual(try retryValue(prefix + "activationCount", in: result).intValue, 1)
+                    XCTAssertEqual(try retryValue(prefix + "deactivationCount", in: result).intValue, 1)
+                } else {
+                    XCTAssertNil(result[prefix + "activationCount"])
+                    XCTAssertNil(result[prefix + "deactivationCount"])
+                }
+            }
+        }
     }
 
     func testNativeFailureContextRetainsRouteFactsBeforeInnerRollback() throws {

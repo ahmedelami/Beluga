@@ -2885,6 +2885,10 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         native.debugRetainedFailureContextForTesting()
     }
 
+    public func debugProbeRealSessionPolicySetterForTesting() -> [String: NSNumber] {
+        native.debugProbeRealSessionPolicySetterForTesting()
+    }
+
     public func debugBoundedDiagnosticsReadForTesting() -> [String: NSNumber] {
         native.debugBoundedDiagnosticsReadForTesting()
     }
@@ -2931,6 +2935,14 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
 
     public func debugAppAudioPolicyCarrierOrderingForTesting() -> Bool {
         native.debugAppAudioPolicyCarrierOrderingForTesting()
+    }
+
+    public func debugConfigurationGenerationRecoveryForTesting() -> [String: NSNumber] {
+        native.debugConfigurationGenerationRecoveryForTesting()
+    }
+
+    public func debugOutputOnlyPolicyRepairForTesting() -> [String: NSNumber] {
+        native.debugOutputOnlyPolicyRepairForTesting()
     }
 
     public func debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting()
