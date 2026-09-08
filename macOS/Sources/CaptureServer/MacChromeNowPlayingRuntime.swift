@@ -14,6 +14,8 @@ final class MacChromeNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked S
     private var permissionPending = false
     private var relativeConsumed = false
     private var current: (player: MacChromePlayerSnapshot, token: MacNowPlayingClientToken)?
+    // Selection only: an uncertain read always retires current command authority.
+    private var selectionHint: MacChromePlayerSnapshot?
     private var discoveryStatus: MacChromeDiscoveryStatus = .idle
     var isAvailable: Bool { true }
     var lastDiscoveryStatus: MacChromeDiscoveryStatus { lock.withLock { discoveryStatus } }
@@ -33,7 +35,7 @@ final class MacChromeNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked S
         guard let admitted else { completion(.retry); return }
         let deadline = now() + 1.5
         queue.async { [self] in
-            let preferred = lock.withLock { current?.player }
+            let preferred = lock.withLock { selectionHint }
             var selected: MacChromePlayerSnapshot?
             var failure: Error?
             do {
@@ -49,12 +51,13 @@ final class MacChromeNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked S
                 guard epoch == admitted else { return .retry }
                 if let failure {
                     epoch &+= 1; current = nil; relativeConsumed = false
+                    if failure as? MacChromeBackendError != .timedOut { selectionHint = nil }
                     discoveryStatus = MacChromeDiscoveryStatus(error: failure)
                     // Unknown browser state must revoke its commands without choosing another tab.
                     return .retry
                 }
                 guard let selected, let metadata = Self.metadata(selected) else {
-                    epoch &+= 1; current = nil; relativeConsumed = false
+                    epoch &+= 1; current = nil; selectionHint = nil; relativeConsumed = false
                     discoveryStatus = selected == nil ? .noPlayer : .invalidData
                     return .noActiveMedia
                 }
@@ -66,7 +69,7 @@ final class MacChromeNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked S
                     token = MacNowPlayingClientToken(object: NSObject(), clientIdentity: "chrome:" + UUID().uuidString)
                 }
                 if !commandPending || current?.player.hasSameItem(as: selected) != true { relativeConsumed = false }
-                current = (selected, token); discoveryStatus = .available
+                current = (selected, token); selectionHint = selected; discoveryStatus = .available
                 return .snapshot(.init(client: token, sourceName: "YouTube", metadata: metadata,
                                        enabledCommands: selected.media.enabledCommands))
             }
@@ -131,7 +134,7 @@ final class MacChromeNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked S
 
     func stop() {
         lock.withLock {
-            epoch &+= 1; lifecycle &+= 1; current = nil; relativeConsumed = false; discoveryStatus = .idle
+            epoch &+= 1; lifecycle &+= 1; current = nil; selectionHint = nil; relativeConsumed = false; discoveryStatus = .idle
         }
     }
 

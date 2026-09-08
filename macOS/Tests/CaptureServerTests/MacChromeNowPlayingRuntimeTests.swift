@@ -10,6 +10,7 @@ private final class ChromeTestBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
     func get() -> Value { lock.withLock { value } }
     func set(_ value: Value) { lock.withLock { self.value = value } }
+    func update(_ body: (inout Value) -> Void) { lock.withLock { body(&value) } }
 }
 
 private let chromeOwner = MacChromePlayerIdentity(processID: 42, launchDate: Date(timeIntervalSince1970: 100))
@@ -18,16 +19,18 @@ private let chromeNextURL = "https://www.youtube.com/watch?v=lmnopqrstuv"
 
 private func chromeMedia(video: String = "abcdefghijk", paused: Bool = false,
                          item: String = "00000000-0000-4000-8000-000000000001", generation: Int64 = 1,
-                         title: String = "Video", pageTime: Double = 50_000) -> MacChromeScriptSnapshot {
-    .init(documentID: "00000000-0000-4000-8000-000000000002", itemID: item, itemGeneration: generation,
+                         title: String = "Video", pageTime: Double = 50_000,
+                         document: String = "00000000-0000-4000-8000-000000000002") -> MacChromeScriptSnapshot {
+    .init(documentID: document, itemID: item, itemGeneration: generation,
           videoID: video, title: title, artist: "Channel", duration: 120, elapsedTime: 15,
           playbackRate: 1, paused: paused, observedAtUnixMilliseconds: 1_000_000,
           observedAtPageMilliseconds: pageTime, canPlay: paused, canPause: !paused,
           canNext: true, canPrevious: true)
 }
 
-private func chromePlayer(tab: String = "2", media: MacChromeScriptSnapshot = chromeMedia()) -> MacChromePlayerSnapshot {
-    .init(tab: .init(owner: chromeOwner, windowID: "1", tabID: tab), media: media, receivedAtUptime: 10)
+private func chromePlayer(tab: String = "2", media: MacChromeScriptSnapshot = chromeMedia(),
+                          owner: MacChromePlayerIdentity = chromeOwner, window: String = "1") -> MacChromePlayerSnapshot {
+    .init(tab: .init(owner: owner, windowID: window, tabID: tab), media: media, receivedAtUptime: 10)
 }
 
 private final class ChromeTestBackend: MacChromeNowPlayingBackend, @unchecked Sendable {
@@ -35,9 +38,11 @@ private final class ChromeTestBackend: MacChromeNowPlayingBackend, @unchecked Se
     var error: MacChromeBackendError?
     var commandError: MacChromeBackendError?
     var commands: [MacChromeCommand] = []
+    var commandTargets: [MacChromeTabIdentity] = []
     var reads = 0
     var permissions = 0
     var onPermission: (() -> Void)?
+    var onCommand: ((MacChromeCommand) -> Void)?
     func readSnapshots(deadline: TimeInterval) throws -> [MacChromePlayerSnapshot] {
         reads += 1
         if let error { throw error }
@@ -47,10 +52,25 @@ private final class ChromeTestBackend: MacChromeNowPlayingBackend, @unchecked Se
     func send(_ command: MacChromeCommand, expected: MacChromePlayerSnapshot, deadline: TimeInterval,
               isAuthorized: @escaping @Sendable () -> Bool) throws -> WebRTCRemoteMediaCommandResult {
         guard isAuthorized() else { return .staleContext }
-        commands.append(command)
+        commands.append(command); commandTargets.append(expected.tab)
         if let commandError { throw commandError }
+        onCommand?(command)
         return .applied
     }
+}
+
+private struct ChromeRecoveryAbsentMusic: MacSystemNowPlayingRuntime {
+    var isAvailable: Bool { true }
+    func fetchSnapshot(completion: @escaping @Sendable (MacNowPlayingRuntimeSnapshotResult) -> Void) {
+        completion(.noActiveMedia)
+    }
+    func send(rawCommand: Int, snapshot: MacNowPlayingRuntimeSnapshot,
+              isAuthorized: @escaping @Sendable () -> Bool,
+              completion: @escaping @Sendable (WebRTCRemoteMediaCommandResult) -> Void) {
+        XCTFail("Chrome recovery transferred a command to absent Music")
+        completion(.failed)
+    }
+    func stop() {}
 }
 
 /// Executes actual production Apple Event descriptor queries against a changing fake target.
@@ -365,6 +385,241 @@ final class MacChromeNowPlayingRuntimeTests: XCTestCase {
         runtime.stop()
         let third = try await snapshot(runtime)
         XCTAssertFalse(second.client === third.client)
+    }
+
+    func testPausedOwnerRecoversAfterTimeoutWithoutRevivingOldCommandAuthority() async throws {
+        let backend = ChromeTestBackend()
+        let pausedOther = chromePlayer(tab: "3", media: chromeMedia(paused: true))
+        backend.snapshots = [chromePlayer(), pausedOther]
+        let runtime = makeRuntime(backend)
+        let playing = try await snapshot(runtime)
+        await assertSend(runtime, command: 1, snapshot: playing, equals: .applied)
+        backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), pausedOther]
+        let paused = try await snapshot(runtime)
+        XCTAssertTrue(paused.client === playing.client)
+        XCTAssertTrue(paused.enabledCommands.contains(0))
+
+        backend.error = .timedOut
+        guard case .retry = await fetch(runtime) else { return XCTFail("Timeout retained command authority") }
+        await assertSend(runtime, command: 0, snapshot: paused, equals: .staleContext)
+        backend.error = nil
+        let recovered = try await snapshot(runtime)
+        XCTAssertEqual(runtime.lastDiscoveryStatus, .available)
+        XCTAssertFalse(recovered.client === paused.client)
+        XCTAssertEqual(recovered.metadata.playbackRate, 0)
+        await assertSend(runtime, command: 0, snapshot: paused, equals: .staleContext)
+        await assertSend(runtime, command: 0, snapshot: recovered, equals: .applied)
+        XCTAssertEqual(backend.commands, [.pause, .play])
+    }
+
+    func testTimeoutHintRequiresEveryExactOwnerTabAndItemFieldAndCannotSurviveObservedReplacement() async throws {
+        let mutations = [
+            chromePlayer(media: chromeMedia(paused: true), owner: .init(processID: 43, launchDate: chromeOwner.launchDate)),
+            chromePlayer(media: chromeMedia(paused: true), owner: .init(processID: 42, launchDate: Date(timeIntervalSince1970: 101))),
+            chromePlayer(media: chromeMedia(paused: true), window: "4"),
+            chromePlayer(tab: "4", media: chromeMedia(paused: true)),
+            chromePlayer(media: chromeMedia(paused: true, document: "00000000-0000-4000-8000-000000000004")),
+            chromePlayer(media: chromeMedia(paused: true, item: "00000000-0000-4000-8000-000000000004")),
+            chromePlayer(media: chromeMedia(paused: true, generation: 2)),
+            chromePlayer(media: chromeMedia(video: "lmnopqrstuv", paused: true))
+        ]
+        for changed in mutations {
+            let backend = ChromeTestBackend(), runtime = makeRuntime(backend)
+            let old = try await snapshot(runtime)
+            backend.error = .timedOut
+            guard case .retry = await fetch(runtime) else { return XCTFail("Timeout published") }
+            backend.error = nil
+            let other = chromePlayer(tab: "3", media: chromeMedia(paused: true))
+            backend.snapshots = [changed, other]
+            guard case .retry = await fetch(runtime) else { return XCTFail("Changed identity reused timeout hint") }
+            XCTAssertEqual(runtime.lastDiscoveryStatus, .ambiguousPlayers)
+            backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), other]
+            guard case .retry = await fetch(runtime) else { return XCTFail("Retired owner returned through ABA") }
+            await assertSend(runtime, command: 1, snapshot: old, equals: .staleContext)
+            XCTAssertTrue(backend.commands.isEmpty)
+        }
+    }
+
+    func testPlayingTakeoverReplacesTimeoutHintAndRemainsStickyWhenBothPause() async throws {
+        let backend = ChromeTestBackend(), runtime = makeRuntime(backend)
+        let old = try await snapshot(runtime)
+        backend.error = .timedOut
+        guard case .retry = await fetch(runtime) else { return XCTFail("Timeout published") }
+        backend.error = nil
+        let firstPaused = chromePlayer(media: chromeMedia(paused: true))
+        backend.snapshots = [firstPaused, chromePlayer(tab: "3", media: chromeMedia(title: "Other"))]
+        let takeover = try await snapshot(runtime)
+        XCTAssertEqual(takeover.metadata.title, "Other")
+        backend.snapshots = [firstPaused, chromePlayer(tab: "3", media: chromeMedia(paused: true, title: "Other"))]
+        let paused = try await snapshot(runtime)
+        XCTAssertTrue(takeover.client === paused.client)
+        XCTAssertEqual(paused.metadata.title, "Other")
+        await assertSend(runtime, command: 1, snapshot: old, equals: .staleContext)
+        await assertSend(runtime, command: 0, snapshot: paused, equals: .applied)
+        XCTAssertEqual(backend.commands, [.play])
+    }
+
+    func testRemovedOwnerCannotStealSelectionBackFromFreshPausedPlayer() async throws {
+        let backend = ChromeTestBackend(), runtime = makeRuntime(backend)
+        let old = try await snapshot(runtime)
+        backend.error = .timedOut
+        guard case .retry = await fetch(runtime) else { return XCTFail("Timeout published") }
+        backend.error = nil
+        let other = chromePlayer(tab: "3", media: chromeMedia(paused: true, title: "Other"))
+        backend.snapshots = [other]
+        let replacement = try await snapshot(runtime)
+        backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), other]
+        let selected = try await snapshot(runtime)
+        XCTAssertTrue(replacement.client === selected.client)
+        XCTAssertEqual(selected.metadata.title, "Other")
+        await assertSend(runtime, command: 1, snapshot: old, equals: .staleContext)
+        await assertSend(runtime, command: 0, snapshot: selected, equals: .applied)
+    }
+
+    func testActualAmbiguityAfterTimeoutRetiresSelectionHint() async throws {
+        let backend = ChromeTestBackend(), runtime = makeRuntime(backend)
+        let old = try await snapshot(runtime)
+        backend.error = .timedOut
+        guard case .retry = await fetch(runtime) else { return XCTFail("Timeout published") }
+        backend.error = nil
+        backend.snapshots = [chromePlayer(), chromePlayer(tab: "3")]
+        guard case .retry = await fetch(runtime) else { return XCTFail("Ambiguous playing owner selected") }
+        backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), chromePlayer(tab: "3", media: chromeMedia(paused: true))]
+        guard case .retry = await fetch(runtime) else { return XCTFail("Ambiguity preserved old preference") }
+        await assertSend(runtime, command: 1, snapshot: old, equals: .staleContext)
+    }
+
+    func testStopAndNonTimeoutFailuresClearSelectionHint() async throws {
+        let failures: [MacChromeBackendError?] = [nil, .permissionRequired, .permissionDenied,
+            .javascriptPermissionRequired, .staleItem, .invalidData, .unavailable, .ambiguousPlayers]
+        for failure in failures {
+            let backend = ChromeTestBackend(), runtime = makeRuntime(backend)
+            let old = try await snapshot(runtime)
+            backend.error = .timedOut
+            guard case .retry = await fetch(runtime) else { return XCTFail("Timeout published") }
+            if let failure {
+                backend.error = failure
+                guard case .retry = await fetch(runtime) else { return XCTFail("Failure published") }
+            } else { runtime.stop() }
+            backend.error = nil
+            backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), chromePlayer(tab: "3", media: chromeMedia(paused: true))]
+            guard case .retry = await fetch(runtime) else { return XCTFail("Retired hint survived stop or non-timeout failure") }
+            await assertSend(runtime, command: 1, snapshot: old, equals: .staleContext)
+            XCTAssertTrue(backend.commands.isEmpty)
+        }
+    }
+
+    func testConfirmedAbsenceAndInvalidMetadataClearTimeoutHint() async throws {
+        let unavailableSnapshots: [[MacChromePlayerSnapshot]] = [[], [chromePlayer(media: chromeMedia(title: ""))]]
+        for unavailable in unavailableSnapshots {
+            let backend = ChromeTestBackend(), runtime = makeRuntime(backend)
+            _ = try await snapshot(runtime)
+            backend.error = .timedOut
+            guard case .retry = await fetch(runtime) else { return XCTFail("Timeout published") }
+            backend.error = nil; backend.snapshots = unavailable
+            guard case .noActiveMedia = await fetch(runtime) else { return XCTFail("Invalid or absent media published") }
+            backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), chromePlayer(tab: "3", media: chromeMedia(paused: true))]
+            guard case .retry = await fetch(runtime) else { return XCTFail("Confirmed absence preserved old hint") }
+        }
+    }
+
+    func testPendingPlayRetiredByTimeoutCannotRegainAuthorityWhenPausedOwnerRecovers() async throws {
+        let backend = ChromeTestBackend()
+        let queue = DispatchQueue(label: "chrome-paused-recovery-test")
+        let runtime = MacChromeNowPlayingRuntime(backend: backend, queue: queue, now: { 10 })
+        _ = try await snapshot(runtime)
+        backend.snapshots = [chromePlayer(media: chromeMedia(paused: true)), chromePlayer(tab: "3", media: chromeMedia(paused: true))]
+        let old = try await snapshot(runtime)
+        queue.suspend(); backend.error = .timedOut
+        let read = expectation(description: "timeout revokes pending Play")
+        runtime.fetchSnapshot { value in
+            guard case .retry = value else { return XCTFail("Timeout published") }
+            read.fulfill()
+        }
+        let command = expectation(description: "old pending Play rejected")
+        runtime.send(rawCommand: 0, snapshot: old, isAuthorized: { true }) { value in
+            XCTAssertEqual(value, .staleContext); command.fulfill()
+        }
+        queue.resume()
+        await fulfillment(of: [read, command], timeout: 2)
+        XCTAssertTrue(backend.commands.isEmpty)
+        backend.error = nil
+        let fresh = try await snapshot(runtime)
+        XCTAssertFalse(fresh.client === old.client)
+        await assertSend(runtime, command: 0, snapshot: old, equals: .staleContext)
+        await assertSend(runtime, command: 0, snapshot: fresh, equals: .applied)
+        XCTAssertEqual(backend.commands, [.play])
+    }
+
+    func testPausedRecoveryAcrossRealChromeCompositeAndControllerRequiresFreshPlayContext() async throws {
+        let backend = ChromeTestBackend()
+        let other = chromePlayer(tab: "3", media: chromeMedia(paused: true, title: "Other"))
+        backend.snapshots = [chromePlayer(), other]
+        backend.onCommand = { [weak backend] command in
+            guard let backend else { return }
+            backend.snapshots = [chromePlayer(media: chromeMedia(paused: command == .pause)), other]
+        }
+        let chrome = makeRuntime(backend)
+        let composite = MacSupportedNowPlayingRuntime(browser: chrome, music: ChromeRecoveryAbsentMusic())
+        let controller = MacSystemNowPlayingController(runtime: composite, operationTimeout: 5,
+                                                       now: { Date(timeIntervalSince1970: 1000) })
+        defer { controller.stop() }
+        let updates = ChromeTestBox<[WebRTCRemoteMediaStateUpdate]>([])
+        let playing = expectation(description: "exact Chrome owner playing")
+        let paused = expectation(description: "exact owner paused")
+        let withdrawn = expectation(description: "uncertainty withdraws outer authority")
+        let recovered = expectation(description: "fresh same owner paused")
+        let resumed = expectation(description: "fresh Play resumes exact owner")
+        controller.start { update in
+            updates.update { $0.append(update) }
+            switch update.revision {
+            case 1: playing.fulfill()
+            case 2: paused.fulfill()
+            case 3: withdrawn.fulfill()
+            case 4: recovered.fulfill()
+            case 5: resumed.fulfill()
+            default: XCTFail("Unexpected additional media publication")
+            }
+        }
+        await fulfillment(of: [playing], timeout: 2)
+        let playingItem = try XCTUnwrap(updates.get().last?.item)
+        XCTAssertEqual(playingItem.title, "Video")
+        let pause = try XCTUnwrap(controller.prepareCommand(.pause, contextID: playingItem.contextID,
+                                                            isAuthorized: { true }))
+        let pauseResult = await controller.perform(pause)
+        XCTAssertEqual(pauseResult, .applied)
+        await fulfillment(of: [paused], timeout: 2)
+        let pausedItem = try XCTUnwrap(updates.get().last?.item)
+        XCTAssertEqual(pausedItem.playbackState, .paused)
+        XCTAssertTrue(pausedItem.capabilities.canPlay)
+        let stalePlay = try XCTUnwrap(controller.prepareCommand(.play, contextID: pausedItem.contextID,
+                                                                isAuthorized: { true }))
+        backend.error = .timedOut
+        controller.refresh()
+        await fulfillment(of: [withdrawn], timeout: 2)
+        XCTAssertNil(updates.get().last?.item)
+        XCTAssertNil(controller.prepareCommand(.play, contextID: pausedItem.contextID, isAuthorized: { true }))
+        let uncertainResult = await controller.perform(stalePlay)
+        XCTAssertEqual(uncertainResult, .staleContext)
+        backend.error = nil
+        controller.refresh()
+        await fulfillment(of: [recovered], timeout: 2)
+        let freshItem = try XCTUnwrap(updates.get().last?.item)
+        XCTAssertNotEqual(freshItem.contextID, pausedItem.contextID)
+        XCTAssertEqual(freshItem.title, pausedItem.title)
+        XCTAssertEqual(freshItem.playbackState, .paused)
+        XCTAssertTrue(freshItem.capabilities.canPlay)
+        let staleResult = await controller.perform(stalePlay)
+        XCTAssertEqual(staleResult, .staleContext)
+        let freshPlay = try XCTUnwrap(controller.prepareCommand(.play, contextID: freshItem.contextID,
+                                                                isAuthorized: { true }))
+        let playResult = await controller.perform(freshPlay)
+        XCTAssertEqual(playResult, .applied)
+        await fulfillment(of: [resumed], timeout: 2)
+        XCTAssertEqual(updates.get().last?.item?.playbackState, .playing)
+        XCTAssertEqual(backend.commands, [.pause, .play])
+        XCTAssertEqual(backend.commandTargets, [chromePlayer().tab, chromePlayer().tab])
+        XCTAssertEqual(updates.get().map(\.revision), [1, 2, 3, 4, 5])
     }
 
     func testStoppedAndExpiredQueuedReadsNeverCallBackendOrPublish() async {

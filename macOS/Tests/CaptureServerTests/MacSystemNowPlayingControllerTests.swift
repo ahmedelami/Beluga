@@ -206,6 +206,135 @@ final class MacSystemNowPlayingControllerTests: XCTestCase {
         XCTAssertEqual(result, .staleContext)
     }
 
+    func testRetryWithdrawsPausedControlsAndFreshSnapshotCannotReviveOldPlay() async throws {
+        let runtime = FakeMacSystemNowPlayingRuntime()
+        let pausedSnapshot = Self.snapshot(playbackRate: 0, enabledCommands: [0])
+        runtime.enqueue(.snapshot(pausedSnapshot))
+        runtime.deferCommands = true
+        let fetchTimes = NowPlayingLockedBox<[TimeInterval]>([])
+        let thirdRetryFetched = expectation(description: "three bounded retry responses fetched")
+        runtime.onFetch = { [weak runtime] in
+            fetchTimes.update { $0.append(ProcessInfo.processInfo.systemUptime) }
+            if runtime?.fetchCount == 4 { thirdRetryFetched.fulfill() }
+        }
+        let controller = MacSystemNowPlayingController(runtime: runtime, operationTimeout: 5)
+        defer { controller.stop() }
+        let updates = NowPlayingLockedBox<[WebRTCRemoteMediaStateUpdate]>([])
+        let initiallyPaused = expectation(description: "initial paused item published")
+        let withdrawn = expectation(description: "retry withdraws command presentation")
+        let recovered = expectation(description: "fresh paused item republished")
+        controller.start { update in
+            updates.update { $0.append(update) }
+            if update.revision == 1 { initiallyPaused.fulfill() }
+            else if update.item == nil { withdrawn.fulfill() }
+            else { recovered.fulfill() }
+        }
+        await fulfillment(of: [initiallyPaused], timeout: 1)
+        let oldItem = try XCTUnwrap(updates.read().first?.item)
+        XCTAssertEqual(oldItem.playbackState, .paused)
+        XCTAssertTrue(oldItem.capabilities.canPlay)
+        let preparedBeforeRetry = try XCTUnwrap(controller.prepareCommand(
+            .play, contextID: oldItem.contextID, isAuthorized: { true }
+        ))
+        let pendingPrepared = try XCTUnwrap(controller.prepareCommand(
+            .play, contextID: oldItem.contextID, isAuthorized: { true }
+        ))
+        let reachedRuntime = expectation(description: "old Play waits at native boundary")
+        runtime.onSend = { reachedRuntime.fulfill() }
+        let pendingPlay = Task { await controller.perform(pendingPrepared) }
+        await fulfillment(of: [reachedRuntime], timeout: 1)
+
+        runtime.enqueue(.retry)
+        runtime.enqueue(.retry)
+        runtime.enqueue(.retry)
+        controller.refresh()
+        await fulfillment(of: [withdrawn], timeout: 1)
+        // A missing clear is the original defect. Do not let a later timeout
+        // masquerade as the retry transition or leave native work outstanding.
+        guard updates.read().last?.item == nil else {
+            controller.stop()
+            XCTAssertEqual(runtime.resolveDeferredCommands(), [false])
+            _ = await pendingPlay.value
+            return
+        }
+        XCTAssertNil(controller.prepareCommand(
+            .play, contextID: oldItem.contextID, isAuthorized: { true }
+        ))
+        let rejectedWhileUncertain = await controller.perform(preparedBeforeRetry)
+        XCTAssertEqual(rejectedWhileUncertain, .staleContext)
+        XCTAssertEqual(runtime.commands, [0])
+
+        await fulfillment(of: [thirdRetryFetched], timeout: 1)
+        let observedFetchTimes = fetchTimes.read()
+        XCTAssertEqual(observedFetchTimes.count, 4)
+        guard observedFetchTimes.count == 4 else {
+            controller.stop()
+            _ = runtime.resolveDeferredCommands()
+            _ = await pendingPlay.value
+            return
+        }
+        XCTAssertGreaterThanOrEqual(observedFetchTimes[2] - observedFetchTimes[1], 0.20)
+        XCTAssertGreaterThanOrEqual(observedFetchTimes[3] - observedFetchTimes[2], 0.20)
+        XCTAssertEqual(updates.read().map(\.revision), [1, 2], "repeated retry must not spam clears")
+
+        runtime.enqueue(.snapshot(pausedSnapshot))
+        controller.refresh()
+        await fulfillment(of: [recovered], timeout: 1)
+        let freshItem = try XCTUnwrap(updates.read().last?.item)
+        XCTAssertEqual(updates.read().map(\.revision), [1, 2, 3])
+        XCTAssertNotEqual(freshItem.contextID, oldItem.contextID)
+        XCTAssertEqual(freshItem.title, oldItem.title)
+        XCTAssertEqual(freshItem.playbackState, .paused)
+        XCTAssertTrue(freshItem.capabilities.canPlay)
+        XCTAssertEqual(runtime.resolveDeferredCommands(), [false], "fresh state cannot revive a pending Play")
+        let pendingResult = await pendingPlay.value
+        XCTAssertEqual(pendingResult, .staleContext)
+        let oldResultAfterRecovery = await controller.perform(preparedBeforeRetry)
+        XCTAssertEqual(oldResultAfterRecovery, .staleContext)
+
+        runtime.onSend = nil
+        runtime.deferCommands = false
+        let freshPrepared = try XCTUnwrap(controller.prepareCommand(
+            .play, contextID: freshItem.contextID, isAuthorized: { true }
+        ))
+        let freshResult = await controller.perform(freshPrepared)
+        XCTAssertEqual(freshResult, .applied)
+        XCTAssertEqual(runtime.commands, [0, 0], "only fresh Play adds a new native dispatch")
+    }
+
+    func testFailedPlayAlonePreservesPausedPresentationAndDoesNotReplay() async throws {
+        let runtime = FakeMacSystemNowPlayingRuntime()
+        runtime.enqueue(.snapshot(Self.snapshot(playbackRate: 0, enabledCommands: [0])))
+        runtime.commandResult = .failed
+        let controller = MacSystemNowPlayingController(runtime: runtime, operationTimeout: 5)
+        defer { controller.stop() }
+        let updates = NowPlayingLockedBox<[WebRTCRemoteMediaStateUpdate]>([])
+        let published = expectation(description: "paused item published")
+        controller.start { update in
+            updates.update { $0.append(update) }
+            if update.revision == 1 { published.fulfill() }
+        }
+        await fulfillment(of: [published], timeout: 1)
+        let item = try XCTUnwrap(updates.read().first?.item)
+        let failedPress = try XCTUnwrap(controller.prepareCommand(
+            .play, contextID: item.contextID, isAuthorized: { true }
+        ))
+        let failedResult = await controller.perform(failedPress)
+        XCTAssertEqual(failedResult, .failed)
+        XCTAssertEqual(runtime.commands, [0])
+        XCTAssertEqual(updates.read().count, 1)
+        XCTAssertEqual(updates.read().last?.item, item)
+
+        runtime.commandResult = .applied
+        let freshPress = try XCTUnwrap(controller.prepareCommand(
+            .play, contextID: item.contextID, isAuthorized: { true }
+        ))
+        let freshResult = await controller.perform(freshPress)
+        XCTAssertEqual(freshResult, .applied)
+        XCTAssertEqual(runtime.commands, [0, 0], "only a new press may retry the action")
+        XCTAssertEqual(updates.read().last?.item, item)
+    }
+
     func testInvalidationRevokesQueuedNextBeforeItCanAdoptReplacementEpoch() async throws {
         let runtime = FakeMacSystemNowPlayingRuntime()
         runtime.enqueue(.snapshot(Self.snapshot()))
@@ -737,6 +866,7 @@ final class MacSystemNowPlayingControllerTests: XCTestCase {
     private static func snapshot(
         title: String = "Track",
         timestamp: Date? = nil,
+        playbackRate: Double = 1,
         enabledCommands: Set<Int> = [0, 1, 4, 5]
     ) -> MacNowPlayingRuntimeSnapshot {
         MacNowPlayingRuntimeSnapshot(
@@ -751,7 +881,7 @@ final class MacSystemNowPlayingControllerTests: XCTestCase {
                 album: "Album",
                 duration: 120,
                 elapsedTime: 10,
-                playbackRate: 1,
+                playbackRate: playbackRate,
                 timestamp: timestamp,
                 contentIdentifier: "track-1",
                 uniqueIdentifier: nil

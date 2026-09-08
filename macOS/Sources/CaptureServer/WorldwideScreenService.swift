@@ -810,6 +810,7 @@ actor WorldwideScreenService {
         WorldwideScreenVideoAdaptationFreshnessFence()
     private var keyFrameControlTask: Task<Void, Never>?
     private var remoteMediaCommandTask: Task<Void, Never>?
+    private let remoteMediaTraceSession = UUID()
     private var remoteMediaCommandCapacity =
         WorldwideRemoteMediaCommandQueueCapacity()
     private var peer: WebRTCPeer?
@@ -1811,7 +1812,10 @@ actor WorldwideScreenService {
         sourcePeer: WebRTCPeer,
         sourcePeerGeneration: UInt64
     ) async {
+        traceRemoteMediaCommand(.serviceReceived, command: command, sourcePeerGeneration: sourcePeerGeneration)
         guard let commandGeneration = remoteMediaCommandCapacity.reserve() else {
+            traceRemoteMediaCommand(.capacityRejected, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: .failed)
             await acknowledgeRemoteMediaCommand(
                 command,
                 result: .failed,
@@ -1831,6 +1835,9 @@ actor WorldwideScreenService {
                     sourcePeerGeneration: sourcePeerGeneration,
                     commandGeneration: commandGeneration
                 )
+            } else {
+                await self.traceRemoteMediaCommand(.queueCancelled, command: command,
+                                                   sourcePeerGeneration: sourcePeerGeneration)
             }
             await self.finishRemoteMediaCommand(generation: commandGeneration)
         }
@@ -1848,6 +1855,8 @@ actor WorldwideScreenService {
               remoteMediaCommandCapacity.admits(generation: commandGeneration),
               command.isValid,
               transportAllowsCapture else {
+            traceRemoteMediaCommand(.executionRetired, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration)
             return
         }
 
@@ -1876,12 +1885,17 @@ actor WorldwideScreenService {
             result = .noActiveMedia
         }
 
+        traceRemoteMediaCommand(.resultResolved, command: command,
+                                sourcePeerGeneration: sourcePeerGeneration, result: result)
+
         guard !Task.isCancelled,
               !isStopped,
               peer === sourcePeer,
               peerGeneration == sourcePeerGeneration,
               remoteMediaCommandCapacity.admits(generation: commandGeneration),
               transportAllowsCapture else {
+            traceRemoteMediaCommand(.acknowledgementRetired, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
             return
         }
         await acknowledgeRemoteMediaCommand(
@@ -1901,18 +1915,47 @@ actor WorldwideScreenService {
         guard !isStopped,
               peer === sourcePeer,
               peerGeneration == sourcePeerGeneration,
-              transportAllowsCapture else { return }
+              transportAllowsCapture else {
+            traceRemoteMediaCommand(.acknowledgementRetired, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
+            return
+        }
         do {
             try await sourcePeer.acknowledgeRemoteMediaCommand(
                 command,
                 result: result
             )
+            traceRemoteMediaCommand(.acknowledgementSent, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
         } catch {
+            traceRemoteMediaCommand(.acknowledgementFailed, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
             logger.debug(
                 "Worldwide remote media command acknowledgement deferred: "
                     + error.localizedDescription
             )
         }
+    }
+
+    private func traceRemoteMediaCommand(
+        _ stage: WorldwideRemoteMediaCommandTrace.Stage,
+        command: WebRTCReceivedRemoteMediaCommand,
+        sourcePeerGeneration: UInt64,
+        result: WebRTCRemoteMediaCommandResult? = nil
+    ) {
+        logger.info(WorldwideRemoteMediaCommandTrace.message(
+            stage: stage,
+            session: remoteMediaTraceSession,
+            processID: ProcessInfo.processInfo.processIdentifier,
+            peerGeneration: sourcePeerGeneration,
+            request: command.request,
+            publishedRevision: remoteMediaPublication.lastSuccessfullySent?.revision,
+            contextMatches: latestRemoteMediaItem?.contextID == command.request.contextID,
+            authorized: command.isValid,
+            transportReady: !isStopped && peerGeneration == sourcePeerGeneration && transportAllowsCapture,
+            result: result,
+            uptime: ProcessInfo.processInfo.systemUptime
+        ))
     }
 
     private func finishRemoteMediaCommand(generation: UInt64) {

@@ -931,6 +931,9 @@ final class MacSystemNowPlayingController: MacRemoteMediaControlling,
         case .noActiveMedia:
             publish(item: nil, snapshot: nil)
         case .retry:
+            // Uncertain runtime state is not command authority, even if the
+            // same paused item is selected again by the next successful read.
+            publish(item: nil, snapshot: nil)
             refreshPending = false
             // Permission denial or a busy native player may fail immediately.
             // Keep retries bounded rather than spinning on the control queue.
