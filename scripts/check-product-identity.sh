@@ -1282,7 +1282,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'function resolve_pinned_package_dependencies() {' 1 \
   'side-by-side TestFlight one-time native package resolution'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_PACKAGE_MANIFEST_SHA256="59368397825697a878ba3219377bfff26be040735c9a6732a8952dc55a4c031b"' 1 \
+  'EXPECTED_PACKAGE_MANIFEST_SHA256="375ee94b787f2cc9f4ba176e6a81ecb7e09eba56b7faf82a210f2ae1d149b1af"' 1 \
   'side-by-side TestFlight exact package manifest pin'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_PACKAGE_RESOLVED_STATE="absent"' 1 \

@@ -107,7 +107,7 @@ readonly -i APP_STORE_PROCESSING_WAIT_POLL_SECONDS=5
 readonly -i APP_STORE_PROCESSING_TERMINATION_GRACE_SECONDS=5
 readonly PACKAGE_MANIFEST_PATH="${REPOSITORY_ROOT}/Package.swift"
 readonly PACKAGE_RESOLVED_PATH="${REPOSITORY_ROOT}/Package.resolved"
-readonly EXPECTED_PACKAGE_MANIFEST_SHA256="59368397825697a878ba3219377bfff26be040735c9a6732a8952dc55a4c031b"
+readonly EXPECTED_PACKAGE_MANIFEST_SHA256="375ee94b787f2cc9f4ba176e6a81ecb7e09eba56b7faf82a210f2ae1d149b1af"
 readonly EXPECTED_PACKAGE_RESOLVED_STATE="absent"
 readonly VENDOR_ARCHIVE_PATH="${REPOSITORY_ROOT}/shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"
 # Replaced only after the actual patched slices and complete ZIP pass artifact verification.
