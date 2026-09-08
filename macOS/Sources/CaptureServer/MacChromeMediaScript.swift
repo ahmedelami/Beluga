@@ -1,4 +1,4 @@
-/// Executed only through Chrome's permissioned, isolated-world AppleEvent API.
+/// Executed only through Chrome's permissioned page-context AppleEvent API.
 enum MacChromeMediaScript {
     static let source = #"""
     function(request) {
@@ -84,10 +84,9 @@ enum MacChromeMediaScript {
           if (nodes.length !== 1) return null;
           const node = nodes[0];
           if (!(node instanceof HTMLElement) || !node.isConnected || node.disabled ||
-              node.getAttribute("aria-disabled") === "true" || node.getAttribute("aria-hidden") === "true" ||
-              node.getClientRects().length === 0) return null;
-          const style = getComputedStyle(node);
-          if (style.display === "none" || style.visibility === "hidden") return null;
+              node.getAttribute("aria-disabled") === "true" || node.getAttribute("aria-hidden") === "true") return null;
+          // YouTube can hide an enabled next/previous link in compact player layouts.
+          // Command authority comes from its destination and state, not its pixels.
           try {
             const href = node.getAttribute("href");
             if (!href) return null;

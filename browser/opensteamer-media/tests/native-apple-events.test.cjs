@@ -10,7 +10,7 @@ const source = swift.match(/static let source = #"""\n([\s\S]*?)\n    """#/)[1];
 const A = "AAAAAAAAAAA", B = "BBBBBBBBBBB", C = "CCCCCCCCCCC";
 const base = 1788800000000;
 function fixture(code = source) {
-  const h = {time:100,wall:base,clicks:0,pauses:0,plays:0,styles:0,styleHook:null,playHook:null,pending:null};
+  const h = {time:100,wall:base,clicks:0,pauses:0,plays:0,hrefReads:0,controlReadHook:null,playHook:null,pending:null};
   class Events {
     constructor() { this.listeners = new Map(); }
     addEventListener(name,callback,options = {}) {
@@ -22,8 +22,11 @@ function fixture(code = source) {
   }
   class Element extends Events {
     constructor() { super(); this.isConnected = true; this.disabled = false; this.attrs = {}; this.display = "block"; this.visibility = "visible"; }
-    getAttribute(key) { return this.attrs[key] ?? null; }
-    getClientRects() { return this.display === "none" ? [] : [{}]; }
+    getAttribute(key) {
+      if (key === "href") { h.hrefReads++; h.controlReadHook?.(h.hrefReads,this); }
+      return this.attrs[key] ?? null;
+    }
+    getClientRects() { return this.display === "none" || this.boxless ? [] : [{}]; }
     click() { h.clicks++; if (h.clickHook) h.clickHook(this); }
   }
   class Media extends Element {
@@ -48,7 +51,7 @@ function fixture(code = source) {
     location:h.location,document:h.document,navigator:{mediaSession:{metadata:h.metadata}},
     addEventListener:h.window.addEventListener.bind(h.window),
     performance:{now:()=>h.time},Date:class extends Date { static now() { return h.wall; } },
-    getComputedStyle:node=>{ h.styles++; h.styleHook?.(h.styles,node); return {display:node.display,visibility:node.visibility}; }});
+    getComputedStyle:node=>({display:node.display,visibility:node.visibility})});
   h.run = vm.runInContext(`(${code})`,h.context,{timeout:1000});
   h.call = request => JSON.parse(h.run(request));
   h.read = () => h.call({schemaVersion:1,operation:"read"});
@@ -120,16 +123,85 @@ test("relative success requires the advertised successor rather than any navigat
   assert.equal(h.result(q).status,"staleContext");assert.equal(h.clicks,1);
 });
 test("next and previous require exact supported controls and confirm their distinct targets", () => {
-  for(const key of ["disabled","foreign","hidden","missingHref","duplicates"]) {
+  for(const key of ["disabled","ariaDisabled","ariaHidden","disconnected","foreign","missingHref","duplicates"]) {
     const h=fixture();
     if(key==="disabled")h.next.disabled=true;
     if(key==="foreign")h.next.attrs.href=`https://evil.example/watch?v=${B}`;
-    if(key==="hidden")h.next.display="none";
+    if(key==="ariaDisabled")h.next.attrs["aria-disabled"]="true";
+    if(key==="ariaHidden")h.next.attrs["aria-hidden"]="true";
+    if(key==="disconnected")h.next.isConnected=false;
     if(key==="missingHref")delete h.next.attrs.href;
     if(key==="duplicates")h.player.querySelectorAll=()=>[h.next,h.next];
     assert.equal(h.read().snapshot.canNext,false);assert.equal(h.call(h.request("next")).status,"unsupported");assert.equal(h.clicks,0);
   }
   const h=fixture(),q=h.request("previous");h.call(q);h.navigate(C);assert.equal(h.result(q).status,"ok");
+});
+function hiddenControlOracle(code, command = "next", layout = "display") {
+  const h=fixture(code), node=h[command];
+  if(layout==="display")node.display="none";
+  if(layout==="visibility")node.visibility="hidden";
+  if(layout==="boxless")node.boxless=true;
+  const presentation=[node.display,node.visibility,node.boxless];
+  const target=command==="next" ? B : C;
+  const snapshot=h.read().snapshot;
+  assert.equal(snapshot[command==="next" ? "canNext" : "canPrevious"],true,"enabled hidden control was not advertised");
+  h.clickHook=clicked=>{ assert.equal(clicked,node);h.navigate(target); };
+  const q=h.request(command,snapshot);
+  assert.equal(h.call(q).status,"ok");
+  assert.equal(h.rendered,target,"hidden control did not reach its exact successor");
+  assert.equal(h.call(q).status,"ok");assert.equal(h.result(q).status,"ok");
+  assert.equal(h.clicks,1,"hidden relative command was replayed");
+  assert.deepEqual([node.display,node.visibility,node.boxless],presentation);
+}
+test("hidden enabled controls advertise and execute their exact successor once without changing layout", () => {
+  for(const command of ["next","previous"])for(const layout of ["display","visibility","boxless"])
+    hiddenControlOracle(source,command,layout);
+});
+test("hidden controls remain unavailable without an enabled authoritative destination", () => {
+  for(const command of ["next","previous"])for(const invalid of ["disabled","ariaDisabled","ariaHidden","missingHref","foreign"]) {
+    const h=fixture(),node=h[command];node.display="none";
+    if(invalid==="disabled")node.disabled=true;
+    if(invalid==="ariaDisabled")node.attrs["aria-disabled"]="true";
+    if(invalid==="ariaHidden")node.attrs["aria-hidden"]="true";
+    if(invalid==="missingHref")delete node.attrs.href;
+    if(invalid==="foreign")node.attrs.href=`https://evil.example/watch?v=${B}`;
+    assert.equal(h.read().snapshot[command==="next" ? "canNext" : "canPrevious"],false);
+    assert.equal(h.call(h.request(command)).status,"unsupported");assert.equal(h.clicks,0);
+  }
+});
+test("behavioral mutations reintroducing layout-dependent capability are rejected", () => {
+  for(const [guard,layout] of [
+    ['if (node.getClientRects().length === 0) return null;',"boxless"],
+    ['if (getComputedStyle(node).display === "none") return null;',"display"],
+    ['if (getComputedStyle(node).visibility === "hidden") return null;',"visibility"]]) {
+    hiddenControlOracle(source,"next",layout);
+    const mutant=source.replace('const node = nodes[0];',`const node = nodes[0]; ${guard}`);
+    assert.notEqual(mutant,source);
+    assert.throws(()=>hiddenControlOracle(mutant,"next",layout),/enabled hidden control was not advertised/);
+  }
+});
+test("hidden controls revalidate destination and disabled state at final command admission", () => {
+  for(const mutation of ["target","disabled","missing"]) {
+    const h=fixture();h.next.display="none";
+    const q=h.request("next");h.hrefReads=0;
+    h.controlReadHook=count=>{
+      if(count!==2)return;
+      if(mutation==="target")h.next.attrs.href=`https://www.youtube.com/watch?v=${C}`;
+      if(mutation==="disabled")h.next.attrs["aria-disabled"]="true";
+      if(mutation==="missing")delete h.next.attrs.href;
+    };
+    assert.equal(h.call(q).status,"staleContext");assert.equal(h.clicks,0);
+  }
+});
+test("an ignored hidden click expires without success or replay even after late navigation", () => {
+  const h=fixture();h.next.display="none";
+  const q=h.request("next");
+  assert.equal(h.call(q).status,"pending");assert.equal(h.result(q).status,"pending");
+  h.advance(1001);
+  assert.equal(h.result(q).status,"failed");assert.equal(h.call(q).status,"failed");
+  h.navigate(B);
+  assert.equal(h.result(q).status,"failed");assert.equal(h.call(q).status,"failed");
+  assert.equal(h.clicks,1);
 });
 test("navigation transition and unready/render-mismatched media are unavailable", () => {
   const h=fixture(),q=h.request("play");h.document.fire("yt-navigate-start");
@@ -184,13 +256,13 @@ test("ledger is bounded, survives source transitions, and never admits oversized
   h.advance(60001);assert.equal(h.call(h.request("pause")).status,"ok");
 });
 function finalIdentityOracle(code) {
-  const h=fixture(code),q=h.request("play");h.styles=0;
-  h.styleHook=count=>{if(count===3)h.video.currentSrc="blob:replacement";};
+  const h=fixture(code),q=h.request("play");h.hrefReads=0;
+  h.controlReadHook=count=>{if(count===3)h.video.currentSrc="blob:replacement";};
   h.call(q);assert.equal(h.plays,0,"identity changed at final admission but native play ran");
 }
 function finalDeadlineOracle(code) {
-  const h=fixture(code),q=h.request("play");h.styles=0;
-  h.styleHook=count=>{if(count===3)h.advance(1001);};
+  const h=fixture(code),q=h.request("play");h.hrefReads=0;
+  h.controlReadHook=count=>{if(count===3)h.advance(1001);};
   h.call(q);assert.equal(h.plays,0,"expired at final admission but native play ran");
 }
 test("behavioral mutant removing the final identity fence is rejected", () => {
@@ -210,8 +282,8 @@ test("behavioral mutant removing duplicate interception is rejected", () => {
 });
 test("behavioral mutant removing final relative-target fencing is rejected", () => {
   const oracle=code=>{
-    const h=fixture(code),q=h.request("next");h.styles=0;
-    h.styleHook=count=>{if(count===3)h.next.attrs.href=`https://www.youtube.com/watch?v=${C}`;};
+    const h=fixture(code),q=h.request("next");h.hrefReads=0;
+    h.controlReadHook=count=>{if(count===3)h.next.attrs.href=`https://www.youtube.com/watch?v=${C}`;};
     h.call(q);assert.equal(h.clicks,0,"changed relative target was clicked");
   };
   oracle(source);
