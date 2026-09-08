@@ -931,7 +931,14 @@ final class MacSystemNowPlayingController: MacRemoteMediaControlling,
         case .noActiveMedia:
             publish(item: nil, snapshot: nil)
         case .retry:
-            refreshPending = true
+            refreshPending = false
+            // Permission denial or a busy native player may fail immediately.
+            // Keep retries bounded rather than spinning on the control queue.
+            queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self, self.lifecycle == candidateLifecycle else { return }
+                self.requestRefresh()
+            }
+            return
         }
         if refreshPending {
             refreshPending = false

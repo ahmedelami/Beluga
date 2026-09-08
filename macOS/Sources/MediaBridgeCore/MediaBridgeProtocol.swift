@@ -53,11 +53,11 @@ public enum MediaBridgeProtocol {
             let value = try decoder.decode(BrowserMediaResult.self, from: data)
             guard isUUID(value.id), isUUID(value.contextID) else { throw MediaBridgeError.invalidMessage }
             return .result(value)
-        case "authorizeMusic":
+        case "authorizeMusic", "authorizeChrome":
             guard Set(object.keys) == Set(["v", "type", "id"]) else { throw MediaBridgeError.invalidMessage }
             let value = try decoder.decode(MediaAuthorizationRequest.self, from: data)
             guard isUUID(value.id) else { throw MediaBridgeError.invalidMessage }
-            return .authorizeMusic(value)
+            return type == "authorizeChrome" ? .authorizeChrome(value) : .authorizeMusic(value)
         default: throw MediaBridgeError.invalidMessage
         }
     }
@@ -144,4 +144,5 @@ public enum MediaBridgeInbound: Sendable {
     case state(BrowserMediaState)
     case result(BrowserMediaResult)
     case authorizeMusic(MediaAuthorizationRequest)
+    case authorizeChrome(MediaAuthorizationRequest)
 }

@@ -1,4 +1,51 @@
-# opensteamer Media for Chrome
+# opensteamer Mac media integration
+
+The Mac host now uses native Apple Events for ordinary YouTube watch tabs in Chrome
+and for Music. No Chrome extension is required. An inactive tab is still an ordinary
+background Chrome tab; discovery does not select it, bring Chrome forward, or start
+playback. Next/Previous are offered only when the selected player has those controls.
+Multiple ambiguous players clear selection rather than choosing an arbitrary target.
+
+Enable Automation through the installed signed host (Chrome or Music must already
+be running):
+
+```sh
+"/Applications/opensteamer Host.app/Contents/MacOS/OpensteamerMediaBridge" --authorize-chrome
+"/Applications/opensteamer Host.app/Contents/MacOS/OpensteamerMediaBridge" --authorize-music
+```
+
+The helper asks the running host to request macOS consent; it does not impersonate
+the host or launch another host. No iPhone connection is needed for permission setup.
+Chrome additionally requires its **Allow JavaScript from Apple Events** setting.
+Ordinary discovery never requests consent or changes that setting. Denied permission,
+disabled JavaScript, stale reads, or ambiguous state revoke controls; diagnostics
+report the capability state. The host cannot prove a safe Chrome/Music selection when
+a running Chrome instance is unreadable, so controls remain unavailable in that case.
+
+Native requests bind the Chrome PID/launch, stable window/tab IDs, exact URL, and
+document/player/item generation. The production script runs in the page context,
+not an isolated extension world: page state and returned metadata are untrusted.
+Bounded values, exact source checks, original deadlines, and non-replayed relative
+commands protect command routing; they are not a security boundary against a
+compromised page or another process running as the same macOS user.
+
+Run the exact production native-script behavior and mutation tests:
+
+```sh
+node --test browser/opensteamer-media/tests/native-apple-events.test.cjs
+```
+
+Native Swift tests cover final dispatch authorization, deadlines, source replacement,
+overlapping polls/commands, and permission-only IPC. These tests do not prove macOS
+consent, live player behavior, or the iPhone's system Now Playing UI. Those remain
+separate installed-host and physical-device release checks in `TESTING_ORACLES.md`.
+
+## Retained optional extension implementation
+
+The extension implementation below remains available for development and compatibility
+testing; the default host source runtime uses native Apple Events instead. Loading the
+extension alone does not switch that runtime, and the permission-only host endpoint
+rejects extension media-state injection. Do not install it as a native-integration step.
 
 This local Manifest V3 extension supplies current YouTube metadata and Play, Pause,
 Next, and Previous commands to the opensteamer native media helper. Its fixed ID is

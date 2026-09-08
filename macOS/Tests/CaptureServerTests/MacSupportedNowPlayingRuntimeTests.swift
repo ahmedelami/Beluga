@@ -60,6 +60,31 @@ private final class SupportedRuntimeFake: MacSystemNowPlayingRuntime, @unchecked
 }
 
 final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
+    func testSimultaneouslyDiscoveredPlayersDoNotChooseAnArbitraryCommandTarget() throws {
+        let browser = SupportedRuntimeFake(), music = SupportedRuntimeFake()
+        browser.result = .snapshot(item(source: "YouTube", identity: "browser-a"))
+        music.result = .snapshot(item(source: "Music", identity: "music-a"))
+        let runtime = MacSupportedNowPlayingRuntime(browser: browser, music: music)
+        guard case .noActiveMedia = try fetch(runtime) else { return XCTFail("Ambiguous owner chosen") }
+        guard case .noActiveMedia = try fetch(runtime) else { return XCTFail("Ambiguity disappeared without evidence") }
+        music.result = .noActiveMedia
+        XCTAssertEqual(try snapshot(runtime).sourceName, "YouTube")
+    }
+
+    func testSameInnerIdentityWithReplacementTokenRetiresPriorPublication() throws {
+        let browser = SupportedRuntimeFake(), music = SupportedRuntimeFake()
+        browser.result = .snapshot(item(source: "YouTube", identity: "same-owner"))
+        let runtime = MacSupportedNowPlayingRuntime(browser: browser, music: music)
+        let old = try snapshot(runtime)
+        let queued = send(runtime, snapshot: old)
+        browser.result = .snapshot(item(source: "YouTube", identity: "same-owner"))
+        XCTAssertNotEqual(try snapshot(runtime).identityKey, old.identityKey)
+        browser.completeCommand()
+        XCTAssertEqual(queued.read(), .staleContext)
+        XCTAssertEqual(send(runtime, snapshot: old).read(), .staleContext)
+        XCTAssertTrue(browser.commands.isEmpty)
+    }
+
     func testPlayingYouTubeWinsPausedMusicAndPreservesExactMetadataAndCapabilities() throws {
         let browser = SupportedRuntimeFake()
         let music = SupportedRuntimeFake()
@@ -70,7 +95,7 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
 
         let actual = try snapshot(runtime)
 
-        XCTAssertTrue(actual.client === expected.client)
+        XCTAssertFalse(actual.client === expected.client)
         XCTAssertEqual(actual.metadata, expected.metadata)
         XCTAssertEqual(actual.sourceName, "YouTube")
         XCTAssertEqual(actual.enabledCommands, [1, 4])
@@ -95,24 +120,28 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
         XCTAssertEqual(paused.enabledCommands, [0])
     }
 
-    func testSelectedSourceRetryPreservesSelectionAndExistingCommandAuthority() throws {
+    func testSelectedSourceRetryRetiresCommandAuthorityWithoutSwitchingPlayer() throws {
         let browser = SupportedRuntimeFake()
         let music = SupportedRuntimeFake()
         let original = item(source: "YouTube", identity: "browser-a")
         browser.result = .snapshot(original)
         music.result = .snapshot(item(source: "Music", identity: "music-a", playing: false))
         let runtime = MacSupportedNowPlayingRuntime(browser: browser, music: music)
-        let queued = send(runtime, snapshot: try snapshot(runtime))
+        let before = try snapshot(runtime)
+        let queued = send(runtime, snapshot: before)
 
         browser.result = .retry
         guard case .retry = try fetch(runtime) else { return XCTFail("Indeterminate source switched to paused Music") }
         browser.completeCommand()
-        XCTAssertEqual(queued.read(), .applied)
-        XCTAssertEqual(browser.commands, [1])
+        XCTAssertEqual(queued.read(), .staleContext)
+        XCTAssertTrue(browser.commands.isEmpty)
         XCTAssertEqual(music.pendingCommandCount, 0)
 
         browser.result = .snapshot(original)
-        XCTAssertEqual(try snapshot(runtime).identityKey, original.identityKey)
+        let recovered = try snapshot(runtime)
+        XCTAssertEqual(recovered.metadata, original.metadata)
+        XCTAssertNotEqual(recovered.identityKey, before.identityKey)
+        XCTAssertEqual(send(runtime, snapshot: before).read(), .staleContext)
     }
 
     func testCommandGoesOnlyToSelectedSourceAndExternalRevocationClosesPendingAction() throws {
@@ -171,7 +200,7 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
         music.result = .snapshot(item(source: "Music", identity: "music-a", playing: false))
         _ = try snapshot(runtime)
         browser.result = .snapshot(original)
-        XCTAssertEqual(try snapshot(runtime).identityKey, original.identityKey)
+        XCTAssertEqual(try snapshot(runtime).metadata, original.metadata)
         browser.completeCommand()
 
         XCTAssertEqual(queued.read(), .staleContext)
@@ -188,7 +217,7 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
         browser.result = .snapshot(item(source: "YouTube", identity: "browser-a", content: "item-b"))
         XCTAssertEqual(try snapshot(runtime).metadata.contentIdentifier, "item-b")
         browser.result = .snapshot(original)
-        XCTAssertEqual(try snapshot(runtime).identityKey, original.identityKey)
+        XCTAssertEqual(try snapshot(runtime).metadata, original.metadata)
         browser.completeCommand()
 
         XCTAssertEqual(queued.read(), .staleContext)
@@ -206,7 +235,8 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
         runtime.stop()
         XCTAssertEqual(browser.stopCount, 1)
         XCTAssertEqual(music.stopCount, 1)
-        XCTAssertEqual(try snapshot(runtime).identityKey, old.identityKey)
+        XCTAssertNotEqual(try snapshot(runtime).identityKey, old.identityKey)
+        XCTAssertEqual(send(runtime, snapshot: old).read(), .staleContext)
         browser.completeCommand()
 
         XCTAssertEqual(queued.read(), .staleContext)
@@ -236,7 +266,10 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
         XCTAssertEqual(old.read().count, 1)
         guard let oldResult = old.read().first, case .retry = oldResult else { return XCTFail("Old fetch changed selection") }
         XCTAssertEqual(new.read().count, 1)
-        let command = send(runtime, snapshot: selected)
+        guard let publication = new.read().first, case .snapshot(let published) = publication else {
+            return XCTFail("New selection was not published")
+        }
+        let command = send(runtime, snapshot: published)
         music.completeCommand()
         XCTAssertEqual(command.read(), .applied)
         XCTAssertEqual(browser.pendingCommandCount, 0)
@@ -260,7 +293,7 @@ final class MacSupportedNowPlayingRuntimeTests: XCTestCase {
         XCTAssertEqual(publications.read().count, 1)
         guard let publication = publications.read().first,
               case .snapshot(let actual) = publication else { return XCTFail("Snapshot missing") }
-        XCTAssertEqual(actual.identityKey, original.identityKey)
+        XCTAssertEqual(actual.metadata, original.metadata)
         XCTAssertTrue(actual.enabledCommands.isEmpty)
     }
 

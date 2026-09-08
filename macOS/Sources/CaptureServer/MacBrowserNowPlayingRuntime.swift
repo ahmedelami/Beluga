@@ -78,6 +78,8 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
     private var activityOrder: UInt64 = 0
     private var lastStartAttempt: TimeInterval = -.infinity
     private let permissionRequest: @Sendable (@escaping @Sendable (Bool) -> Void) -> Void
+    private let chromePermissionRequest: @Sendable (@escaping @Sendable (Bool) -> Void) -> Void
+    private let acceptsMediaStates: Bool
     private let now: @Sendable () -> TimeInterval
     private let peerIsTrusted: @Sendable (Int32) -> Bool
     private let socketPath: String
@@ -90,12 +92,16 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         peerIsTrusted: @escaping @Sendable (Int32) -> Bool = MacBrowserNowPlayingRuntime.trustedHelper,
         commandQueue: DispatchQueue = .global(qos: .utility),
+        acceptsMediaStates: Bool = true,
+        chromePermissionRequest: @escaping @Sendable (@escaping @Sendable (Bool) -> Void) -> Void = { $0(false) },
         permissionRequest: @escaping @Sendable (@escaping @Sendable (Bool) -> Void) -> Void
     ) {
         self.socketPath = socketPath
         self.now = now
         self.peerIsTrusted = peerIsTrusted
         self.permissionRequest = permissionRequest
+        self.chromePermissionRequest = chromePermissionRequest
+        self.acceptsMediaStates = acceptsMediaStates
         self.commandQueue = commandQueue
     }
 
@@ -258,8 +264,11 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
                     DispatchQueue.global(qos: .utility).async { [weak self] in
                         defer { Darwin.close(readFD) }
                         do {
-                            while let data = try MediaBridgeFraming.readFrame(readFD, idleTimeout: 3.5) {
-                                guard let self else { break }
+                            while let self {
+                                let timeout: TimeInterval = self.lock.withLock {
+                                    self.permissionPending?.connection == connection.id ? 35 : 3.5
+                                }
+                                guard let data = try MediaBridgeFraming.readFrame(readFD, idleTimeout: timeout) else { break }
                                 try self.receive(data, from: connection)
                             }
                         } catch { /* Retire, never repair/replay a closed channel. */ }
@@ -273,6 +282,7 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
     private func receive(_ data: Data, from connection: BrowserBridgeConnection) throws {
         switch try MediaBridgeProtocol.decode(data) {
         case .state(let state):
+            guard acceptsMediaStates else { throw MediaBridgeError.invalidMessage }
             try lock.withLock {
                 guard var source = sources[connection.id], state.revision > source.revision else {
                     throw MediaBridgeError.invalidMessage
@@ -286,6 +296,7 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
                 sources[connection.id] = source
             }
         case .result(let result):
+            guard acceptsMediaStates else { throw MediaBridgeError.invalidMessage }
             let current = lock.withLock {
                 pending[result.id]?.connectionID == connection.id
                     && pending[result.id]?.contextID == result.contextID
@@ -293,7 +304,7 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
             guard current else { return }
             let mapped = WebRTCRemoteMediaCommandResult(rawValue: result.result.rawValue) ?? .failed
             finish(result.id, result: mapped == .applied && !stillAdmits(result.id) ? .staleContext : mapped)
-        case .authorizeMusic(let request):
+        case .authorizeMusic(let request), .authorizeChrome(let request):
             let admitted = lock.withLock {
                 guard sources[connection.id] != nil, permissionPending == nil,
                       (permissionIDs[connection.id]?.count ?? 0) < 16,
@@ -305,7 +316,8 @@ final class MacBrowserNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked 
                 try connection.send(MediaBridgeProtocol.encode(MediaAuthorizationResult(id: request.id, result: "unavailable")))
                 return
             }
-            permissionRequest { [weak self] allowed in
+            let requestPermission = request.type == "authorizeChrome" ? chromePermissionRequest : permissionRequest
+            requestPermission { [weak self] allowed in
                 self?.finishPermission(connection, id: request.id, result: allowed ? "authorized" : "denied")
             }
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) { [weak self] in

@@ -99,7 +99,20 @@ Backpressure must not replay a relative command or permanently disable controls 
 unchanged paused item. Native metadata tests must cover owner replacement, source clear,
 unsupported controls, and preservation of local interruption/headphone privacy policy.
 
-Supported-player integration additionally requires the production browser worker,
+Native Chrome integration additionally requires exact-production-script behavior
+tests for document/item identity in Chrome's page execution context, video replacement, navigation
+unavailability, same-URL ABA/reload/BFCache, bounded metadata and command ledgers,
+renderer-side deadlines, duplicate relative commands, and late promise completion.
+Native Apple Event tests must bind PID/launch identity and stable window/tab IDs,
+reject changed targets, enforce final host authorization/deadlines, verify actual
+command readback, and fail closed on ambiguous or indeterminate player discovery.
+Mutation oracles must reject removal of final renderer/native admission and expiry
+checks and relative-command duplicate interception. Permission-only helper IPC must
+work without an extension or connected peer, reject media-state injection, tolerate
+ordinary consent latency, recover from a transient listener failure, and retire on
+stop/disconnect. Ordinary polling must never prompt or activate Chrome.
+
+The retained optional extension path additionally requires the production browser worker,
 isolated bridge, and MAIN adapter behavior tests; native framed-socket tests; Music
 Apple Event identity/readback tests; and composite source/item ABA revocation tests.
 Exercise expired queued commands, wrong peers, malformed/replayed revisions,
@@ -107,8 +120,11 @@ disconnect during permission requests, source replacement, and indeterminate rea
 Mutation oracles must reject removal of final command authorization and deadline
 checks, not merely match source text. Verify the signed helper, exact native origin,
 host Automation entitlement and old-bundle rollback compatibility independently.
-Normal macOS Music consent and a real installed Chrome extension remain live gates;
-fake descriptors and VM DOM tests do not prove those integrations.
+Normal signed-host Automation consent and real native Chrome/Music operations remain
+live integration gates; fake descriptors and VM DOM tests do not prove them. A real
+installed extension is required only for claims about the optional extension path,
+not for the native Apple Events path. Preserve the old signed bundle's rollback
+verifier separately when changing the reviewed Automation usage description.
 
 A physical release claim additionally requires the deployed host and intended iPhone
 build: observe the system Lock Screen/Control Center metadata, change between two real

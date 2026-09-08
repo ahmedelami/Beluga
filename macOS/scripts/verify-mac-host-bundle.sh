@@ -14,7 +14,7 @@ readonly EXPECTED_MEDIA_BRIDGE_NAME="OpensteamerMediaBridge"
 readonly EXPECTED_MEDIA_BRIDGE_IDENTIFIER="org.example.opensteamer.MediaBridge"
 readonly EXPECTED_MEDIA_NATIVE_MANIFEST="org.example.opensteamer.media.json"
 readonly EXPECTED_MEDIA_ORIGIN="chrome-extension://dhmdpbpcldmnkjfibepklolofapiceab/"
-readonly EXPECTED_APPLE_EVENTS_USAGE="opensteamer reads playback information and controls Music when you enable Music integration."
+readonly EXPECTED_APPLE_EVENTS_USAGE="opensteamer reads playback information and controls Chrome and Music when you enable media integration."
 
 fail() {
     print -u2 -- "verify-mac-host-bundle: $*"

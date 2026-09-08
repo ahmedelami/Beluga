@@ -36,6 +36,8 @@ struct CaptureServerMain {
         var attemptedVirtualDisplayConfiguration: VirtualDisplayConfiguration?
         var worldwideHostProcessLock: WorldwideHostProcessLock?
         var activeTerminationSignalMonitor: ProcessTerminationSignalMonitor?
+        var mediaAutomationService: MacMediaAutomationService?
+        defer { mediaAutomationService?.stop() }
         do {
             let options = try CaptureServerOptions.parse(CommandLine.arguments)
             if options.showHelp {
@@ -253,6 +255,9 @@ struct CaptureServerMain {
             if options.worldwideEnabled,
                let rendezvousURL = options.rendezvousURL,
                let worldwideHostProcessLock {
+                let automationService = MacMediaAutomationService()
+                automationService.start()
+                mediaAutomationService = automationService
                 let remoteInputController = MacRemoteInputController(
                     allowRemoteControl: options.allowRemoteControl
                 )

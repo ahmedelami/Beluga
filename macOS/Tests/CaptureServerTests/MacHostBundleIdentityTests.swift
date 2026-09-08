@@ -701,6 +701,13 @@ final class MacHostBundleIdentityTests: XCTestCase {
         let manifestPath = "Contents/Resources/org.example.opensteamer.media.json"
         let infoPath = "Contents/Info.plist"
 
+        let info = try XCTUnwrap(PropertyListSerialization.propertyList(
+            from: Data(contentsOf: app.appendingPathComponent(infoPath)),
+            options: [], format: nil
+        ) as? [String: Any])
+        XCTAssertEqual(info["NSAppleEventsUsageDescription"] as? String,
+            "opensteamer reads playback information and controls Chrome and Music when you enable media integration.")
+
         for (name, relative, diagnostic) in [
             ("missing-media-bridge", bridgePath, "media bridge executable is not a real regular file"),
             ("missing-native-manifest", manifestPath, "native messaging manifest is not a real regular file"),
@@ -781,6 +788,15 @@ final class MacHostBundleIdentityTests: XCTestCase {
         ) { mutant in
             try self.editPlist(mutant.appendingPathComponent(infoPath)) {
                 $0.removeValue(forKey: "NSAppleEventsUsageDescription")
+            }
+        }
+        try assertMutationRejected(
+            app: app, verifier: verifier, name: "obsolete-music-only-automation-usage",
+            expectedDiagnostic: "Apple Events usage description differs"
+        ) { mutant in
+            try self.editPlist(mutant.appendingPathComponent(infoPath)) {
+                $0["NSAppleEventsUsageDescription"] =
+                    "opensteamer reads playback information and controls Music when you enable Music integration."
             }
         }
         for (key, value) in [
