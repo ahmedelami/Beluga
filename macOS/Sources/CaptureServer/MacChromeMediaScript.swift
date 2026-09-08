@@ -98,11 +98,15 @@ enum MacChromeMediaScript {
         const observe = () => {
           const page = identity();
           if (!page || s.retired || s.navigating) return unavailable();
-          const players = document.querySelectorAll("#movie_player"), videos = document.querySelectorAll("video");
-          if (players.length !== 1 || videos.length !== 1) return unavailable();
-          const player = players[0], video = videos[0];
-          if (!(player instanceof HTMLElement) || !(video instanceof HTMLVideoElement) ||
-              !player.isConnected || !video.isConnected || player.querySelector("video.html5-main-video") !== video)
+          const players = document.querySelectorAll("#movie_player");
+          if (players.length !== 1) return unavailable();
+          const player = players[0];
+          if (!(player instanceof HTMLElement) || !player.isConnected) return unavailable();
+          const videos = player.querySelectorAll("video");
+          if (videos.length !== 1) return unavailable();
+          const video = videos[0];
+          if (!(video instanceof HTMLVideoElement) || !video.isConnected ||
+              player.querySelector("video.html5-main-video") !== video)
             return unavailable();
           if (s.video !== video) {
             s.videoEvents?.abort(); s.videoEvents = new AbortController();
@@ -133,7 +137,8 @@ enum MacChromeMediaScript {
           // Recheck after all metadata/control getters; a read cannot create mixed authority.
           if (s.retired || s.navigating || s.video !== video || s.player !== player ||
               location.href !== page.href || video.currentSrc !== s.src || !video.isConnected || !player.isConnected ||
-              document.querySelector("#movie_player") !== player || player.querySelector("video.html5-main-video") !== video ||
+              document.querySelectorAll("#movie_player").length !== 1 || document.querySelector("#movie_player") !== player ||
+              player.querySelectorAll("video").length !== 1 || player.querySelector("video.html5-main-video") !== video ||
               document.querySelector("ytd-watch-flexy")?.getAttribute("video-id") !== page.videoID)
             return unavailable();
           return {snapshot,video,player,next,previous,href:page.href,src:s.src};

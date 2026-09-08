@@ -10,7 +10,7 @@ const source = swift.match(/static let source = #"""\n([\s\S]*?)\n    """#/)[1];
 const A = "AAAAAAAAAAA", B = "BBBBBBBBBBB", C = "CCCCCCCCCCC";
 const base = 1788800000000;
 function fixture(code = source) {
-  const h = {time:100,wall:base,clicks:0,pauses:0,plays:0,hrefReads:0,controlReadHook:null,playHook:null,pending:null};
+  const h = {time:100,wall:base,clicks:0,pauses:0,plays:0,playTargets:[],pauseTargets:[],hrefReads:0,controlReadHook:null,playHook:null,pending:null};
   class Events {
     constructor() { this.listeners = new Map(); }
     addEventListener(name,callback,options = {}) {
@@ -31,15 +31,18 @@ function fixture(code = source) {
   }
   class Media extends Element {
     constructor() { super(); this.paused = true; this.ended = false; this.readyState = 4; this.currentSrc = "blob:source-A"; this.currentTime = 10; this.duration = 120; this.playbackRate = 1; }
-    play() { h.plays++; this.paused = false; if (h.playHook) return h.playHook(this); return Promise.resolve(); }
-    pause() { h.pauses++; this.paused = true; }
+    play() { h.plays++; h.playTargets.push(this); this.paused = false; if (h.playHook) return h.playHook(this); return Promise.resolve(); }
+    pause() { h.pauses++; h.pauseTargets.push(this); this.paused = true; }
   }
-  class Video extends Media {}
-  h.video = new Video(); h.videos = [h.video]; h.player = new Element(); h.players = [h.player];
+  class Video extends Media { constructor() { super(); this.isMainVideo = true; } }
+  h.createVideo = () => new Video(); h.createPlayer = () => new Element();
+  h.video = new Video(); h.videos = [h.video]; h.playerVideos = [h.video]; h.player = new Element(); h.players = [h.player];
   h.next = new Element(); h.next.attrs.href = `https://www.youtube.com/watch?v=${B}`;
   h.previous = new Element(); h.previous.attrs.href = `https://www.youtube.com/watch?v=${C}`;
-  h.player.querySelector = selector => selector === "video.html5-main-video" ? h.video : null;
-  h.player.querySelectorAll = selector => selector === ".ytp-next-button" ? (h.next ? [h.next] : []) : (h.previous ? [h.previous] : []);
+  h.player.querySelector = selector => selector === "video.html5-main-video" ? h.playerVideos.find(video => video.isMainVideo) : null;
+  h.player.querySelectorAll = selector => selector === "video" ? h.playerVideos :
+    selector === "video.html5-main-video" ? h.playerVideos.filter(video => video.isMainVideo) :
+    selector === ".ytp-next-button" ? (h.next ? [h.next] : []) : selector === ".ytp-prev-button" ? (h.previous ? [h.previous] : []) : [];
   h.rendered = A; h.watch = new Element(); h.watch.getAttribute = key => key === "video-id" ? h.rendered : null;
   h.document = new Events();
   h.document.querySelectorAll = selector => selector === "#movie_player" ? h.players : selector === "video" ? h.videos : [];
@@ -65,7 +68,7 @@ function fixture(code = source) {
     h.video.fire("emptied"); if (!sameSource) h.video.currentSrc=`blob:${id}`;
     h.rendered=id; h.document.fire("yt-navigate-finish");
   };
-  h.replaceVideo = () => { const old = h.video; old.isConnected=false; h.video=new Video(); h.videos=[h.video]; return old; };
+  h.replaceVideo = () => { const old = h.video; old.isConnected=false; h.video=new Video(); h.videos=[h.video]; h.playerVideos=[h.video]; return old; };
   return h;
 }
 const flush = () => new Promise(setImmediate);
@@ -110,6 +113,95 @@ test("absolute pause is idempotent and async play requires fulfillment and readb
   assert.equal(h.result(q).status,"ok"); assert.equal(h.video.paused,false); assert.equal(h.plays,1);
   assert.equal(h.call(q).status,"ok"); assert.equal(h.plays,1);
 });
+async function externalPreviewOracle(code, previewPaused = true) {
+  const h=fixture(code);h.video.paused=false;h.video.currentTime=2464;h.video.duration=3600;
+  const before=h.read().snapshot,preview=h.createVideo();
+  preview.paused=previewPaused;preview.currentTime=0;preview.muted=true;preview.boxless=true;
+  preview.currentSrc="blob:inline-preview";h.videos=[preview,h.video];
+  const current=h.read();
+  assert.equal(current.status,"ok","external preview incorrectly rejected the main player");
+  assert.deepEqual([current.snapshot.documentID,current.snapshot.itemID,current.snapshot.itemGeneration],
+    [before.documentID,before.itemID,before.itemGeneration]);
+  assert.equal(current.snapshot.elapsedTime,2464);
+  const pause=h.request("pause",before);
+  assert.equal(h.call(pause).status,"ok");assert.equal(h.video.paused,true);
+  assert.deepEqual(h.pauseTargets,[h.video]);assert.equal(preview.paused,previewPaused);
+  h.videos=[h.video];
+  const paused=h.read().snapshot;
+  assert.deepEqual([paused.documentID,paused.itemID,paused.itemGeneration],
+    [before.documentID,before.itemID,before.itemGeneration]);
+  const play=h.request("play",paused);h.videos=[preview,h.video];
+  assert.equal(h.call(play).status,"pending");await flush();
+  assert.equal(h.result(play).status,"ok");assert.equal(h.video.paused,false);
+  assert.deepEqual(h.playTargets,[h.video]);assert.equal(preview.paused,previewPaused);
+  assert.equal(preview.currentTime,0);assert.equal(preview.muted,true);assert.deepEqual(preview.getClientRects(),[]);
+  assert.equal(h.call(play).status,"ok");assert.equal(h.plays,1);
+}
+test("external inline preview insertion and removal preserve main identity and exact Pause/Play targets", async () => {
+  for(const paused of [true,false])await externalPreviewOracle(source,paused);
+});
+test("behavioral mutant counting unrelated document videos is rejected", async () => {
+  await externalPreviewOracle(source);
+  const mutant=source.replace('const videos = player.querySelectorAll("video");','const videos = document.querySelectorAll("video");');
+  assert.notEqual(mutant,source);
+  await assert.rejects(()=>externalPreviewOracle(mutant),/external preview incorrectly rejected the main player/);
+});
+function changeCanonicalPlayer(h, mutation) {
+  if(mutation==="duplicatePlayer")h.players.push(h.createPlayer());
+  if(mutation==="duplicateMain" || mutation==="duplicateNonMain") {
+    const second=h.createVideo();second.isMainVideo=mutation==="duplicateMain";
+    h.playerVideos.push(second);h.videos.push(second);
+  }
+  if(mutation==="missingPlayer")h.players=[];
+  if(mutation==="missingVideo")h.playerVideos=[];
+  if(mutation==="notMain")h.video.isMainVideo=false;
+  if(mutation==="disconnectedPlayer")h.player.isConnected=false;
+  if(mutation==="disconnectedVideo")h.video.isConnected=false;
+  if(mutation==="replacementVideo")h.replaceVideo();
+  if(mutation==="replacementPlayer") {
+    const replacement=h.createPlayer();replacement.querySelector=h.player.querySelector;
+    replacement.querySelectorAll=h.player.querySelectorAll;h.player=replacement;h.players=[replacement];
+  }
+}
+test("missing or ambiguous canonical players and any extra in-player video revoke old authority", () => {
+  for(const mutation of ["duplicatePlayer","duplicateMain","duplicateNonMain","missingPlayer","missingVideo","notMain","disconnectedPlayer","disconnectedVideo"]) {
+    const h=fixture(),q=h.request("play");changeCanonicalPlayer(h,mutation);
+    assert.equal(h.read().status,"noMedia",mutation);
+    assert.equal(h.call(q).status,"staleContext",mutation);assert.deepEqual(h.playTargets,[]);
+    h.players=[h.player];h.playerVideos=[h.video];h.videos=[h.video];
+    h.video.isMainVideo=true;h.player.isConnected=true;h.video.isConnected=true;
+    assert.equal(h.read().status,"ok");assert.equal(h.call(q).status,"staleContext");
+    assert.deepEqual(h.playTargets,[]);
+  }
+});
+function lateCanonicalPlayerOracle(code, mutation, command = "play") {
+  const h=fixture(code),q=h.request(command);h.hrefReads=0;
+  h.controlReadHook=count=>{if(count===3)changeCanonicalPlayer(h,mutation);};
+  const value=h.call(q);
+  assert.equal(h.plays+h.pauses+h.clicks,0,"canonical authority changed during final observation but native operation ran");
+  assert.equal(value.status,"staleContext");
+}
+test("late duplicate, missing, disconnected, and replaced canonical targets cannot receive commands", () => {
+  for(const command of ["play","pause","next","previous"])
+    for(const mutation of ["duplicatePlayer","duplicateMain","duplicateNonMain","missingPlayer","missingVideo","notMain","disconnectedPlayer","disconnectedVideo","replacementVideo","replacementPlayer"])
+      lateCanonicalPlayerOracle(source,mutation,command);
+});
+test("behavioral mutants removing either final uniqueness check are rejected", () => {
+  for(const [guard,mutation] of [
+    ['document.querySelectorAll("#movie_player").length !== 1 || ',"duplicatePlayer"],
+    ['player.querySelectorAll("video").length !== 1 || ',"duplicateNonMain"]]) {
+    lateCanonicalPlayerOracle(source,mutation);
+    const mutant=source.replace(guard,"");assert.notEqual(mutant,source);
+    assert.throws(()=>lateCanonicalPlayerOracle(mutant,mutation),/native operation ran/);
+  }
+});
+test("external preview appearing during final observation does not revoke main command authority", async () => {
+  const h=fixture(),q=h.request("play"),preview=h.createVideo();
+  preview.currentTime=0;preview.muted=true;preview.boxless=true;h.hrefReads=0;
+  h.controlReadHook=count=>{if(count===3)h.videos=[preview,h.video];};
+  assert.equal(h.call(q).status,"pending");await flush();assert.equal(h.result(q).status,"ok");
+  assert.deepEqual(h.playTargets,[h.video]);assert.equal(preview.paused,true);assert.equal(preview.currentTime,0);
+});
 test("relative intent executes once in same generation and duplicate result never clicks", () => {
   const h=fixture(), q=h.request("next");
   assert.equal(h.call(q).status,"pending"); assert.equal(h.call(q).status,"pending");
@@ -131,7 +223,7 @@ test("next and previous require exact supported controls and confirm their disti
     if(key==="ariaHidden")h.next.attrs["aria-hidden"]="true";
     if(key==="disconnected")h.next.isConnected=false;
     if(key==="missingHref")delete h.next.attrs.href;
-    if(key==="duplicates")h.player.querySelectorAll=()=>[h.next,h.next];
+    if(key==="duplicates") { const query=h.player.querySelectorAll;h.player.querySelectorAll=selector=>selector===".ytp-next-button" ? [h.next,h.next] : query(selector); }
     assert.equal(h.read().snapshot.canNext,false);assert.equal(h.call(h.request("next")).status,"unsupported");assert.equal(h.clicks,0);
   }
   const h=fixture(),q=h.request("previous");h.call(q);h.navigate(C);assert.equal(h.result(q).status,"ok");
@@ -214,10 +306,10 @@ test("unsupported, ambiguous, missing IDs and temporary source absence retire ol
   for(const mutation of ["unsupported","ambiguous","missingID","emptySource"]) {
     const h=fixture(),q=h.request("play"),url=h.location.href,src=h.video.currentSrc;
     if(mutation==="unsupported")h.location.href="https://www.youtube.com/results";
-    if(mutation==="ambiguous")h.videos.push(h.video);
+    if(mutation==="ambiguous") { const second=h.createVideo();h.videos.push(second);h.playerVideos.push(second); }
     if(mutation==="missingID"){h.location.href="https://www.youtube.com/watch";h.rendered=null;}
     if(mutation==="emptySource")h.video.currentSrc="";
-    assert.equal(h.read().status,"noMedia");h.location.href=url;h.rendered=A;h.videos=[h.video];h.video.currentSrc=src;
+    assert.equal(h.read().status,"noMedia");h.location.href=url;h.rendered=A;h.videos=[h.video];h.playerVideos=[h.video];h.video.currentSrc=src;
     assert.equal(h.read().status,"ok");assert.equal(h.call(q).status,"staleContext");assert.equal(h.plays,0);
   }
 });
