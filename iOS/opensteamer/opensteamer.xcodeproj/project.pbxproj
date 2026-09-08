@@ -17,8 +17,10 @@
 		303BED46E3673163FCA92B36 /* WebRTCAudioPlaybackSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECB116DB67832023573C8889 /* WebRTCAudioPlaybackSessionTests.swift */; };
 		36CBD1F0C6AD6F23F693C3C2 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90600912C0AAEC02C723EDA9 /* ContentView.swift */; };
 		40AFC270DF77FF0D0BAB3BB3 /* WebRTCRemoteScreenView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB6E5C0C5FD82651759A73F3 /* WebRTCRemoteScreenView.swift */; };
+		410A20E5A1359F7ACEC16FEE /* RemoteMediaArtworkNetworkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2929FAEAC7A483ECCCDA903 /* RemoteMediaArtworkNetworkTests.swift */; };
 		4D7160E2C12B45C36CA6F0B5 /* WorldwideCallActivityObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE7AAEDB7B667B93413D7D8E /* WorldwideCallActivityObserver.swift */; };
 		53A239A67395BC6888999045 /* BrowserView+WorldwidePresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 218C21538913DA6CC4E8E209 /* BrowserView+WorldwidePresentation.swift */; };
+		5F6310C5C74FD76205C2BDD6 /* RemoteMediaArtworkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7B1BF8B41EA3FE864A61077 /* RemoteMediaArtworkTests.swift */; };
 		627187065AADC178DAECE8BE /* ScreenViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A452CD7D5104C509DB5D168E /* ScreenViewerView.swift */; };
 		6550CFB51C42A93D157E803F /* WebRTCTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 525D57D5DCA36B6B514B1F0A /* WebRTCTransport */; };
 		683C25329BC8E20088E6116B /* RemoteTokenState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEC26144551DD1E27BA28F74 /* RemoteTokenState.swift */; };
@@ -55,6 +57,7 @@
 		D2FB014BB9E23EC04BBBE548 /* ScreenVideoClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BDB3748CE96A0E684F2EF76 /* ScreenVideoClient.swift */; };
 		D4EAE6BA0BBBC5807F6B32F6 /* WorldwideRemoteInputLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D11FA42392B5E334511C469E /* WorldwideRemoteInputLifecycleTests.swift */; };
 		D7DA2F47EE5B5EF6EBCF40C7 /* RemoteScrollGesturePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4F9F8CF671205198FE2CCDB /* RemoteScrollGesturePolicy.swift */; };
+		D806D73117B192D1A552E2E5 /* RemoteMediaArtwork.swift in Sources */ = {isa = PBXBuildFile; fileRef = E21F5AD974B8BC968D754A01 /* RemoteMediaArtwork.swift */; };
 		D89D6AFCD4145A0A6EF255D9 /* PhysicalOracleEvaluator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77E21C152BA0763A029B6EA5 /* PhysicalOracleEvaluator.swift */; };
 		DB46B27CD3BB1CC0812D07A0 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B627D77889C9E574BD3AF2F5 /* KeychainStore.swift */; };
 		DCC8E31D0010C395981E59BC /* DiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CA340C807653853951DB090 /* DiagnosticsView.swift */; };
@@ -123,6 +126,7 @@
 		A4F9F8CF671205198FE2CCDB /* RemoteScrollGesturePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteScrollGesturePolicy.swift; sourceTree = "<group>"; };
 		B627D77889C9E574BD3AF2F5 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
 		B740987453823FD64F7C0982 /* RemoteKeyboardInputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteKeyboardInputView.swift; sourceTree = "<group>"; };
+		C7B1BF8B41EA3FE864A61077 /* RemoteMediaArtworkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMediaArtworkTests.swift; sourceTree = "<group>"; };
 		C9E111D70F8EAA03A7EE07F2 /* opensteamerTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = opensteamerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CCF50C685C4CBFD9F3AC8546 /* ScreenVideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenVideoRenderer.swift; sourceTree = "<group>"; };
 		CE709A348BA23148805A49B5 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; name = THIRD_PARTY_NOTICES.md; path = ../../THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
@@ -132,9 +136,11 @@
 		DD7C32B18437F49BE65ED68D /* WorldwidePhysicalOracles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwidePhysicalOracles.swift; sourceTree = "<group>"; };
 		DEC26144551DD1E27BA28F74 /* RemoteTokenState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteTokenState.swift; sourceTree = "<group>"; };
 		DF002ECF8773045115B13E3F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		E21F5AD974B8BC968D754A01 /* RemoteMediaArtwork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMediaArtwork.swift; sourceTree = "<group>"; };
 		ECB116DB67832023573C8889 /* WebRTCAudioPlaybackSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebRTCAudioPlaybackSessionTests.swift; sourceTree = "<group>"; };
 		EE7AAEDB7B667B93413D7D8E /* WorldwideCallActivityObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideCallActivityObserver.swift; sourceTree = "<group>"; };
 		EF58ACCC60E0F1CDD3B085F1 /* WorldwideAudioLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideAudioLifecycleTests.swift; sourceTree = "<group>"; };
+		F2929FAEAC7A483ECCCDA903 /* RemoteMediaArtworkNetworkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMediaArtworkNetworkTests.swift; sourceTree = "<group>"; };
 		F36373D0CB1979AF2ABF3A1F /* WorldwideViewerConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideViewerConnectionCoordinator.swift; sourceTree = "<group>"; };
 		F524855347D7B066F88321D0 /* ScreenVideoConnectionDescriptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenVideoConnectionDescriptor.swift; sourceTree = "<group>"; };
 		FB6E5C0C5FD82651759A73F3 /* WebRTCRemoteScreenView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebRTCRemoteScreenView.swift; sourceTree = "<group>"; };
@@ -301,6 +307,7 @@
 				093577922497DF95FEAFD8EF /* BackgroundPlaybackCoordinator.swift */,
 				90600912C0AAEC02C723EDA9 /* ContentView.swift */,
 				76F2CC18DCFD9E1ACAC69A25 /* OpensteamerApp.swift */,
+				E21F5AD974B8BC968D754A01 /* RemoteMediaArtwork.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -345,6 +352,8 @@
 				05F997BDA71C2DC04DB754E9 /* KeychainStoreTests.swift */,
 				DA37DD740FBC007D8FFBCA52 /* PhysicalOracleEvaluatorTests.swift */,
 				0B08A0C97FDDE54F9FD2A8EE /* RemoteKeyboardInputProxyTests.swift */,
+				F2929FAEAC7A483ECCCDA903 /* RemoteMediaArtworkNetworkTests.swift */,
+				C7B1BF8B41EA3FE864A61077 /* RemoteMediaArtworkTests.swift */,
 				6958FC2CA2AB682B2500A8CA /* ViewerPairingPersistenceTests.swift */,
 				ECB116DB67832023573C8889 /* WebRTCAudioPlaybackSessionTests.swift */,
 				EF58ACCC60E0F1CDD3B085F1 /* WorldwideAudioLifecycleTests.swift */,
@@ -503,6 +512,7 @@
 				70D49162C0A5742D3966087D /* OpensteamerApp.swift in Sources */,
 				9D6CA655E54E17D37AC4035E /* PlayerView.swift in Sources */,
 				0A6518B4EB4B3E68DC6BD363 /* RemoteKeyboardInputView.swift in Sources */,
+				D806D73117B192D1A552E2E5 /* RemoteMediaArtwork.swift in Sources */,
 				EA28552E783109EE7CEB283A /* RemotePointerGestureSurface.swift in Sources */,
 				BBADB8147D541A4D9973FD50 /* RemotePrimaryDragGesturePolicy.swift in Sources */,
 				D7DA2F47EE5B5EF6EBCF40C7 /* RemoteScrollGesturePolicy.swift in Sources */,
@@ -537,6 +547,8 @@
 				D89D6AFCD4145A0A6EF255D9 /* PhysicalOracleEvaluator.swift in Sources */,
 				1E220F17ECE4F06A1552C770 /* PhysicalOracleEvaluatorTests.swift in Sources */,
 				AB6196D04E1C6B5D11B5771D /* RemoteKeyboardInputProxyTests.swift in Sources */,
+				410A20E5A1359F7ACEC16FEE /* RemoteMediaArtworkNetworkTests.swift in Sources */,
+				5F6310C5C74FD76205C2BDD6 /* RemoteMediaArtworkTests.swift in Sources */,
 				103C41100893D8012C60ADE6 /* ViewerPairingPersistenceTests.swift in Sources */,
 				303BED46E3673163FCA92B36 /* WebRTCAudioPlaybackSessionTests.swift in Sources */,
 				7A896917C5694180149B0C64 /* WorldwideAudioLifecycleTests.swift in Sources */,

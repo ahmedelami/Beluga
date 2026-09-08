@@ -154,7 +154,8 @@ final class MacChromeNowPlayingRuntime: MacSystemNowPlayingRuntime, @unchecked S
                      playbackRate: media.paused ? 0 : media.playbackRate,
                      timestamp: Date(timeIntervalSince1970: media.observedAtUnixMilliseconds / 1000),
                      contentIdentifier: media.itemID + ":" + String(media.itemGeneration),
-                     uniqueIdentifier: nil)
+                     uniqueIdentifier: nil,
+                     artwork: WebRTCRemoteMediaArtworkReference(videoID: media.videoID))
     }
 
     private static func boundedText(_ value: String?, maximum: Int) -> String? {

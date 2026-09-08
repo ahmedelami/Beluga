@@ -199,6 +199,39 @@ private final class ChromeTestClient: MacChromeAppleEventsClient, @unchecked Sen
 }
 
 final class MacChromeNowPlayingRuntimeTests: XCTestCase {
+    func testArtworkUsesValidatedVideoIDWithoutChangingItemIdentity() throws {
+        let original = try XCTUnwrap(MacChromeNowPlayingRuntime.metadata(chromePlayer()))
+        XCTAssertEqual(original.artwork, WebRTCRemoteMediaArtworkReference(videoID: "abcdefghijk"))
+        let newArtwork = try XCTUnwrap(MacChromeNowPlayingRuntime.metadata(
+            chromePlayer(media: chromeMedia(video: "lmnopqrstuv"))))
+        XCTAssertEqual(newArtwork.artwork?.videoID, "lmnopqrstuv")
+        XCTAssertEqual(original.identityComponent, newArtwork.identityComponent)
+        XCTAssertNotEqual(original, newArtwork)
+        for id in ["", "abcdefghij", "abcdefghij/", "abcdefghij?", "abcdefghié"] {
+            XCTAssertNil(MacChromeNowPlayingRuntime.metadata(chromePlayer(media: chromeMedia(video: id))))
+        }
+        XCTAssertNil(MacChromeNowPlayingRuntime.metadata(chromePlayer(media: chromeMedia(document: "bad-document"))))
+        XCTAssertNil(MacChromeNowPlayingRuntime.metadata(chromePlayer(media: chromeMedia(item: "bad-item"))))
+        XCTAssertNil(MacChromeNowPlayingRuntime.metadata(chromePlayer(media: chromeMedia(generation: 0))))
+        XCTAssertNil(MacChromeNowPlayingRuntime.metadata(chromePlayer(
+            owner: .init(processID: 0, launchDate: chromeOwner.launchDate))))
+    }
+
+    func testArtworkFollowsSourceReplacementAndNeverRestoresRetiredItem() async throws {
+        let backend = ChromeTestBackend()
+        let runtime = makeRuntime(backend)
+        let old = try await snapshot(runtime)
+        XCTAssertEqual(old.metadata.artwork?.videoID, "abcdefghijk")
+        backend.snapshots = [chromePlayer(media: chromeMedia(video: "lmnopqrstuv",
+            item: "00000000-0000-4000-8000-000000000003", generation: 2))]
+        let successor = try await snapshot(runtime)
+        XCTAssertEqual(successor.metadata.artwork?.videoID, "lmnopqrstuv")
+        XCTAssertNotEqual(old.identityKey, successor.identityKey)
+        await assertSend(runtime, command: 1, snapshot: old, equals: .staleContext)
+        XCTAssertTrue(backend.commands.isEmpty)
+        runtime.stop()
+    }
+
     func testNoRunningChromeSendsNothingAndCannotRequestLaunchOrPermission() throws {
         let client = ChromeTestClient(); client.owner = nil
         let backend = makeBackend(client)

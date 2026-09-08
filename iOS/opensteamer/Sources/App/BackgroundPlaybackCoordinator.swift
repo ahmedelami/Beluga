@@ -170,9 +170,16 @@ final class BackgroundPlaybackCoordinator {
     private var remoteMediaTransportIsReady = false
     private var remoteMediaCommandSender: RemoteMediaCommandSender?
     private var genericPlayback: (serverName: String?, isPlaying: Bool)?
+    private let artwork: RemoteMediaArtworkPresentation
+    private var metadataPublishedAt: TimeInterval = 0
+    var pendingArtworkLoadTask: Task<Void, Never>? { artwork.pendingLoadTask }
 
-    private init() {
-        installCommandTargetsIfNeeded()
+    init(
+        artworkLoader: any RemoteMediaArtworkLoading = RemoteMediaArtworkLoader(),
+        installNativeCommandTargets: Bool = true
+    ) {
+        artwork = RemoteMediaArtworkPresentation(loader: artworkLoader)
+        if installNativeCommandTargets { installCommandTargetsIfNeeded() }
         updateNativeCommandAvailability()
     }
 
@@ -240,6 +247,11 @@ final class BackgroundPlaybackCoordinator {
         remoteMediaTransportIsReady = isReady
         updateCommandGate()
         updateNativeCommandAvailability()
+        reconcileArtwork()
+        if !isReady, var info = MPNowPlayingInfoCenter.default().nowPlayingInfo,
+           info.removeValue(forKey: MPMediaItemPropertyArtwork) != nil {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
     }
 
     func publishRemoteMedia(
@@ -253,10 +265,12 @@ final class BackgroundPlaybackCoordinator {
             return
         }
         remoteMediaState = state
+        metadataPublishedAt = ProcessInfo.processInfo.systemUptime
         updateCommandGate()
         updateNativeCommandAvailability()
+        reconcileArtwork()
 
-        guard let item = update.item else {
+        guard update.item != nil else {
             if let genericPlayback {
                 publishGenericPlayback(
                     serverName: genericPlayback.serverName,
@@ -267,7 +281,19 @@ final class BackgroundPlaybackCoordinator {
             }
             return
         }
+        publishCurrentRemoteMedia(advancingElapsed: false)
+    }
 
+    private func reconcileArtwork() {
+        artwork.update(state: remoteMediaState, owner: remoteMediaCommandOwner,
+                       isReady: remoteMediaTransportIsReady) { [weak self] in
+            guard let self, self.remoteMediaTransportIsReady else { return }
+            self.publishCurrentRemoteMedia(advancingElapsed: true)
+        }
+    }
+
+    private func publishCurrentRemoteMedia(advancingElapsed: Bool) {
+        guard let item = remoteMediaUpdate?.item else { return }
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: item.title,
             MPMediaItemPropertyArtist: item.artist ?? item.sourceName,
@@ -277,10 +303,16 @@ final class BackgroundPlaybackCoordinator {
         ]
         if let album = item.album { info[MPMediaItemPropertyAlbumTitle] = album }
         if let elapsedTime = item.elapsedTime {
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime
+            let delta = advancingElapsed
+                ? max(0, ProcessInfo.processInfo.systemUptime - metadataPublishedAt) * item.playbackRate : 0
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = min(elapsedTime + delta, item.duration ?? .infinity)
         }
         if let duration = item.duration {
             info[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+        if let decoded = artwork.image {
+            let image = UIImage(cgImage: decoded.image)
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         MPNowPlayingInfoCenter.default().playbackState = switch item.playbackState {
@@ -307,6 +339,7 @@ final class BackgroundPlaybackCoordinator {
     }
 
     private func publishGenericPlayback(serverName: String?, isPlaying: Bool) {
+        artwork.clear()
         // Lock-screen metadata is visible outside the unlocked app. Keep it deliberately generic
         // rather than exposing the paired Mac's user-assigned name.
         _ = serverName
@@ -328,6 +361,7 @@ final class BackgroundPlaybackCoordinator {
     }
 
     private func clearNowPlayingInfo() {
+        artwork.clear()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         MPNowPlayingInfoCenter.default().playbackState = .stopped
     }

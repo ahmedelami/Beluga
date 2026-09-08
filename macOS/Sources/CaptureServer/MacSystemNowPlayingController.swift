@@ -53,6 +53,24 @@ struct MacNowPlayingMetadata: Sendable, Equatable {
     let timestamp: Date?
     let contentIdentifier: String?
     let uniqueIdentifier: String?
+    let artwork: WebRTCRemoteMediaArtworkReference?
+
+    init(
+        title: String?, artist: String?, album: String?, duration: Double?, elapsedTime: Double?,
+        playbackRate: Double, timestamp: Date?, contentIdentifier: String?, uniqueIdentifier: String?,
+        artwork: WebRTCRemoteMediaArtworkReference? = nil
+    ) {
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.duration = duration
+        self.elapsedTime = elapsedTime
+        self.playbackRate = playbackRate
+        self.timestamp = timestamp
+        self.contentIdentifier = contentIdentifier
+        self.uniqueIdentifier = uniqueIdentifier
+        self.artwork = artwork
+    }
 
     var identityComponent: String {
         if let contentIdentifier, !contentIdentifier.isEmpty {
@@ -1006,7 +1024,8 @@ final class MacSystemNowPlayingController: MacRemoteMediaControlling,
                 canPause: enabled.contains(CommandValue.pause.rawValue),
                 canSkipForward: enabled.contains(CommandValue.nextTrack.rawValue),
                 canSkipBackward: enabled.contains(CommandValue.previousTrack.rawValue)
-            )
+            ),
+            artwork: snapshot.metadata.artwork
         )
         publish(item: item.isValid ? item : nil, snapshot: snapshot)
     }

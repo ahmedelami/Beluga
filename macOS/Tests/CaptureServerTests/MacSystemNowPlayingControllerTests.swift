@@ -106,6 +106,32 @@ private final class FakeMacSystemNowPlayingRuntime: MacSystemNowPlayingRuntime,
 }
 
 final class MacSystemNowPlayingControllerTests: XCTestCase {
+    func testArtworkPublishesAndClearsWithoutRotatingSameItemContext() async throws {
+        let reference = try XCTUnwrap(WebRTCRemoteMediaArtworkReference(videoID: "abcdefghijk"))
+        let runtime = FakeMacSystemNowPlayingRuntime()
+        runtime.enqueue(.snapshot(Self.snapshot(artwork: reference)))
+        let controller = MacSystemNowPlayingController(runtime: runtime)
+        let states = NowPlayingLockedBox<[WebRTCRemoteMediaStateUpdate]>([])
+        let initial = expectation(description: "artwork published")
+        let cleared = expectation(description: "artwork cleared")
+        controller.start { state in
+            states.update { $0.append(state) }
+            if state.item?.artwork != nil { initial.fulfill() }
+            else if state.item != nil { cleared.fulfill() }
+        }
+        await fulfillment(of: [initial], timeout: 1)
+        let first = try XCTUnwrap(states.read().last)
+        XCTAssertEqual(first.item?.artwork, reference)
+        runtime.enqueue(.snapshot(Self.snapshot()))
+        controller.refresh()
+        await fulfillment(of: [cleared], timeout: 1)
+        let after = try XCTUnwrap(states.read().last)
+        XCTAssertNil(after.item?.artwork)
+        XCTAssertEqual(after.item?.contextID, first.item?.contextID)
+        XCTAssertEqual(after.revision, first.revision + 1)
+        controller.stop()
+    }
+
     func testSnapshotRebasesElapsedAndUsesOnlyExactEnabledCommands() async {
         let currentDate = Date(timeIntervalSinceReferenceDate: 1_000)
         let runtime = FakeMacSystemNowPlayingRuntime()
@@ -867,7 +893,8 @@ final class MacSystemNowPlayingControllerTests: XCTestCase {
         title: String = "Track",
         timestamp: Date? = nil,
         playbackRate: Double = 1,
-        enabledCommands: Set<Int> = [0, 1, 4, 5]
+        enabledCommands: Set<Int> = [0, 1, 4, 5],
+        artwork: WebRTCRemoteMediaArtworkReference? = nil
     ) -> MacNowPlayingRuntimeSnapshot {
         MacNowPlayingRuntimeSnapshot(
             client: MacNowPlayingClientToken(
@@ -884,7 +911,8 @@ final class MacSystemNowPlayingControllerTests: XCTestCase {
                 playbackRate: playbackRate,
                 timestamp: timestamp,
                 contentIdentifier: "track-1",
-                uniqueIdentifier: nil
+                uniqueIdentifier: nil,
+                artwork: artwork
             ),
             enabledCommands: enabledCommands
         )

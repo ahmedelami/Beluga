@@ -90,6 +90,14 @@ driver evidence and does not certify a later build from this source cleanup.
 
 ## Native media controls release boundary
 
+Thumbnail decoration must remain independent of command delivery. Cover legacy/malformed
+optional artwork decoding, current-source reference binding, immediate metadata/controls while
+loading stalls, and owner/context/negotiation replacement rejecting late results. The actual
+network loader must reject a streamed oversized body before EOF and cancel superseded requests;
+a post-download size assertion alone is insufficient. Reject untrusted redirects and oversized
+decoded dimensions. A matching iPhone build must separately prove native artwork presentation;
+unit dictionaries and a successful image fetch are not Lock Screen evidence.
+
 Before shipping a change to Now Playing controls, require deterministic coverage of
 negotiation with legacy peers, the 4 KiB wire bound, exact current-source command
 admission, at-most-once Next/Previous execution, and fresh state after startup and

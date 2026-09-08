@@ -54,8 +54,48 @@ public struct WebRTCRemoteMediaCapabilities: Codable, Equatable, Sendable {
     }
 }
 
-/// Bounded metadata for one Mac system Now Playing owner. Artwork is deliberately excluded from
-/// the 4 KiB ordered control channel; it can be added later through a separate bounded blob lane.
+/// A bounded provider identifier, never a peer-supplied URL or image payload.
+public struct WebRTCRemoteMediaArtworkReference: Codable, Equatable, Hashable, Sendable {
+    public enum Provider: String, Codable, Hashable, Sendable {
+        case youtube
+    }
+
+    public let provider: Provider
+    public let videoID: String
+
+    public init?(provider: Provider = .youtube, videoID: String) {
+        guard videoID.utf8.count == 11,
+              videoID.utf8.allSatisfy({ byte in
+                  (65...90).contains(byte) || (97...122).contains(byte)
+                      || (48...57).contains(byte) || byte == 45 || byte == 95
+              }) else { return nil }
+        self.provider = provider
+        self.videoID = videoID
+    }
+
+    public var url: URL {
+        URL(string: "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg")!
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider, videoID
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let provider = try values.decode(Provider.self, forKey: .provider)
+        let videoID = try values.decode(String.self, forKey: .videoID)
+        guard let reference = Self(provider: provider, videoID: videoID) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .videoID, in: values, debugDescription: "Invalid artwork identifier"
+            )
+        }
+        self = reference
+    }
+}
+
+/// Bounded metadata for one Mac system Now Playing owner. Only a small artwork reference may
+/// accompany it; image bytes never enter the 4 KiB ordered control channel.
 public struct WebRTCRemoteMediaItem: Codable, Equatable, Sendable {
     public static let maximumContextIDBytes = 128
     public static let maximumSourceNameBytes = 128
@@ -73,6 +113,7 @@ public struct WebRTCRemoteMediaItem: Codable, Equatable, Sendable {
     public let duration: TimeInterval?
     public let playbackRate: Double
     public let capabilities: WebRTCRemoteMediaCapabilities
+    public let artwork: WebRTCRemoteMediaArtworkReference?
 
     public init(
         contextID: String,
@@ -84,7 +125,8 @@ public struct WebRTCRemoteMediaItem: Codable, Equatable, Sendable {
         elapsedTime: TimeInterval? = nil,
         duration: TimeInterval? = nil,
         playbackRate: Double,
-        capabilities: WebRTCRemoteMediaCapabilities
+        capabilities: WebRTCRemoteMediaCapabilities,
+        artwork: WebRTCRemoteMediaArtworkReference? = nil
     ) {
         self.contextID = contextID
         self.sourceName = sourceName
@@ -96,6 +138,28 @@ public struct WebRTCRemoteMediaItem: Codable, Equatable, Sendable {
         self.duration = duration
         self.playbackRate = playbackRate
         self.capabilities = capabilities
+        self.artwork = artwork
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case contextID, sourceName, title, artist, album, playbackState
+        case elapsedTime, duration, playbackRate, capabilities, artwork
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        contextID = try values.decode(String.self, forKey: .contextID)
+        sourceName = try values.decode(String.self, forKey: .sourceName)
+        title = try values.decode(String.self, forKey: .title)
+        artist = try values.decodeIfPresent(String.self, forKey: .artist)
+        album = try values.decodeIfPresent(String.self, forKey: .album)
+        playbackState = try values.decode(WebRTCRemoteMediaPlaybackState.self, forKey: .playbackState)
+        elapsedTime = try values.decodeIfPresent(TimeInterval.self, forKey: .elapsedTime)
+        duration = try values.decodeIfPresent(TimeInterval.self, forKey: .duration)
+        playbackRate = try values.decode(Double.self, forKey: .playbackRate)
+        capabilities = try values.decode(WebRTCRemoteMediaCapabilities.self, forKey: .capabilities)
+        // Optional decoration must not revoke otherwise valid playback controls.
+        artwork = try? values.decodeIfPresent(WebRTCRemoteMediaArtworkReference.self, forKey: .artwork)
     }
 
     public var isValid: Bool {
