@@ -937,7 +937,7 @@ struct BlackHoleDeviceEndpointPairResolver: Sendable {
         _ detail: String
     ) -> CaptureError {
         CaptureError.audioDeviceNotFound(
-            "validated opensteamer virtual-microphone topology: \(detail)"
+            "validated Beluga virtual-microphone topology: \(detail)"
         )
     }
 }

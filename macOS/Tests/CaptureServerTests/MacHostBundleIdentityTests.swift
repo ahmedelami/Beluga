@@ -68,17 +68,36 @@ final class MacHostBundleIdentityTests: XCTestCase {
         environment.removeValue(forKey: "OPENSTEAMER_HOST_DESIGNATED_REQUIREMENT_REFERENCE")
 
         let builder = repositoryRoot.appendingPathComponent(
-            "macOS/scripts/build-opensteamer-host-app.sh"
+            "macOS/scripts/build-beluga-host-app.sh"
         )
         let build = try run(executable: builder, environment: environment)
         XCTAssertEqual(build.status, 0, build.diagnostic)
-        let app = outputDirectory.appendingPathComponent("opensteamer Host.app")
+        let app = outputDirectory.appendingPathComponent("Beluga Host.app")
         let executable = app.appendingPathComponent("Contents/MacOS/CaptureServer")
         let framework = app.appendingPathComponent(
             "Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC"
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: framework.path))
+        let builtInfo = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")),
+                format: nil
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(builtInfo["CFBundleName"] as? String, "Beluga Host")
+        XCTAssertEqual(builtInfo["CFBundleDisplayName"] as? String, "Beluga Host")
+        XCTAssertEqual(builtInfo["CFBundleIconFile"] as? String, "AppIcon.icns")
+        XCTAssertEqual(
+            builtInfo["CFBundleIdentifier"] as? String,
+            "com.elamin.AudioStreamer.CaptureServer"
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: app.appendingPathComponent("Contents/Resources/AppIcon.icns")),
+            try Data(contentsOf: repositoryRoot.appendingPathComponent(
+                "macOS/BelugaHost/Resources/AppIcon.icns"
+            ))
+        )
         let frameworkRoot = app.appendingPathComponent(
             "Contents/Frameworks/LiveKitWebRTC.framework"
         )
@@ -177,7 +196,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         XCTAssertFalse(rpaths.contains { $0.contains("Xcode.app") || $0.contains(".build") })
 
         let verifier = repositoryRoot.appendingPathComponent(
-            "macOS/scripts/verify-mac-host-bundle.sh"
+            "macOS/scripts/verify-beluga-host-bundle.sh"
         )
         let positive = try run(executable: verifier, arguments: [app.path])
         XCTAssertEqual(positive.status, 0, positive.diagnostic)
@@ -188,7 +207,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         XCTAssertNotEqual(noncanonicalRuntimeMode.status, 0, noncanonicalRuntimeMode.diagnostic)
         XCTAssertTrue(
             noncanonicalRuntimeMode.standardError.contains(
-                "--installed-runtime is restricted to '/Applications/opensteamer Host.app'"
+                "--installed-runtime is restricted to '/Applications/Beluga Host.app'"
             ),
             noncanonicalRuntimeMode.diagnostic
         )
@@ -208,6 +227,45 @@ final class MacHostBundleIdentityTests: XCTestCase {
                 arguments: [
                     "-c",
                     "Set :CFBundleDisplayName Wrong Host",
+                    mutant.appendingPathComponent("Contents/Info.plist").path,
+                ]
+            )
+            XCTAssertEqual(edit.status, 0, edit.diagnostic)
+        }
+
+        try assertMutationRejected(
+            app: app,
+            verifier: verifier,
+            name: "missing-icon",
+            expectedDiagnostic: "Beluga app icon is not a real regular file"
+        ) { mutant in
+            try FileManager.default.removeItem(
+                at: mutant.appendingPathComponent("Contents/Resources/AppIcon.icns")
+            )
+        }
+
+        try assertMutationRejected(
+            app: app,
+            verifier: verifier,
+            name: "changed-icon",
+            expectedDiagnostic: "Beluga app icon differs from the approved logo"
+        ) { mutant in
+            let icon = mutant.appendingPathComponent("Contents/Resources/AppIcon.icns")
+            var bytes = try Data(contentsOf: icon)
+            bytes[bytes.count - 1] ^= 1
+            try bytes.write(to: icon)
+        }
+
+        try assertMutationRejected(
+            app: app,
+            verifier: verifier,
+            name: "icon-reference",
+            expectedDiagnostic: "CFBundleIconFile: expected 'AppIcon.icns'"
+        ) { mutant in
+            let edit = try self.run(
+                executable: URL(fileURLWithPath: "/usr/libexec/PlistBuddy"),
+                arguments: [
+                    "-c", "Set :CFBundleIconFile MissingIcon.icns",
                     mutant.appendingPathComponent("Contents/Info.plist").path,
                 ]
             )
@@ -515,7 +573,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
             for: MacHostBundleIdentityTests.self
         ).bundleURL.deletingLastPathComponent()
         let builder = repositoryRoot.appendingPathComponent(
-            "macOS/scripts/build-opensteamer-host-app.sh"
+            "macOS/scripts/build-beluga-host-app.sh"
         )
 
         func assertRejected(
@@ -612,13 +670,13 @@ final class MacHostBundleIdentityTests: XCTestCase {
     func testBuilderAndVerifierSourceContainFreshReleaseAndCompleteIdentityGates() throws {
         let builder = try String(
             contentsOf: repositoryRoot.appendingPathComponent(
-                "macOS/scripts/build-opensteamer-host-app.sh"
+                "macOS/scripts/build-beluga-host-app.sh"
             ),
             encoding: .utf8
         )
         let verifier = try String(
             contentsOf: repositoryRoot.appendingPathComponent(
-                "macOS/scripts/verify-mac-host-bundle.sh"
+                "macOS/scripts/verify-beluga-host-bundle.sh"
             ),
             encoding: .utf8
         )
@@ -674,7 +732,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         }
         XCTAssertTrue(
             verifier.contains(
-                "INSTALLED_RUNTIME_APP_PATH=\"/Applications/opensteamer Host.app\""
+                "INSTALLED_RUNTIME_APP_PATH=\"/Applications/Beluga Host.app\""
             )
         )
         XCTAssertTrue(verifier.contains("${#MACL_HEX} -eq 144"))
@@ -691,7 +749,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         let parent = app.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("mutant-\(name)")
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        let mutant = parent.appendingPathComponent("opensteamer Host.app")
+        let mutant = parent.appendingPathComponent("Beluga Host.app")
         let clone = try run(
             executable: URL(fileURLWithPath: "/bin/cp"),
             arguments: ["-cR", app.path, mutant.path]

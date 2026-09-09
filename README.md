@@ -1,6 +1,8 @@
-# opensteamer
+# Beluga
 
-opensteamer pairs an iPhone with an awake Mac and streams Mac system audio,
+<img src="branding/BelugaLogo.png" alt="Beluga logo" width="160">
+
+Beluga pairs an iPhone with an awake Mac and streams Mac system audio,
 optional screen video, narrowly scoped remote input, and an automatically enabled
 iPhone-microphone uplink over WebRTC for the authenticated paired Mac. It prefers a direct
 ICE route and can fall back to TURN. An outbound WSS rendezvous service coordinates pairing and
@@ -14,6 +16,10 @@ credentials. Forks and independent deployments must supply their own stable iden
 infrastructure before using worldwide mode. Do not claim that a build "works anywhere" until it
 passes the unrelated-network and forced-TURN gates described in
 [TESTING_ORACLES.md](TESTING_ORACLES.md).
+
+Beluga was previously named opensteamer. The app uses the existing Beluga logo on iPhone and Mac.
+Build targets, deployed service names, and persistent identifiers retain their existing spellings
+for compatibility; see [BRANDING.md](BRANDING.md).
 
 ## Capabilities
 
@@ -34,7 +40,7 @@ passes the unrelated-network and forced-TURN gates described in
   input-only endpoint for FaceTime and a separate hidden output-only writer.
   The host writes decoded iPhone PCM only to the hidden endpoint while the
   visible endpoint is the default input. When the authenticated
-  WebRTC peer, ICE route, and control channel are all healthy, opensteamer
+  WebRTC peer, ICE route, and control channel are all healthy, Beluga
   automatically selects the product virtual microphone as the Mac default input before starting
   system audio. It conditionally restores the prior input after disconnect. For
   authenticated worldwide duplex audio, neither product endpoint nor either retired
@@ -82,7 +88,7 @@ firewalls; it relays encrypted DTLS-SRTP media rather than plaintext audio or vi
 
 The Mac must remain powered on, awake, and running the signed host. The project does not
 provide arbitrary Internet wake-up. Force-quitting the iOS app stops background playback.
-During an active iPhone call, opensteamer keeps authenticated streamed playback alive in
+During an active iPhone call, Beluga keeps authenticated streamed playback alive in
 output-only mode, temporarily mutes the iPhone microphone uplink, and automatically restores
 the microphone after the call ends and the exact built-in-microphone route is healthy again.
 
@@ -176,11 +182,11 @@ upload evidence.
 
 The directly distributed Mac host accepts `--virtual-phone-display`. The flag is off by default,
 conflicts with `--display-id`, and currently requires the sole Apple headless placeholder display.
-It intentionally rejects physical or multi-display workspaces until OpenSteamer has explicit
+It intentionally rejects physical or multi-display workspaces until Beluga has explicit
 window-placement UX for a second desktop.
 
 The host preserves the starting desktop mapping and verifies every required resolution before it
-advertises availability. macOS Display Settings then shows `opensteamer Display`, including the
+advertises availability. macOS Display Settings then shows `Beluga Display`, including the
 iPhone 17 Pro Retina mapping of 603x1311 logical points to 1206x2622 framebuffer pixels. On the
 supported macOS host, the smallest compatibility choice is the native 750x1334 framebuffer because
 WindowServer does not publish its 375x667 HiDPI counterpart. A resolution selected before
@@ -222,10 +228,10 @@ Build the signed Mac host from the repository root:
 
 ```sh
 OPENSTEAMER_HOST_CODESIGN_IDENTITY='Apple Development: Your Name (TEAMID)' \
-  macOS/scripts/build-opensteamer-host-app.sh
+  macOS/scripts/build-beluga-host-app.sh
 ```
 
-Use the signed `opensteamer Host.app` for pairing and macOS privacy permissions. A naked
+Use the signed `Beluga Host.app` for pairing and macOS privacy permissions. A naked
 SwiftPM executable is useful for deterministic tests but is not a substitute for the signed
 host identity.
 
@@ -247,6 +253,11 @@ npm test
 ```
 
 ## Pairing and unattended hosting
+
+The commands below describe the existing deployed host path. Fresh builds are named
+`Beluga Host.app`; replacing an existing installation requires a separate reviewed update
+that preserves pairing and accounts for its LaunchAgent path. This source rebrand does not
+install or migrate a host.
 
 Run the signed host interactively for initial pairing so the short-lived invitation is not
 written to a persistent LaunchAgent log:
@@ -287,10 +298,10 @@ own Keychain service and therefore presents a fresh one-time code for the side-b
 - [MAINTENANCE.md](MAINTENANCE.md) — source ownership, generated files, and frozen evidence boundaries.
 - [WORLDWIDE_REMOTE_ACCESS.md](WORLDWIDE_REMOTE_ACCESS.md) — protocol and trust boundaries.
 - [TESTING_ORACLES.md](TESTING_ORACLES.md) — claims, independent evidence, and mutation gates.
-- [BRANDING.md](BRANDING.md) — lowercase naming rules and immutable compatibility identifiers.
+- [BRANDING.md](BRANDING.md) — product naming rules and immutable compatibility identifiers.
 - [HOST_MIGRATION.md](HOST_MIGRATION.md) — one-time upgrade for an existing persistent Mac host.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — documentation, testing, and secret-hygiene standards.
 
-opensteamer is licensed under the [GNU General Public License v2.0 only](LICENSE)
+Beluga is licensed under the [GNU General Public License v2.0 only](LICENSE)
 (`GPL-2.0-only`). Third-party components remain under their own terms, reproduced in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

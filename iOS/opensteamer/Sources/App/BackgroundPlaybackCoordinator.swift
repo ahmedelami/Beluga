@@ -64,7 +64,7 @@ final class BackgroundPlaybackCoordinator {
         // rather than exposing the paired Mac's user-assigned name.
         _ = serverName
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [
-            MPMediaItemPropertyTitle: "opensteamer",
+            MPMediaItemPropertyTitle: "Beluga",
             MPMediaItemPropertyArtist: "Connected Mac",
             MPMediaItemPropertyAlbumTitle: "Mac audio stream",
             MPNowPlayingInfoPropertyIsLiveStream: true,

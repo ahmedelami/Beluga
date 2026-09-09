@@ -796,7 +796,7 @@ static bool TestPluginAndUIDTranslation(void) {
   CHECK(GetCFString(driver, kOSVAObjectIDPlugIn,
                     Address(kAudioObjectPropertyManufacturer,
                             kAudioObjectPropertyScopeGlobal),
-                    CFSTR("opensteamer")));
+                    CFSTR("Beluga")));
   CHECK(GetCFString(driver, kOSVAObjectIDPlugIn,
                     Address(kAudioPlugInPropertyResourceBundle,
                             kAudioObjectPropertyScopeGlobal),
@@ -1047,11 +1047,11 @@ static bool TestDeviceIdentityVisibilityAndDefaults(void) {
   CHECK(GetCFString(
       driver, kOSVAObjectIDVisibleInputDevice,
       Address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal),
-      CFSTR("opensteamer Virtual Microphone")));
+      CFSTR("Beluga Virtual Microphone")));
   CHECK(GetCFString(
       driver, kOSVAObjectIDHiddenWriterDevice,
       Address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal),
-      CFSTR("opensteamer Virtual Microphone Writer")));
+      CFSTR("Beluga Virtual Microphone Writer")));
   CHECK(GetCFString(
       driver, kOSVAObjectIDVisibleInputDevice,
       Address(kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal),

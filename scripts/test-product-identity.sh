@@ -97,14 +97,22 @@ mkdir -p \
   "$BASELINE/services/RendezvousWorker"
 cp "$ROOT_DIR/scripts/check-product-identity.sh" "$BASELINE/scripts/"
 chmod +x "$BASELINE/scripts/check-product-identity.sh"
+cp "$ROOT_DIR/scripts/check-beluga-artwork.mjs" "$BASELINE/scripts/"
+cp -R "$ROOT_DIR/branding" "$BASELINE/branding"
+cp -R "$ROOT_DIR/iOS/opensteamer/Sources/Assets.xcassets" \
+  "$BASELINE/iOS/opensteamer/Sources/Assets.xcassets"
+cp -R "$ROOT_DIR/macOS/BelugaHost" "$BASELINE/macOS/BelugaHost"
+cp "$ROOT_DIR/macOS/scripts/build-beluga-host-app.sh" "$BASELINE/macOS/scripts/"
+cp "$ROOT_DIR/macOS/scripts/verify-beluga-host-bundle.sh" "$BASELINE/macOS/scripts/"
+
 
 print -r -- '// swift-tools-version: 6.1
 import PackageDescription
 let package = Package(
-    name: "opensteamer",
+    name: "Beluga",
     platforms: [.iOS(.v17)]
 )' >"$BASELINE/Package.swift"
-print -r -- '# opensteamer
+print -r -- '# Beluga
 
 Identity regression fixture.' >"$BASELINE/README.md"
 
@@ -121,9 +129,13 @@ packages:
 targets:
   opensteamer:
     type: application
+    productName: Beluga
     settings:
       base:
         SWIFT_VERSION: 6.0
+        PRODUCT_NAME: Beluga
+        PRODUCT_MODULE_NAME: opensteamer
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: org.example.AudioStreamer.dev
@@ -150,7 +162,7 @@ print -r -- '// !$*UTF8*$!
   objectVersion = 56;
   objects = {
 /* Begin PBXFileReference section */
-    E1 /* opensteamer.app */ = {isa = PBXFileReference; lastKnownFileType = wrapper.application; path = opensteamer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+    E1 /* Beluga.app */ = {isa = PBXFileReference; lastKnownFileType = wrapper.application; path = Beluga.app; sourceTree = BUILT_PRODUCTS_DIR; };
     E2 /* opensteamerTests.xctest */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = opensteamerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
     E3 /* opensteamerUITests.xctest */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = opensteamerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -160,7 +172,7 @@ print -r -- '// !$*UTF8*$!
       buildConfigurationList = D1 /* Build configuration list for PBXNativeTarget "opensteamer" */;
       name = opensteamer;
       productName = opensteamer;
-      productReference = E1 /* opensteamer.app */;
+      productReference = E1 /* Beluga.app */;
       productType = "com.apple.product-type.application";
     };
     A2 /* opensteamerTests */ = {
@@ -184,6 +196,9 @@ print -r -- '// !$*UTF8*$!
     B1 /* Debug */ = {
       isa = XCBuildConfiguration;
       buildSettings = {
+        PRODUCT_NAME = Beluga;
+        PRODUCT_MODULE_NAME = opensteamer;
+        ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
         PRODUCT_BUNDLE_IDENTIFIER = org.example.AudioStreamer.dev;
       };
       name = Debug;
@@ -191,6 +206,9 @@ print -r -- '// !$*UTF8*$!
     B2 /* Release */ = {
       isa = XCBuildConfiguration;
       buildSettings = {
+        PRODUCT_NAME = Beluga;
+        PRODUCT_MODULE_NAME = opensteamer;
+        ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
         PRODUCT_BUNDLE_IDENTIFIER = com.elamin.AudioStreamer;
       };
       name = Release;
@@ -226,6 +244,9 @@ print -r -- '// !$*UTF8*$!
     B7 /* TestFlight */ = {
       isa = XCBuildConfiguration;
       buildSettings = {
+        PRODUCT_NAME = Beluga;
+        PRODUCT_MODULE_NAME = opensteamer;
+        ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
         PRODUCT_BUNDLE_IDENTIFIER = com.elamin.opensteamer;
       };
       name = TestFlight;
@@ -299,7 +320,7 @@ print -r -- '// !$*UTF8*$!
 
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <Scheme>
-  <BuildableReference BuildableName="opensteamer.app" BlueprintName="opensteamer" BlueprintIdentifier="A1" ReferencedContainer="container:opensteamer.xcodeproj"/>
+  <BuildableReference BuildableName="Beluga.app" BlueprintName="opensteamer" BlueprintIdentifier="A1" ReferencedContainer="container:opensteamer.xcodeproj"/>
   <BuildableReference BuildableName="opensteamerTests.xctest" BlueprintName="opensteamerTests" BlueprintIdentifier="A2" ReferencedContainer="container:opensteamer.xcodeproj"/>
 </Scheme>' >"$BASELINE/iOS/opensteamer/opensteamer.xcodeproj/xcshareddata/xcschemes/opensteamer.xcscheme"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
@@ -311,7 +332,7 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
   <BuildAction>
     <BuildActionEntries>
       <BuildActionEntry buildForTesting="NO" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="YES" buildForAnalyzing="NO">
-        <BuildableReference BuildableName="opensteamer.app" BlueprintName="opensteamer" BlueprintIdentifier="A1" ReferencedContainer="container:opensteamer.xcodeproj"/>
+        <BuildableReference BuildableName="Beluga.app" BlueprintName="opensteamer" BlueprintIdentifier="A1" ReferencedContainer="container:opensteamer.xcodeproj"/>
       </BuildActionEntry>
     </BuildActionEntries>
   </BuildAction>
@@ -343,17 +364,17 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleDisplayName</key><string>opensteamer</string>
-<key>CFBundleName</key><string>opensteamer</string>
+<key>CFBundleDisplayName</key><string>Beluga</string>
+<key>CFBundleName</key><string>Beluga</string>
 <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
 <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-<key>NSCameraUsageDescription</key><string>opensteamer may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.</string>
-<key>NSLocalNetworkUsageDescription</key><string>opensteamer finds the Mac capture server on your local Wi-Fi network.</string>
+<key>NSCameraUsageDescription</key><string>Beluga may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.</string>
+<key>NSLocalNetworkUsageDescription</key><string>Beluga finds the Mac capture server on your local Wi-Fi network.</string>
 </dict></plist>' >"$BASELINE/iOS/opensteamer/Sources/Support/Info.plist"
 print -r -- 'struct BrowserViewFixture {
-  var body: some View { Text("Fixture").navigationTitle("opensteamer") }
+  var body: some View { Text("Fixture").navigationTitle("Beluga") }
 }' >"$BASELINE/iOS/opensteamer/Sources/Views/BrowserView.swift"
-print -r -- 'let nowPlaying = [MPMediaItemPropertyTitle: "opensteamer"]' \
+print -r -- 'let nowPlaying = [MPMediaItemPropertyTitle: "Beluga"]' \
   >"$BASELINE/iOS/opensteamer/Sources/App/BackgroundPlaybackCoordinator.swift"
 
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
@@ -369,9 +390,9 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleName</key><string>opensteamer Capture Server</string>
+<key>CFBundleName</key><string>Beluga Capture Server</string>
 <key>CFBundleIdentifier</key><string>com.elamin.AudioStreamer.CaptureServer</string>
-<key>NSMicrophoneUsageDescription</key><string>opensteamer uses its virtual microphone to route your iPhone&apos;s microphone into calls on this Mac.</string>
+<key>NSMicrophoneUsageDescription</key><string>Beluga uses its virtual microphone to route your iPhone&apos;s microphone into calls on this Mac.</string>
 </dict></plist>' >"$BASELINE/macOS/Sources/CaptureServer/Info.plist"
 print -r -- 'enum BlackHoleRouteManagerFixture {
   static let uid = "BlackHole2ch_UID"
@@ -399,7 +420,7 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>OpensteamerVirtualMicrophone</string>
 <key>CFBundleIdentifier</key><string>com.elamin.opensteamer.VirtualMicrophoneDriver</string>
-<key>CFBundleName</key><string>opensteamer Virtual Microphone</string>
+<key>CFBundleName</key><string>Beluga Virtual Microphone</string>
 <key>CFBundlePackageType</key><string>BNDL</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>CFBundleVersion</key><string>1</string>
@@ -537,16 +558,59 @@ require_rejection() {
 
 if [[ "${OPENSTEAMER_IDENTITY_BEHAVIOR_ONLY:-0}" != 1 ]]; then
 
+CASE=$(new_case beluga-root-package)
+replace_once "$CASE/Package.swift" 'name: "Beluga"' 'name: "opensteamer"'
+require_rejection "$CASE" 'root Swift package name'
+
+CASE=$(new_case beluga-readme-heading)
+replace_once "$CASE/README.md" '# Beluga' '# opensteamer'
+require_rejection "$CASE" 'README heading'
+
+CASE=$(new_case beluga-project-product)
+replace_once "$CASE/iOS/opensteamer/project.yml" 'productName: Beluga' 'productName: opensteamer'
+require_rejection "$CASE" 'project.yml app product name'
+
+CASE=$(new_case beluga-project-module)
+replace_once "$CASE/iOS/opensteamer/project.yml" \
+  'PRODUCT_MODULE_NAME: opensteamer' 'PRODUCT_MODULE_NAME: Beluga'
+require_rejection "$CASE" 'project.yml stable app module'
+
+CASE=$(new_case beluga-project-icon)
+replace_once "$CASE/iOS/opensteamer/project.yml" \
+  'ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon' 'ASSETCATALOG_COMPILER_APPICON_NAME: OldIcon'
+require_rejection "$CASE" 'project.yml app icon selection'
+
+CASE=$(new_case beluga-host-name)
+/usr/bin/plutil -replace CFBundleDisplayName -string opensteamer \
+  "$CASE/macOS/BelugaHost/Info.plist"
+require_rejection "$CASE" 'Beluga host CFBundleDisplayName'
+
+CASE=$(new_case beluga-host-bundle)
+/usr/bin/plutil -replace CFBundleIdentifier -string com.elamin.Beluga \
+  "$CASE/macOS/BelugaHost/Info.plist"
+require_rejection "$CASE" 'preserved Beluga host bundle identifier'
+
+CASE=$(new_case beluga-host-icon-selection)
+/usr/bin/plutil -replace CFBundleIconFile -string OldIcon.icns \
+  "$CASE/macOS/BelugaHost/Info.plist"
+require_rejection "$CASE" 'Beluga host icon selection'
+
+CASE=$(new_case beluga-host-icon-copy)
+replace_once "$CASE/macOS/scripts/build-beluga-host-app.sh" \
+  '/bin/cp "$ROOT_DIR/macOS/BelugaHost/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"' \
+  '/usr/bin/true'
+require_rejection "$CASE" 'Beluga host icon copy'
+
 CASE=$(new_case lowercase-casing)
 replace_once "$CASE/iOS/opensteamer/Sources/Support/Info.plist" \
-  '<key>CFBundleDisplayName</key><string>opensteamer</string>' \
+  '<key>CFBundleDisplayName</key><string>Beluga</string>' \
   '<key>CFBundleDisplayName</key><string>Opensteamer</string>'
-require_rejection "$CASE" 'iOS CFBundleDisplayName lowercase identity'
+require_rejection "$CASE" 'iOS CFBundleDisplayName identity'
 
 CASE=$(new_case camera-usage-description)
 replace_once "$CASE/iOS/opensteamer/Sources/Support/Info.plist" \
-  '<key>NSCameraUsageDescription</key><string>opensteamer may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.</string>' \
-  '<key>NSCameraUsageDescription</key><string>opensteamer uses the camera during ordinary audio streaming.</string>'
+  '<key>NSCameraUsageDescription</key><string>Beluga may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.</string>' \
+  '<key>NSCameraUsageDescription</key><string>Beluga uses the camera during ordinary audio streaming.</string>'
 require_rejection "$CASE" 'iOS camera usage description'
 
 CASE=$(new_case readme-retired-rendezvous-environment-alias)
@@ -555,8 +619,8 @@ require_rejection "$CASE" 'README retired rendezvous environment alias count'
 
 CASE=$(new_case info-retired-rendezvous-plist-alias)
 replace_once "$CASE/iOS/opensteamer/Sources/Support/Info.plist" \
-  '<key>CFBundleName</key><string>opensteamer</string>' \
-  $'<key>CFBundleName</key><string>opensteamer</string>\n<key>AudioStreamerRendezvousURL</key><string>https://retired.invalid</string>'
+  '<key>CFBundleName</key><string>Beluga</string>' \
+  $'<key>CFBundleName</key><string>Beluga</string>\n<key>AudioStreamerRendezvousURL</key><string>https://retired.invalid</string>'
 require_rejection "$CASE" 'iOS retired rendezvous plist key count'
 
 CASE=$(new_case project-target)
@@ -1475,7 +1539,7 @@ require_rejection "$CASE" 'side-by-side TestFlight exact archive signing identit
 
 CASE=$(new_case testflight-archive-application-path)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
-  '&& "${semantic_fields[5]}" == '\''Applications/opensteamer.app'\'' \' \
+  '&& "${semantic_fields[5]}" == '\''Applications/Beluga.app'\'' \' \
   '&& "${semantic_fields[5]}" == '\''Applications/AudioStreamer.app'\'' \'
 require_rejection "$CASE" 'side-by-side TestFlight exact archive application path'
 
@@ -2115,13 +2179,13 @@ require_rejection "$CASE" 'generated Xcode product-name setting count'
 
 CASE=$(new_case generated-project-product-reference)
 replace_once "$CASE/iOS/opensteamer/opensteamer.xcodeproj/project.pbxproj" \
-  'productReference = E1 /* opensteamer.app */;' \
-  'productReference = E2 /* opensteamer.app */;'
+  'productReference = E1 /* Beluga.app */;' \
+  'productReference = E2 /* Beluga.app */;'
 require_rejection "$CASE" 'generated Xcode target/product mapping'
 
 CASE=$(new_case generated-product-path)
 replace_once "$CASE/iOS/opensteamer/opensteamer.xcodeproj/project.pbxproj" \
-  'path = opensteamer.app;' 'path = Opensteamer.app;'
+  'path = Beluga.app;' 'path = Opensteamer.app;'
 require_rejection "$CASE" 'generated Xcode target/product mapping'
 
 CASE=$(new_case generated-configuration-name)
@@ -2132,8 +2196,8 @@ require_rejection "$CASE" 'could not parse generated Xcode target/product/config
 
 CASE=$(new_case scheme-buildable-pairing)
 replace_once "$CASE/iOS/opensteamer/opensteamer.xcodeproj/xcshareddata/xcschemes/opensteamer.xcscheme" \
-  'BuildableName="opensteamer.app" BlueprintName="opensteamer"' \
-  'BuildableName="opensteamer.app" BlueprintName="opensteamerTests"'
+  'BuildableName="Beluga.app" BlueprintName="opensteamer"' \
+  'BuildableName="Beluga.app" BlueprintName="opensteamerTests"'
 require_rejection "$CASE" 'opensteamer scheme buildable/blueprint/project mapping'
 
 CASE=$(new_case scheme-blueprint-identifier)
@@ -2181,8 +2245,8 @@ fi
 
 CASE=$(new_case visible-navigation-title)
 replace_once "$CASE/iOS/opensteamer/Sources/Views/BrowserView.swift" \
-  '.navigationTitle("opensteamer")' '.navigationTitle("Opensteamer")'
-require_rejection "$CASE" 'iOS navigation-title lowercase identity'
+  '.navigationTitle("Beluga")' '.navigationTitle("Opensteamer")'
+require_rejection "$CASE" 'iOS navigation-title identity'
 
 CASE=$(new_case virtual-driver-directory)
 mv "$CASE/macOS/VirtualAudioDriver" "$CASE/macOS/VirtualAudioDriverRenamed"
@@ -2251,7 +2315,7 @@ require_rejection "$CASE" 'virtual microphone driver bundle identifier'
 
 CASE=$(new_case virtual-driver-bundle-name)
 replace_once "$CASE/macOS/VirtualAudioDriver/Driver/Info.plist" \
-  '<key>CFBundleName</key><string>opensteamer Virtual Microphone</string>' \
+  '<key>CFBundleName</key><string>Beluga Virtual Microphone</string>' \
   '<key>CFBundleName</key><string>opensteamer Microphone</string>'
 require_rejection "$CASE" 'virtual microphone driver bundle name'
 
@@ -2460,9 +2524,9 @@ require_rejection "$CASE" 'macOS host microphone description lowercase identity'
 
 CASE=$(new_case swiftpm-host-microphone-usage-description)
 replace_once "$CASE/macOS/Sources/CaptureServer/Info.plist" \
-  '<key>NSMicrophoneUsageDescription</key><string>opensteamer uses its virtual microphone to route your iPhone&apos;s microphone into calls on this Mac.</string>' \
-  '<key>NSMicrophoneUsageDescription</key><string>opensteamer records the BlackHole virtual input.</string>'
-require_rejection "$CASE" 'SwiftPM capture-server microphone description lowercase identity'
+  '<key>NSMicrophoneUsageDescription</key><string>Beluga uses its virtual microphone to route your iPhone&apos;s microphone into calls on this Mac.</string>' \
+  '<key>NSMicrophoneUsageDescription</key><string>Beluga records the BlackHole virtual input.</string>'
+require_rejection "$CASE" 'SwiftPM capture-server microphone description identity'
 
 CASE=$(new_case mac-host-bundle-identifier)
 replace_once "$CASE/macOS/OpensteamerHost/Info.plist" \
@@ -2952,15 +3016,15 @@ expect_t7_identity_rejection external-media-flag
 T7TEST
 
 MANIFEST_ARCHIVE="$BEHAVIOR_ROOT/manifest.xcarchive"
-MANIFEST_APP="$MANIFEST_ARCHIVE/Products/Applications/opensteamer.app"
+MANIFEST_APP="$MANIFEST_ARCHIVE/Products/Applications/Beluga.app"
 MANIFEST_FRAMEWORK="$MANIFEST_APP/Frameworks/LiveKitWebRTC.framework"
 mkdir -p "$MANIFEST_FRAMEWORK"
-/bin/cp -- /usr/bin/true "$MANIFEST_APP/opensteamer"
+/bin/cp -- /usr/bin/true "$MANIFEST_APP/Beluga"
 /bin/cp -- /usr/bin/true "$MANIFEST_FRAMEWORK/LiveKitWebRTC"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>com.elamin.opensteamer</string>
-<key>CFBundleExecutable</key><string>opensteamer</string>
+<key>CFBundleExecutable</key><string>Beluga</string>
 </dict></plist>' >"$MANIFEST_APP/Info.plist"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
@@ -2983,7 +3047,7 @@ function expect_manifest_rejection() {
 
 verify_reviewed_archive_product_manifest "$MANIFEST_ARCHIVE"
 typeset products="$MANIFEST_ARCHIVE/Products"
-typeset app="$products/Applications/opensteamer.app"
+typeset app="$products/Applications/Beluga.app"
 
 /bin/mkdir "$products/Applications/sibling.app"
 expect_manifest_rejection sibling-app
@@ -3073,7 +3137,7 @@ POSTUPLOAD_ARCHIVE_INFO="$BEHAVIOR_ROOT/archive-info-postupload.plist"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>ApplicationProperties</key><dict>
-<key>ApplicationPath</key><string>Applications/opensteamer.app</string>
+<key>ApplicationPath</key><string>Applications/Beluga.app</string>
 <key>Architectures</key><array><string>arm64</string></array>
 <key>CFBundleIdentifier</key><string>com.elamin.opensteamer</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -3089,7 +3153,7 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>ApplicationProperties</key><dict>
-<key>ApplicationPath</key><string>Applications/opensteamer.app</string>
+<key>ApplicationPath</key><string>Applications/Beluga.app</string>
 <key>Architectures</key><array><string>arm64</string></array>
 <key>CFBundleIdentifier</key><string>com.elamin.opensteamer</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -3144,7 +3208,7 @@ if archive_info_without_distributions_sha256 "$BASELINE_ARCHIVE_INFO" \
   exit 1
 fi
 /usr/bin/plutil -replace ApplicationProperties.ApplicationPath \
-  -string Applications/opensteamer.app "$BASELINE_ARCHIVE_INFO"
+  -string Applications/Beluga.app "$BASELINE_ARCHIVE_INFO"
 /usr/bin/plutil -replace ApplicationProperties.Team \
   -string UNREVIEWED "$BASELINE_ARCHIVE_INFO"
 if archive_info_without_distributions_sha256 "$BASELINE_ARCHIVE_INFO" \

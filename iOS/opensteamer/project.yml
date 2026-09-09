@@ -18,6 +18,7 @@ packages:
 targets:
   opensteamer:
     type: application
+    productName: Beluga
     platform: iOS
     sources:
       - Sources
@@ -38,6 +39,8 @@ targets:
       ProvisioningStyle: Automatic
     settings:
       base:
+        PRODUCT_NAME: Beluga
+        PRODUCT_MODULE_NAME: opensteamer
         INFOPLIST_FILE: Sources/Support/Info.plist
         MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1

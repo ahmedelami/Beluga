@@ -103,7 +103,7 @@ expected = {
     "CFBundleExecutable": "OpensteamerVirtualMicrophone",
     "CFBundleIdentifier": "com.elamin.opensteamer.VirtualMicrophoneDriver",
     "CFBundleInfoDictionaryVersion": "6.0",
-    "CFBundleName": "opensteamer Virtual Microphone",
+    "CFBundleName": "Beluga Virtual Microphone",
     "CFBundlePackageType": "BNDL",
     "CFBundleShortVersionString": "0.1.0",
     "CFBundleSignature": "????",

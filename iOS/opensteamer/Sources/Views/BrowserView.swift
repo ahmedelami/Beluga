@@ -33,7 +33,7 @@ struct BrowserView: View {
     }
 
     static let savedPairUnavailableMessage =
-        "opensteamer couldn’t reach the saved paired Mac. The pairing remains saved securely on this iPhone. The Mac may be asleep, offline, or temporarily unavailable."
+        "Beluga couldn’t reach the saved paired Mac. The pairing remains saved securely on this iPhone. The Mac may be asleep, offline, or temporarily unavailable."
 
     static func rawMicrophoneOracleAccessibilityValue(
         _ oracle: WorldwideRawMicrophoneOracleSnapshot?
@@ -225,7 +225,7 @@ struct BrowserView: View {
                 }
             }
         }
-        .navigationTitle("opensteamer")
+        .navigationTitle("Beluga")
         .onAppear {
             invitationCodeState.loadIfNeeded()
             remoteTokenState.loadIfNeeded()
@@ -409,7 +409,7 @@ struct BrowserView: View {
             Label("Forget Paired Mac", systemImage: "trash")
         }
 
-        Text("The Mac must be awake with opensteamer Host running. Each connection uses fresh end-to-end-encrypted WebRTC keys; direct routing is preferred and TURN is only a fallback.")
+        Text("The Mac must be awake with Beluga Host running. Each connection uses fresh end-to-end-encrypted WebRTC keys; direct routing is preferred and TURN is only a fallback.")
             .font(.caption)
             .foregroundStyle(.secondary)
     }

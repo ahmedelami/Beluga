@@ -87,18 +87,17 @@
 		093577922497DF95FEAFD8EF /* BackgroundPlaybackCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundPlaybackCoordinator.swift; sourceTree = "<group>"; };
 		0B08A0C97FDDE54F9FD2A8EE /* RemoteKeyboardInputProxyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteKeyboardInputProxyTests.swift; sourceTree = "<group>"; };
 		132D234332E7CDAD5F0F3213 /* ServerInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerInfo.swift; sourceTree = "<group>"; };
+		1C92AB7DA244DF1596EEB1A2 /* Beluga */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Beluga; path = ../..; sourceTree = SOURCE_ROOT; };
 		1D8B7D553630E727E5BA02A0 /* WorldwideAudioLifecycleController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideAudioLifecycleController.swift; sourceTree = "<group>"; };
 		218C21538913DA6CC4E8E209 /* BrowserView+WorldwidePresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BrowserView+WorldwidePresentation.swift"; sourceTree = "<group>"; };
 		22BA2C0E3FA5E56CBEFF2B54 /* WorldwideScreenViewerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideScreenViewerView.swift; sourceTree = "<group>"; };
 		235E2095A9F021D79D1278C5 /* PlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerView.swift; sourceTree = "<group>"; };
 		2ADDF37DFF4BF8165F226443 /* opensteamerUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = opensteamerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2F3847AFDCAAE82502B598F0 /* ViewerPairingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerPairingStore.swift; sourceTree = "<group>"; };
-		33F120C227DF28ABE6BBF84F /* opensteamer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = opensteamer; path = ../..; sourceTree = SOURCE_ROOT; };
 		3509D44693CBE35F3D3D8633 /* H264SampleBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264SampleBuilder.swift; sourceTree = "<group>"; };
 		3F4D135483CC5D23B56ADE12 /* StreamSessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionViewModel.swift; sourceTree = "<group>"; };
 		4CA340C807653853951DB090 /* DiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsView.swift; sourceTree = "<group>"; };
 		5C1DE117468B2DA4EEECD94B /* IOSOrdinaryPlayoutLivenessTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSOrdinaryPlayoutLivenessTracker.swift; sourceTree = "<group>"; };
-		5C6B4041518106AC0A4A5151 /* opensteamer.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = opensteamer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5EAE7108773997E7E6897AE1 /* AspectFitCoordinateMapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AspectFitCoordinateMapperTests.swift; sourceTree = "<group>"; };
 		62EE29F300BD14D456C513EA /* AppArtifactContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppArtifactContractTests.swift; sourceTree = "<group>"; };
 		64465AAC8CF00A21486FD95A /* ViewerPairingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerPairingState.swift; sourceTree = "<group>"; };
@@ -127,6 +126,7 @@
 		CCF50C685C4CBFD9F3AC8546 /* ScreenVideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenVideoRenderer.swift; sourceTree = "<group>"; };
 		CE709A348BA23148805A49B5 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; name = THIRD_PARTY_NOTICES.md; path = ../../THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
 		D11FA42392B5E334511C469E /* WorldwideRemoteInputLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideRemoteInputLifecycleTests.swift; sourceTree = "<group>"; };
+		D569873264824C9D3B3BE438 /* Beluga.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Beluga.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D6219C964B51CAC699E64A54 /* ScreenSessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenSessionViewModel.swift; sourceTree = "<group>"; };
 		DA37DD740FBC007D8FFBCA52 /* PhysicalOracleEvaluatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalOracleEvaluatorTests.swift; sourceTree = "<group>"; };
 		DD7C32B18437F49BE65ED68D /* WorldwidePhysicalOracles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwidePhysicalOracles.swift; sourceTree = "<group>"; };
@@ -322,7 +322,7 @@
 		C9FF2FEC5B71276CD94BF158 /* Packages */ = {
 			isa = PBXGroup;
 			children = (
-				33F120C227DF28ABE6BBF84F /* opensteamer */,
+				1C92AB7DA244DF1596EEB1A2 /* Beluga */,
 			);
 			name = Packages;
 			sourceTree = "<group>";
@@ -330,7 +330,7 @@
 		D6D71F515168A280ADD05F7E /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				5C6B4041518106AC0A4A5151 /* opensteamer.app */,
+				D569873264824C9D3B3BE438 /* Beluga.app */,
 				C9E111D70F8EAA03A7EE07F2 /* opensteamerTests.xctest */,
 				2ADDF37DFF4BF8165F226443 /* opensteamerUITests.xctest */,
 			);
@@ -395,7 +395,7 @@
 				525D57D5DCA36B6B514B1F0A /* WebRTCTransport */,
 			);
 			productName = opensteamer;
-			productReference = 5C6B4041518106AC0A4A5151 /* opensteamer.app */;
+			productReference = D569873264824C9D3B3BE438 /* Beluga.app */;
 			productType = "com.apple.product-type.application";
 		};
 		D4974D879526F71B318F85EA /* opensteamerUITests */ = {
@@ -576,6 +576,8 @@
 				MARKETING_VERSION = 0.1.0;
 				OPENSTEAMER_RENDEZVOUS_URL = "";
 				PRODUCT_BUNDLE_IDENTIFIER = org.example.AudioStreamer.dev;
+				PRODUCT_MODULE_NAME = opensteamer;
+				PRODUCT_NAME = Beluga;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -680,6 +682,8 @@
 				MARKETING_VERSION = 0.1.0;
 				OPENSTEAMER_RENDEZVOUS_URL = "wss://audiostreamer-rendezvous.elaminahmed03.workers.dev";
 				PRODUCT_BUNDLE_IDENTIFIER = com.elamin.opensteamer;
+				PRODUCT_MODULE_NAME = opensteamer;
+				PRODUCT_NAME = Beluga;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -702,6 +706,8 @@
 				MARKETING_VERSION = 0.1.0;
 				OPENSTEAMER_RENDEZVOUS_URL = "wss://audiostreamer-rendezvous.elaminahmed03.workers.dev";
 				PRODUCT_BUNDLE_IDENTIFIER = com.elamin.AudioStreamer;
+				PRODUCT_MODULE_NAME = opensteamer;
+				PRODUCT_NAME = Beluga;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -723,7 +729,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/opensteamer.app/opensteamer";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Beluga.app/Beluga";
 			};
 			name = TestFlight;
 		};
@@ -817,7 +823,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/opensteamer.app/opensteamer";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Beluga.app/Beluga";
 			};
 			name = Release;
 		};
@@ -855,7 +861,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/opensteamer.app/opensteamer";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Beluga.app/Beluga";
 			};
 			name = Debug;
 		};
