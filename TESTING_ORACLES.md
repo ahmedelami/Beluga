@@ -98,6 +98,19 @@ a post-download size assertion alone is insufficient. Reject untrusted redirects
 decoded dimensions. A matching iPhone build must separately prove native artwork presentation;
 unit dictionaries and a successful image fetch are not Lock Screen evidence.
 
+Native artwork must also be requested from a non-main executor through the actual
+published MPMediaItemArtwork, without a prior main-thread image request. Require
+returned dimensions and pixels plus unchanged metadata/controls. Artwork and native
+command handlers must remain explicitly Sendable: Objective-C may invoke them outside
+the main actor. Restoring the inferred MainActor artwork callback must fail this
+background test with the executor assertion, not merely a missing-image assertion.
+Run `ruby scripts/test-native-media-callback-isolation.rb EMPTY_PRIVATE_OUTPUT_DIRECTORY
+DEVELOPER_DIRECTORY` with the selected canonical Xcode developer directory. This bounded
+compiler oracle extracts both production callbacks and checks their isolation in SILGen
+and optimized Swift 6, with independent annotation-removal mutants. It complements the
+signed artwork runtime test; it does not execute a native remote command or prove a
+physical iPhone crash has the same cause.
+
 Before shipping a change to Now Playing controls, require deterministic coverage of
 negotiation with legacy peers, the 4 KiB wire bound, exact current-source command
 admission, at-most-once Next/Previous execution, and fresh state after startup and
@@ -141,6 +154,24 @@ Repeat while paused, through a connection recovery, and with local audio muted b
 privacy policy. A successful command acknowledgement or metadata dictionary alone does
 not prove native iOS presentation or the Mac player's observable response. Keep this
 physical evidence separate from compile, simulator, upload, and deployment results.
+
+## Focused-window resize boundary
+
+Exercise the actual controller against position-dependent size clamping and rejection,
+including right-flush left expansion, partial room, negative display origins, all four
+corners, mixed-axis directions, and application minimum/maximum constraints. Observe
+actual intermediate and final mock window frames, bounded writes, opposite-corner
+anchoring, and successor authority; accepting an unchanged frame is not resize success.
+Independently remove prepositioning and the no-op rejection to prove those regressions
+fail. Preserve exact editable/secure focus and existing stale-target/session tests.
+
+Each forward and rollback write must recheck authorization, window eligibility, focus,
+geometry, and the previously observed owned frame. Test failures between phases and
+external frame drift after readback. Unknown readback or lost authority must not cause
+blind rollback or replay. These deterministic fixtures model synchronous AX behavior;
+they do not establish how a real application settles delayed Accessibility changes.
+A physical resize claim still requires the matching installed host and a disposable
+real window, with before/after AX bounds and pixels plus uninterrupted keyboard focus.
 
 ## Execution and Claim Boundary
 
