@@ -312,7 +312,7 @@ final class BackgroundPlaybackCoordinator {
         }
         if let decoded = artwork.image {
             let image = UIImage(cgImage: decoded.image)
-            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         MPNowPlayingInfoCenter.default().playbackState = switch item.playbackState {
@@ -376,7 +376,7 @@ final class BackgroundPlaybackCoordinator {
         ]
         for (nativeCommand, command) in mappings {
             let gate = commandGate
-            let target = nativeCommand.addTarget { _ in
+            let target = nativeCommand.addTarget { @Sendable _ in
                 gate.dispatch(command) ? .success : .commandFailed
             }
             commandTargets.append((nativeCommand, target))

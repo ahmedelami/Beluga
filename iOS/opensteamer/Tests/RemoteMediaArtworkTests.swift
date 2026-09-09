@@ -10,6 +10,37 @@ import XCTest
 /// deliberately noncooperative loader still returns an image.
 @MainActor
 final class RemoteMediaArtworkTests: XCTestCase {
+    func testNativeArtworkRequestFromBackgroundReturnsPublishedPixels() async throws {
+        let loader = makeLoader()
+        let coordinator = BackgroundPlaybackCoordinator(
+            artworkLoader: loader, installNativeCommandTargets: false
+        )
+        let owner = coordinator.claimRemoteMediaCommandSender { _ in }
+        defer { coordinator.releaseRemoteMediaCommandSender(owner: owner); coordinator.clear() }
+        coordinator.setRemoteMediaTransportReady(true, owner: owner)
+        coordinator.publishRemoteMedia(state(item: item(playing: false)), owner: owner)
+        let pending = try XCTUnwrap(coordinator.pendingArtworkLoadTask)
+        await loader.waitForRequestCount(1)
+        let expected = try image(color: .green)
+        await loader.complete(0, with: expected)
+        await pending.value
+
+        // Do not prewarm image(at:) on the main actor: the framework callback is the boundary.
+        let request = BackgroundArtworkRequest(artwork: try XCTUnwrap(nativeArtwork))
+        let size = CGSize(width: CGFloat(expected.image.width), height: CGFloat(expected.image.height))
+        let result = await Task.detached(priority: .userInitiated) { @Sendable in
+            request.load(size: size)
+        }.value
+
+        XCTAssertFalse(result.wasMainThread, "The native request must exercise the off-main callback")
+        let returned = try XCTUnwrap(result.image)
+        XCTAssertEqual(returned.image.width, expected.image.width)
+        XCTAssertEqual(returned.image.height, expected.image.height)
+        XCTAssertEqual(try pixel(returned.image), try pixel(expected.image))
+        assertMetadata(title: "Track", elapsed: 12, rate: 0)
+        assertControls(play: true, pause: false)
+    }
+
     func testSuspendedArtworkDoesNotDelayMetadataOrControlsAndAttachesToLatestRevision() async throws {
         let loader = makeLoader()
         let coordinator = BackgroundPlaybackCoordinator(
@@ -552,6 +583,17 @@ final class RemoteMediaArtworkTests: XCTestCase {
         context.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
         let bytes = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
         return Array(UnsafeBufferPointer(start: bytes, count: 4))
+    }
+}
+
+/// The immutable framework artwork handle is only read by the detached native-image request.
+private struct BackgroundArtworkRequest: @unchecked Sendable {
+    let artwork: MPMediaItemArtwork
+
+    nonisolated func load(size: CGSize) -> (wasMainThread: Bool, image: RemoteMediaArtworkImage?) {
+        let wasMainThread = Thread.isMainThread
+        let image = artwork.image(at: size)?.cgImage.map { RemoteMediaArtworkImage(image: $0) }
+        return (wasMainThread: wasMainThread, image: image)
     }
 }
 
