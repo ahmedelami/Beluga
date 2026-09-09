@@ -224,6 +224,18 @@ their own packet/delay delta, not the ordinary queue window; keep proposed budge
 from native apply results. Numeric/enum diagnostics must reject malformed values without
 logging media, peer addresses, or raw connection identities, and must not change policy state.
 
+Below-reserve floor recovery must require two advancing native ordinary reports with
+measured low packet delay, healthy RTT, rising capacity, and at least 500 ms separation
+within a 1.5 s evidence lease. Fast/no-packet/cached reports must not supply admission
+witnesses. Keep the visible floor unchanged while testing bounded capacity, use the
+trial's seed-relative collapse threshold, preserve real congestion and the original
+hard deadline, and consume at most one attempt per acknowledged Show. Reserve ownership
+before asynchronous Show work and activate only for its exact successful capture/ACK;
+failed or superseded native application cannot refund the allowance or transfer positive
+health to another Show. Cover expiry, disproof, cooldown, stale identities, and seed
+retirement. Independently disable admission, restore the ordinary collapse threshold,
+and remove failed-apply attempt consumption; their behavioral regressions must fail.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac

@@ -736,10 +736,21 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
             after: "    private func adaptScreenVideoForNetworkConditions(",
             before: "    private func beginAutomaticScreenMediaResumeIfPossible("
         )
+        let applyingRevision = try XCTUnwrap(
+            adaptation.range(of: "var applyingPolicyRevision = expectedPolicyRevision")
+        )
+        let consumedRevision = try XCTUnwrap(
+            adaptation.range(of: "applyingPolicyRevision = screenVideoAdaptationPolicyRevision")
+        )
+        let nativeApply = try XCTUnwrap(
+            adaptation.range(of: "await sourcePeer.applyScreenVideoEncodingLimits(")
+        )
+        XCTAssertLessThan(applyingRevision.lowerBound, consumedRevision.lowerBound)
+        XCTAssertLessThan(consumedRevision.lowerBound, nativeApply.lowerBound)
         XCTAssertGreaterThanOrEqual(
             adaptation.components(
                 separatedBy:
-                    "screenVideoAdaptationPolicyRevision\n                        == expectedPolicyRevision"
+                    "screenVideoAdaptationPolicyRevision\n                        == applyingPolicyRevision"
             ).count - 1,
             2
         )

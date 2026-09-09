@@ -1228,6 +1228,7 @@ actor WorldwideScreenService {
         let teardownWatchdog = makeServiceTeardownWatchdog()
         isStopped = true
         stopIsInProgress = true
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
         defer { finishStopping() }
         safeOutputInvariantNeedsRedrive = false
         safeOutputInvariantVerificationWasFailing = false
@@ -2855,6 +2856,7 @@ actor WorldwideScreenService {
             }
             return
         }
+        var applyingPolicyRevision = expectedPolicyRevision
         if changedRecommendation != nil
             || appliedScreenVideoRecommendation != recommendation {
             guard let source = captureSource,
@@ -2866,6 +2868,14 @@ actor WorldwideScreenService {
                 return
             }
 
+            var attemptConsumption = screenVideoAdaptationPolicy
+            attemptConsumption.retainFloorRecoveryAttemptConsumption(from: proposedPolicy)
+            if attemptConsumption != screenVideoAdaptationPolicy {
+                // The attempt belongs to this Show even if native apply is later superseded.
+                screenVideoAdaptationPolicy = attemptConsumption
+                screenVideoAdaptationPolicyRevision &+= 1
+                applyingPolicyRevision = screenVideoAdaptationPolicyRevision
+            }
             do {
                 let senderUpdate = try await sourcePeer.applyScreenVideoEncodingLimits(
                     recommendation.webRTCLimits
@@ -2873,7 +2883,7 @@ actor WorldwideScreenService {
                 guard peer === sourcePeer,
                       peerGeneration == sourcePeerGeneration,
                       screenVideoAdaptationPolicyRevision
-                        == expectedPolicyRevision,
+                        == applyingPolicyRevision,
                       captureSource === source,
                       captureSink === sink,
                       self.captureAuthorization === captureAuthorization,
@@ -2887,7 +2897,7 @@ actor WorldwideScreenService {
                       captureVideoBaseDimensions == baseDimensions else {
                     logger.debug(
                         "Worldwide screen capacity nativeApply=stale "
-                            + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(expectedPolicyRevision)"
+                            + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision)"
                     )
                     do {
                         _ = try await sourcePeer
@@ -2915,7 +2925,7 @@ actor WorldwideScreenService {
                 appliedScreenVideoRecommendation = recommendation
                 logger.debug(
                     "Worldwide screen capacity nativeApply=accepted "
-                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(expectedPolicyRevision) "
+                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision) "
                         + "totalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
                 )
                 logger.info(
@@ -2930,7 +2940,7 @@ actor WorldwideScreenService {
                 guard peer === sourcePeer,
                       peerGeneration == sourcePeerGeneration,
                       screenVideoAdaptationPolicyRevision
-                        == expectedPolicyRevision,
+                        == applyingPolicyRevision,
                       captureSource === source,
                       captureSink === sink,
                       self.captureAuthorization === captureAuthorization,
@@ -2947,20 +2957,28 @@ actor WorldwideScreenService {
                 )
                 logger.debug(
                     "Worldwide screen capacity nativeApply=failed "
-                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(expectedPolicyRevision) "
+                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision) "
                         + "proposedTotalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
                 )
-                if capacityProbeOnly,
-                   screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil,
-                   proposedPolicy.applicationLimitedProbeOriginTier == nil {
-                    // Retain a fast negative even if reducing the native ceiling failed. The
-                    // unapplied recommendation is retried; no later fast report may regrow it.
+                let cancelledFloorRecoveryProbe =
+                    screenVideoAdaptationPolicy.floorRecoveryProbeIsActive
+                        && proposedPolicy.floorRecoveryProbeWasCancelled
+                screenVideoAdaptationPolicy.retainFloorRecoveryAttemptConsumption(
+                    from: proposedPolicy
+                )
+                if cancelledFloorRecoveryProbe
+                    || (capacityProbeOnly
+                        && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil
+                        && proposedPolicy.applicationLimitedProbeOriginTier == nil) {
+                    // A failed cap reduction must not erase a terminal floor or fast negative.
                     screenVideoAdaptationPolicy = proposedPolicy
                     screenVideoAdaptationPolicyRevision &+= 1
                 } else if capacityProbeOnly {
                     screenVideoAdaptationPolicy.retainCapacityProbeObservationIdentity(
                         from: proposedPolicy
                     )
+                    screenVideoAdaptationPolicyRevision &+= 1
+                } else {
                     screenVideoAdaptationPolicyRevision &+= 1
                 }
                 return
@@ -2970,7 +2988,7 @@ actor WorldwideScreenService {
         guard peer === sourcePeer,
               peerGeneration == sourcePeerGeneration,
               screenVideoAdaptationPolicyRevision
-                == expectedPolicyRevision else {
+                == applyingPolicyRevision else {
             return
         }
         screenVideoAdaptationPolicy = proposedPolicy
@@ -3799,6 +3817,8 @@ actor WorldwideScreenService {
     /// is acknowledged only after native stop succeeds; every uncertainty path revokes media.
     private func handleControlRequest(_ request: WebRTCControlRequest) async {
         guard let peer else {
+            screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+            screenVideoAdaptationPolicyRevision &+= 1
             _ = await stopScreenCaptureOrCloseSession(
                 context: "a control request arrived without a peer"
             )
@@ -3810,11 +3830,22 @@ actor WorldwideScreenService {
             if screenVisibilityCommandEpoch == 0 {
                 screenVisibilityCommandEpoch = 1
             }
+            if request.command == .showScreen {
+                screenVideoAdaptationPolicy.beginFloorRecoveryVisibility(
+                    peerGeneration: peerGeneration,
+                    showEpoch: screenVisibilityCommandEpoch
+                )
+            } else {
+                screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+            }
+            screenVideoAdaptationPolicyRevision &+= 1
             // Visibility commands own the serial control lane immediately. A deferred key-frame
             // acknowledgement must yield before Hide stops capture or Show starts a new generation.
             keyFrameControlTask?.cancel()
             keyFrameControlTask = nil
         }
+        let visibilityCommandEpoch = screenVisibilityCommandEpoch
+        let visibilityPeerGeneration = peerGeneration
 
         if request.command == .showScreen,
            screenMediaSuspension.activeScreenRequestID != nil {
@@ -3891,6 +3922,12 @@ actor WorldwideScreenService {
                       captureTransitionIsOwned else {
                     // The Active transition linearized before a newer uncertainty boundary.
                     // Stop immediately and never send a contradictory ACK for the same ID.
+                    if self.peer === peer,
+                       peerGeneration == visibilityPeerGeneration,
+                       screenVisibilityCommandEpoch == visibilityCommandEpoch {
+                        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+                        screenVideoAdaptationPolicyRevision &+= 1
+                    }
                     _ = await stopScreenCaptureOrCloseSession(
                         context: "screen authorization changed during Active acknowledgement"
                     )
@@ -3898,10 +3935,25 @@ actor WorldwideScreenService {
                     logger.error("Worldwide screen authorization changed during Active acknowledgement")
                     return
                 }
+                if self.peer === peer,
+                   peerGeneration == visibilityPeerGeneration,
+                   screenVisibilityCommandEpoch == visibilityCommandEpoch {
+                    screenVideoAdaptationPolicy.activateFloorRecoveryVisibility(
+                        peerGeneration: visibilityPeerGeneration,
+                        showEpoch: visibilityCommandEpoch
+                    )
+                    screenVideoAdaptationPolicyRevision &+= 1
+                }
                 activateAutomaticScreenMediaSuspensionOwnership(
                     screenRequestID: request.id
                 )
             } catch {
+                if self.peer === peer,
+                   peerGeneration == visibilityPeerGeneration,
+                   screenVisibilityCommandEpoch == visibilityCommandEpoch {
+                    screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+                    screenVideoAdaptationPolicyRevision &+= 1
+                }
                 screenMediaSuspension.retire()
                 if isNativeScreenStopFailure(error) {
                     logger.error(
@@ -4667,6 +4719,8 @@ actor WorldwideScreenService {
     /// Revokes both media gates before asynchronously stopping their native sources.
     private func stopCaptureForTransportUncertainty(_ reason: String) async {
         // Revoke both media gates before either asynchronous ScreenCaptureKit stop begins.
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+        screenVideoAdaptationPolicyRevision &+= 1
         revokeCaptureAuthorization()
         pauseSystemAudioForTransportUncertainty()
         captureSink?.stopForwarding()
@@ -4716,6 +4770,8 @@ actor WorldwideScreenService {
     /// Enters fail-closed recovery and invalidates any pre-uncertainty authorization.
     private func enterRecovery(reason: String) async {
         isRecovering = true
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+        screenVideoAdaptationPolicyRevision &+= 1
         resetRemoteMediaCommandQueue()
         resetAutomaticScreenMediaSuspensionState()
         revokeCaptureAuthorization()
@@ -4741,6 +4797,8 @@ actor WorldwideScreenService {
     /// Creates a fresh epoch that requires answer installation plus a Hide/Inactive proof.
     @discardableResult
     private func installRecoveryProofBoundary(awaitingAnswer: Bool) -> UInt64 {
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+        screenVideoAdaptationPolicyRevision &+= 1
         resetRemoteMediaCommandQueue()
         resetAutomaticScreenMediaSuspensionState()
         revokeCaptureAuthorization()
