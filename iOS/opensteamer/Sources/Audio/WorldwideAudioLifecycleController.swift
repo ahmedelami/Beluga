@@ -4590,7 +4590,7 @@ final class WorldwideAudioLifecycleController {
             hostedCallPolicyIsClosedForCurrentInterruption = true
         }
         playbackErrorText =
-            "The iPhone audio route changed outside opensteamer’s authorized microphone policy."
+            "The iPhone audio route changed outside Beluga’s authorized microphone policy."
         playbackDiagnosticText =
             "Unexpected AVAudioSession category=\(change.category), mode=\(change.mode), options=\(change.categoryOptionsRawValue)."
         retireExpectedAudioCategoryTransitionForBoundary()

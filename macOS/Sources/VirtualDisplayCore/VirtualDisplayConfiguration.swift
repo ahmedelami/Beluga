@@ -105,7 +105,7 @@ public struct VirtualDisplayConfiguration: Equatable, Sendable {
         }
         do {
             return try Self(
-                name: "opensteamer Phone Display",
+                name: "Beluga Phone Display",
                 vendorID: 0x6F73,
                 productID: 0x1717,
                 serialNumber: 0x0001,

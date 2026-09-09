@@ -10692,7 +10692,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             lastError = "Remote control needs Accessibility permission on the Mac."
             invalidateRemoteInputState()
         case .eventPostingPermissionRequired:
-            lastError = "The Mac has not allowed opensteamer to post mouse and keyboard events."
+            lastError = "The Mac has not allowed Beluga to post mouse and keyboard events."
             invalidateRemoteInputState()
         case .inputDisabled:
             lastError = "Remote control is disabled on the Mac."

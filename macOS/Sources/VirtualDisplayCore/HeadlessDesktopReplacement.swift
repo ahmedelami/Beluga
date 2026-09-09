@@ -413,7 +413,7 @@ public enum HeadlessDesktopReplacement {
 
         let pixelsPerInch = 220.0
         return try VirtualDisplayConfiguration(
-            name: "opensteamer Display",
+            name: "Beluga Display",
             vendorID: 0x6F73,
             productID: 0x1718,
             serialNumber: 0x0001,

@@ -381,15 +381,15 @@ enum WorldwideHostProcessLockError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .alreadyRunning:
-            "Another opensteamer worldwide host is already running for this macOS account."
+            "Another Beluga worldwide host is already running for this macOS account."
         case .applicationSupportUnavailable:
-            "opensteamer could not locate this macOS account's Application Support directory."
+            "Beluga could not locate this macOS account's Application Support directory."
         case .unsafeLockDirectory:
-            "opensteamer's worldwide-host runtime directory changed or is not safely owned."
+            "Beluga's worldwide-host runtime directory changed or is not safely owned."
         case .unsafeLockFile:
-            "opensteamer's worldwide-host process lock changed or is not a safe regular file."
+            "Beluga's worldwide-host process lock changed or is not a safe regular file."
         case .systemCall(let operation, let code):
-            "opensteamer could not \(operation) (errno \(code))."
+            "Beluga could not \(operation) (errno \(code))."
         }
     }
 }

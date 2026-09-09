@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "D2AF3999BADD967EBD466D86"
-               BuildableName = "opensteamer.app"
+               BuildableName = "Beluga.app"
                BlueprintName = "opensteamer"
                ReferencedContainer = "container:opensteamer.xcodeproj">
             </BuildableReference>

@@ -634,7 +634,7 @@ function archive_info_without_distributions_sha256() {
   [[ "${semantic_fields[1]}" == '2' \
       && "${semantic_fields[3]}" == "${EXPECTED_SCHEME}" \
       && "${semantic_fields[4]}" == "${EXPECTED_SCHEME}" \
-      && "${semantic_fields[5]}" == 'Applications/opensteamer.app' \
+      && "${semantic_fields[5]}" == 'Applications/Beluga.app' \
       && "${semantic_fields[6]}" == 'arm64' \
       && "${semantic_fields[7]}" == "${EXPECTED_BUNDLE_IDENTIFIER}" \
       && "${semantic_fields[8]}" == "${EXPECTED_SHORT_VERSION}" \
@@ -4604,7 +4604,7 @@ function verify_archive_filesystem_identity() {
   local products_path="${archive_path}/Products"
   local applications_path="${products_path}/Applications"
   local archive_info="${archive_path}/Info.plist"
-  local app_path="${applications_path}/opensteamer.app"
+  local app_path="${applications_path}/Beluga.app"
   local app_info="${app_path}/Info.plist"
   local app_profile="${app_path}/embedded.mobileprovision"
   local -a application_products=("${applications_path}"/*(ND))
@@ -4650,7 +4650,7 @@ function pin_archive_filesystem_identity() {
   local products_path="${archive_path}/Products"
   local applications_path="${products_path}/Applications"
   local archive_info="${archive_path}/Info.plist"
-  local app_path="${applications_path}/opensteamer.app"
+  local app_path="${applications_path}/Beluga.app"
   local app_info="${app_path}/Info.plist"
   local app_profile="${app_path}/embedded.mobileprovision"
   local -a application_products=("${applications_path}"/*(ND))
@@ -4907,8 +4907,8 @@ function verify_reviewed_archive_product_manifest() {
   local archive_path=$1
   local products_path="${archive_path}/Products"
   local applications_path="${products_path}/Applications"
-  local app_path="${applications_path}/opensteamer.app"
-  local main_executable="${app_path}/opensteamer"
+  local app_path="${applications_path}/Beluga.app"
+  local main_executable="${app_path}/Beluga"
   local expected_framework="${app_path}/Frameworks/LiveKitWebRTC.framework"
   local framework_executable="${expected_framework}/LiveKitWebRTC"
   local app_info="${app_path}/Info.plist"
@@ -4932,7 +4932,7 @@ function verify_reviewed_archive_product_manifest() {
       && "$(plist_raw_value "${app_info}" CFBundleIdentifier)" \
         == "${EXPECTED_BUNDLE_IDENTIFIER}" \
       && "$(plist_raw_value "${app_info}" CFBundleExecutable)" \
-        == 'opensteamer' \
+        == 'Beluga' \
       && "$(plist_raw_value "${framework_info}" CFBundleIdentifier)" \
         == 'io.livekit.LiveKitWebRTC' \
       && "$(plist_raw_value "${framework_info}" CFBundleExecutable)" \
@@ -4978,7 +4978,7 @@ function verify_reviewed_archive_product_manifest() {
 function verify_reviewed_nested_code() {
   local archive_path=$1
   verify_reviewed_archive_product_manifest "${archive_path}" || return $?
-  local app_path="${archive_path}/Products/Applications/opensteamer.app"
+  local app_path="${archive_path}/Products/Applications/Beluga.app"
   local expected_framework="${app_path}/Frameworks/LiveKitWebRTC.framework"
   local framework_executable="${expected_framework}/LiveKitWebRTC"
 
@@ -5010,7 +5010,7 @@ function verify_reviewed_nested_code() {
 function verify_archive_contents_at_path() {
   local archive_path=$1
   local archive_info="${archive_path}/Info.plist"
-  local app_info="${archive_path}/Products/Applications/opensteamer.app/Info.plist"
+  local app_info="${archive_path}/Products/Applications/Beluga.app/Info.plist"
   local app_path="${app_info:h}"
 
   require_exact_plist_value \
@@ -5132,7 +5132,7 @@ function verify_archive_payload_after_upload() {
   local products_path="${archive_path}/Products"
   local applications_path="${products_path}/Applications"
   local archive_info="${archive_path}/Info.plist"
-  local app_path="${applications_path}/opensteamer.app"
+  local app_path="${applications_path}/Beluga.app"
   local app_info="${app_path}/Info.plist"
   local app_profile="${app_path}/embedded.mobileprovision"
   local -a application_products=("${applications_path}"/*(ND))

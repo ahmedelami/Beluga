@@ -11,9 +11,9 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>opensteamer</string>
+	<string>Beluga</string>
 	<key>CFBundleDisplayName</key>
-	<string>opensteamer</string>
+	<string>Beluga</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
@@ -32,11 +32,11 @@
 		<string>_mcap-screen._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>opensteamer may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.</string>
+	<string>Beluga may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>opensteamer finds the Mac capture server on your local Wi-Fi network.</string>
+	<string>Beluga finds the Mac capture server on your local Wi-Fi network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>opensteamer may automatically activate the iPhone microphone for your authenticated paired Mac after the secure connection becomes healthy. You can turn it off at any time.</string>
+	<string>Beluga may automatically activate the iPhone microphone for your authenticated paired Mac after the secure connection becomes healthy. You can turn it off at any time.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

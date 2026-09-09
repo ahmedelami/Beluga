@@ -1,6 +1,6 @@
-# opensteamer Cloudflare rendezvous
+# Beluga Cloudflare rendezvous
 
-This Worker is the public signaling control plane for opensteamer's direct WebRTC path. It deploys to a stable `workers.dev` hostname and routes each unguessable channel to one SQLite-backed Durable Object. The Worker and Durable Object never relay media or decrypt signaling envelopes.
+This Worker is the public signaling control plane for Beluga's direct WebRTC path. It deploys to a stable `workers.dev` hostname and routes each unguessable channel to one SQLite-backed Durable Object. The Worker and Durable Object never relay media or decrypt signaling envelopes.
 
 The public surface is deliberately small:
 
@@ -11,7 +11,7 @@ The public surface is deliberately small:
 
 The `X-AudioStreamer-*`, `audiostreamer.pairing.v1`, and
 `audiostreamer.availability.v1` spellings are deployed v1 compatibility ABI. They intentionally
-retain the former product name so opensteamer clients remain compatible with existing releases.
+retain the former product name so Beluga clients remain compatible with existing releases.
 
 Invitation Durable Objects store the first host's admission proof, expiration, consumed bit, and a bounded tombstone. They compare the viewer's 32-byte proof before checking viewer occupancy, consuming the invitation, or provisioning TURN. Availability Durable Objects use a separate `availability:<channel>` namespace and retain distinct host and viewer capabilities so one host can coordinate a sequence of viewer reconnections without either proof claiming the opposite role. Hibernating WebSocket attachments retain mode, role, generation, active exchange ID, next sequence, last activity, and rate-window state. No source path logs channels, proofs, payloads, TURN identifiers, tokens, or credentials.
 

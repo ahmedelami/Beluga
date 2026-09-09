@@ -7,7 +7,7 @@ final class VirtualDisplayConfigurationTests: XCTestCase {
     func testIPhone17ProPresetHasStableIdentityAndExactNativeFirstMode() throws {
         let configuration = VirtualDisplayConfiguration.iPhone17Pro
 
-        XCTAssertEqual(configuration.name, "opensteamer Phone Display")
+        XCTAssertEqual(configuration.name, "Beluga Phone Display")
         XCTAssertEqual(configuration.vendorID, 0x6F73)
         XCTAssertEqual(configuration.productID, 0x1717)
         XCTAssertEqual(configuration.serialNumber, 1)
@@ -123,7 +123,7 @@ final class VirtualDisplayConfigurationTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(configuration.name, "opensteamer Display")
+        XCTAssertEqual(configuration.name, "Beluga Display")
         XCTAssertEqual(configuration.displaySettingsHiDPI, 1)
         XCTAssertEqual(configuration.maximumWidth, 1_206)
         XCTAssertEqual(configuration.maximumHeight, 2_622)

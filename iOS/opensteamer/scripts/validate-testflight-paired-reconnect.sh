@@ -1963,7 +1963,7 @@ function capture_production_candidate() {
     [.result.apps[] | select(.bundleIdentifier == $bundle)] as $matches
     | (($matches | length) == 1) and
       ($matches[0].bundleVersion == $build) and
-      ($matches[0].name == "opensteamer") and
+      ($matches[0].name == "Beluga") and
       ($matches[0].appClip == false) and
       ($matches[0].internalApp == false) and
       ($matches[0].removable == true)
@@ -4611,7 +4611,7 @@ function production_app_pid_from_process_json() {
         | select(
             (.bundle == $bundle) or
             .pathMatches or
-            (.name == "opensteamer")
+            (.name == "Beluga")
           )
       ] as $identities |
       if all(
@@ -4665,7 +4665,7 @@ function capture_raw_probe_production_identity() {
     candidate_json="${RAW_PROOF_WORK_DIR}/.raw-probe-self-test-candidate.json"
     jq -n \
       --arg bundle "${EXPECTED_APP_BUNDLE_IDENTIFIER}" \
-      '{bundleIdentifier:$bundle,path:"/Applications/opensteamer.app"}' \
+      '{bundleIdentifier:$bundle,path:"/Applications/Beluga.app"}' \
       > "${candidate_json}" || return $?
     fixture_pid=7101
     if [[ "${boundary}" == "completion" ]]; then
@@ -4681,7 +4681,7 @@ function capture_raw_probe_production_identity() {
       jq -n \
         --arg bundle "${EXPECTED_APP_BUNDLE_IDENTIFIER}" \
         --argjson pid "${fixture_pid}" \
-        '{info:{outcome:"success"},result:{processes:[{processIdentifier:$pid,bundleIdentifier:$bundle,executable:"/Applications/opensteamer.app/opensteamer"}]}}' \
+        '{info:{outcome:"success"},result:{processes:[{processIdentifier:$pid,bundleIdentifier:$bundle,executable:"/Applications/Beluga.app/Beluga"}]}}' \
         > "${process_json}" || return $?
     else
       return 3

@@ -96,7 +96,7 @@ EOF
 EOF
 
   cat >"$repository/README.md" <<EOF
-# opensteamer
+# Beluga
 
 | Configuration field | Checked-in value |
 | --- | --- |
@@ -156,7 +156,7 @@ mkdir -p \
   "$ALLOWED/iOS/opensteamer/Tests" \
   "$ALLOWED/macOS/Sources/CaptureServer" \
   "$ALLOWED/shared/Sources/RemoteSessionCore"
-print -r -- "# opensteamer" >"$ALLOWED/README.md"
+print -r -- "# Beluga" >"$ALLOWED/README.md"
 print -r -- 'export const CHANNEL_HEADER = "x-audiostreamer-channel";' \
   >"$ALLOWED/services/Rendezvous/src/protocol.mjs"
 print -r -- 'let service = "org.example.AudioStreamer"' \
@@ -419,4 +419,12 @@ print -r -- "stale path" >"$STALE_PATH/AudioStreamer-notes.md"
 commit_all "$STALE_PATH"
 require_failure "$STALE_PATH" "former product branding remains in a tracked path"
 
-print -- "opensteamer branding regression tests passed"
+STALE_BELUGA_DISPLAY="$TEMPORARY_ROOT/stale-beluga-display"
+initialize_repository "$STALE_BELUGA_DISPLAY"
+mkdir -p "$STALE_BELUGA_DISPLAY/iOS/opensteamer/Sources/Views"
+print -r -- '.navigationTitle("opensteamer")' \
+  >"$STALE_BELUGA_DISPLAY/iOS/opensteamer/Sources/Views/BrowserView.swift"
+commit_all "$STALE_BELUGA_DISPLAY"
+require_failure "$STALE_BELUGA_DISPLAY" "superseded app display branding remains"
+
+print -- "Beluga branding regression tests passed"
