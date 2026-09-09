@@ -202,6 +202,19 @@ the sequence fence disappears, or either copy drops the observation. A provision
 initial reference must not add two native ping intervals to cold startup; document
 that it has less initial outlier filtering than a three-distinct-measurement baseline.
 
+Intermediate startup-capacity observations must use the same single-flight collector,
+retain 500 ms quality/pressure windows, and leave the original probe deadline intact.
+Require advancing native report identity and increasing measured BWE before raising
+the bounded ceiling. A native UTC timestamp is identity, not an elapsed-time clock.
+Cached requests cannot compound capacity or renew primary RTT/queue leases. Preserve
+negative RTT identity across fast/ordinary lanes, including pair ABA and malformed
+metadata followed by a repaired cached tuple. Neutral queue bursts and small bandwidth
+declines withhold growth rather than becoming extra congestion samples. Keep a
+cap-dependent feedback oracle for first-full timing, plus disabled-growth, cached-report,
+deadline, cadence, and negative-invalidation mutants. Fence requests to their original
+Show/capture before interpreting callbacks. Full host compilation and new installed-host
+and iPhone evidence remain required; synthetic feedback timing is not a network prediction.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac

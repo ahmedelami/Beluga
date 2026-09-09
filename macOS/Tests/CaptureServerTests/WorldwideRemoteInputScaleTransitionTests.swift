@@ -441,13 +441,16 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         )
         XCTAssertTrue(sampler.contains("screenVideoStatisticsSnapshot("))
         XCTAssertTrue(
-            sampler.contains("timeout: Self.screenVideoAdaptationStatisticsTimeout")
+            sampler.contains(": Self.screenVideoAdaptationStatisticsTimeout")
         )
         XCTAssertTrue(
-            sampler.contains("Self.screenVideoAdaptationStatisticsInterval")
+            sampler.contains("WorldwideScreenVideoSamplingCadence(startedAt: clock.now)")
         )
-        XCTAssertTrue(sampler.contains("if nextDeadline < clock.now"))
-        XCTAssertTrue(sampler.contains("if let snapshot"))
+        XCTAssertTrue(sampler.contains("cadence.didFinishSample(at: now)"))
+        XCTAssertTrue(sampler.contains("cadence.takeDueSample(at: clock.now)"))
+        XCTAssertTrue(sampler.contains("if let report"))
+        XCTAssertTrue(sampler.contains("capacityProbeOnly: capacityProbeOnly"))
+        XCTAssertTrue(sampler.contains("report.nativeReportTimestampMicroseconds"))
         XCTAssertTrue(
             sampler.contains(
                 "screenVideoAdaptationFastStatisticsAreAvailable = false"
@@ -461,7 +464,7 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
             after: "    public func screenVideoStatisticsSnapshot(\n",
             before: "    private func collectStatistics("
         )
-        XCTAssertTrue(fastPeerSnapshot.contains("-> WebRTCStatisticsSnapshot?"))
+        XCTAssertTrue(fastPeerSnapshot.contains("-> WebRTCScreenVideoStatisticsReport?"))
         XCTAssertTrue(
             fastPeerSnapshot.contains("statistics(for: localVideoSender)")
         )
@@ -691,7 +694,7 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
     func testFastAdaptationFencesRouteAndConcurrentPolicyChanges() throws {
         let evidencePreparation = try serviceSlice(
             after: "    private func prepareScreenVideoAdaptationEvidence(",
-            before: "    /// Samples only the candidate-pair and outbound-video report"
+            before: "    private func sampleScreenVideoAdaptationStatistics("
         )
         XCTAssertTrue(evidencePreparation.contains("previousLane != lane"))
         XCTAssertTrue(evidencePreparation.contains("exceededMaximumGap"))
@@ -713,6 +716,21 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
                 "screenVideoAdaptationPolicyRevision\n                == expectedPolicyRevision"
             )
         )
+        let request = try XCTUnwrap(sampler.range(of: "await sourcePeer.screenVideoStatisticsSnapshot("))
+        for capturedBinding in [
+            "let expectedVisibilityEpoch = screenVisibilityCommandEpoch",
+            "let expectedCaptureSource = captureSource",
+            "let expectedCaptureAuthorization = captureAuthorization",
+        ] {
+            XCTAssertLessThan(try XCTUnwrap(sampler.range(of: capturedBinding)).lowerBound, request.lowerBound)
+        }
+        for bindingCheck in [
+            "screenVisibilityCommandEpoch == expectedVisibilityEpoch",
+            "captureSource === expectedCaptureSource",
+            "captureAuthorization === expectedCaptureAuthorization",
+        ] {
+            XCTAssertGreaterThan(try XCTUnwrap(sampler.range(of: bindingCheck)).lowerBound, request.lowerBound)
+        }
 
         let adaptation = try serviceSlice(
             after: "    private func adaptScreenVideoForNetworkConditions(",

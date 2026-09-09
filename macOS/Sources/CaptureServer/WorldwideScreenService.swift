@@ -2548,19 +2548,17 @@ actor WorldwideScreenService {
         return screenVideoAdaptationPolicyRevision
     }
 
-    /// Samples only the candidate-pair and outbound-video report on a fixed half-second cadence.
-    /// The ordinary one-second sampler retains microphone freshness and route-maintenance timing.
+    /// One collector retains ordinary quality decisions while observing bounded startup probes
+    /// between them. Microphone freshness and route maintenance keep their one-second cadence.
     private func sampleScreenVideoAdaptationStatistics(
         sourcePeer: WebRTCPeer,
         sourcePeerGeneration: UInt64
     ) async {
         let clock = ContinuousClock()
-        var nextDeadline = clock.now.advanced(
-            by: Self.screenVideoAdaptationStatisticsInterval
-        )
+        var cadence = WorldwideScreenVideoSamplingCadence(startedAt: clock.now)
         while !Task.isCancelled {
             do {
-                try await clock.sleep(until: nextDeadline)
+                try await clock.sleep(until: cadence.nextDeadline)
             } catch {
                 return
             }
@@ -2570,12 +2568,22 @@ actor WorldwideScreenService {
                   peerGeneration == sourcePeerGeneration else {
                 return
             }
+            guard let sample = cadence.takeDueSample(at: clock.now) else { continue }
+            let capacityProbeOnly = sample == .capacityOnly
+            defer {
+                let now = clock.now
+                cadence.didFinishSample(at: now)
+                cadence.setCapacityProbeEnabled(
+                    captureSource != nil
+                        && automaticScreenMediaResumeContext == nil
+                        && screenVideoAdaptationFastStatisticsAreAvailable
+                        && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil,
+                    at: now
+                )
+            }
             logNativeScreenProbeDiagnostics()
             guard captureSource != nil else {
                 screenVideoAdaptationFastStatisticsAreAvailable = false
-                nextDeadline = clock.now.advanced(
-                    by: Self.screenVideoAdaptationStatisticsInterval
-                )
                 continue
             }
             guard automaticScreenMediaResumeContext == nil else {
@@ -2583,19 +2591,19 @@ actor WorldwideScreenService {
                 // ordinary encoder limits have committed. Do not launch a request inside that
                 // interval: its result could otherwise arrive just after the context is released
                 // and cause a second back-to-back encoder transition from pre-restoration data.
-                nextDeadline = nextDeadline.advanced(
-                    by: Self.screenVideoAdaptationStatisticsInterval
-                )
-                if nextDeadline < clock.now {
-                    nextDeadline = clock.now
-                }
                 continue
             }
 
             let expectedPolicyRevision =
                 screenVideoAdaptationPolicyRevision
-            let snapshot = await sourcePeer.screenVideoStatisticsSnapshot(
-                timeout: Self.screenVideoAdaptationStatisticsTimeout
+            let expectedVisibilityEpoch = screenVisibilityCommandEpoch
+            let expectedCaptureSource = captureSource
+            let expectedCaptureAuthorization = captureAuthorization
+            let statisticsStartedAt = clock.now
+            let report = await sourcePeer.screenVideoStatisticsSnapshot(
+                timeout: capacityProbeOnly
+                    ? .milliseconds(100)
+                    : Self.screenVideoAdaptationStatisticsTimeout
             )
             guard !Task.isCancelled,
                   !isStopped,
@@ -2603,27 +2611,45 @@ actor WorldwideScreenService {
                   peerGeneration == sourcePeerGeneration else {
                 return
             }
-            if let snapshot,
+            let statisticsDuration = statisticsStartedAt.duration(to: clock.now).components
+            let statisticsMilliseconds = Double(statisticsDuration.seconds) * 1_000
+                + Double(statisticsDuration.attoseconds) / 1_000_000_000_000_000
+            logger.debug(
+                "Worldwide screen statistics evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular") "
+                    + "peerGeneration=\(sourcePeerGeneration) showEpoch=\(expectedVisibilityEpoch) "
+                    + "durationMs=\(String(format: "%.1f", statisticsMilliseconds)) "
+                    + "received=\(report != nil)"
+            )
+            if let report,
+               case let snapshot = report.snapshot,
                screenVideoAdaptationFreshnessFence.admits(snapshot),
+               screenVisibilityCommandEpoch == expectedVisibilityEpoch,
+               captureSource === expectedCaptureSource,
+               captureAuthorization === expectedCaptureAuthorization,
                screenVideoAdaptationPolicyRevision
                 == expectedPolicyRevision {
-                screenVideoAdaptationFastStatisticsAreAvailable = true
-                let adaptationRevision =
-                    prepareScreenVideoAdaptationEvidence(
-                        from: .fastSender
-                    )
+                if !capacityProbeOnly {
+                    screenVideoAdaptationFastStatisticsAreAvailable = true
+                }
+                let adaptationRevision = capacityProbeOnly
+                    ? expectedPolicyRevision
+                    : prepareScreenVideoAdaptationEvidence(from: .fastSender)
                 await adaptScreenVideoForNetworkConditions(
                     snapshot,
                     sourcePeer: sourcePeer,
                     sourcePeerGeneration: sourcePeerGeneration,
                     expectedPolicyRevision: adaptationRevision,
-                    allowsAutomaticResume: false
+                    allowsAutomaticResume: false,
+                    nativeReportTimestampMicroseconds: report.nativeReportTimestampMicroseconds,
+                    capacityProbeOnly: capacityProbeOnly
                 )
             } else {
                 // A timeout, an outstanding native request, or an ordered route/policy change
                 // makes the ordinary one-second event the authoritative fallback until a fresh
                 // sender-scoped sample succeeds.
-                screenVideoAdaptationFastStatisticsAreAvailable = false
+                if !capacityProbeOnly {
+                    screenVideoAdaptationFastStatisticsAreAvailable = false
+                }
                 // A missing report cannot extend a temporary ceiling indefinitely, even if the
                 // ordinary statistics lane is also stalled. Expiry never supplies health proof.
                 await adaptScreenVideoForNetworkConditions(
@@ -2635,12 +2661,6 @@ actor WorldwideScreenService {
                 )
             }
 
-            nextDeadline = nextDeadline.advanced(
-                by: Self.screenVideoAdaptationStatisticsInterval
-            )
-            if nextDeadline < clock.now {
-                nextDeadline = clock.now
-            }
         }
     }
 
@@ -2671,7 +2691,9 @@ actor WorldwideScreenService {
         sourcePeer: WebRTCPeer,
         sourcePeerGeneration: UInt64,
         expectedPolicyRevision: UInt64,
-        allowsAutomaticResume: Bool
+        allowsAutomaticResume: Bool,
+        nativeReportTimestampMicroseconds: Double? = nil,
+        capacityProbeOnly: Bool = false
     ) async {
         // Marker and real-frame RTP deltas are valid only while the exact sender configuration
         // remains frozen. The bounded probe owns its temporary ceiling; the first statistics
@@ -2696,7 +2718,21 @@ actor WorldwideScreenService {
         var proposedPolicy = screenVideoAdaptationPolicy
         let changedRecommendation:
             WorldwideScreenVideoEncodingRecommendation?
-        if let snapshot {
+        if let snapshot, capacityProbeOnly {
+            changedRecommendation = proposedPolicy.updateCapacityProbe(
+                peerGeneration: sourcePeerGeneration,
+                isCaptureActive: isCaptureActive,
+                availableOutgoingBitrateBps: snapshot.availableOutgoingBitrate,
+                currentRoundTripTimeSeconds: snapshot.currentRoundTripTime,
+                roundTripTimeObservation: snapshot.roundTripTimeObservation,
+                collectionSequence: snapshot.collectionSequence,
+                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
+                selectedRoute: snapshot.route,
+                outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    snapshot.outboundVideo?.totalPacketSendDelay
+            )
+        } else if let snapshot {
             changedRecommendation = proposedPolicy.update(
                 peerGeneration: sourcePeerGeneration,
                 isCaptureActive: isCaptureActive,
@@ -2710,7 +2746,8 @@ actor WorldwideScreenService {
                 selectedRoute: snapshot.route,
                 outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
                 outboundVideoTotalPacketSendDelaySeconds:
-                    snapshot.outboundVideo?.totalPacketSendDelay
+                    snapshot.outboundVideo?.totalPacketSendDelay,
+                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds
             )
         } else {
             changedRecommendation = proposedPolicy
@@ -2786,6 +2823,7 @@ actor WorldwideScreenService {
                 + (snapshot?.outboundVideo?.framesPerSecond.map {
                     String(format: "%.1f", $0)
                 } ?? "unknown")
+                + " evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular")"
         )
         guard isCaptureActive else {
             if peer === sourcePeer,
@@ -2866,19 +2904,42 @@ actor WorldwideScreenService {
                     "Worldwide screen video tier=\(String(describing: recommendation.tier)) "
                         + "maxKbps=\(recommendation.maximumBitrateBps / 1_000) "
                         + "fps=\(recommendation.maximumFramesPerSecond) "
-                        + "scale=\(String(format: "%.2f", recommendation.scaleResolutionDownBy))"
+                        + "scale=\(String(format: "%.2f", recommendation.scaleResolutionDownBy)) "
+                        + "totalCapKbps=\(recommendation.maximumTotalRTPBitrateBps / 1_000) "
+                        + "evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular")"
                 )
             } catch {
                 guard peer === sourcePeer,
                       peerGeneration == sourcePeerGeneration,
                       screenVideoAdaptationPolicyRevision
-                        == expectedPolicyRevision else {
+                        == expectedPolicyRevision,
+                      captureSource === source,
+                      captureSink === sink,
+                      self.captureAuthorization === captureAuthorization,
+                      self.captureForwardingAuthorization === forwardingAuthorization,
+                      captureAuthorization.isValid,
+                      forwardingAuthorization.isValid,
+                      sink.allowsActiveUse(authorizedBy: forwardingAuthorization),
+                      captureVideoBaseDimensions == baseDimensions else {
                     return
                 }
                 logger.error(
                     "Worldwide screen video adaptation held its previous tier: "
                         + error.localizedDescription
                 )
+                if capacityProbeOnly,
+                   screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil,
+                   proposedPolicy.applicationLimitedProbeOriginTier == nil {
+                    // Retain a fast negative even if reducing the native ceiling failed. The
+                    // unapplied recommendation is retried; no later fast report may regrow it.
+                    screenVideoAdaptationPolicy = proposedPolicy
+                    screenVideoAdaptationPolicyRevision &+= 1
+                } else if capacityProbeOnly {
+                    screenVideoAdaptationPolicy.retainCapacityProbeObservationIdentity(
+                        from: proposedPolicy
+                    )
+                    screenVideoAdaptationPolicyRevision &+= 1
+                }
                 return
             }
         }

@@ -8289,13 +8289,13 @@ public actor WebRTCPeer {
         statisticsCollectionSequencer.minimumNextSequence()
     }
 
-    /// Collects one sender-scoped screen-video report without accelerating whole-peer audio or
-    /// the receiver-scoped microphone report used by the one-second health sampler. The native
-    /// API cannot cancel a timed-out request, so keep it single-flight until its callback arrives;
-    /// callers can use the ordinary statistics stream as a fallback while this returns `nil`.
+    /// Collects sender-filtered statistics without advancing the one-second audio-health sampler.
+    /// Native collection may still gather a shared cached report before filtering. A timed-out
+    /// request remains single-flight until its callback arrives; callers may use ordinary
+    /// statistics as a fallback while this returns `nil`.
     public func screenVideoStatisticsSnapshot(
         timeout: Duration
-    ) async -> WebRTCStatisticsSnapshot? {
+    ) async -> WebRTCScreenVideoStatisticsReport? {
         precondition(timeout > .zero)
         guard let localVideoSender,
               let requestID = screenVideoStatisticsRequestGate.begin() else {
@@ -8304,7 +8304,7 @@ public actor WebRTCPeer {
         let collectionSequence =
             statisticsCollectionSequencer.reserveNextSequence()
         let expectedRouteRevision = currentRouteRevision
-        let nativeSnapshot: WebRTCStatisticsSnapshot? =
+        let nativeReport: WebRTCScreenVideoStatisticsReport? =
             await WebRTCBoundedCallback.value(timeout: timeout) {
                 [
                     peerConnection,
@@ -8316,18 +8316,21 @@ public actor WebRTCPeer {
                         screenVideoStatisticsRequestGate.complete(requestID)
                     }
                     resolve(
-                        WebRTCStatisticsParser.parse(
-                            report,
-                            collectionSequence: collectionSequence
+                        WebRTCScreenVideoStatisticsReport(
+                            snapshot: WebRTCStatisticsParser.parse(
+                                report,
+                                collectionSequence: collectionSequence
+                            ),
+                            nativeReportTimestampMicroseconds: report.timestamp_us
                         )
                     )
                 }
             }
-        guard let nativeSnapshot,
+        guard let nativeReport,
               currentRouteRevision == expectedRouteRevision else {
             return nil
         }
-        return snapshotRestoringCurrentRouteIfNeeded(nativeSnapshot)
+        return nativeReport.restoringRouteIfNeeded(currentRoute)
     }
 
     private func collectStatistics(

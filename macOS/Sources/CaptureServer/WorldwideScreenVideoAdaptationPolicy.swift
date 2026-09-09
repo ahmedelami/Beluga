@@ -111,6 +111,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         let permitsLegacyMissingValue: Bool
     }
 
+    private struct RoundTripTimeObservationFence: Equatable, Sendable {
+        let measurement: WebRTCRoundTripTimeMeasurement
+        let current: Double?
+    }
+
     private struct AutomaticResumeProbeRestoration: Equatable, Sendable {
         let belowReserveProbeDisprovedSenderLimitation: Bool
         let applicationLimitedProbeCooldownSamplesRemaining: Int
@@ -121,6 +126,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         let tier: WorldwideScreenVideoAdaptationTier
         var maximumTotalRTPBitrateBps: Int
         let deadline: ContinuousClock.Instant
+    }
+
+    private struct CapacityProbeSample: Equatable, Sendable {
+        let packetsSent: UInt64?
+        let totalPacketSendDelaySeconds: Double?
     }
 
     /// The dedicated video sampler runs independently from the one-second microphone-health
@@ -254,6 +264,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private(set) var roundTripTimeReferenceIsProvisional = false
     private(set) var lastConsumedCollectionSequence: UInt64?
     private var roundTripTimeWatermark: WebRTCRoundTripTimeMeasurement?
+    private var roundTripTimeObservationFence: RoundTripTimeObservationFence?
     private var nativeRoundTripTimeHealth: NativeRoundTripTimeHealth = .unknown
     private var usesNativeRoundTripTimeEvidence = false
     private var lastRoundTripTimeAdvancement: ContinuousClock.Instant?
@@ -263,6 +274,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private(set) var selectedRoute: WebRTCICERouteDiagnostics?
     private var lastOutboundVideoPacketsSent: UInt64?
     private var lastOutboundVideoTotalPacketSendDelaySeconds: Double?
+    private var capacityProbeSample: CapacityProbeSample?
+    private var capacityProbeBandwidthHighWatermark: Double?
+    private var capacityProbeNativeReportTimestamp: Double?
+    private var lastCapacityProbeCollectionSequence: UInt64?
+    private var capacityProbeGrowthIsVetoed = false
 
     init(
         configuredTotalRTPBitrateBps: Int,
@@ -370,7 +386,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         // Collection order and native measurement identity belong to the peer, not the sampler
         // cadence, geometry, Show/Hide lifetime, or selected-route diagnostics lifetime.
         lastConsumedCollectionSequence = nil
+        lastCapacityProbeCollectionSequence = nil
+        capacityProbeNativeReportTimestamp = nil
         roundTripTimeWatermark = nil
+        roundTripTimeObservationFence = nil
         lastRoundTripTimeAdvancement = nil
         lastMeasuredRoundTripTimeSeconds = nil
         roundTripTimeObservationAge = nil
@@ -399,6 +418,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     /// from being combined with a later sample. Stable route baselines and any already-applied
     /// probe remain intact; only incomplete evidence windows are discarded.
     mutating func resetIncompleteEvidenceWindow() {
+        capacityProbeSample = nil
+        capacityProbeBandwidthHighWatermark = nil
         promotionCapacityContinuity = nil
         healthyUpgradeSampleCount = 0
         bandwidthOnlyDowngradeSampleCount = 0
@@ -425,6 +446,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         selectedRoute: WebRTCICERouteDiagnostics? = nil,
         outboundVideoPacketsSent: UInt64? = nil,
         outboundVideoTotalPacketSendDelaySeconds: Double? = nil,
+        nativeReportTimestampMicroseconds: Double? = nil,
         observedAt: ContinuousClock.Instant = .now
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         let didResetForNewPeer = bind(toPeerGeneration: generation)
@@ -447,6 +469,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             )
         }
         if let collectionSequence {
+            if let lastCapacityProbeCollectionSequence,
+               collectionSequence <= lastCapacityProbeCollectionSequence {
+                return expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: generation,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: observedAt
+                )
+            }
             if let lastConsumedCollectionSequence,
                collectionSequence <= lastConsumedCollectionSequence {
                 // A slower fallback request may finish after a newer fast-lane report. Reject
@@ -461,6 +491,15 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 )
             }
             lastConsumedCollectionSequence = collectionSequence
+        }
+        capacityProbeGrowthIsVetoed = false
+        defer {
+            recordCapacityProbeBaseline(
+                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
+                availableOutgoingBitrateBps: availableOutgoingBitrateBps,
+                packetsSent: outboundVideoPacketsSent,
+                totalPacketSendDelaySeconds: outboundVideoTotalPacketSendDelaySeconds
+            )
         }
         let previousRecommendation = currentRecommendation
         let hadPromotionCapacityContinuity = promotionCapacityContinuity != nil
@@ -495,6 +534,196 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return nil
         }
         return currentRecommendation
+    }
+
+    /// An unsuccessful native cap increase does not erase a report already observed. Retain
+    /// only ordering/identity fences; the unapplied budget and positive health stay unchanged.
+    mutating func retainCapacityProbeObservationIdentity(from observed: Self) {
+        guard peerGeneration == observed.peerGeneration,
+              applicationLimitedProbeOriginTier != nil,
+              applicationLimitedProbeOriginTier == observed.applicationLimitedProbeOriginTier,
+              let sequence = observed.lastCapacityProbeCollectionSequence,
+              sequence > (lastConsumedCollectionSequence ?? 0),
+              sequence > (lastCapacityProbeCollectionSequence ?? 0) else {
+            return
+        }
+        lastCapacityProbeCollectionSequence = sequence
+        capacityProbeNativeReportTimestamp = observed.capacityProbeNativeReportTimestamp
+        roundTripTimeObservationFence = observed.roundTripTimeObservationFence
+    }
+
+    /// Intermediate reports can grow or revoke speculative capacity, never qualify geometry.
+    /// Positive RTT/queue leases still belong exclusively to the ordinary 500 ms reducer.
+    mutating func updateCapacityProbe(
+        peerGeneration generation: UInt64,
+        isCaptureActive: Bool,
+        availableOutgoingBitrateBps: Double?,
+        currentRoundTripTimeSeconds: Double?,
+        roundTripTimeObservation: WebRTCRoundTripTimeObservation?,
+        collectionSequence: UInt64?,
+        nativeReportTimestampMicroseconds: Double?,
+        selectedRoute: WebRTCICERouteDiagnostics? = nil,
+        outboundVideoPacketsSent: UInt64?,
+        outboundVideoTotalPacketSendDelaySeconds: Double?,
+        observedAt: ContinuousClock.Instant = .now
+    ) -> WorldwideScreenVideoEncodingRecommendation? {
+        guard peerGeneration == generation, isCaptureActive else { return nil }
+        if let expired = expireApplicationLimitedProbeWithoutReport(
+            peerGeneration: generation,
+            isCaptureActive: isCaptureActive,
+            observedAt: observedAt
+        ) { return expired }
+        guard let origin = applicationLimitedProbeOriginTier,
+              let currentCeiling = applicationLimitedProbeMaximumTotalRTPBitrateBps,
+              let collectionSequence,
+              collectionSequence > (lastConsumedCollectionSequence ?? 0),
+              collectionSequence > (lastCapacityProbeCollectionSequence ?? 0),
+              let timestamp = nativeReportTimestampMicroseconds,
+              timestamp.isFinite, timestamp > 0,
+              let previousTimestamp = capacityProbeNativeReportTimestamp,
+              timestamp > previousTimestamp else {
+            return nil
+        }
+        // The native timestamp is a report identity, not an elapsed-time clock. Equal or
+        // regressing UTC timestamps cannot mint capacity proof even with a new request number.
+        capacityProbeNativeReportTimestamp = timestamp
+        lastCapacityProbeCollectionSequence = collectionSequence
+        let baseline = capacityProbeSample
+        capacityProbeSample = CapacityProbeSample(
+            packetsSent: outboundVideoPacketsSent,
+            totalPacketSendDelaySeconds: outboundVideoTotalPacketSendDelaySeconds
+        )
+        // Positive fast observations advance only the identity fence, never the ordinary
+        // reference or health lease. Negative identities must poison subsequent ordinary use.
+        var validation = self
+        let rtt = validation.consumeRoundTripTimeEvidence(
+            current: validRoundTripTime(currentRoundTripTimeSeconds),
+            observation: roundTripTimeObservation ?? .unavailable,
+            observedAt: observedAt
+        )
+        roundTripTimeObservationFence = validation.roundTripTimeObservationFence
+        guard rtt.allowsUpgrade else {
+            revokeRoundTripTimeHealth()
+            permitsInitialRoundTripTimeReference = false
+            if !rtt.hasFreshPressure {
+                roundTripTimeWatermark = validation.roundTripTimeWatermark
+                roundTripTimeDisposition = validation.roundTripTimeDisposition
+                if validation.roundTripTimeBaselineSeconds == nil {
+                    roundTripTimeBaselineSeconds = nil
+                    roundTripTimeBootstrapSamples = []
+                    distinctHealthyRoundTripTimeReferenceCount = 0
+                    roundTripTimeReferenceIsProvisional = false
+                }
+            }
+            // Leave a fresh inflated measurement unconsumed: the ordinary lane must still
+            // apply its one RTT-pressure decision, not lose it to this capacity-only abort.
+            failApplicationLimitedProbe(revertingTo: origin)
+            return currentRecommendation
+        }
+        if selectedRoute != self.selectedRoute {
+            // Sender-filtered stats can reveal a route change before the ordinary route event.
+            // Its RTT tuple must not become new health when the next regular report reuses it.
+            revokeRoundTripTimeHealth()
+            permitsInitialRoundTripTimeReference = false
+            roundTripTimeWatermark = validation.roundTripTimeWatermark
+            failApplicationLimitedProbe(revertingTo: origin)
+            return currentRecommendation
+        }
+        guard let baseline,
+              let previousBandwidth = capacityProbeBandwidthHighWatermark,
+              nativeRoundTripTimeHealth == .healthy,
+              let advancement = lastRoundTripTimeAdvancement,
+              advancement.duration(to: observedAt) >= .zero,
+              advancement.duration(to: observedAt) <= Self.roundTripTimeObservationValidity else {
+            failApplicationLimitedProbe(revertingTo: origin)
+            return currentRecommendation
+        }
+        validation.lastOutboundVideoPacketsSent = baseline.packetsSent
+        validation.lastOutboundVideoTotalPacketSendDelaySeconds =
+            baseline.totalPacketSendDelaySeconds
+        let queue = validation.packetQueueObservationSinceLastSample(
+            packetsSent: outboundVideoPacketsSent,
+            totalPacketSendDelaySeconds: outboundVideoTotalPacketSendDelaySeconds
+        )
+        let queueAllowsGrowth: Bool
+        switch queue {
+        case let .measured(delay):
+            if delay >= Self.immediateAveragePacketSendDelaySeconds {
+                failApplicationLimitedProbe(revertingTo: origin)
+                return currentRecommendation
+            }
+            queueAllowsGrowth = delay <= Self.maximumUpgradePacketSendDelaySeconds
+        case .noNewPackets:
+            queueAllowsGrowth = lastLowDelayPacketQueueObservation.map {
+                isFreshPacketQueueObservation($0, at: observedAt)
+            } ?? false
+        case .unavailableOrReset:
+            queueAllowsGrowth = false
+        }
+        guard let availableOutgoingBitrateBps,
+              availableOutgoingBitrateBps.isFinite,
+              availableOutgoingBitrateBps > 0 else {
+            capacityProbeGrowthIsVetoed = true
+            return nil
+        }
+        let collapseThreshold = max(
+            requiredOutgoingBitrateBps(for: .audioPriority),
+            Double(recommendation(for: origin).maximumBitrateBps)
+                * Self.applicationLimitedProbeImmediateAbortRatio
+        )
+        if availableOutgoingBitrateBps < collapseThreshold {
+            failApplicationLimitedProbe(revertingTo: origin)
+            return currentRecommendation
+        }
+        // Neutral transition bursts withhold growth for this regular observation window;
+        // they do not turn a 200 ms poll into an extra congestion/backoff decision.
+        guard queueAllowsGrowth,
+              let queuePermission = lastLowDelayPacketQueueObservation,
+              isFreshPacketQueueObservation(queuePermission, at: observedAt) else {
+            capacityProbeGrowthIsVetoed = true
+            return nil
+        }
+        guard !capacityProbeGrowthIsVetoed else { return nil }
+        guard availableOutgoingBitrateBps > previousBandwidth else { return nil }
+        capacityProbeBandwidthHighWatermark = availableOutgoingBitrateBps
+        let nextCeiling = boundedApplicationLimitedProbeCeiling(
+            availableOutgoingBitrateBps: availableOutgoingBitrateBps,
+            currentCeilingBps: currentCeiling
+        )
+        guard nextCeiling > currentCeiling else { return nil }
+        applicationLimitedProbeMaximumTotalRTPBitrateBps = nextCeiling
+        return currentRecommendation
+    }
+
+    private mutating func recordCapacityProbeBaseline(
+        nativeReportTimestampMicroseconds: Double?,
+        availableOutgoingBitrateBps: Double?,
+        packetsSent: UInt64?,
+        totalPacketSendDelaySeconds: Double?
+    ) {
+        guard let timestamp = nativeReportTimestampMicroseconds,
+              timestamp.isFinite, timestamp > 0,
+              timestamp >= (capacityProbeNativeReportTimestamp ?? 0) else {
+            capacityProbeSample = nil
+            return
+        }
+        capacityProbeNativeReportTimestamp = timestamp
+        guard applicationLimitedProbeOriginTier != nil,
+              let availableOutgoingBitrateBps,
+              availableOutgoingBitrateBps.isFinite,
+              availableOutgoingBitrateBps > 0 else {
+            capacityProbeSample = nil
+            capacityProbeBandwidthHighWatermark = nil
+            return
+        }
+        capacityProbeBandwidthHighWatermark = max(
+            capacityProbeBandwidthHighWatermark ?? 0,
+            availableOutgoingBitrateBps
+        )
+        capacityProbeSample = CapacityProbeSample(
+            packetsSent: packetsSent,
+            totalPacketSendDelaySeconds: totalPacketSendDelaySeconds
+        )
     }
 
     private mutating func updateNetworkEvidence(
@@ -1387,6 +1616,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return false
         }
         applicationLimitedProbeMaximumTotalRTPBitrateBps = probeCeiling
+        capacityProbeBandwidthHighWatermark = availableOutgoingBitrateBps
+        capacityProbeGrowthIsVetoed = false
         promotionCapacityContinuity = nil
         // This is a bitrate/BWE-ceiling-only transition. Preserve the fresh low-delay packet
         // observation so a 1 fps sender can evaluate the next no-packet poll; visible tier changes
@@ -1547,6 +1778,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     private mutating func resetPathMeasurements() {
+        capacityProbeSample = nil
+        capacityProbeBandwidthHighWatermark = nil
         promotionCapacityContinuity = nil
         healthyUpgradeSampleCount = 0
         bandwidthOnlyDowngradeSampleCount = 0
@@ -1580,6 +1813,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     private mutating func resetQueueEvidenceForTierTransition() {
+        capacityProbeSample = nil
+        capacityProbeBandwidthHighWatermark = nil
         promotionCapacityContinuity = nil
         queuePressureSampleCount = 0
         lastLowDelayPacketQueueObservation = nil
@@ -1643,8 +1878,41 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
               isValidRoundTripTimeWatermark(measurement) else {
             // Never forget the consumed watermark: missing metadata followed by the same old
             // measurement cannot revive health or apply the same pressure a second time.
+            if let fence = roundTripTimeObservationFence {
+                roundTripTimeWatermark = fence.measurement
+                permitsInitialRoundTripTimeReference = false
+            }
             revokeRoundTripTimeHealth()
             return unknown
+        }
+
+        let previousFence = roundTripTimeObservationFence
+        roundTripTimeObservationFence = RoundTripTimeObservationFence(
+            measurement: measurement,
+            current: current
+        )
+        if let previousFence {
+            let replacedPair = measurement.selectedCandidatePairFingerprint
+                != previousFence.measurement.selectedCandidatePairFingerprint
+            let regressed = measurement.totalRoundTripTimeSeconds
+                    < previousFence.measurement.totalRoundTripTimeSeconds
+                || measurement.responsesReceived
+                    < previousFence.measurement.responsesReceived
+            let contradictoryScalar = measurement == previousFence.measurement
+                && current != previousFence.current
+            if replacedPair || regressed || contradictoryScalar {
+                roundTripTimeWatermark = measurement
+                permitsInitialRoundTripTimeReference = false
+                revokeRoundTripTimeHealth()
+                roundTripTimeDisposition = contradictoryScalar ? .unavailable : .reseeded
+                if replacedPair {
+                    roundTripTimeBaselineSeconds = nil
+                    roundTripTimeBootstrapSamples = []
+                    distinctHealthyRoundTripTimeReferenceCount = 0
+                    roundTripTimeReferenceIsProvisional = false
+                }
+                return unknown
+            }
         }
 
         let previous = roundTripTimeWatermark

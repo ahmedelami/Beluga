@@ -677,14 +677,20 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
 
         let screenSenderBoundary =
             host.minimumNextStatisticsCollectionSequence()
-        let optionalScreenSenderSnapshot =
+        let optionalScreenSenderReport =
             await host.screenVideoStatisticsSnapshot(timeout: .seconds(1))
-        let screenSenderSnapshot = try XCTUnwrap(
-            optionalScreenSenderSnapshot
+        let screenSenderReport = try XCTUnwrap(
+            optionalScreenSenderReport
         )
         XCTAssertEqual(
-            screenSenderSnapshot.collectionSequence,
+            screenSenderReport.snapshot.collectionSequence,
             screenSenderBoundary
+        )
+        XCTAssertTrue(
+            screenSenderReport.nativeReportTimestampMicroseconds.isFinite
+        )
+        XCTAssertGreaterThan(
+            screenSenderReport.nativeReportTimestampMicroseconds, 0
         )
         XCTAssertGreaterThan(screenSenderBoundary, wholePeerBoundary)
         XCTAssertEqual(
