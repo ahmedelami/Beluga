@@ -173,6 +173,22 @@ they do not establish how a real application settles delayed Accessibility chang
 A physical resize claim still requires the matching installed host and a disposable
 real window, with before/after AX bounds and pixels plus uninterrupted keyboard focus.
 
+## Screen startup quality boundary
+
+Replay promotion-cap contraction and the recorded adverse queue, RTT, and bandwidth
+samples independently. A temporary promotion ceiling must use fresh measured capacity,
+never exceed the active probe/configured ceiling, expire without statistics, and be
+revoked by stale ownership or genuine congestion. Mutants must reject removing this
+continuity or substituting the doubled probe budget for measured capacity.
+
+Parse native probe diagnostics from the actual pinned SDK, not only synthetic log
+fixtures; retain only bounded numeric/enum events. Native callbacks are process-scoped
+and must not acquire a current peer's identity merely because that peer drains them.
+A cluster-created event or accepted sender parameter is not probe-feedback or frame
+presentation evidence. Bind live timing to the installed host and one acknowledged
+Show request, distinguish host-receipt timing from actual display timing, and retain
+intermediate reversals. Full-resolution reports do not alone prove perceived clarity.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac

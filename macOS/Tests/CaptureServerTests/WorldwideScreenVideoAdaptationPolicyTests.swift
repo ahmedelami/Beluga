@@ -1142,7 +1142,14 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     missingBandwidthFixture.totalPacketSendDelay,
                 observedAt: originalDeadline.advanced(by: .seconds(sample))
             )
-            XCTAssertNil(update)
+            if sample == 1 {
+                XCTAssertEqual(
+                    update,
+                    missingBandwidthFixture.policy.recommendation(for: .critical)
+                )
+            } else {
+                XCTAssertNil(update)
+            }
             XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
         }
         XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
@@ -1167,13 +1174,12 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     noReportFixture.totalPacketSendDelay
             )
         }
-        XCTAssertNil(
-            noReportFixture.policy.expireApplicationLimitedProbeWithoutReport(
-                peerGeneration: 1,
-                isCaptureActive: true,
-                observedAt: deadline
-            )
+        let expired = noReportFixture.policy.expireApplicationLimitedProbeWithoutReport(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            observedAt: deadline
         )
+        XCTAssertEqual(expired, noReportFixture.policy.recommendation(for: .critical))
         XCTAssertEqual(noReportFixture.policy.currentTier, .critical)
         XCTAssertNil(noReportFixture.policy.applicationLimitedProbeOriginTier)
     }

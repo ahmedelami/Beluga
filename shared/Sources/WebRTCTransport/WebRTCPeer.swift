@@ -12937,5 +12937,11 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
 }
 
 private enum WebRTCRuntime {
-    static let isInitialized = LKRTCInitializeSSL()
+    static let isInitialized: Bool = {
+        guard LKRTCInitializeSSL() else { return false }
+        #if os(macOS)
+        WebRTCNativeProbeDiagnostics.start()
+        #endif
+        return true
+    }()
 }

@@ -2570,6 +2570,7 @@ actor WorldwideScreenService {
                   peerGeneration == sourcePeerGeneration else {
                 return
             }
+            logNativeScreenProbeDiagnostics()
             guard captureSource != nil else {
                 screenVideoAdaptationFastStatisticsAreAvailable = false
                 nextDeadline = clock.now.advanced(
@@ -2623,6 +2624,15 @@ actor WorldwideScreenService {
                 // makes the ordinary one-second event the authoritative fallback until a fresh
                 // sender-scoped sample succeeds.
                 screenVideoAdaptationFastStatisticsAreAvailable = false
+                // A missing report cannot extend a temporary ceiling indefinitely, even if the
+                // ordinary statistics lane is also stalled. Expiry never supplies health proof.
+                await adaptScreenVideoForNetworkConditions(
+                    nil,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    expectedPolicyRevision: screenVideoAdaptationPolicyRevision,
+                    allowsAutomaticResume: false
+                )
             }
 
             nextDeadline = nextDeadline.advanced(
@@ -2631,6 +2641,26 @@ actor WorldwideScreenService {
             if nextDeadline < clock.now {
                 nextDeadline = clock.now
             }
+        }
+    }
+
+    private func logNativeScreenProbeDiagnostics() {
+        let batch = WebRTCNativeProbeDiagnostics.drain()
+        for event in batch.events {
+            // Native log callbacks are process-wide; do not attach this peer's identity to them.
+            logger.debug(
+                "Worldwide screen native probe scope=process "
+                    + "seq=\(event.sequence) ageMs=\(event.processDiagnosticsAgeMilliseconds) "
+                    + "kind=\(event.kind.rawValue) "
+                    + "active=\(event.isActive.map(String.init) ?? "unknown") "
+                    + "sendBps=\(event.bitrateBps.map(String.init) ?? "unknown") "
+                    + "receiveBps=\(event.receiveBitrateBps.map(String.init) ?? "unknown") "
+                    + "minimumBytes=\(event.minimumBytes.map(String.init) ?? "unknown") "
+                    + "minimumPackets=\(event.minimumPackets.map(String.init) ?? "unknown") "
+                    + "cluster=\(event.clusterID.map(String.init) ?? "unknown") "
+                    + "blocked=\(event.blockReason?.rawValue ?? "none") "
+                    + "dropped=\(batch.droppedEventCount)"
+            )
         }
     }
 
@@ -2702,6 +2732,10 @@ actor WorldwideScreenService {
                 + " appliedCeilingKbps=\(recommendation.maximumBitrateBps / 1_000)"
                 + " appliedTotalCapKbps="
                 + "\(recommendation.maximumTotalRTPBitrateBps / 1_000)"
+                + " promotionCapKbps="
+                + (proposedPolicy.promotionCapacityContinuity.map {
+                    String($0.maximumTotalRTPBitrateBps / 1_000)
+                } ?? "none")
                 + " probeOrigin="
                 + (proposedPolicy.applicationLimitedProbeOriginTier.map {
                     String(describing: $0)
