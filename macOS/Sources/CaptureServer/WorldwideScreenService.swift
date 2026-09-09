@@ -2704,6 +2704,9 @@ actor WorldwideScreenService {
                     screenMediaSuspension.isAutomaticallySuspended,
                 availableOutgoingBitrateBps: snapshot.availableOutgoingBitrate,
                 currentRoundTripTimeSeconds: snapshot.currentRoundTripTime,
+                roundTripTimeObservation: snapshot.roundTripTimeObservation,
+                collectionSequence: snapshot.collectionSequence,
+                requireRoundTripTimeObservation: true,
                 selectedRoute: snapshot.route,
                 outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
                 outboundVideoTotalPacketSendDelaySeconds:
@@ -2719,6 +2722,9 @@ actor WorldwideScreenService {
         }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
+        let rttDiagnostics = WorldwideScreenRoundTripTimeDiagnostics(
+            observation: snapshot?.roundTripTimeObservation
+        )
         logger.debug(
             "Worldwide screen network totalCapKbps=\(maximumVideoBitrate / 1_000) "
                 + "fullVideoKbps=\(proposedPolicy.maximumTierVideoBitrateBps / 1_000) "
@@ -2755,6 +2761,15 @@ actor WorldwideScreenService {
                 + (snapshot?.currentRoundTripTime.map {
                     String(format: "%.1f", $0 * 1_000)
                 } ?? "unknown")
+                + " rttObservation=\(proposedPolicy.roundTripTimeDisposition.rawValue)"
+                + " rttTotalMicros="
+                + (rttDiagnostics.totalMicroseconds.map(String.init) ?? "unknown")
+                + " rttResponses="
+                + (rttDiagnostics.responsesReceived.map(String.init) ?? "unknown")
+                + " collectionSeq="
+                + (snapshot?.collectionSequence.map(String.init) ?? "unknown")
+                + " consumedSeq="
+                + (proposedPolicy.lastConsumedCollectionSequence.map(String.init) ?? "unknown")
                 + " sendQueueMs="
                 + (proposedPolicy.lastAveragePacketSendDelaySeconds.map {
                     String(format: "%.1f", $0 * 1_000)
@@ -3076,8 +3091,8 @@ actor WorldwideScreenService {
         automaticScreenMediaResumeTimeoutTask = nil
     }
 
-    /// Opens a new statistics epoch only after the resumed sender ceiling and capturer FPS are
-    /// restored. It also discards partial threshold evidence from the suspended encoder state.
+    /// Fences native requests at sender restoration or Hide and discards partial threshold
+    /// evidence from the preceding encoder/visibility epoch.
     private func beginPostResumeScreenVideoAdaptationEpoch() {
         if let peer {
             screenVideoAdaptationFreshnessFence.beginPostResumeEpoch(
@@ -3821,6 +3836,15 @@ actor WorldwideScreenService {
             }
 
         case .hideScreen:
+            logger.debug(
+                "Worldwide screen visibility command=hide "
+                    + "requestID=\(request.id) peerGeneration=\(peerGeneration) "
+                    + "hostPID=\(ProcessInfo.processInfo.processIdentifier)"
+            )
+            // Hide and a new Show can complete between statistics polls. Retire old RTT health
+            // and in-flight reports synchronously, without resetting the native watermark.
+            screenVideoAdaptationPolicy.invalidateRoundTripTimeObservation()
+            beginPostResumeScreenVideoAdaptationEpoch()
             if recoveryProofRequired {
                 let proofRequest = PendingRecoveryProofRequest(
                     id: request.id,

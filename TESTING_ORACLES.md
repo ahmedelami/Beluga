@@ -189,6 +189,19 @@ presentation evidence. Bind live timing to the installed host and one acknowledg
 Show request, distinguish host-receipt timing from actual display timing, and retain
 intermediate reversals. Full-resolution reports do not alone prove perceived clarity.
 
+Selected ICE-pair RTT is cached between native ping responses. A new statistics request
+or collection sequence is not a new RTT measurement. Consume a privacy-reduced pair
+identity plus advancing cumulative total RTT/response counters once for RTT-only
+pressure and baseline learning; piggyback acknowledgements may advance only the total.
+Reject missing/malformed native metadata and reordered reports. Keep retained unhealthy
+or expired evidence from authorizing upgrades, while preserving independent fresh
+queue/bandwidth protection and clock-bounded probe expiry. Cover pair ABA/reset,
+Hide/route/lane changes, legacy snapshot decoding, and both native snapshot-copy paths.
+Mutants must fail when duplicate watermarks regain pressure, unknown RTT becomes healthy,
+the sequence fence disappears, or either copy drops the observation. A provisional
+initial reference must not add two native ping intervals to cold startup; document
+that it has less initial outlier filtering than a three-distinct-measurement baseline.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac

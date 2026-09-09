@@ -1,5 +1,6 @@
 @preconcurrency import LiveKitWebRTC
 import CoreFoundation
+import CryptoKit
 import Foundation
 
 /// Strictly parsed evidence from one sender-scoped native statistics report.
@@ -111,6 +112,7 @@ enum WebRTCStatisticsParser {
             currentRoundTripTime: selectedPair.flatMap {
                 double("currentRoundTripTime", in: $0.values)
             },
+            roundTripTimeObservation: roundTripTimeObservation(in: selectedPair),
             availableOutgoingBitrate: selectedPair.flatMap {
                 double("availableOutgoingBitrate", in: $0.values)
             },
@@ -486,7 +488,8 @@ enum WebRTCStatisticsParser {
 
     private static func strictUnsigned(
         _ key: String,
-        in values: [String: Any]
+        in values: [String: Any],
+        maximumValue: UInt64 = UInt64(Int64.max)
     ) -> UInt64? {
         guard let number = values[key] as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID() else {
@@ -500,7 +503,7 @@ enum WebRTCStatisticsParser {
             return UInt64(value)
         case "C", "S", "I", "L", "Q":
             let value = number.uint64Value
-            guard value <= UInt64(Int64.max) else { return nil }
+            guard value <= maximumValue else { return nil }
             return value
         case "f", "d":
             let value = number.doubleValue
@@ -518,7 +521,8 @@ enum WebRTCStatisticsParser {
 
     private static func strictNonnegativeDouble(
         _ key: String,
-        in values: [String: Any]
+        in values: [String: Any],
+        maximumValue: Double = 1_000_000_000
     ) -> Double? {
         guard let number = values[key] as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID() else {
@@ -527,10 +531,46 @@ enum WebRTCStatisticsParser {
         let value = number.doubleValue
         guard value.isFinite,
               value >= 0,
-              value <= 1_000_000_000 else {
+              value <= maximumValue else {
             return nil
         }
         return value
+    }
+
+    private static func roundTripTimeObservation(
+        in selectedPair: WebRTCStatisticsRecord?
+    ) -> WebRTCRoundTripTimeObservation {
+        guard let selectedPair,
+              !selectedPair.id.isEmpty,
+              selectedPair.id.utf8.prefix(513).count <= 512,
+              let current = strictNonnegativeDouble(
+                  "currentRoundTripTime",
+                  in: selectedPair.values,
+                  maximumValue: .infinity
+              ),
+              let total = strictNonnegativeDouble(
+                  "totalRoundTripTime",
+                  in: selectedPair.values,
+                  maximumValue: .infinity
+              ),
+              total >= current,
+              let responses = strictUnsigned(
+                  "responsesReceived",
+                  in: selectedPair.values,
+                  maximumValue: .max
+              ) else {
+            return .unavailable
+        }
+        let fingerprint = SHA256.hash(data: Data(selectedPair.id.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return .measurement(
+            WebRTCRoundTripTimeMeasurement(
+                selectedCandidatePairFingerprint: fingerprint,
+                totalRoundTripTimeSeconds: total,
+                responsesReceived: responses
+            )
+        )
     }
 
     private static func selectedCandidatePair(

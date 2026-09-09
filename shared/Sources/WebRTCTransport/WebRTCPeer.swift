@@ -8352,7 +8352,9 @@ public actor WebRTCPeer {
         )
         let wholePeerReportWasCollected = nativeSnapshotResult != nil
         let nativeSnapshot =
-            nativeSnapshotResult ?? WebRTCStatisticsSnapshot()
+            nativeSnapshotResult ?? WebRTCStatisticsSnapshot(
+                roundTripTimeObservation: .unavailable
+            )
 
         let receiverReport: (
             capture: WebRTCIPhoneMicrophoneReceiverStatisticsCapture,
@@ -8482,44 +8484,14 @@ public actor WebRTCPeer {
     private func snapshotRestoringCurrentRouteIfNeeded(
         _ snapshot: WebRTCStatisticsSnapshot
     ) -> WebRTCStatisticsSnapshot {
-        guard snapshot.route == nil,
-              let currentRoute else {
-            return snapshot
-        }
-        return WebRTCStatisticsSnapshot(
-            collectedAt: snapshot.collectedAt,
-            collectionSequence: snapshot.collectionSequence,
-            route: currentRoute,
-            currentRoundTripTime: snapshot.currentRoundTripTime,
-            availableOutgoingBitrate: snapshot.availableOutgoingBitrate,
-            jitter: snapshot.jitter,
-            outboundVideo: snapshot.outboundVideo,
-            inboundVideo: snapshot.inboundVideo,
-            audioSource: snapshot.audioSource,
-            outboundAudio: snapshot.outboundAudio,
-            inboundAudio: snapshot.inboundAudio,
-            remoteInboundAudio: snapshot.remoteInboundAudio
-        )
+        snapshot.restoringRouteIfNeeded(currentRoute)
     }
 
     private func replacingInboundAudio(
         in snapshot: WebRTCStatisticsSnapshot,
         with inboundAudio: WebRTCAudioStatistics?
     ) -> WebRTCStatisticsSnapshot {
-        WebRTCStatisticsSnapshot(
-            collectedAt: snapshot.collectedAt,
-            collectionSequence: snapshot.collectionSequence,
-            route: snapshot.route,
-            currentRoundTripTime: snapshot.currentRoundTripTime,
-            availableOutgoingBitrate: snapshot.availableOutgoingBitrate,
-            jitter: snapshot.jitter,
-            outboundVideo: snapshot.outboundVideo,
-            inboundVideo: snapshot.inboundVideo,
-            audioSource: snapshot.audioSource,
-            outboundAudio: snapshot.outboundAudio,
-            inboundAudio: inboundAudio,
-            remoteInboundAudio: snapshot.remoteInboundAudio
-        )
+        snapshot.replacingInboundAudio(with: inboundAudio)
     }
 
     private func currentIPhoneMicrophoneReceiverStatisticsCapture()

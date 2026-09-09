@@ -224,6 +224,29 @@ public struct WebRTCAudioStatistics: Codable, Equatable, Sendable {
     }
 }
 
+/// A selected ICE pair's cumulative RTT watermark, without native identifiers or addresses.
+public struct WebRTCRoundTripTimeMeasurement: Codable, Equatable, Sendable {
+    public let selectedCandidatePairFingerprint: String
+    public let totalRoundTripTimeSeconds: Double
+    public let responsesReceived: UInt64
+
+    public init(
+        selectedCandidatePairFingerprint: String,
+        totalRoundTripTimeSeconds: Double,
+        responsesReceived: UInt64
+    ) {
+        self.selectedCandidatePairFingerprint = selectedCandidatePairFingerprint
+        self.totalRoundTripTimeSeconds = totalRoundTripTimeSeconds
+        self.responsesReceived = responsesReceived
+    }
+}
+
+/// A native report without a complete watermark is unavailable, never legacy scalar evidence.
+public enum WebRTCRoundTripTimeObservation: Codable, Equatable, Sendable {
+    case unavailable
+    case measurement(WebRTCRoundTripTimeMeasurement)
+}
+
 /// A timestamped diagnostic snapshot across route, video, and audio statistics.
 public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
     public let collectedAt: Date
@@ -232,6 +255,8 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
     public let collectionSequence: UInt64?
     public let route: WebRTCICERouteDiagnostics?
     public let currentRoundTripTime: Double?
+    /// Nil is reserved for older serialized snapshots and synthetic callers.
+    public let roundTripTimeObservation: WebRTCRoundTripTimeObservation?
     public let availableOutgoingBitrate: Double?
     public let jitter: Double?
     public let outboundVideo: WebRTCVideoStatistics?
@@ -246,6 +271,7 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
         collectionSequence: UInt64? = nil,
         route: WebRTCICERouteDiagnostics? = nil,
         currentRoundTripTime: Double? = nil,
+        roundTripTimeObservation: WebRTCRoundTripTimeObservation? = nil,
         availableOutgoingBitrate: Double? = nil,
         jitter: Double? = nil,
         outboundVideo: WebRTCVideoStatistics? = nil,
@@ -259,6 +285,7 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
         self.collectionSequence = collectionSequence
         self.route = route
         self.currentRoundTripTime = currentRoundTripTime
+        self.roundTripTimeObservation = roundTripTimeObservation
         self.availableOutgoingBitrate = availableOutgoingBitrate
         self.jitter = jitter
         self.outboundVideo = outboundVideo
@@ -267,6 +294,45 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
         self.outboundAudio = outboundAudio
         self.inboundAudio = inboundAudio
         self.remoteInboundAudio = remoteInboundAudio
+    }
+
+    func restoringRouteIfNeeded(
+        _ currentRoute: WebRTCICERouteDiagnostics?
+    ) -> Self {
+        guard route == nil, let currentRoute else { return self }
+        return Self(
+            collectedAt: collectedAt,
+            collectionSequence: collectionSequence,
+            route: currentRoute,
+            currentRoundTripTime: currentRoundTripTime,
+            roundTripTimeObservation: roundTripTimeObservation,
+            availableOutgoingBitrate: availableOutgoingBitrate,
+            jitter: jitter,
+            outboundVideo: outboundVideo,
+            inboundVideo: inboundVideo,
+            audioSource: audioSource,
+            outboundAudio: outboundAudio,
+            inboundAudio: inboundAudio,
+            remoteInboundAudio: remoteInboundAudio
+        )
+    }
+
+    func replacingInboundAudio(with inboundAudio: WebRTCAudioStatistics?) -> Self {
+        Self(
+            collectedAt: collectedAt,
+            collectionSequence: collectionSequence,
+            route: route,
+            currentRoundTripTime: currentRoundTripTime,
+            roundTripTimeObservation: roundTripTimeObservation,
+            availableOutgoingBitrate: availableOutgoingBitrate,
+            jitter: jitter,
+            outboundVideo: outboundVideo,
+            inboundVideo: inboundVideo,
+            audioSource: audioSource,
+            outboundAudio: outboundAudio,
+            inboundAudio: inboundAudio,
+            remoteInboundAudio: remoteInboundAudio
+        )
     }
 }
 

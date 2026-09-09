@@ -88,6 +88,29 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         case unavailableOrReset
     }
 
+    enum RoundTripTimeDisposition: String, Equatable, Sendable {
+        case legacy
+        case provisionalHealthy
+        case freshHealthy
+        case freshInflated
+        case retainedHealthy
+        case retainedInflated
+        case unavailable
+        case expired
+        case reseeded
+        case reordered
+    }
+
+    private enum NativeRoundTripTimeHealth: Equatable, Sendable {
+        case unknown, healthy, inflated
+    }
+
+    private struct RoundTripTimeEvidence {
+        let hasFreshPressure: Bool
+        let allowsUpgrade: Bool
+        let permitsLegacyMissingValue: Bool
+    }
+
     private struct AutomaticResumeProbeRestoration: Equatable, Sendable {
         let belowReserveProbeDisprovedSenderLimitation: Bool
         let applicationLimitedProbeCooldownSamplesRemaining: Int
@@ -160,6 +183,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private static let roundTripTimeAbsoluteInflationSeconds = 0.050
     private static let maximumRoundTripTimeBaselineFallPerSample = 0.010
     static let roundTripTimeBootstrapSampleCount = 3
+    /// Observation age, not the exact ping age: only a distinct cumulative watermark renews it.
+    /// This spans the pinned native stable-pair ping interval without granting indefinite health.
+    static let roundTripTimeObservationValidity = Duration.seconds(4)
     private static let maximumAveragePacketSendDelaySeconds = 0.100
     private static let immediateAveragePacketSendDelaySeconds = 0.200
     private static let maximumUpgradePacketSendDelaySeconds = 0.020
@@ -223,6 +249,17 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         ContinuousClock.Instant?
     private(set) var roundTripTimeBaselineSeconds: Double?
     private var roundTripTimeBootstrapSamples: [Double] = []
+    private(set) var roundTripTimeDisposition: RoundTripTimeDisposition = .unavailable
+    private(set) var roundTripTimeObservationAge: Duration?
+    private(set) var roundTripTimeReferenceIsProvisional = false
+    private(set) var lastConsumedCollectionSequence: UInt64?
+    private var roundTripTimeWatermark: WebRTCRoundTripTimeMeasurement?
+    private var nativeRoundTripTimeHealth: NativeRoundTripTimeHealth = .unknown
+    private var usesNativeRoundTripTimeEvidence = false
+    private var lastRoundTripTimeAdvancement: ContinuousClock.Instant?
+    private var lastMeasuredRoundTripTimeSeconds: Double?
+    private var permitsInitialRoundTripTimeReference = true
+    private var distinctHealthyRoundTripTimeReferenceCount = 0
     private(set) var selectedRoute: WebRTCICERouteDiagnostics?
     private var lastOutboundVideoPacketsSent: UInt64?
     private var lastOutboundVideoTotalPacketSendDelaySeconds: Double?
@@ -330,6 +367,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         selectedRoute = nil
         resetPathMeasurements()
+        // Collection order and native measurement identity belong to the peer, not the sampler
+        // cadence, geometry, Show/Hide lifetime, or selected-route diagnostics lifetime.
+        lastConsumedCollectionSequence = nil
+        roundTripTimeWatermark = nil
+        lastRoundTripTimeAdvancement = nil
+        lastMeasuredRoundTripTimeSeconds = nil
+        roundTripTimeObservationAge = nil
+        permitsInitialRoundTripTimeReference = true
         resetAutomaticSuspensionMeasurements()
         return true
     }
@@ -340,6 +385,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         selectedRoute = nil
         revertApplicationLimitedProbeIfActive()
         resetPathMeasurements()
+    }
+
+    /// Revokes RTT health synchronously at Hide, even if Show arrives before an inactive stats
+    /// report. Preserve peer-owned identity/order and the path reference; only advancement can
+    /// reauthorize RTT health. The service's statistics epoch owns partial-window reset/fencing.
+    mutating func invalidateRoundTripTimeObservation() {
+        revokeRoundTripTimeHealth()
+        permitsInitialRoundTripTimeReference = false
     }
 
     /// Prevents threshold evidence collected on one cadence, or before a long observation gap,
@@ -366,11 +419,49 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         isAutomaticallySuspended: Bool = false,
         availableOutgoingBitrateBps: Double?,
         currentRoundTripTimeSeconds: Double?,
+        roundTripTimeObservation: WebRTCRoundTripTimeObservation? = nil,
+        collectionSequence: UInt64? = nil,
+        requireRoundTripTimeObservation: Bool = false,
         selectedRoute: WebRTCICERouteDiagnostics? = nil,
         outboundVideoPacketsSent: UInt64? = nil,
         outboundVideoTotalPacketSendDelaySeconds: Double? = nil,
         observedAt: ContinuousClock.Instant = .now
     ) -> WorldwideScreenVideoEncodingRecommendation? {
+        let didResetForNewPeer = bind(toPeerGeneration: generation)
+        // Time still passes when a report is rejected. Aging an existing lease is not renewing
+        // it or consuming the report, and prevents stale stable-resume authorization.
+        roundTripTimeObservationAge = lastRoundTripTimeAdvancement.map {
+            $0.duration(to: observedAt)
+        }
+        if requireRoundTripTimeObservation, collectionSequence == nil {
+            // Native request ordering is part of the evidence boundary. Unordered metadata may
+            // expire a wall-clock lease, but cannot change BWE/queue/RTT measurement state.
+            revokeRoundTripTimeHealth()
+            usesNativeRoundTripTimeEvidence = true
+            lastSampleHasLatencyPressure = false
+            lastSampleHasPositiveSuspensionPressure = false
+            return expireApplicationLimitedProbeWithoutReport(
+                peerGeneration: generation,
+                isCaptureActive: isCaptureActive,
+                observedAt: observedAt
+            )
+        }
+        if let collectionSequence {
+            if let lastConsumedCollectionSequence,
+               collectionSequence <= lastConsumedCollectionSequence {
+                // A slower fallback request may finish after a newer fast-lane report. Reject
+                // the entire older report, including BWE/queue/cap changes, before consuming it.
+                roundTripTimeDisposition = .reordered
+                lastSampleHasLatencyPressure = false
+                lastSampleHasPositiveSuspensionPressure = false
+                return expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: generation,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: observedAt
+                )
+            }
+            lastConsumedCollectionSequence = collectionSequence
+        }
         let previousRecommendation = currentRecommendation
         let hadPromotionCapacityContinuity = promotionCapacityContinuity != nil
         updatePromotionCapacityContinuity(
@@ -380,10 +471,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         let changedRecommendation = updateNetworkEvidence(
             peerGeneration: generation,
+            didResetForNewPeer: didResetForNewPeer,
             isCaptureActive: isCaptureActive,
             isAutomaticallySuspended: isAutomaticallySuspended,
             availableOutgoingBitrateBps: availableOutgoingBitrateBps,
             currentRoundTripTimeSeconds: currentRoundTripTimeSeconds,
+            roundTripTimeObservation: roundTripTimeObservation
+                ?? (requireRoundTripTimeObservation ? .unavailable : nil),
             selectedRoute: selectedRoute,
             outboundVideoPacketsSent: outboundVideoPacketsSent,
             outboundVideoTotalPacketSendDelaySeconds:
@@ -405,21 +499,28 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
 
     private mutating func updateNetworkEvidence(
         peerGeneration generation: UInt64,
+        didResetForNewPeer: Bool,
         isCaptureActive: Bool,
         isAutomaticallySuspended: Bool,
         availableOutgoingBitrateBps: Double?,
         currentRoundTripTimeSeconds: Double?,
+        roundTripTimeObservation: WebRTCRoundTripTimeObservation?,
         selectedRoute: WebRTCICERouteDiagnostics?,
         outboundVideoPacketsSent: UInt64?,
         outboundVideoTotalPacketSendDelaySeconds: Double?,
         observedAt: ContinuousClock.Instant
     ) -> WorldwideScreenVideoEncodingRecommendation? {
-        let didResetForNewPeer = bind(toPeerGeneration: generation)
         if let selectedRoute,
            selectedRoute != self.selectedRoute {
+            let isInitialRoute = self.selectedRoute == nil
+                && roundTripTimeWatermark == nil
+                && permitsInitialRoundTripTimeReference
             self.selectedRoute = selectedRoute
             revertApplicationLimitedProbeIfActive()
             resetPathMeasurements()
+            if isInitialRoute {
+                permitsInitialRoundTripTimeReference = true
+            }
         }
 
         // Pre-Show and manually hidden sessions have no outbound video with which to interpret
@@ -432,6 +533,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 configuredTotalRTPBitrateBps: configuredTotalRTPBitrateBps
             )
             resetPathMeasurements()
+            // Hidden reports cannot authorize a later Show using a cached measurement. Keep a
+            // valid watermark as a tombstone, without treating it as RTT/queue/BWE health.
+            if case let .measurement(measurement) = roundTripTimeObservation,
+               isValidRoundTripTimeWatermark(measurement) {
+                roundTripTimeWatermark = measurement
+            }
             resetAutomaticSuspensionMeasurements()
             return nil
         }
@@ -439,12 +546,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         let currentRoundTripTimeSeconds = validRoundTripTime(
             currentRoundTripTimeSeconds
         )
-        let roundTripTimeIsInflated = roundTripTimeIsInflated(
-            currentRoundTripTimeSeconds
+        let roundTripTimeEvidence = consumeRoundTripTimeEvidence(
+            current: currentRoundTripTimeSeconds,
+            observation: roundTripTimeObservation,
+            observedAt: observedAt
         )
-        if let currentRoundTripTimeSeconds {
-            updateRoundTripTimeBaseline(currentRoundTripTimeSeconds)
-        }
+        // Only a fresh inflated native watermark applies additional RTT-only descent. Retained
+        // unhealthy/unknown RTT still vetoes upgrades, without suppressing fresh queue pressure.
+        let roundTripTimeIsInflated = roundTripTimeEvidence.hasFreshPressure
         let packetQueueObservation = packetQueueObservationSinceLastSample(
                 packetsSent: outboundVideoPacketsSent,
                 totalPacketSendDelaySeconds:
@@ -527,12 +636,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         } else {
             packetQueueAllowsUpgrade = false
         }
-        let roundTripTimeAllowsUpgrade = roundTripTimeAllowsUpgrade(
-            currentRoundTripTimeSeconds
-        )
+        let roundTripTimeAllowsUpgrade = roundTripTimeEvidence.allowsUpgrade
         let directUpgradeEvidenceIsHealthy = averagePacketSendDelaySeconds.map {
             $0 <= Self.maximumUpgradePacketSendDelaySeconds
-                && (currentRoundTripTimeSeconds == nil
+                && (roundTripTimeEvidence.permitsLegacyMissingValue
                     || roundTripTimeAllowsUpgrade)
         } ?? roundTripTimeAllowsUpgrade
         let strictUpgradeEvidenceIsHealthy = packetQueueAllowsUpgrade
@@ -999,6 +1106,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         isCaptureActive: Bool,
         observedAt: ContinuousClock.Instant = .now
     ) -> WorldwideScreenVideoEncodingRecommendation? {
+        if peerGeneration == generation {
+            roundTripTimeObservationAge = lastRoundTripTimeAdvancement.map {
+                $0.duration(to: observedAt)
+            }
+        }
         guard peerGeneration == generation,
               isCaptureActive else {
             return nil
@@ -1048,7 +1160,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 maximumSuspensionResumeProbeSampleCount = 0
                 return .resume
             }
-            guard !lastSampleHasLatencyPressure else {
+            let nativeRTTAllowsStableResume = nativeRoundTripTimeHealth == .healthy
+                && roundTripTimeObservationAge.map {
+                    $0 >= .zero && $0 <= Self.roundTripTimeObservationValidity
+                } == true
+            guard !lastSampleHasLatencyPressure,
+                  !usesNativeRoundTripTimeEvidence || nativeRTTAllowsStableResume else {
                 stableSuspensionResumeProbeSampleCount = 0
                 return nil
             }
@@ -1450,6 +1567,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         resetApplicationLimitedProbeBackoff()
         roundTripTimeBaselineSeconds = nil
         roundTripTimeBootstrapSamples = []
+        revokeRoundTripTimeHealth()
+        permitsInitialRoundTripTimeReference = false
+        roundTripTimeReferenceIsProvisional = false
+        distinctHealthyRoundTripTimeReferenceCount = 0
         lastOutboundVideoPacketsSent = nil
         lastOutboundVideoTotalPacketSendDelaySeconds = nil
         bandwidthEstimateIsUnavailable = false
@@ -1474,6 +1595,159 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private func validRoundTripTime(_ value: Double?) -> Double? {
         guard let value, value.isFinite, value > 0 else { return nil }
         return value
+    }
+
+    private mutating func revokeRoundTripTimeHealth() {
+        nativeRoundTripTimeHealth = .unknown
+        roundTripTimeDisposition = .unavailable
+    }
+
+    private func isValidRoundTripTimeWatermark(
+        _ measurement: WebRTCRoundTripTimeMeasurement
+    ) -> Bool {
+        let fingerprint = measurement.selectedCandidatePairFingerprint.utf8
+        return fingerprint.count == 64
+            && fingerprint.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+            && measurement.totalRoundTripTimeSeconds.isFinite
+            && measurement.totalRoundTripTimeSeconds >= 0
+    }
+
+    private mutating func consumeRoundTripTimeEvidence(
+        current: Double?,
+        observation: WebRTCRoundTripTimeObservation?,
+        observedAt: ContinuousClock.Instant
+    ) -> RoundTripTimeEvidence {
+        let unknown = RoundTripTimeEvidence(
+            hasFreshPressure: false,
+            allowsUpgrade: false,
+            permitsLegacyMissingValue: false
+        )
+        usesNativeRoundTripTimeEvidence = observation != nil
+        guard let observation else {
+            // Compatibility is explicit and limited to direct legacy/synthetic callers. Actual
+            // host snapshots request strict observation handling at the service boundary.
+            roundTripTimeDisposition = .legacy
+            let inflated = roundTripTimeIsInflated(current)
+            if let current { updateRoundTripTimeBaseline(current) }
+            return RoundTripTimeEvidence(
+                hasFreshPressure: inflated,
+                allowsUpgrade: roundTripTimeAllowsUpgrade(current),
+                permitsLegacyMissingValue: current == nil
+            )
+        }
+
+        roundTripTimeObservationAge = lastRoundTripTimeAdvancement.map {
+            $0.duration(to: observedAt)
+        }
+        guard case let .measurement(measurement) = observation,
+              isValidRoundTripTimeWatermark(measurement) else {
+            // Never forget the consumed watermark: missing metadata followed by the same old
+            // measurement cannot revive health or apply the same pressure a second time.
+            revokeRoundTripTimeHealth()
+            return unknown
+        }
+
+        let previous = roundTripTimeWatermark
+        let isFirstForPeer = previous == nil && permitsInitialRoundTripTimeReference
+        permitsInitialRoundTripTimeReference = false
+        roundTripTimeWatermark = measurement
+
+        if let previous {
+            let replacedPair = measurement.selectedCandidatePairFingerprint
+                != previous.selectedCandidatePairFingerprint
+            let regressed = measurement.totalRoundTripTimeSeconds
+                    < previous.totalRoundTripTimeSeconds
+                || measurement.responsesReceived < previous.responsesReceived
+            if replacedPair || regressed {
+                // Every pair change is a seed, including A -> B -> A. Counter resets also seed
+                // unknown; neither event is a newly measured ping merely because values differ.
+                revokeRoundTripTimeHealth()
+                roundTripTimeDisposition = .reseeded
+                if replacedPair {
+                    roundTripTimeBaselineSeconds = nil
+                    roundTripTimeBootstrapSamples = []
+                    distinctHealthyRoundTripTimeReferenceCount = 0
+                    roundTripTimeReferenceIsProvisional = false
+                }
+                return unknown
+            }
+        } else if !isFirstForPeer {
+            revokeRoundTripTimeHealth()
+            roundTripTimeDisposition = .reseeded
+            return unknown
+        }
+
+        // Even with valid counters, missing/zero/non-finite/inconsistent scalar RTT is not health.
+        // Consume its watermark so reusing it with a repaired scalar still requires advancement.
+        guard let current,
+              measurement.totalRoundTripTimeSeconds >= current,
+              roundTripTimeObservationAge.map({ $0 >= .zero }) ?? true else {
+            revokeRoundTripTimeHealth()
+            return unknown
+        }
+        let advanced = previous.map {
+            measurement.totalRoundTripTimeSeconds > $0.totalRoundTripTimeSeconds
+                || measurement.responsesReceived > $0.responsesReceived
+        } ?? isFirstForPeer
+        guard advanced else {
+            guard current == lastMeasuredRoundTripTimeSeconds else {
+                // A changed scalar without a changed native watermark is contradictory, not a
+                // new ping. Revoke retained health without minting another RTT penalty.
+                revokeRoundTripTimeHealth()
+                return unknown
+            }
+            switch nativeRoundTripTimeHealth {
+            case .healthy:
+                guard let age = roundTripTimeObservationAge,
+                      age <= Self.roundTripTimeObservationValidity else {
+                    nativeRoundTripTimeHealth = .unknown
+                    roundTripTimeDisposition = .expired
+                    return unknown
+                }
+                roundTripTimeDisposition = .retainedHealthy
+                return RoundTripTimeEvidence(
+                    hasFreshPressure: false,
+                    allowsUpgrade: true,
+                    permitsLegacyMissingValue: false
+                )
+            case .inflated:
+                roundTripTimeDisposition = .retainedInflated
+            case .unknown:
+                roundTripTimeDisposition = .unavailable
+            }
+            return unknown
+        }
+
+        lastRoundTripTimeAdvancement = observedAt
+        lastMeasuredRoundTripTimeSeconds = current
+        roundTripTimeObservationAge = .zero
+        if roundTripTimeBaselineSeconds == nil {
+            // One explicitly provisional reference avoids waiting for three 2.5-second ICE
+            // pings before startup. Fresh queue and consecutive qualified BWE reports remain
+            // mandatory for the existing raised-cap probe; this is not extra capacity evidence.
+            roundTripTimeBaselineSeconds = current
+            roundTripTimeBootstrapSamples = []
+            distinctHealthyRoundTripTimeReferenceCount = 1
+            roundTripTimeReferenceIsProvisional = true
+        } else if !roundTripTimeIsInflated(current) {
+            updateRoundTripTimeBaseline(current)
+            distinctHealthyRoundTripTimeReferenceCount = min(
+                Self.roundTripTimeBootstrapSampleCount,
+                distinctHealthyRoundTripTimeReferenceCount + 1
+            )
+            roundTripTimeReferenceIsProvisional = distinctHealthyRoundTripTimeReferenceCount
+                < Self.roundTripTimeBootstrapSampleCount
+        }
+        let inflated = roundTripTimeIsInflated(current)
+        nativeRoundTripTimeHealth = inflated ? .inflated : .healthy
+        roundTripTimeDisposition = inflated
+            ? .freshInflated
+            : (isFirstForPeer ? .provisionalHealthy : .freshHealthy)
+        return RoundTripTimeEvidence(
+            hasFreshPressure: inflated,
+            allowsUpgrade: !inflated,
+            permitsLegacyMissingValue: false
+        )
     }
 
     private mutating func updateRoundTripTimeBaseline(_ current: Double) {
