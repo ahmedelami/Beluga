@@ -2716,6 +2716,7 @@ actor WorldwideScreenService {
         guard isCaptureActive || allowsAutomaticResume else { return }
 
         var proposedPolicy = screenVideoAdaptationPolicy
+        var capacityDiagnostics: WorldwideScreenCapacityProbeDiagnostics?
         let changedRecommendation:
             WorldwideScreenVideoEncodingRecommendation?
         if let snapshot, capacityProbeOnly {
@@ -2730,7 +2731,8 @@ actor WorldwideScreenService {
                 selectedRoute: snapshot.route,
                 outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
                 outboundVideoTotalPacketSendDelaySeconds:
-                    snapshot.outboundVideo?.totalPacketSendDelay
+                    snapshot.outboundVideo?.totalPacketSendDelay,
+                diagnostics: { capacityDiagnostics = $0 }
             )
         } else if let snapshot {
             changedRecommendation = proposedPolicy.update(
@@ -2759,6 +2761,13 @@ actor WorldwideScreenService {
         }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
+        if let capacityDiagnostics {
+            logger.debug(
+                "Worldwide screen capacity proposal peerGeneration=\(sourcePeerGeneration) "
+                    + "policyRevision=\(expectedPolicyRevision) "
+                    + capacityDiagnostics.logFields
+            )
+        }
         let rttDiagnostics = WorldwideScreenRoundTripTimeDiagnostics(
             observation: snapshot?.roundTripTimeObservation
         )
@@ -2772,8 +2781,8 @@ actor WorldwideScreenService {
                 + (proposedPolicy.nextHigherTierMinimumDirectUpgradeBitrateBps.map {
                     String($0 / 1_000)
                 } ?? "none")
-                + " appliedCeilingKbps=\(recommendation.maximumBitrateBps / 1_000)"
-                + " appliedTotalCapKbps="
+                + " proposedCeilingKbps=\(recommendation.maximumBitrateBps / 1_000)"
+                + " proposedTotalCapKbps="
                 + "\(recommendation.maximumTotalRTPBitrateBps / 1_000)"
                 + " promotionCapKbps="
                 + (proposedPolicy.promotionCapacityContinuity.map {
@@ -2807,7 +2816,7 @@ actor WorldwideScreenService {
                 + (snapshot?.collectionSequence.map(String.init) ?? "unknown")
                 + " consumedSeq="
                 + (proposedPolicy.lastConsumedCollectionSequence.map(String.init) ?? "unknown")
-                + " sendQueueMs="
+                + " primarySendQueueMs="
                 + (proposedPolicy.lastAveragePacketSendDelaySeconds.map {
                     String(format: "%.1f", $0 * 1_000)
                 } ?? "unknown")
@@ -2876,6 +2885,10 @@ actor WorldwideScreenService {
                           authorizedBy: forwardingAuthorization
                       ),
                       captureVideoBaseDimensions == baseDimensions else {
+                    logger.debug(
+                        "Worldwide screen capacity nativeApply=stale "
+                            + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(expectedPolicyRevision)"
+                    )
                     do {
                         _ = try await sourcePeer
                             .rollbackScreenVideoEncodingUpdateIfCurrent(
@@ -2900,6 +2913,11 @@ actor WorldwideScreenService {
                     )
                 }
                 appliedScreenVideoRecommendation = recommendation
+                logger.debug(
+                    "Worldwide screen capacity nativeApply=accepted "
+                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(expectedPolicyRevision) "
+                        + "totalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
+                )
                 logger.info(
                     "Worldwide screen video tier=\(String(describing: recommendation.tier)) "
                         + "maxKbps=\(recommendation.maximumBitrateBps / 1_000) "
@@ -2926,6 +2944,11 @@ actor WorldwideScreenService {
                 logger.error(
                     "Worldwide screen video adaptation held its previous tier: "
                         + error.localizedDescription
+                )
+                logger.debug(
+                    "Worldwide screen capacity nativeApply=failed "
+                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(expectedPolicyRevision) "
+                        + "proposedTotalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
                 )
                 if capacityProbeOnly,
                    screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil,

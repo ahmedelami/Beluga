@@ -565,14 +565,32 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         selectedRoute: WebRTCICERouteDiagnostics? = nil,
         outboundVideoPacketsSent: UInt64?,
         outboundVideoTotalPacketSendDelaySeconds: Double?,
-        observedAt: ContinuousClock.Instant = .now
+        observedAt: ContinuousClock.Instant = .now,
+        diagnostics: ((WorldwideScreenCapacityProbeDiagnostics) -> Void)? = nil
     ) -> WorldwideScreenVideoEncodingRecommendation? {
-        guard peerGeneration == generation, isCaptureActive else { return nil }
+        var evaluation = WorldwideScreenCapacityProbeDiagnostics(
+            origin: applicationLimitedProbeOriginTier,
+            collectionSequence: collectionSequence,
+            previousNativeReportTimestamp: capacityProbeNativeReportTimestamp,
+            nativeReportTimestamp: nativeReportTimestampMicroseconds,
+            beforeTotalCapBps: currentRecommendation.maximumTotalRTPBitrateBps
+        )
+        defer {
+            evaluation.proposedTotalCapBps = currentRecommendation.maximumTotalRTPBitrateBps
+            diagnostics?(evaluation)
+        }
+        guard peerGeneration == generation, isCaptureActive else {
+            evaluation.reason = .inactive
+            return nil
+        }
         if let expired = expireApplicationLimitedProbeWithoutReport(
             peerGeneration: generation,
             isCaptureActive: isCaptureActive,
             observedAt: observedAt
-        ) { return expired }
+        ) {
+            evaluation.reason = .expired
+            return expired
+        }
         guard let origin = applicationLimitedProbeOriginTier,
               let currentCeiling = applicationLimitedProbeMaximumTotalRTPBitrateBps,
               let collectionSequence,
@@ -603,6 +621,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         roundTripTimeObservationFence = validation.roundTripTimeObservationFence
         guard rtt.allowsUpgrade else {
+            evaluation.reason = .roundTripTime
             revokeRoundTripTimeHealth()
             permitsInitialRoundTripTimeReference = false
             if !rtt.hasFreshPressure {
@@ -621,6 +640,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return currentRecommendation
         }
         if selectedRoute != self.selectedRoute {
+            evaluation.reason = .routeChanged
             // Sender-filtered stats can reveal a route change before the ordinary route event.
             // Its RTT tuple must not become new health when the next regular report reuses it.
             revokeRoundTripTimeHealth()
@@ -635,9 +655,16 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
               let advancement = lastRoundTripTimeAdvancement,
               advancement.duration(to: observedAt) >= .zero,
               advancement.duration(to: observedAt) <= Self.roundTripTimeObservationValidity else {
+            evaluation.reason = .missingPrimaryEvidence
             failApplicationLimitedProbe(revertingTo: origin)
             return currentRecommendation
         }
+        evaluation.recordQueue(
+            previousPackets: baseline.packetsSent,
+            previousDelay: baseline.totalPacketSendDelaySeconds,
+            packets: outboundVideoPacketsSent,
+            delay: outboundVideoTotalPacketSendDelaySeconds
+        )
         validation.lastOutboundVideoPacketsSent = baseline.packetsSent
         validation.lastOutboundVideoTotalPacketSendDelaySeconds =
             baseline.totalPacketSendDelaySeconds
@@ -649,6 +676,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         switch queue {
         case let .measured(delay):
             if delay >= Self.immediateAveragePacketSendDelaySeconds {
+                evaluation.reason = .immediateQueue
                 failApplicationLimitedProbe(revertingTo: origin)
                 return currentRecommendation
             }
@@ -663,15 +691,15 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         guard let availableOutgoingBitrateBps,
               availableOutgoingBitrateBps.isFinite,
               availableOutgoingBitrateBps > 0 else {
+            evaluation.reason = .missingBandwidth
             capacityProbeGrowthIsVetoed = true
             return nil
         }
-        let collapseThreshold = max(
-            requiredOutgoingBitrateBps(for: .audioPriority),
-            Double(recommendation(for: origin).maximumBitrateBps)
-                * Self.applicationLimitedProbeImmediateAbortRatio
-        )
+        let collapseThreshold = applicationLimitedProbeCollapseThreshold(for: origin)
+        evaluation.collapseThresholdBps =
+            WorldwideScreenCapacityProbeDiagnostics.boundedInteger(collapseThreshold)
         if availableOutgoingBitrateBps < collapseThreshold {
+            evaluation.reason = .bandwidthCollapse
             failApplicationLimitedProbe(revertingTo: origin)
             return currentRecommendation
         }
@@ -680,18 +708,29 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         guard queueAllowsGrowth,
               let queuePermission = lastLowDelayPacketQueueObservation,
               isFreshPacketQueueObservation(queuePermission, at: observedAt) else {
+            evaluation.reason = .queueWithheld
             capacityProbeGrowthIsVetoed = true
             return nil
         }
-        guard !capacityProbeGrowthIsVetoed else { return nil }
-        guard availableOutgoingBitrateBps > previousBandwidth else { return nil }
+        guard !capacityProbeGrowthIsVetoed else {
+            evaluation.reason = .growthVetoed
+            return nil
+        }
+        guard availableOutgoingBitrateBps > previousBandwidth else {
+            evaluation.reason = .bandwidthNotAdvanced
+            return nil
+        }
         capacityProbeBandwidthHighWatermark = availableOutgoingBitrateBps
         let nextCeiling = boundedApplicationLimitedProbeCeiling(
             availableOutgoingBitrateBps: availableOutgoingBitrateBps,
             currentCeilingBps: currentCeiling
         )
-        guard nextCeiling > currentCeiling else { return nil }
+        guard nextCeiling > currentCeiling else {
+            evaluation.reason = .atCeiling
+            return nil
+        }
         applicationLimitedProbeMaximumTotalRTPBitrateBps = nextCeiling
+        evaluation.reason = .increased
         return currentRecommendation
     }
 
@@ -1038,13 +1077,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 : nil
             let probeCapacityCollapsed =
                 effectiveAvailableOutgoingBitrateBps
-                    < max(
-                        requiredAudioPriorityBitrateBps,
-                        Double(
-                            recommendation(for: probeOriginTier)
-                                .maximumBitrateBps
-                        ) * Self.applicationLimitedProbeImmediateAbortRatio
-                    )
+                    < applicationLimitedProbeCollapseThreshold(for: probeOriginTier)
             let probeDeadlineExpired = applicationLimitedProbeDeadline.map {
                 observedAt >= $0
             } ?? true
@@ -1507,6 +1540,18 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         return Double(Self.baselineReferenceVideoBitrateBps(for: tier))
             * Self.downgradeHeadroomMultiplier
             + Self.audioAndControlReserveBps
+    }
+
+    private func applicationLimitedProbeCollapseThreshold(
+        for origin: WorldwideScreenVideoAdaptationTier
+    ) -> Double {
+        // Sender headroom is not codec demand: at 50 Mbps the nominal high-tier ceiling
+        // would make even the full 16.2 Mbps probe budget look like a capacity collapse.
+        max(
+            requiredOutgoingBitrateBps(for: .audioPriority),
+            Double(Self.baselineReferenceVideoBitrateBps(for: origin))
+                * Self.applicationLimitedProbeImmediateAbortRatio
+        )
     }
 
     private func maximumTotalRTPBitrateBps(

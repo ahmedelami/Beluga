@@ -215,6 +215,15 @@ deadline, cadence, and negative-invalidation mutants. Fence requests to their or
 Show/capture before interpreting callbacks. Full host compilation and new installed-host
 and iPhone evidence remain required; synthetic feedback timing is not a network prediction.
 
+Probe-collapse thresholds must use calibrated codec demand, not the configured sender
+ceiling. Exercise high and balanced origins at 50 Mbps in both ordinary and capacity-only
+lanes, stable/rising estimates below the full probe ceiling, calibrated collapse boundaries,
+and genuine 200 ms queue pressure. Independently restore the configured-ceiling comparison
+in each lane and require its recovery tests to fail. Fast decision diagnostics must report
+their own packet/delay delta, not the ordinary queue window; keep proposed budgets separate
+from native apply results. Numeric/enum diagnostics must reject malformed values without
+logging media, peer addresses, or raw connection identities, and must not change policy state.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac
