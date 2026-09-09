@@ -1348,11 +1348,15 @@ public final class MacRemoteInputController: @unchecked Sendable {
                 originalFrame: finalTarget.originalFrame,
                 proposedFrame: proposal.frame,
                 corner: proposal.corner,
-                displayBounds: finalContext.displayBounds
+                context: finalContext
             ) {
             case .committed(let finalFrame):
-                guard let stillFocused = system.focusedWindow(),
-                      system.elementsEqual(stillFocused, finalTarget.element),
+                guard windowResizeTransactionIsAuthorized(
+                    window: finalTarget.element,
+                    expectedFrame: finalFrame,
+                    context: finalContext,
+                    expectedFocus: finalTarget.element
+                ),
                       let normalizedFrame = finalContext.frameGeometry.frameNormalizedRect(
                           forGlobalRect: finalFrame,
                           in: finalContext.displayBounds
@@ -1360,6 +1364,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                     return rejectCommittedResizeAfterRollback(
                         window: finalTarget.element,
                         originalFrame: finalTarget.originalFrame,
+                        ownedFrame: finalFrame,
+                        context: finalContext,
                         preservedFocus: preservedFocus
                     )
                 }
@@ -1590,10 +1596,14 @@ public final class MacRemoteInputController: @unchecked Sendable {
     private func rejectCommittedResizeAfterRollback(
         window: MacRemoteAccessibilityElement,
         originalFrame: CGRect,
+        ownedFrame: CGRect,
+        context: MacRemoteWindowResizeContext,
         preservedFocus: AuthorizedFocus?
     ) -> MacRemoteWindowResizeDiagnosedResult {
         authorizedWindowResizeTarget = nil
-        if rollbackWindowFrame(window, to: originalFrame) {
+        if rollbackWindowFrame(
+            window, to: originalFrame, ownedFrame: ownedFrame, context: context
+        ) {
             return .init(
                 result: .rejected(.windowResizeFailed),
                 verifiedFocus: focusResult(preserving: preservedFocus)
@@ -1726,68 +1736,168 @@ public final class MacRemoteInputController: @unchecked Sendable {
         originalFrame: CGRect,
         proposedFrame: CGRect,
         corner: MacRemoteWindowResizeCorner,
-        displayBounds: CGRect
+        context: MacRemoteWindowResizeContext
     ) -> WindowResizeTransactionResult {
-        guard system.setWindowSize(proposedFrame.size, for: window),
-              let constrainedFrame = system.windowFrame(window),
-              let anchoredOrigin = MacRemoteWindowResizeGeometry.anchoredOrigin(
-                  for: constrainedFrame.size,
-                  original: originalFrame,
-                  corner: corner
-              ) else {
-            return rollbackWindowFrame(window, to: originalFrame)
-                ? .failedWithProvenRollback
-                : .restorationUncertain
+        var ownedFrame: CGRect? = originalFrame
+        if moveWindowFrame(
+            window, toward: proposedFrame, ownedFrame: &ownedFrame, context: context,
+            expectedFocus: window, anchor: (originalFrame, corner)
+        ), let finalFrame = ownedFrame,
+           MacRemoteWindowResizeGeometry.preservesOppositeCorner(
+               finalFrame, from: originalFrame, corner: corner
+           ), MacRemoteWindowResizeGeometry.followsRequestedResize(
+               finalFrame, from: originalFrame, toward: proposedFrame
+           ) {
+            return .committed(finalFrame)
         }
+        return rollbackWindowFrame(
+            window, to: originalFrame, ownedFrame: ownedFrame, context: context
+        ) ? .failedWithProvenRollback : .restorationUncertain
+    }
 
-        let constrainedCandidate = CGRect(
-            origin: anchoredOrigin,
-            size: constrainedFrame.size
+    /// Four bounded phases, with no polling under the input/dispatch authorization locks.
+    /// Shrinking first makes room for an inward move; prepositioning before growth avoids an
+    /// application's position-dependent size clamp. The final origin uses actual AX size.
+    /// Proof is limited to immediate AX readback: missing/invalid readback is uncertainty and
+    /// never replayed. An unchanged read cannot detect an outstanding asynchronous setter;
+    /// delayed AX convergence requires separate investigation, not waits under these locks.
+    private func moveWindowFrame(
+        _ window: MacRemoteAccessibilityElement,
+        toward goal: CGRect,
+        ownedFrame: inout CGRect?,
+        context: MacRemoteWindowResizeContext,
+        expectedFocus: MacRemoteAccessibilityElement?,
+        anchor: (CGRect, MacRemoteWindowResizeCorner)?
+    ) -> Bool {
+        guard let initial = ownedFrame else { return false }
+        let smaller = CGSize(
+            width: min(initial.width, goal.width), height: min(initial.height, goal.height)
         )
+        if smaller != initial.size,
+           !writeWindowFrame(
+               window, size: smaller, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        guard let current = ownedFrame,
+              let stagingOrigin = MacRemoteWindowResizeGeometry.safeStagingOrigin(
+                  toward: goal, current: current, in: context.displayBounds
+              ) else { return false }
+        if !MacRemoteWindowResizeGeometry.approximatelyEqual(current.origin, stagingOrigin),
+           !writeWindowFrame(
+               window, position: stagingOrigin, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        if ownedFrame?.size != goal.size,
+           !writeWindowFrame(
+               window, size: goal.size, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        guard let sized = ownedFrame else { return false }
+        let finalOrigin: CGPoint
+        if let (original, corner) = anchor {
+            guard let origin = MacRemoteWindowResizeGeometry.anchoredOrigin(
+                for: sized.size, original: original, corner: corner
+            ) else { return false }
+            finalOrigin = origin
+        } else {
+            finalOrigin = goal.origin
+        }
         guard MacRemoteWindowResizeGeometry.contains(
-            constrainedCandidate,
-            in: displayBounds,
-            tolerance: 0.5
-        ) else {
-            return rollbackWindowFrame(window, to: originalFrame)
-                ? .failedWithProvenRollback
-                : .restorationUncertain
-        }
+            CGRect(origin: finalOrigin, size: sized.size),
+            in: context.displayBounds, tolerance: 0.5
+        ) else { return false }
+        if !MacRemoteWindowResizeGeometry.approximatelyEqual(sized.origin, finalOrigin),
+           !writeWindowFrame(
+               window, position: finalOrigin, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        return true
+    }
 
-        if !MacRemoteWindowResizeGeometry.approximatelyEqual(
-            constrainedFrame.origin,
-            anchoredOrigin
-        ), !system.setWindowPosition(anchoredOrigin, for: window) {
-            return rollbackWindowFrame(window, to: originalFrame)
-                ? .failedWithProvenRollback
-                : .restorationUncertain
+    /// Rechecks live authorization and the last owned frame immediately before every AX write.
+    /// A setter may return failure after a partial change: only a bounded readback that changed
+    /// its intended component can be retained for conditional cleanup.
+    private func writeWindowFrame(
+        _ window: MacRemoteAccessibilityElement,
+        size: CGSize? = nil,
+        position: CGPoint? = nil,
+        ownedFrame: inout CGRect?,
+        context: MacRemoteWindowResizeContext,
+        expectedFocus: MacRemoteAccessibilityElement?
+    ) -> Bool {
+        guard let before = ownedFrame,
+              windowResizeTransactionIsAuthorized(
+                  window: window, expectedFrame: before, context: context,
+                  expectedFocus: expectedFocus
+              ) else { return false }
+        let succeeded: Bool
+        if let size {
+            succeeded = system.setWindowSize(size, for: window)
+        } else if let position {
+            succeeded = system.setWindowPosition(position, for: window)
+        } else { return false }
+        guard let actual = system.windowFrame(window),
+              isResizableWindow(window, with: actual, in: context.displayBounds),
+              size != nil
+                ? MacRemoteWindowResizeGeometry.approximatelyEqual(actual.origin, before.origin)
+                : actual.size == before.size else {
+            ownedFrame = nil
+            return false
         }
+        ownedFrame = actual
+        return succeeded
+    }
 
-        guard let finalFrame = system.windowFrame(window),
-              isResizableWindow(
-                  window,
-                  with: finalFrame,
-                  in: displayBounds
-              ),
-              MacRemoteWindowResizeGeometry.preservesOppositeCorner(
-                  finalFrame,
-                  from: originalFrame,
-                  corner: corner
-              ) else {
-            return rollbackWindowFrame(window, to: originalFrame)
-                ? .failedWithProvenRollback
-                : .restorationUncertain
+    private func windowResizeTransactionIsAuthorized(
+        window: MacRemoteAccessibilityElement,
+        expectedFrame: CGRect,
+        context: MacRemoteWindowResizeContext,
+        expectedFocus: MacRemoteAccessibilityElement?
+    ) -> Bool {
+        let resolution = windowResizeContextLocked(
+            screenRequestID: context.session.screenRequestID,
+            inputSessionID: context.session.inputSessionID,
+            viewerVideoSize: context.viewerVideoSize
+        )
+        guard case .available(let current) = resolution,
+              current.frameGeometry.hasSameInputTransform(as: context.frameGeometry),
+              current.viewerVideoSize == context.viewerVideoSize,
+              MacRemoteWindowResizeGeometry.approximatelyEqual(
+                  current.displayBounds, context.displayBounds
+              ), !system.isPhysicalPrimaryButtonPressed() else { return false }
+        let focus = system.focusedWindow()
+        switch (focus, expectedFocus) {
+        case (nil, nil): break
+        case (let actual?, let expected?) where system.elementsEqual(actual, expected): break
+        default: return false
         }
-        return .committed(finalFrame)
+        guard let actual = validatedResizableWindowFrame(window, in: context.displayBounds)
+        else { return false }
+        return MacRemoteWindowResizeGeometry.approximatelyEqual(actual, expectedFrame)
     }
 
     private func rollbackWindowFrame(
         _ window: MacRemoteAccessibilityElement,
-        to originalFrame: CGRect
+        to originalFrame: CGRect,
+        ownedFrame: CGRect?,
+        context: MacRemoteWindowResizeContext
     ) -> Bool {
-        _ = system.setWindowSize(originalFrame.size, for: window)
-        _ = system.setWindowPosition(originalFrame.origin, for: window)
-        guard let restored = system.windowFrame(window) else { return false }
+        var frame = ownedFrame
+        // Cleanup never focuses a window. If focus changed, restore only the exact previously
+        // owned window while the newly observed focus remains stable throughout cleanup.
+        let cleanupFocus = system.focusedWindow()
+        guard let expected = frame,
+              windowResizeTransactionIsAuthorized(
+                  window: window, expectedFrame: expected, context: context,
+                  expectedFocus: cleanupFocus
+              ), moveWindowFrame(
+                  window, toward: originalFrame, ownedFrame: &frame, context: context,
+                  expectedFocus: cleanupFocus, anchor: nil
+              ), let restored = frame,
+              windowResizeTransactionIsAuthorized(
+                  window: window, expectedFrame: restored, context: context,
+                  expectedFocus: cleanupFocus
+              ) else { return false }
         return MacRemoteWindowResizeGeometry.approximatelyEqual(restored, originalFrame)
     }
 
@@ -2306,6 +2416,38 @@ enum MacRemoteWindowResizeGeometry {
             minimumSize: minimumSize
         ) else { return nil }
         return (proposal.corner, proposal.frame)
+    }
+
+    static func safeStagingOrigin(
+        toward goal: CGRect,
+        current: CGRect,
+        in bounds: CGRect
+    ) -> CGPoint? {
+        let width = max(current.width, goal.width)
+        let height = max(current.height, goal.height)
+        guard isFinitePositiveRect(goal), isFinitePositiveRect(current),
+              width <= bounds.width, height <= bounds.height else { return nil }
+        return CGPoint(
+            x: min(max(goal.minX, bounds.minX), bounds.maxX - width),
+            y: min(max(goal.minY, bounds.minY), bounds.maxY - height)
+        )
+    }
+
+    /// Application minimum/maximum sizes may limit progress, but cannot turn a requested
+    /// growth into a shrink, change an untouched axis, or commit a constrained no-op.
+    static func followsRequestedResize(
+        _ actual: CGRect,
+        from original: CGRect,
+        toward proposed: CGRect
+    ) -> Bool {
+        func follows(_ value: CGFloat, _ initial: CGFloat, _ requested: CGFloat) -> Bool {
+            let delta = requested - initial
+            if abs(delta) <= 0.5 { return abs(value - initial) <= 0.5 }
+            return delta > 0 ? value >= initial - 0.5 : value <= initial + 0.5
+        }
+        return !approximatelyEqual(actual, original)
+            && follows(actual.width, original.width, proposed.width)
+            && follows(actual.height, original.height, proposed.height)
     }
 
     static func anchoredOrigin(

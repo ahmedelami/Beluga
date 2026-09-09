@@ -2242,8 +2242,9 @@ final class MacRemoteInputControllerTests: XCTestCase {
                 viewerVideoSize: .init(width: 1_920, height: 1_080)
             ).windowResizeFeedback?.target.generation
         )
-        system.setWindowSizeResults = [true, false]
-        system.setWindowPositionResults = [false, true]
+        // Preposition succeeds, size fails, then restoring the owned position also fails.
+        system.setWindowSizeResults = [false]
+        system.setWindowPositionResults = [true, false]
 
         let result = controller.commitFocusedWindowResize(
             screenRequestID: showID,
@@ -2277,7 +2278,7 @@ final class MacRemoteInputControllerTests: XCTestCase {
         )
         // The exact target is focused at the pre-mutation fence, then focus changes after the
         // successful AX transaction but before new authority can be published.
-        system.focusedWindowSequence = [window, window, replacement]
+        system.afterWindowSizeWrite = { system.currentFocusedWindow = replacement }
 
         let result = controller.commitFocusedWindowResize(
             screenRequestID: showID,
@@ -2325,13 +2326,14 @@ final class MacRemoteInputControllerTests: XCTestCase {
             width: 600.25,
             height: 400
         )
-        system.windowFrameReadSequence = [
-            original,
-            original,
-            applicationConstrained,
-            applicationConstrained,
-            original
-        ]
+        // Bind the fractional application constraint to the actual mutation, not to how many
+        // authorization reads the transaction performs before it.
+        system.afterWindowPositionWrite = {
+            system.setFrame(CGRect(origin: applicationConstrained.origin, size: original.size), of: window)
+            system.afterWindowPositionWrite = nil
+        }
+        system.constrainedWindowSize = applicationConstrained.size
+        system.afterWindowSizeWrite = { system.constrainedWindowSize = nil }
 
         let result = controller.commitFocusedWindowResize(
             screenRequestID: showID,
@@ -2367,7 +2369,7 @@ final class MacRemoteInputControllerTests: XCTestCase {
                 viewerVideoSize: .init(width: 1_920, height: 1_080)
             ).windowResizeFeedback?.target.generation
         )
-        system.focusedWindowSequence = [window, window, replacement]
+        system.afterWindowSizeWrite = { system.currentFocusedWindow = replacement }
         system.setWindowSizeResults = [true, false]
 
         let result = controller.commitFocusedWindowResize(
@@ -2793,6 +2795,242 @@ final class MacRemoteInputControllerTests: XCTestCase {
         XCTAssertTrue(system.windowSizeWrites.isEmpty)
     }
 
+    func testLeftGrowthMakesRoomBeforePositionDependentClampOrReject() throws {
+        for behavior in [MockMacRemoteInputSystem.WindowBoundsBehavior.clamp, .reject] {
+            for (bounds, original) in [
+                (CGRect(x: 0, y: 0, width: 1_080, height: 1_920),
+                 CGRect(x: 300, y: 200, width: 780, height: 600)),
+                (CGRect(x: 0, y: 0, width: 1_080, height: 1_920),
+                 CGRect(x: 250, y: 200, width: 780, height: 600)),
+                (CGRect(x: -1_200, y: -300, width: 1_080, height: 1_920),
+                 CGRect(x: -900, y: -100, width: 780, height: 600))
+            ] {
+                let system = MockMacRemoteInputSystem()
+                system.bounds = bounds
+                system.windowBoundsBehavior = behavior
+                let start = CGPoint(x: original.minX + 20, y: original.minY + 20)
+                let (result, window) = try performTestResize(
+                    system: system, original: original, start: start,
+                    end: CGPoint(x: start.x - 200, y: start.y)
+                )
+                XCTAssertEqual(result.result, .accepted(.none))
+                let expected = CGRect(x: original.minX - 200, y: original.minY, width: 980, height: 600)
+                XCTAssertEqual(try XCTUnwrap(system.windowFrame(window)), expected)
+                XCTAssertEqual(system.windowPositionWrites.first, expected.origin)
+                XCTAssertEqual(system.windowSizeWrites, [expected.size])
+                XCTAssertEqual(system.appliedWindowFrames.count, 2)
+                for frame in system.appliedWindowFrames { XCTAssertTrue(bounds.contains(frame)) }
+            }
+        }
+    }
+
+    func testSafeResizePhasesCoverEveryCornerAndMixedAxisDirection() throws {
+        for left in [true, false] {
+            for top in [true, false] {
+                for (widthDelta, heightDelta) in [(120.0, 80.0), (-120, 80), (120, -80), (-120, -80)] {
+                    let system = MockMacRemoteInputSystem()
+                    system.windowBoundsBehavior = .reject
+                    let original = CGRect(x: 300, y: 180, width: 900, height: 600)
+                    let start = CGPoint(
+                        x: left ? original.minX + 20 : original.maxX - 20,
+                        y: top ? original.minY + 20 : original.maxY - 20
+                    )
+                    let (result, window) = try performTestResize(
+                        system: system, original: original, start: start,
+                        end: CGPoint(
+                            x: start.x + (left ? -widthDelta : widthDelta),
+                            y: start.y + (top ? -heightDelta : heightDelta)
+                        )
+                    )
+                    XCTAssertEqual(result.result, .accepted(.none))
+                    let actual = try XCTUnwrap(system.windowFrame(window))
+                    XCTAssertEqual(actual.width, original.width + widthDelta, accuracy: 0.001)
+                    XCTAssertEqual(actual.height, original.height + heightDelta, accuracy: 0.001)
+                    XCTAssertEqual(left ? actual.maxX : actual.minX, left ? original.maxX : original.minX, accuracy: 0.001)
+                    XCTAssertEqual(top ? actual.maxY : actual.minY, top ? original.maxY : original.minY, accuracy: 0.001)
+                    XCTAssertLessThanOrEqual(system.appliedWindowFrames.count, 4)
+                    for frame in system.appliedWindowFrames { XCTAssertTrue(system.bounds!.contains(frame)) }
+                    XCTAssertTrue(system.postedMousePoints.isEmpty)
+                    XCTAssertTrue(system.postedDragEvents.isEmpty)
+                }
+            }
+        }
+    }
+
+    func testApplicationMinimumAndMaximumAreReanchoredWithoutOffscreenIntermediateFrames() throws {
+        for shrinking in [true, false] {
+            let system = MockMacRemoteInputSystem()
+            system.windowBoundsBehavior = .reject
+            let original = CGRect(x: 1_020, y: 480, width: 900, height: 600)
+            let constraint = shrinking ? CGSize(width: 850, height: 550) : CGSize(width: 980, height: 650)
+            if shrinking { system.minimumWindowSize = constraint }
+            else { system.maximumWindowSize = constraint }
+            let (result, window) = try performTestResize(
+                system: system, original: original,
+                start: CGPoint(x: 1_040, y: 500),
+                end: CGPoint(x: shrinking ? 1_240 : 840, y: shrinking ? 650 : 350)
+            )
+            XCTAssertEqual(result.result, .accepted(.none))
+            let actual = try XCTUnwrap(system.windowFrame(window))
+            XCTAssertEqual(actual.size, constraint)
+            XCTAssertEqual(actual.maxX, original.maxX, accuracy: 0.001)
+            XCTAssertEqual(actual.maxY, original.maxY, accuracy: 0.001)
+            for frame in system.appliedWindowFrames { XCTAssertTrue(system.bounds!.contains(frame)) }
+        }
+    }
+
+    func testConstrainedNoOpFailsRestoresOriginalAndDoesNotGrantSuccessor() throws {
+        let system = MockMacRemoteInputSystem()
+        let original = CGRect(x: 300, y: 180, width: 900, height: 600)
+        system.maximumWindowSize = original.size
+        let (result, window) = try performTestResize(
+            system: system, original: original,
+            start: CGPoint(x: 320, y: 200), end: CGPoint(x: 120, y: 100)
+        )
+        XCTAssertEqual(result.result, .rejected(.windowResizeFailed))
+        XCTAssertNil(result.windowResizeFeedback)
+        XCTAssertEqual(try XCTUnwrap(system.windowFrame(window)), original)
+    }
+
+    func testSafeRollbackRestoresRightFlushFrameAfterFailureFollowingMixedAxisShrink() throws {
+        let system = MockMacRemoteInputSystem()
+        system.windowBoundsBehavior = .reject
+        let original = CGRect(x: 1_020, y: 480, width: 900, height: 600)
+        // Width shrinks, then preposition fails. Rollback must restore size at the old position.
+        system.setWindowPositionResults = [false]
+        let (result, window) = try performTestResize(
+            system: system, original: original,
+            start: CGPoint(x: 1_040, y: 500), end: CGPoint(x: 1_240, y: 350)
+        )
+        XCTAssertEqual(result.result, .rejected(.windowResizeFailed))
+        XCTAssertEqual(try XCTUnwrap(system.windowFrame(window)), original)
+        XCTAssertEqual(system.windowSizeWrites.count, 2)
+        for frame in system.appliedWindowFrames { XCTAssertTrue(system.bounds!.contains(frame)) }
+    }
+
+    func testResizeStopsBeforeNextWriteWhenAuthorityChangesAfterPreposition() throws {
+        for drift in ["permission", "display", "button", "focus", "frame", "expectedFrame", "eligibility"] {
+            let system = MockMacRemoteInputSystem()
+            let original = CGRect(x: 300, y: 180, width: 900, height: 600)
+            let (result, _) = try performTestResize(
+                system: system, original: original,
+                start: CGPoint(x: 320, y: 200), end: CGPoint(x: 120, y: 100),
+                configure: { window in
+                    system.afterWindowPositionWrite = {
+                        system.afterWindowPositionWrite = nil
+                        switch drift {
+                        case "permission":
+                            system.permissions = .init(accessibilityTrusted: false, postEventAllowed: true)
+                        case "display": system.bounds = nil
+                        case "button": system.physicalPrimaryButtonPressed = true
+                        case "focus": system.currentFocusedWindow = system.makeResizableWindow(frame: original)
+                        case "frame":
+                            // A concurrent change to the component this position write did not own.
+                            system.setFrame(CGRect(x: 100, y: 80, width: 901, height: 600), of: window)
+                        case "expectedFrame":
+                            // The write's immediate readback is valid, but a later external move
+                            // must be rejected by the next write's expected-frame fence.
+                            system.afterWindowFrameRead = {
+                                system.afterWindowFrameRead = nil
+                                system.setFrame(CGRect(x: 101, y: 80, width: 900, height: 600), of: window)
+                            }
+                        default: system.setSubrole("AXDialog", of: window)
+                        }
+                    }
+                }
+            )
+            XCTAssertTrue(system.windowSizeWrites.isEmpty, drift)
+            XCTAssertNil(result.windowResizeFeedback, drift)
+            if drift == "focus" {
+                XCTAssertEqual(result.result, .rejected(.windowResizeFailed))
+                XCTAssertEqual(system.windowPositionWrites.count, 2)
+            } else {
+                XCTAssertEqual(result.result, .rejected(.windowResizeUncertain), drift)
+                XCTAssertEqual(system.windowPositionWrites.count, 1, drift)
+            }
+        }
+    }
+
+    func testMissingImmediateReadbackDoesNotReplayOrAttemptBlindRollback() throws {
+        let system = MockMacRemoteInputSystem()
+        system.afterWindowPositionWrite = { system.windowReadbackUnavailable = true }
+        let (result, _) = try performTestResize(
+            system: system, original: CGRect(x: 300, y: 180, width: 900, height: 600),
+            start: CGPoint(x: 320, y: 200), end: CGPoint(x: 120, y: 100)
+        )
+        XCTAssertEqual(result.result, .rejected(.windowResizeUncertain))
+        XCTAssertEqual(system.windowPositionWrites.count, 1)
+        XCTAssertTrue(system.windowSizeWrites.isEmpty)
+        XCTAssertNil(result.windowResizeFeedback)
+    }
+
+    func testSetterThatMutatesThenReturnsFalseIsConditionallyRolledBack() throws {
+        for failSize in [false, true] {
+            let system = MockMacRemoteInputSystem()
+            system.windowBoundsBehavior = .reject
+            let original = CGRect(x: 1_020, y: 480, width: 900, height: 600)
+            system.failNextSizeAfterApplying = failSize
+            system.failNextPositionAfterApplying = !failSize
+            let (result, window) = try performTestResize(
+                system: system, original: original,
+                start: CGPoint(x: 1_040, y: 500), end: CGPoint(x: 840, y: 350)
+            )
+            XCTAssertEqual(result.result, .rejected(.windowResizeFailed))
+            XCTAssertNil(result.windowResizeFeedback)
+            XCTAssertEqual(try XCTUnwrap(system.windowFrame(window)), original)
+            XCTAssertEqual(system.windowPositionWrites.count, 2)
+            XCTAssertEqual(system.windowSizeWrites.count, failSize ? 2 : 0)
+            for frame in system.appliedWindowFrames { XCTAssertTrue(system.bounds!.contains(frame)) }
+        }
+    }
+
+    func testRollbackStopsIfCleanupFocusChangesAgainWithoutStealingFocus() throws {
+        let system = MockMacRemoteInputSystem()
+        let original = CGRect(x: 300, y: 180, width: 900, height: 600)
+        let firstReplacement = system.makeResizableWindow(frame: original)
+        let secondReplacement = system.makeResizableWindow(frame: original)
+        var sizeWrites = 0
+        system.afterWindowSizeWrite = {
+            sizeWrites += 1
+            system.currentFocusedWindow = sizeWrites == 1 ? firstReplacement : secondReplacement
+        }
+        let (result, _) = try performTestResize(
+            system: system, original: original,
+            start: CGPoint(x: 320, y: 200), end: CGPoint(x: 120, y: 100)
+        )
+        XCTAssertEqual(result.result, .rejected(.windowResizeUncertain))
+        XCTAssertNil(result.windowResizeFeedback)
+        XCTAssertEqual(system.windowSizeWrites.count, 2)
+        XCTAssertEqual(system.windowPositionWrites.count, 1)
+        XCTAssertTrue(system.currentFocusedWindow === secondReplacement)
+        XCTAssertTrue(system.postedMousePoints.isEmpty)
+    }
+
+    private func performTestResize(
+        system: MockMacRemoteInputSystem,
+        original: CGRect,
+        start: CGPoint,
+        end: CGPoint,
+        configure: ((MacRemoteAccessibilityElement) -> Void)? = nil
+    ) throws -> (MacRemoteWindowResizeDiagnosedResult, MacRemoteAccessibilityElement) {
+        let bounds = try XCTUnwrap(system.bounds)
+        let viewer = MacRemoteInputVideoSize(width: Int(bounds.width), height: Int(bounds.height))
+        let window = system.makeResizableWindow(frame: original)
+        system.currentFocusedWindow = window
+        let controller = armedController(system: system)
+        let generation = try XCTUnwrap(controller.requestFocusedWindowResizeTarget(
+            screenRequestID: showID, inputSessionID: sessionID, viewerVideoSize: viewer
+        ).windowResizeFeedback?.target.generation)
+        configure?(window)
+        let result = controller.commitFocusedWindowResize(
+            screenRequestID: showID, inputSessionID: sessionID, targetGeneration: generation,
+            start: .init(x: (start.x - bounds.minX) / bounds.width, y: (start.y - bounds.minY) / bounds.height),
+            end: .init(x: (end.x - bounds.minX) / bounds.width, y: (end.y - bounds.minY) / bounds.height),
+            viewerVideoSize: viewer
+        )
+        return (result, window)
+    }
+
     private func makeController(
         system: MockMacRemoteInputSystem,
         clock: MockMacRemoteInputClock = .init()
@@ -3019,6 +3257,16 @@ private final class MockMacRemoteInputSystem: @unchecked Sendable, MacRemoteInpu
     var setWindowSizeResults: [Bool] = []
     var setWindowPositionResults: [Bool] = []
     var constrainedWindowSize: CGSize?
+    enum WindowBoundsBehavior { case unconstrained, clamp, reject }
+    var windowBoundsBehavior: WindowBoundsBehavior = .unconstrained
+    var minimumWindowSize: CGSize?
+    var maximumWindowSize: CGSize?
+    var afterWindowSizeWrite: (() -> Void)?
+    var afterWindowPositionWrite: (() -> Void)?
+    var afterWindowFrameRead: (() -> Void)?
+    var windowReadbackUnavailable = false
+    var failNextSizeAfterApplying = false
+    var failNextPositionAfterApplying = false
 
     var mousePostSucceeds = true
     var dragPostSucceeds = true
@@ -3033,6 +3281,7 @@ private final class MockMacRemoteInputSystem: @unchecked Sendable, MacRemoteInpu
     private(set) var postedKeys: [MacRemoteInputKey] = []
     private(set) var windowSizeWrites: [CGSize] = []
     private(set) var windowPositionWrites: [CGPoint] = []
+    private(set) var appliedWindowFrames: [CGRect] = []
     private var nodes: [ObjectIdentifier: Node] = [:]
 
     func makeElement(
@@ -3159,10 +3408,13 @@ private final class MockMacRemoteInputSystem: @unchecked Sendable, MacRemoteInpu
     }
 
     func windowFrame(_ window: MacRemoteAccessibilityElement) -> CGRect? {
+        if windowReadbackUnavailable { return nil }
         if !windowFrameReadSequence.isEmpty {
             return windowFrameReadSequence.removeFirst()
         }
-        return nodes[ObjectIdentifier(window)]?.windowFrame
+        let frame = nodes[ObjectIdentifier(window)]?.windowFrame
+        afterWindowFrameRead?()
+        return frame
     }
 
     func isWindowMinimized(_ window: MacRemoteAccessibilityElement) -> Bool? {
@@ -3189,9 +3441,31 @@ private final class MockMacRemoteInputSystem: @unchecked Sendable, MacRemoteInpu
             return false
         }
         guard nodes[ObjectIdentifier(window)]?.windowSizeSettable == true else { return false }
-        let applied = constrainedWindowSize ?? size
+        var applied = constrainedWindowSize ?? size
+        if let minimumWindowSize {
+            applied.width = max(applied.width, minimumWindowSize.width)
+            applied.height = max(applied.height, minimumWindowSize.height)
+        }
+        if let maximumWindowSize {
+            applied.width = min(applied.width, maximumWindowSize.width)
+            applied.height = min(applied.height, maximumWindowSize.height)
+        }
+        guard let before = nodes[ObjectIdentifier(window)]?.windowFrame else { return false }
+        if let bounds, windowBoundsBehavior != .unconstrained {
+            let candidate = CGRect(origin: before.origin, size: applied)
+            if windowBoundsBehavior == .reject,
+               !MacRemoteWindowResizeGeometry.contains(candidate, in: bounds, tolerance: 0.001) {
+                return false
+            }
+            applied.width = min(applied.width, bounds.maxX - before.minX)
+            applied.height = min(applied.height, bounds.maxY - before.minY)
+        }
         nodes[ObjectIdentifier(window)]?.windowFrame?.size = applied
-        return true
+        let failAfterApplying = failNextSizeAfterApplying
+        failNextSizeAfterApplying = false
+        afterWindowSizeWrite?()
+        if let actual = nodes[ObjectIdentifier(window)]?.windowFrame { appliedWindowFrames.append(actual) }
+        return !failAfterApplying
     }
 
     func setWindowPosition(_ position: CGPoint, for window: MacRemoteAccessibilityElement) -> Bool {
@@ -3200,8 +3474,21 @@ private final class MockMacRemoteInputSystem: @unchecked Sendable, MacRemoteInpu
             return false
         }
         guard nodes[ObjectIdentifier(window)]?.windowPositionSettable == true else { return false }
+        if let bounds, let frame = nodes[ObjectIdentifier(window)]?.windowFrame,
+           windowBoundsBehavior != .unconstrained,
+           !MacRemoteWindowResizeGeometry.contains(
+               CGRect(origin: position, size: frame.size), in: bounds, tolerance: 0.001
+           ) { return false }
         nodes[ObjectIdentifier(window)]?.windowFrame?.origin = position
-        return true
+        let failAfterApplying = failNextPositionAfterApplying
+        failNextPositionAfterApplying = false
+        afterWindowPositionWrite?()
+        if let actual = nodes[ObjectIdentifier(window)]?.windowFrame { appliedWindowFrames.append(actual) }
+        return !failAfterApplying
+    }
+
+    func setFrame(_ frame: CGRect, of window: MacRemoteAccessibilityElement) {
+        nodes[ObjectIdentifier(window)]?.windowFrame = frame
     }
 
     func elementsEqual(
