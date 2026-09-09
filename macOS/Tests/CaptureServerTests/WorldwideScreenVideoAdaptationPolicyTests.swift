@@ -1094,8 +1094,11 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         XCTAssertEqual(fullPolicy.currentTier, .balanced)
     }
 
-    func testRetainedIntermediateProbeProofSurvivesTelemetryEnding() {
+    func testCommittedIntermediateProbeQualitySurvivesTelemetryEnding() {
         var missingBandwidthFixture = makeLiveCeilingProbeFromAudioPriority()
+        let originalDeadline = try! XCTUnwrap(
+            missingBandwidthFixture.policy.applicationLimitedProbeDeadline
+        )
         for sample in 1...2 {
             missingBandwidthFixture.packetsSent += 40
             missingBandwidthFixture.totalPacketSendDelay += 0.004
@@ -1119,23 +1122,16 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 XCTAssertEqual(update?.maximumFramesPerSecond, 1)
                 XCTAssertEqual(update?.scaleResolutionDownBy, 12)
             } else {
-                XCTAssertNil(update)
+                XCTAssertEqual(update?.tier, .critical)
+                XCTAssertEqual(update?.maximumFramesPerSecond, 10)
+                XCTAssertEqual(update?.scaleResolutionDownBy, 3)
             }
         }
-        XCTAssertEqual(
-            missingBandwidthFixture.policy
-                .applicationLimitedProbeBestQualifiedTier,
-            .critical
+        XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
+        XCTAssertNil(
+            missingBandwidthFixture.policy.applicationLimitedProbeOriginTier
         )
-        XCTAssertEqual(
-            missingBandwidthFixture.policy
-                .applicationLimitedProbeHealthySampleCount,
-            WorldwideScreenVideoAdaptationPolicy
-                .requiredHealthyUpgradeSampleCount
-        )
-        let missingBandwidthSampleCount = missingBandwidthFixture.policy
-            .applicationLimitedProbeGraceSamplesRemaining
-        for sample in 1...missingBandwidthSampleCount {
+        for sample in 1...8 {
             let update = missingBandwidthFixture.policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
@@ -1143,22 +1139,11 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 currentRoundTripTimeSeconds: 0.020,
                 outboundVideoPacketsSent: missingBandwidthFixture.packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
-                    missingBandwidthFixture.totalPacketSendDelay
+                    missingBandwidthFixture.totalPacketSendDelay,
+                observedAt: originalDeadline.advanced(by: .seconds(sample))
             )
-            if sample < missingBandwidthSampleCount {
-                XCTAssertNil(update)
-                XCTAssertEqual(
-                    missingBandwidthFixture.policy.currentTier,
-                    .audioPriority
-                )
-                XCTAssertEqual(
-                    missingBandwidthFixture.policy
-                        .applicationLimitedProbeOriginTier,
-                    .audioPriority
-                )
-            } else {
-                XCTAssertEqual(update?.tier, .critical)
-            }
+            XCTAssertNil(update)
+            XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
         }
         XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
         XCTAssertNil(
@@ -1166,6 +1151,9 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
 
         var noReportFixture = makeLiveCeilingProbeFromAudioPriority()
+        let deadline = try! XCTUnwrap(
+            noReportFixture.policy.applicationLimitedProbeDeadline
+        )
         for _ in 0..<2 {
             noReportFixture.packetsSent += 40
             noReportFixture.totalPacketSendDelay += 0.004
@@ -1179,16 +1167,12 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     noReportFixture.totalPacketSendDelay
             )
         }
-        let deadline = try! XCTUnwrap(
-            noReportFixture.policy.applicationLimitedProbeDeadline
-        )
-        XCTAssertEqual(
+        XCTAssertNil(
             noReportFixture.policy.expireApplicationLimitedProbeWithoutReport(
                 peerGeneration: 1,
                 isCaptureActive: true,
                 observedAt: deadline
-            )?.tier,
-            .critical
+            )
         )
         XCTAssertEqual(noReportFixture.policy.currentTier, .critical)
         XCTAssertNil(noReportFixture.policy.applicationLimitedProbeOriginTier)

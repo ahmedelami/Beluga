@@ -487,6 +487,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             bandwidthOnlyDowngradeSampleCount = 0
             applicationLimitedUpgradeSampleCount = 0
             if let probeOriginTier = applicationLimitedProbeOriginTier {
+                applicationLimitedProbeHealthySampleCount = 0
                 let probeDeadlineExpired = applicationLimitedProbeDeadline.map {
                     observedAt >= $0
                 } ?? true
@@ -677,6 +678,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 // A single transition burst neither confirms capacity nor consumes sample grace.
                 // The absolute deadline still bounds the ceiling-only probe.
                 applicationLimitedUpgradeSampleCount = 0
+                applicationLimitedProbeHealthySampleCount = 0
                 lastSampleHasPositiveSuspensionPressure = false
                 if probeDeadlineExpired {
                     if applicationLimitedProbeBestQualifiedTier == nil,
@@ -708,10 +710,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 applicationLimitedProbeHealthySampleCount = 0
             }
 
+            // A proven intermediate tier is useful immediately; the grace window bounds
+            // unresolved probes, not how long a qualified improvement must stay hidden.
             if applicationLimitedProbeHealthySampleCount
                 >= Self.requiredHealthyUpgradeSampleCount,
-               applicationLimitedProbeBestQualifiedTier == .full {
-                completeApplicationLimitedProbe(committing: .full)
+               let qualifiedTier = applicationLimitedProbeBestQualifiedTier {
+                completeApplicationLimitedProbe(committing: qualifiedTier)
                 lastSampleHasPositiveSuspensionPressure = false
                 return isCaptureActive ? currentRecommendation : nil
             }
