@@ -1,7 +1,7 @@
 # Third-party notices
 
-opensteamer uses the following directly distributed runtime components. Their terms remain
-independent of the opensteamer project license. Keep this file with source and binary
+Beluga uses the following directly distributed runtime components. Their terms remain
+independent of the Beluga project license. Keep this file with source and binary
 distributions that contain the corresponding component.
 
 ## LiveKit WebRTC XCFramework wrapper

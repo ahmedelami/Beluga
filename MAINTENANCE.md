@@ -21,7 +21,7 @@ state.
 | Area | Source of truth |
 | --- | --- |
 | iPhone app | `iOS/opensteamer/Sources`, configured by `iOS/opensteamer/project.yml` |
-| Mac production host | `macOS/Sources/CaptureServer`, `macOS/Sources/CaptureCore`, and `macOS/OpensteamerHost/Info.plist` |
+| Mac production host | `macOS/Sources/CaptureServer`, `macOS/Sources/CaptureCore`, and `macOS/BelugaHost/Info.plist` |
 | Shared protocol, session, and media libraries | `shared/Sources`; target boundaries are declared in `Package.swift` |
 | Virtual microphone | `macOS/VirtualAudioDriver/Driver`, `src`, `include`, and `Resources` |
 | Public rendezvous Worker | `services/RendezvousWorker/src`, `wrangler.toml`, and its package manifest |
@@ -51,8 +51,9 @@ to shorten a file.
   `macOS/Tests`, and `shared/Tests`.
 - Repository identity and release checks live under root `scripts/`.
 - Generic host build and read-only verification use
-  `macOS/scripts/build-opensteamer-host-app.sh` and
-  `macOS/scripts/verify-*.sh`.
+  `macOS/scripts/build-beluga-host-app.sh` and
+  `macOS/scripts/verify-beluga-host-bundle.sh`. Existing deployment verifiers and the
+  former host builder remain available for their pinned historical workflows.
 - Generic driver verification uses `macOS/VirtualAudioDriver/tests`,
   `macOS/VirtualAudioDriver/scripts/build-driver.sh`,
   `verify-driver-bundle.sh`, and their test scripts.

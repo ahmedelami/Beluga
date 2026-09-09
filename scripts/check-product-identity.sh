@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Verifies that every build and deployment surface agrees on the exact opensteamer product
+# Verifies that every build and deployment surface agrees on the exact Beluga product
 # identity. The iOS Release app uses its App Store identity; Debug, test, Keychain, protocol, and
 # macOS compatibility identifiers remain separately asserted so no configuration can drift.
 set -uo pipefail
@@ -297,12 +297,12 @@ if require_file Package.swift; then
       exit
     }
   ' "$ROOT/Package.swift")
-  assert_equal "root Swift package name" opensteamer "$SWIFT_PACKAGE_NAME"
+  assert_equal "root Swift package name" Beluga "$SWIFT_PACKAGE_NAME"
 fi
 
 if require_file README.md; then
   README_HEADING=$(sed -n '1p' "$ROOT/README.md")
-  assert_equal "README heading" '# opensteamer' "$README_HEADING"
+  assert_equal "README heading" '# Beluga' "$README_HEADING"
   assert_literal_count \
     README.md 'AUDIOSTREAMER_RENDEZVOUS_URL' 0 \
     'README retired rendezvous environment alias count'
@@ -326,10 +326,17 @@ if require_file "$PROJECT_YML"; then
     "$PROJECT_YML" \
     'postGenCommand: /bin/zsh scripts/restore-archive-only-testflight-scheme.sh' 1 \
     'project.yml archive-only TestFlight scheme restoration hook'
-  # Target names are the product names. An override can silently rename only one configuration,
-  # so the authoritative XcodeGen source must continue to inherit its exact target identities.
+  # The app product is Beluga; target and module names remain stable for source and test imports.
   assert_literal_count \
-    "$PROJECT_YML" 'PRODUCT_NAME:' 0 'project.yml product-name override count'
+    "$PROJECT_YML" 'PRODUCT_NAME:' 1 'project.yml product-name override count'
+  assert_literal_count "$PROJECT_YML" '    productName: Beluga' 1 \
+    'project.yml app product name'
+  assert_literal_count "$PROJECT_YML" '        PRODUCT_NAME: Beluga' 1 \
+    'project.yml Beluga product override'
+  assert_literal_count "$PROJECT_YML" '        PRODUCT_MODULE_NAME: opensteamer' 1 \
+    'project.yml stable app module'
+  assert_literal_count "$PROJECT_YML" '        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon' 1 \
+    'project.yml app icon selection'
   assert_literal_count \
     "$PROJECT_YML" 'CODE_SIGN_IDENTITY:' 0 'project.yml code-sign identity override count'
   assert_literal_count \
@@ -540,6 +547,9 @@ if [[ -f "$ROOT/$PBX_PROJECT" ]]; then
         configurationNames.add(configurationName);
         const bundleID = setting(configuration.body, "PRODUCT_BUNDLE_IDENTIFIER");
         lines.push(`build|${name}|${configurationName}|${bundleID}`);
+        if (name === "opensteamer") {
+          lines.push(`app-product|${configurationName}|${setting(configuration.body, "PRODUCT_NAME")}|${setting(configuration.body, "PRODUCT_MODULE_NAME")}|${setting(configuration.body, "ASSETCATALOG_COMPILER_APPICON_NAME")}`);
+        }
       }
       if (entryIDs.length !== 3 || configurationNames.size !== 3) {
         throw new Error(`wrong configuration set for ${name}`);
@@ -552,7 +562,7 @@ if [[ -f "$ROOT/$PBX_PROJECT" ]]; then
     PBX_TARGET_CONTRACTS=$(print -r -- "$PBX_CONTRACTS" \
       | sed -n '/^target|/p' | LC_ALL=C sort)
     EXPECTED_PBX_TARGET_CONTRACTS=$(printf '%s\n' \
-      'target|opensteamer|opensteamer|opensteamer.app|wrapper.application|com.apple.product-type.application' \
+      'target|opensteamer|opensteamer|Beluga.app|wrapper.application|com.apple.product-type.application' \
       'target|opensteamerTests|opensteamerTests|opensteamerTests.xctest|wrapper.cfbundle|com.apple.product-type.bundle.unit-test' \
       'target|opensteamerUITests|opensteamerUITests|opensteamerUITests.xctest|wrapper.cfbundle|com.apple.product-type.bundle.ui-testing' \
       | LC_ALL=C sort)
@@ -579,6 +589,12 @@ if [[ -f "$ROOT/$PBX_PROJECT" ]]; then
       "$EXPECTED_PBX_BUILD_CONTRACTS" \
       "$PBX_BUILD_CONTRACTS"
 
+    PBX_APP_PRODUCT_CONTRACTS=$(print -r -- "$PBX_CONTRACTS" \
+      | sed -n '/^app-product|/p' | LC_ALL=C sort)
+    assert_equal "generated Xcode app product/module/icon mapping" \
+      $'app-product|Debug|Beluga|opensteamer|AppIcon\napp-product|Release|Beluga|opensteamer|AppIcon\napp-product|TestFlight|Beluga|opensteamer|AppIcon' \
+      "$PBX_APP_PRODUCT_CONTRACTS"
+
     APP_TARGET_ID=$(print -r -- "$PBX_CONTRACTS" | awk -F'|' \
       '$1 == "target-id" && $2 == "opensteamer" { print $3 }')
     UNIT_TEST_TARGET_ID=$(print -r -- "$PBX_CONTRACTS" | awk -F'|' \
@@ -593,11 +609,9 @@ if [[ -f "$ROOT/$PBX_PROJECT" ]]; then
       || fail "could not resolve exactly one generated UI-test target ID"
   fi
 
-  # XcodeGen emits one project-level fallback for each configuration. Target configurations must not
-  # override it; together with the target-name mapping above this proves the effective product,
-  # wrapper, and executable names in both configurations.
+  # Keep the inherited test-product defaults and require the app override in every configuration.
   assert_literal_count \
-    "$PBX_PROJECT" 'PRODUCT_NAME = ' 3 'generated Xcode product-name setting count'
+    "$PBX_PROJECT" 'PRODUCT_NAME = ' 6 'generated Xcode product-name setting count'
   assert_literal_count \
     "$PBX_PROJECT" 'PRODUCT_NAME = "$(TARGET_NAME)";' 3 \
     'generated Xcode inherited product-name defaults'
@@ -644,7 +658,7 @@ if require_directory "$SCHEME_DIRECTORY"; then
       fail "could not parse opensteamer scheme buildable mappings"
     else
       EXPECTED_APP_SCHEME_CONTRACTS=$(printf '%s\n' \
-        "$APP_TARGET_ID|opensteamer.app|opensteamer|container:opensteamer.xcodeproj" \
+        "$APP_TARGET_ID|Beluga.app|opensteamer|container:opensteamer.xcodeproj" \
         "$UNIT_TEST_TARGET_ID|opensteamerTests.xctest|opensteamerTests|container:opensteamer.xcodeproj" \
         | LC_ALL=C sort)
       assert_equal \
@@ -661,7 +675,7 @@ if require_directory "$SCHEME_DIRECTORY"; then
     else
       assert_equal \
         "opensteamerTestFlight scheme buildable/blueprint/project mapping" \
-        "$APP_TARGET_ID|opensteamer.app|opensteamer|container:opensteamer.xcodeproj" \
+        "$APP_TARGET_ID|Beluga.app|opensteamer|container:opensteamer.xcodeproj" \
         "$TESTFLIGHT_SCHEME_CONTRACTS"
     fi
     TESTFLIGHT_ARCHIVE_CONFIG=$(xmllint --xpath \
@@ -1727,7 +1741,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_ARCHIVE_SIGNING_IDENTITY="Apple Development: Ahmed Elamin (92LVX32M8K)"' 1 \
   'side-by-side TestFlight exact archive signing identity'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  '&& "${semantic_fields[5]}" == '\''Applications/opensteamer.app'\'' \' 1 \
+  '&& "${semantic_fields[5]}" == '\''Applications/Beluga.app'\'' \' 1 \
   'side-by-side TestFlight exact archive application path'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   '== "${TESTFLIGHT_ARCHIVE_INFO_WITHOUT_DISTRIBUTIONS_SHA256}"' 1 \
@@ -1798,27 +1812,27 @@ assert_plist_value "$SIDE_BY_SIDE_EXPORT_OPTIONS" uploadSymbols true \
   'side-by-side TestFlight symbol upload policy'
 
 assert_plist_value iOS/opensteamer/Sources/Support/Info.plist \
-  CFBundleDisplayName opensteamer 'iOS CFBundleDisplayName lowercase identity'
+  CFBundleDisplayName Beluga 'iOS CFBundleDisplayName identity'
 assert_literal_count iOS/opensteamer/Sources/Support/Info.plist \
   'AudioStreamerRendezvousURL' 0 'iOS retired rendezvous plist key count'
 assert_plist_value iOS/opensteamer/Sources/Support/Info.plist \
-  CFBundleName opensteamer 'iOS CFBundleName lowercase identity'
+  CFBundleName Beluga 'iOS CFBundleName identity'
 assert_plist_value iOS/opensteamer/Sources/Support/Info.plist \
   CFBundleExecutable '$(EXECUTABLE_NAME)' 'iOS Info.plist executable indirection'
 assert_plist_value iOS/opensteamer/Sources/Support/Info.plist \
   CFBundleIdentifier '$(PRODUCT_BUNDLE_IDENTIFIER)' 'iOS Info.plist bundle identifier indirection'
 assert_plist_value iOS/opensteamer/Sources/Support/Info.plist \
   NSLocalNetworkUsageDescription \
-  'opensteamer finds the Mac capture server on your local Wi-Fi network.' \
-  'iOS local-network description lowercase identity'
+  'Beluga finds the Mac capture server on your local Wi-Fi network.' \
+  'iOS local-network description identity'
 assert_plist_value iOS/opensteamer/Sources/Support/Info.plist \
   NSCameraUsageDescription \
-  'opensteamer may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.' \
+  'Beluga may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera.' \
   'iOS camera usage description'
 assert_literal_count iOS/opensteamer/Sources/Views/BrowserView.swift \
-  '.navigationTitle("opensteamer")' 1 'iOS navigation-title lowercase identity'
+  '.navigationTitle("Beluga")' 1 'iOS navigation-title identity'
 assert_literal_count iOS/opensteamer/Sources/App/BackgroundPlaybackCoordinator.swift \
-  'MPMediaItemPropertyTitle: "opensteamer"' 1 'iOS Now Playing lowercase identity'
+  'MPMediaItemPropertyTitle: "Beluga"' 1 'iOS Now Playing identity'
 
 # The repo-owned virtual microphone has one fixed AudioServerPlugIn identity. Keep the product
 # gate source-only: it validates the build inputs and verifier contract without loading Core
@@ -1863,7 +1877,7 @@ assert_plist_value "$VIRTUAL_AUDIO_DRIVER_PLIST" \
   CFBundleIdentifier com.elamin.opensteamer.VirtualMicrophoneDriver \
   'virtual microphone driver bundle identifier'
 assert_plist_value "$VIRTUAL_AUDIO_DRIVER_PLIST" \
-  CFBundleName 'opensteamer Virtual Microphone' \
+  CFBundleName 'Beluga Virtual Microphone' \
   'virtual microphone driver bundle name'
 assert_plist_value "$VIRTUAL_AUDIO_DRIVER_PLIST" \
   CFBundleExecutable OpensteamerVirtualMicrophone \
@@ -1979,6 +1993,30 @@ if require_directory "$VIRTUAL_AUDIO_DRIVER_DIRECTORY"; then
     || fail 'legacy BlackHole device UID appears in the new virtual microphone driver'
 fi
 
+# Fresh Beluga builds are separate from the immutable installed-host rollback scripts.
+BELUGA_HOST_PLIST='macOS/BelugaHost/Info.plist'
+assert_plist_value "$BELUGA_HOST_PLIST" CFBundleDisplayName 'Beluga Host' \
+  'Beluga host CFBundleDisplayName'
+assert_plist_value "$BELUGA_HOST_PLIST" CFBundleName 'Beluga Host' 'Beluga host CFBundleName'
+assert_plist_value "$BELUGA_HOST_PLIST" CFBundleIdentifier \
+  com.elamin.AudioStreamer.CaptureServer 'preserved Beluga host bundle identifier'
+assert_plist_value "$BELUGA_HOST_PLIST" CFBundleExecutable CaptureServer \
+  'Beluga host executable name'
+assert_plist_value "$BELUGA_HOST_PLIST" CFBundleIconFile AppIcon.icns \
+  'Beluga host icon selection'
+assert_literal_count macOS/scripts/build-beluga-host-app.sh \
+  'readonly APP_DIR="$APP_OUTPUT_DIR/Beluga Host.app"' 1 'Beluga host output path'
+assert_literal_count macOS/scripts/build-beluga-host-app.sh \
+  '/bin/cp "$ROOT_DIR/macOS/BelugaHost/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"' 1 \
+  'Beluga host icon copy'
+assert_literal_count macOS/scripts/verify-beluga-host-bundle.sh \
+  'EXPECTED_BUNDLE_IDENTIFIER="com.elamin.AudioStreamer.CaptureServer"' 1 \
+  'preserved Beluga host verifier identity'
+if require_file scripts/check-beluga-artwork.mjs; then
+  node "$ROOT/scripts/check-beluga-artwork.mjs" "$ROOT" \
+    || fail 'Beluga artwork source identity'
+fi
+
 # The distributed host uses user-facing opensteamer naming but retains the established bundle ID.
 assert_plist_value macOS/OpensteamerHost/Info.plist \
   CFBundleDisplayName 'opensteamer Host' 'macOS host CFBundleDisplayName'
@@ -2000,11 +2038,11 @@ assert_plist_value macOS/Sources/CaptureServer/Info.plist \
   CFBundleIdentifier com.elamin.AudioStreamer.CaptureServer \
   'preserved SwiftPM capture-server bundle identifier'
 assert_plist_value macOS/Sources/CaptureServer/Info.plist \
-  CFBundleName 'opensteamer Capture Server' 'SwiftPM capture-server bundle name'
+  CFBundleName 'Beluga Capture Server' 'SwiftPM capture-server bundle name'
 assert_plist_value macOS/Sources/CaptureServer/Info.plist \
   NSMicrophoneUsageDescription \
-  "opensteamer uses its virtual microphone to route your iPhone's microphone into calls on this Mac." \
-  'SwiftPM capture-server microphone description lowercase identity'
+  "Beluga uses its virtual microphone to route your iPhone's microphone into calls on this Mac." \
+  'SwiftPM capture-server microphone description identity'
 assert_literal_count macOS/Sources/CaptureServer/WorldwidePairingStore.swift \
   '"com.elamin.opensteamer.CaptureServer.WorldwidePairing.v1"' 1 \
   'isolated opensteamer pairing Keychain service'
@@ -2081,8 +2119,8 @@ assert_toml_name services/RendezvousWorker/wrangler.test.toml opensteamer-rendez
   'test Worker name'
 
 if (( FAILURES > 0 )); then
-  print -u2 -- "opensteamer product identity check rejected $FAILURES mismatch(es)"
+  print -u2 -- "Beluga product identity check rejected $FAILURES mismatch(es)"
   exit 1
 fi
 
-print -- 'opensteamer product identity check passed'
+print -- 'Beluga product identity check passed'

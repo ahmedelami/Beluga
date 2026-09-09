@@ -9,9 +9,9 @@ final class AppArtifactContractTests: XCTestCase {
     func testBuiltApplicationKeepsRenamedVisibleIdentityAndUpgradeBundle() throws {
         let info = Bundle.main.infoDictionary
 
-        XCTAssertEqual(info?["CFBundleDisplayName"] as? String, "opensteamer")
-        XCTAssertEqual(info?["CFBundleName"] as? String, "opensteamer")
-        XCTAssertEqual(info?["CFBundleExecutable"] as? String, "opensteamer")
+        XCTAssertEqual(info?["CFBundleDisplayName"] as? String, "Beluga")
+        XCTAssertEqual(info?["CFBundleName"] as? String, "Beluga")
+        XCTAssertEqual(info?["CFBundleExecutable"] as? String, "Beluga")
         XCTAssertEqual(
             Bundle.main.bundleIdentifier,
             "org.example.AudioStreamer.dev",
@@ -19,16 +19,16 @@ final class AppArtifactContractTests: XCTestCase {
         )
         XCTAssertEqual(
             info?["NSLocalNetworkUsageDescription"] as? String,
-            "opensteamer finds the Mac capture server on your local Wi-Fi network."
+            "Beluga finds the Mac capture server on your local Wi-Fi network."
         )
         XCTAssertEqual(
             info?["NSCameraUsageDescription"] as? String,
-            "opensteamer may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera."
+            "Beluga may request camera access through its real-time communication framework only when you explicitly start a camera-capable sharing feature. Ordinary audio and screen streaming do not access the camera."
         )
 
         XCTAssertEqual(
             info?["NSMicrophoneUsageDescription"] as? String,
-            "opensteamer may automatically activate the iPhone microphone for your authenticated paired Mac after the secure connection becomes healthy. You can turn it off at any time."
+            "Beluga may automatically activate the iPhone microphone for your authenticated paired Mac after the secure connection becomes healthy. You can turn it off at any time."
         )
     }
 

@@ -27,7 +27,7 @@ struct CaptureServerOptions {
     var displayID: UInt32?
     var virtualPhoneDisplayEnabled = false
     var captureMode: AudioCaptureMode = .blackHoleInput
-    var bonjourName: String? = Host.current().localizedName ?? "opensteamer"
+    var bonjourName: String? = Host.current().localizedName ?? "Beluga"
     var authToken = ProcessInfo.processInfo.environment["MCAP_TOKEN"]?.nilIfEmpty
     var verbose = false
     var listDisplays = false

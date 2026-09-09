@@ -1169,7 +1169,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             let aggregateUID =
                 "com.elamin.opensteamer.SystemAudioTap.\(UUID().uuidString)"
             let aggregateDescription: [String: Any] = [
-                kAudioAggregateDeviceNameKey: "opensteamer System Audio Tap",
+                kAudioAggregateDeviceNameKey: "Beluga System Audio Tap",
                 kAudioAggregateDeviceUIDKey: aggregateUID,
                 kAudioAggregateDeviceMainSubDeviceKey: clockDevice.uid,
                 kAudioAggregateDeviceSubDeviceListKey: [[
@@ -1541,7 +1541,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
         let description = CATapDescription(
             stereoGlobalTapButExcludeProcesses: excludedProcessIDs
         )
-        description.name = "opensteamer System Audio"
+        description.name = "Beluga System Audio"
         description.uuid = uuid
         description.isPrivate = true
         description.isExclusive = true

@@ -2,9 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  SwiftPM executable metadata for local CaptureServer runs. Distribution uses the canonical
-  BelugaHost template, while these usage descriptions keep development capture prompts
-  explicit and attributable to the same bundle identifier.
+  Bundle template consumed by build-beluga-host-app.sh. The UI-element app has no Dock
+  icon; the usage strings declare the system-audio and virtual-microphone boundaries whose TCC
+  grants belong to this stable bundle identity.
 -->
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
@@ -12,20 +12,28 @@
 	<key>CFBundleExecutable</key>
 	<string>CaptureServer</string>
 	<key>CFBundleIdentifier</key>
-	<!-- Match the shipped host identity so local runs share the established privacy boundary. -->
+	<!-- Keep the shipped code identity stable so upgrades retain macOS privacy grants. -->
 	<string>com.elamin.AudioStreamer.CaptureServer</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Beluga Capture Server</string>
+	<string>Beluga Host</string>
+	<key>CFBundleDisplayName</key>
+	<string>Beluga Host</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>4</string>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Beluga captures system audio from this Mac so it can stream playback to your iPhone.</string>
+	<string>Beluga captures this Mac's audio so it can stream playback to your iPhone.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Beluga uses its virtual microphone to route your iPhone's microphone into calls on this Mac.</string>
 </dict>

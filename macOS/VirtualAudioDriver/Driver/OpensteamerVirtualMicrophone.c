@@ -1861,13 +1861,13 @@ static AudioClassID OSVAClassForObject(AudioObjectID objectID) {
 static CFStringRef OSVANameForObject(AudioObjectID objectID) {
   switch (objectID) {
   case kOSVAObjectIDVisibleInputDevice:
-    return CFSTR("opensteamer Virtual Microphone");
+    return CFSTR("Beluga Virtual Microphone");
   case kOSVAObjectIDVisibleInputStream:
-    return CFSTR("opensteamer Virtual Microphone Input Stream");
+    return CFSTR("Beluga Virtual Microphone Input Stream");
   case kOSVAObjectIDHiddenWriterDevice:
-    return CFSTR("opensteamer Virtual Microphone Writer");
+    return CFSTR("Beluga Virtual Microphone Writer");
   case kOSVAObjectIDHiddenWriterStream:
-    return CFSTR("opensteamer Virtual Microphone Writer Output Stream");
+    return CFSTR("Beluga Virtual Microphone Writer Output Stream");
   default:
     return CFSTR("");
   }
@@ -2069,7 +2069,7 @@ static OSStatus OSVAGetPropertyData(AudioServerPlugInDriverRef driver,
                            outData);
   }
   case kAudioObjectPropertyManufacturer: {
-    CFStringRef value = CFSTR("opensteamer");
+    CFStringRef value = CFSTR("Beluga");
     return OSVAWriteScalar(&value, sizeof(value), dataSize, outDataSize,
                            outData);
   }

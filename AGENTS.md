@@ -10,9 +10,13 @@ runtime without the user's explicit approval.
 
 # Agent Guidelines
 
-## opensteamer Product Contract
+The current product and app display name is **Beluga**. Existing opensteamer source paths,
+build targets, deployed identifiers, and frozen release records retain their original names
+for compatibility. Follow [BRANDING.md](BRANDING.md) for the branding boundary.
 
-opensteamer's production remote path must connect a Mac and iPhone on unrelated
+## Beluga Product Contract
+
+Beluga's production remote path must connect a Mac and iPhone on unrelated
 Internet-connected Wi-Fi networks from anywhere in the world. The intended user
 experience is to enter one secure pairing code on the iPhone; it must not require
 manual IP addresses, router configuration, or public TCP ports.

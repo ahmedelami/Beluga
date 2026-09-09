@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Rejects former product branding in the current tracked tree while allowing only the exact
-# persistence and protocol identifiers that shipped before the opensteamer rename. The allowlist
+# persistence and protocol identifiers that shipped before the Beluga rename. The allowlist
 # is deliberately path- and token-specific: compatibility bytes may remain, but they cannot be
 # copied into new user-facing text or unversioned identifiers unnoticed.
 set -eu
@@ -416,11 +416,13 @@ is_allowed_legacy_token() {
     iOS/opensteamer/Sources/Security/ViewerPairingStore.swift)
       is_crypto_token "$token"
       ;;
-    macOS/OpensteamerHost/Info.plist|macOS/Sources/CaptureServer/Info.plist|\
+    macOS/BelugaHost/Info.plist|macOS/OpensteamerHost/Info.plist|macOS/Sources/CaptureServer/Info.plist|\
       macOS/Sources/CaptureCore/SystemAudioCaptureSource.swift|\
       macOS/Sources/CaptureServer/WorldwideHostProcessLock.swift|\
       macOS/Sources/CaptureServer/WorldwidePairingStore.swift|\
       macOS/scripts/build-opensteamer-host-app.sh|\
+      macOS/scripts/build-beluga-host-app.sh|\
+      macOS/scripts/verify-beluga-host-bundle.sh|\
       macOS/scripts/verify-mac-host-bundle.sh|\
       macOS/Tests/CaptureCoreTests/SystemAudioCaptureSourceTests.swift|\
       macOS/Tests/CaptureServerTests/WorldwideHostProcessLockTests.swift|\
@@ -511,4 +513,15 @@ if [[ -n "$UNAPPROVED" ]]; then
   exit 1
 fi
 
-print -- "opensteamer branding audit passed"
+# Source/target identifiers remain stable; current app-facing strings must carry Beluga.
+CURRENT_BRAND_MATCHES="$(git grep -I -n -E \
+  '("[Oo]pensteamer([[:space:]"]|$)|<string>opensteamer([[:space:]<]|$)|^# opensteamer$)' -- \
+  README.md iOS/opensteamer/Sources macOS/BelugaHost macOS/Sources/CaptureServer/Info.plist \
+  || true)"
+if [[ -n "$CURRENT_BRAND_MATCHES" ]]; then
+  print -u2 -- "superseded app display branding remains:"
+  print -u2 -- "$CURRENT_BRAND_MATCHES"
+  exit 1
+fi
+
+print -- "Beluga branding audit passed"
