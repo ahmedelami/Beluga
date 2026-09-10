@@ -2718,6 +2718,7 @@ actor WorldwideScreenService {
 
         var proposedPolicy = screenVideoAdaptationPolicy
         var capacityDiagnostics: WorldwideScreenCapacityProbeDiagnostics?
+        var floorDiagnostics: WorldwideScreenFloorRecoveryDiagnostics?
         let changedRecommendation:
             WorldwideScreenVideoEncodingRecommendation?
         if let snapshot, capacityProbeOnly {
@@ -2750,7 +2751,8 @@ actor WorldwideScreenService {
                 outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
                 outboundVideoTotalPacketSendDelaySeconds:
                     snapshot.outboundVideo?.totalPacketSendDelay,
-                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds
+                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
+                diagnostics: { floorDiagnostics = $0 }
             )
         } else {
             changedRecommendation = proposedPolicy
@@ -2762,6 +2764,16 @@ actor WorldwideScreenService {
         }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
+        if let floorDiagnostics,
+           screenVideoAdaptationPolicy.currentTier == .audioPriority
+            || proposedPolicy.currentTier == .audioPriority {
+            logger.debug(
+                "Worldwide screen floor proposal peerGeneration=\(sourcePeerGeneration) "
+                    + "policyRevision=\(expectedPolicyRevision) "
+                    + "visibilityEpoch=\(screenVisibilityCommandEpoch) "
+                    + floorDiagnostics.logFields
+            )
+        }
         if let capacityDiagnostics {
             logger.debug(
                 "Worldwide screen capacity proposal peerGeneration=\(sourcePeerGeneration) "

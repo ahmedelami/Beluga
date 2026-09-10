@@ -520,15 +520,36 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         outboundVideoPacketsSent: UInt64? = nil,
         outboundVideoTotalPacketSendDelaySeconds: Double? = nil,
         nativeReportTimestampMicroseconds: Double? = nil,
-        observedAt: ContinuousClock.Instant = .now
+        observedAt: ContinuousClock.Instant = .now,
+        diagnostics: ((WorldwideScreenFloorRecoveryDiagnostics) -> Void)? = nil
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         let didResetForNewPeer = bind(toPeerGeneration: generation)
+        var evaluation = WorldwideScreenFloorRecoveryDiagnostics(
+            showEpoch: floorRecoveryShowEpoch,
+            reserved: floorRecoveryVisibilityIsReserved, active: floorRecoveryVisibilityIsActive,
+            consumed: floorRecoveryAttemptConsumed, disproved: belowReserveProbeDisprovedSenderLimitation,
+            cooldownRemaining: applicationLimitedProbeCooldownSamplesRemaining,
+            collectionSequence: collectionSequence, previousRegularSequence: floorRecoveryLastRegularSequence,
+            previousRegularTimestamp: floorRecoveryLastRegularTimestamp,
+            capacityTimestamp: capacityProbeNativeReportTimestamp,
+            nativeReportTimestamp: nativeReportTimestampMicroseconds,
+            currentBandwidthBps: availableOutgoingBitrateBps,
+            firstBandwidthBps: floorRecoveryFirstWitness?.bandwidthBps,
+            witnessAge: floorRecoveryFirstWitness.map { $0.observedAt.duration(to: observedAt) },
+            beforeTotalCapBps: currentRecommendation.maximumTotalRTPBitrateBps
+        )
+        defer {
+            evaluation.proposedTotalCapBps = currentRecommendation.maximumTotalRTPBitrateBps
+            diagnostics?(evaluation)
+        }
         // Time still passes when a report is rejected. Aging an existing lease is not renewing
         // it or consuming the report, and prevents stale stable-resume authorization.
         roundTripTimeObservationAge = lastRoundTripTimeAdvancement.map {
             $0.duration(to: observedAt)
         }
         if requireRoundTripTimeObservation, collectionSequence == nil {
+            evaluation.identity = .rejectedOrder
+            evaluation.reason = .rejectedOrder
             floorRecoveryFirstWitness = nil
             // Native request ordering is part of the evidence boundary. Unordered metadata may
             // expire a wall-clock lease, but cannot change BWE/queue/RTT measurement state.
@@ -545,6 +566,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         if let collectionSequence {
             if let lastCapacityProbeCollectionSequence,
                collectionSequence <= lastCapacityProbeCollectionSequence {
+                evaluation.identity = .rejectedOrder
+                evaluation.reason = .rejectedOrder
                 floorRecoveryFirstWitness = nil
                 return expireApplicationLimitedProbeWithoutReport(
                     peerGeneration: generation,
@@ -554,6 +577,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             }
             if let lastConsumedCollectionSequence,
                collectionSequence <= lastConsumedCollectionSequence {
+                evaluation.identity = .rejectedOrder
+                evaluation.reason = .rejectedOrder
                 floorRecoveryFirstWitness = nil
                 // A slower fallback request may finish after a newer fast-lane report. Reject
                 // the entire older report, including BWE/queue/cap changes, before consuming it.
@@ -574,6 +599,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             timestamp: nativeReportTimestampMicroseconds,
             requiresNativeEvidence: requireRoundTripTimeObservation
         )
+        evaluation.identity = floorRecoveryReportIsFresh ? .fresh
+            : (requireRoundTripTimeObservation ? .rejectedTimestamp : .rejectedOrder)
         defer {
             recordCapacityProbeBaseline(
                 nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
@@ -603,7 +630,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             outboundVideoTotalPacketSendDelaySeconds:
                 outboundVideoTotalPacketSendDelaySeconds,
             floorRecoveryReportIsFresh: floorRecoveryReportIsFresh,
-            observedAt: observedAt
+            observedAt: observedAt,
+            floorDiagnostics: &evaluation
         )
         if lastSampleHasLatencyPressure {
             promotionCapacityContinuity = nil
@@ -859,7 +887,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         outboundVideoPacketsSent: UInt64?,
         outboundVideoTotalPacketSendDelaySeconds: Double?,
         floorRecoveryReportIsFresh: Bool,
-        observedAt: ContinuousClock.Instant
+        observedAt: ContinuousClock.Instant,
+        floorDiagnostics: inout WorldwideScreenFloorRecoveryDiagnostics
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         if let selectedRoute,
            selectedRoute != self.selectedRoute {
@@ -880,6 +909,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         // Reset to the configured conservative start tier and consume path samples only for an
         // active sender or an explicit automatic-pause recovery probe.
         guard isCaptureActive || isAutomaticallySuspended else {
+            floorDiagnostics.reason = .inactiveVisibility
             currentTier = Self.initialTier(
                 configuredTotalRTPBitrateBps: configuredTotalRTPBitrateBps
             )
@@ -1006,7 +1036,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             roundTripTimeAllowsUpgrade: roundTripTimeAllowsUpgrade,
             bandwidthBps: availableOutgoingBitrateBps,
             isCaptureActive: isCaptureActive,
-            observedAt: observedAt
+            observedAt: observedAt,
+            diagnostics: &floorDiagnostics
         )
 
         guard let availableOutgoingBitrateBps,
@@ -1298,6 +1329,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                availableOutgoingBitrateBps: effectiveAvailableOutgoingBitrateBps,
                observedAt: observedAt
            ) {
+            floorDiagnostics.reason = .admitted
             floorRecoveryAttemptConsumed = true
             floorRecoveryProbeWasCancelled = false
             floorRecoveryProbeSeedBandwidthBps = effectiveAvailableOutgoingBitrateBps
@@ -1676,16 +1708,49 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         roundTripTimeAllowsUpgrade: Bool,
         bandwidthBps: Double?,
         isCaptureActive: Bool,
-        observedAt: ContinuousClock.Instant
+        observedAt: ContinuousClock.Instant,
+        diagnostics: inout WorldwideScreenFloorRecoveryDiagnostics
     ) -> Bool {
-        guard reportIsFresh, isCaptureActive, floorRecoveryVisibilityIsActive,
-              !floorRecoveryAttemptConsumed, !belowReserveProbeDisprovedSenderLimitation,
-              currentTier == .audioPriority, applicationLimitedProbeOriginTier == nil,
-              usesNativeRoundTripTimeEvidence, nativeRoundTripTimeHealth == .healthy,
-              roundTripTimeAllowsUpgrade,
-              let bandwidthBps, bandwidthBps.isFinite, bandwidthBps > 0,
-              !estimatorIsApplicationLimited(bandwidthBps),
+        diagnostics.roundTripTimeDisposition = roundTripTimeDisposition
+        diagnostics.roundTripTimeAllowsUpgrade = roundTripTimeAllowsUpgrade
+        switch queue {
+        case let .measured(delay):
+            diagnostics.queueKind = .measured
+            diagnostics.queueMicroseconds = WorldwideScreenFloorRecoveryDiagnostics.boundedMicroseconds(seconds: delay)
+        case .noNewPackets: diagnostics.queueKind = .noNewPackets
+        case .unavailableOrReset: diagnostics.queueKind = .unavailableOrReset
+        }
+        let rejection: WorldwideScreenFloorRecoveryDiagnostics.Reason?
+        if !reportIsFresh {
+            rejection = diagnostics.identity == .rejectedOrder ? .rejectedOrder : .rejectedTimestamp
+        } else if !isCaptureActive || !floorRecoveryVisibilityIsActive {
+            rejection = .inactiveVisibility
+        } else if floorRecoveryAttemptConsumed {
+            rejection = .consumed
+        } else if belowReserveProbeDisprovedSenderLimitation {
+            rejection = .disproved
+        } else if currentTier != .audioPriority {
+            rejection = .notFloor
+        } else if applicationLimitedProbeOriginTier != nil {
+            rejection = .existingProbe
+        } else if !usesNativeRoundTripTimeEvidence || nativeRoundTripTimeHealth != .healthy || !roundTripTimeAllowsUpgrade {
+            rejection = .rttBlocked
+        } else {
+            rejection = nil
+        }
+        if let rejection {
+            diagnostics.reason = rejection
+            floorRecoveryFirstWitness = nil
+            return false
+        }
+        guard let bandwidthBps, bandwidthBps.isFinite, bandwidthBps > 0 else {
+            diagnostics.reason = .invalidBandwidth
+            floorRecoveryFirstWitness = nil
+            return false
+        }
+        guard !estimatorIsApplicationLimited(bandwidthBps),
               bandwidthBps * 2 > Double(currentRecommendation.maximumTotalRTPBitrateBps) else {
+            diagnostics.reason = estimatorIsApplicationLimited(bandwidthBps) ? .ordinaryProbeEligible : .noHeadroom
             floorRecoveryFirstWitness = nil
             return false
         }
@@ -1693,16 +1758,25 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
            !isFreshPacketQueueObservation(first.observedAt, at: observedAt) {
             floorRecoveryFirstWitness = nil
         }
+        if let first = floorRecoveryFirstWitness, bandwidthBps < first.bandwidthBps {
+            // Negative evidence retires the window even on an early or no-packet report.
+            diagnostics.reason = .bandwidthFalling
+            floorRecoveryFirstWitness = nil
+            return false
+        }
         switch queue {
         case let .measured(delay) where delay <= Self.maximumUpgradePacketSendDelaySeconds:
             break
         case .noNewPackets:
+            diagnostics.reason = .noNewPackets
             return false
         case .measured, .unavailableOrReset:
+            diagnostics.reason = .queueBlocked
             floorRecoveryFirstWitness = nil
             return false
         }
         if applicationLimitedProbeCooldownSamplesRemaining > 0 {
+            diagnostics.reason = .cooldown
             floorRecoveryFirstWitness = nil
             if floorRecoveryLastCooldownObservation.map({
                 $0.duration(to: observedAt) >= .milliseconds(Self.sampleIntervalMilliseconds)
@@ -1713,12 +1787,17 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return false
         }
         guard let first = floorRecoveryFirstWitness else {
+            diagnostics.reason = .firstWitness
             floorRecoveryFirstWitness = FloorRecoveryWitness(observedAt: observedAt, bandwidthBps: bandwidthBps)
             return false
         }
-        // A slightly early completion does not throw away the first healthy regular window.
-        guard first.observedAt.duration(to: observedAt) >= .milliseconds(Self.sampleIntervalMilliseconds),
-              bandwidthBps > first.bandwidthBps else { return false }
+        // Flat estimates can be sender-limited too. Only this initial bounded discovery
+        // accepts equality; subsequent ceiling growth still needs increasing measured BWE.
+        guard first.observedAt.duration(to: observedAt) >= .milliseconds(Self.sampleIntervalMilliseconds) else {
+            diagnostics.reason = .tooEarly
+            return false
+        }
+        diagnostics.reason = .qualified
         return true
     }
 

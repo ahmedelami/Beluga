@@ -101,8 +101,8 @@ final class WorldwideScreenFloorRecoveryTests: XCTestCase {
         }
     }
 
-    func testNonrisingInvalidOrInsufficientBandwidthCannotAdmitTrial() {
-        for bandwidth in [nil, 0, -1, Double.nan, .infinity, 300_000, 304_000] as [Double?] {
+    func testFallingInvalidOrInsufficientBandwidthCannotAdmitTrial() {
+        for bandwidth in [nil, 0, -1, Double.nan, .infinity, 300_000] as [Double?] {
             var fixture = FloorRecoveryFixture()
             _ = fixture.normal(bandwidth: 304_000)
             _ = fixture.normal(bandwidth: bandwidth)

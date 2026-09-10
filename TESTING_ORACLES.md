@@ -225,7 +225,8 @@ from native apply results. Numeric/enum diagnostics must reject malformed values
 logging media, peer addresses, or raw connection identities, and must not change policy state.
 
 Below-reserve floor recovery must require two advancing native ordinary reports with
-measured low packet delay, healthy RTT, rising capacity, and at least 500 ms separation
+measured low packet delay, healthy RTT, capacity at least the first witness's value,
+and at least 500 ms separation
 within a 1.5 s evidence lease. Fast/no-packet/cached reports must not supply admission
 witnesses. Keep the visible floor unchanged while testing bounded capacity, use the
 trial's seed-relative collapse threshold, preserve real congestion and the original
@@ -235,6 +236,12 @@ failed or superseded native application cannot refund the allowance or transfer 
 health to another Show. Cover expiry, disproof, cooldown, stale identities, and seed
 retirement. Independently disable admission, restore the ordinary collapse threshold,
 and remove failed-apply attempt consumption; their behavioral regressions must fail.
+Cold-first-Show fixtures must also admit a constant below-reserve estimate without
+fabricated prior congestion or per-poll RTT advancement. An intervening estimate below
+the first witness invalidates that pending window, including early/no-packet reports.
+Equality permits initial bounded discovery only, never repeated capacity growth or
+visible promotion. Retain exact-value trend and admission-reason diagnostics as
+proposal evidence separate from native acceptance and client presentation.
 
 ## Execution and Claim Boundary
 
