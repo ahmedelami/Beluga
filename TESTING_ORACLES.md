@@ -189,6 +189,21 @@ presentation evidence. Bind live timing to the installed host and one acknowledg
 Show request, distinguish host-receipt timing from actual display timing, and retain
 intermediate reversals. Full-resolution reports do not alone prove perceived clarity.
 
+Mac native probing must not wait indefinitely for a large media packet when a
+low-detail screencast produces only small RTP packets. Exercise the actual
+production peer initializer in a fresh process, with continuous tiny frames,
+unchanged encoded geometry and a bounded total-cap increase. Require native
+feedback, advancing sender-scoped measured BWE, and receiver frame progress
+before the original deadline; a created cluster or accepted cap is insufficient.
+Removing the startup configuration must make the recovery oracle fail. A
+factory field trial is process-wide configuration, not a per-Show permission;
+never toggle it during capture or reconnect. Preserve PCM/device policy and
+verify same-peer Show/Hide/Show with decoded-frame cessation after drain and
+continued independent audio. Padding packets while hidden are not new screen
+frames, and a configured probe target is not a hard instantaneous wire-rate cap.
+Synthetic local recovery remains separate from installed-host and real-iPhone
+clarity timing.
+
 Selected ICE-pair RTT is cached between native ping responses. A new statistics request
 or collection sequence is not a new RTT measurement. Consume a privacy-reduced pair
 identity plus advancing cumulative total RTT/response counters once for RTT-only

@@ -12915,6 +12915,10 @@ private enum WebRTCRuntime {
     static let isInitialized: Bool = {
         guard LKRTCInitializeSSL() else { return false }
         #if os(macOS)
+        // Tiny screencast packets must not leave an already-budgeted probe waiting for 200 bytes.
+        LKRTCPeerConnectionFactory.configureFieldTrials(
+            "WebRTC-Bwe-ProbingBehavior/min_packet_size:0/"
+        )
         WebRTCNativeProbeDiagnostics.start()
         #endif
         return true
