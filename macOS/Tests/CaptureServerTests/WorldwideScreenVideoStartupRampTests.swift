@@ -133,7 +133,7 @@ final class WorldwideScreenVideoStartupRampTests: XCTestCase {
         var fixture = ProbeFixture()
         let probeStartedAt = fixture.now
         var visibleTiers: [WorldwideScreenVideoAdaptationTier] = [.audioPriority]
-        for bandwidth in [700_000.0, 1_465_000, 2_831_000, 5_662_000, 10_308_000, 15_896_000, 15_896_000] {
+        for bandwidth in [700_000.0, 1_465_000, 2_831_000, 10_308_000, 15_896_000, 15_896_000] {
             _ = fixture.sample(bandwidth: bandwidth)
             if fixture.policy.currentTier != visibleTiers.last {
                 visibleTiers.append(fixture.policy.currentTier)
@@ -146,7 +146,7 @@ final class WorldwideScreenVideoStartupRampTests: XCTestCase {
             )
         }
         XCTAssertEqual(visibleTiers, [.audioPriority, .full])
-        XCTAssertEqual(probeStartedAt.duration(to: fixture.now), .milliseconds(3_500))
+        XCTAssertEqual(probeStartedAt.duration(to: fixture.now), .milliseconds(3_000))
         XCTAssertEqual(fixture.policy.currentRecommendation.maximumFramesPerSecond, 60)
         XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
         XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)

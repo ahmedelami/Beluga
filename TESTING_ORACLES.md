@@ -204,6 +204,27 @@ frames, and a configured probe target is not a hard instantaneous wire-rate cap.
 Synthetic local recovery remains separate from installed-host and real-iPhone
 clarity timing.
 
+During active startup discovery, successively improving ordinary reports must expose
+the best tier qualified by both reports, without treating the latest higher tier as
+confirmed or ending discovery merely to show the intermediate picture. Native
+qualification requires advancing report identity, measured low packet delay, healthy
+RTT evidence, and 500–1500 ms separation. A fresh no-packet report may hold the original
+witness only while its tier remains supported and its original lease is valid; it
+must not increment the count or renew any timestamp. Missing/reset queue, invalid
+identity, unsupported capacity, or unhealthy RTT breaks pending qualification.
+Geometry changes reset queue permission, so fast growth waits for a new ordinary
+low-queue measurement. Preserve the original probe origin, deadline, accepted budget
+and bandwidth high-water mark across intermediate geometry. Silence or expiry removes
+speculative capacity without erasing previously applied quality; fresh adverse
+capacity must protect that quality's sustainable requirement in both statistics lanes.
+Hide/Show and route boundaries retire pending and confirmed discovery state. Rejected
+native application must never copy positive geometry confirmation. Exercise rising
+capacity, plateau completion, no-packet cadence, expiry, adverse capacity, ownership
+and failed-apply outcomes; mutations must reject disabled intermediate presentation,
+selection of the better single-witness tier, and removal of freshness/lease guards.
+This policy improvement does not establish recovery from invalid native feedback;
+installed-host and real-iPhone startup timing remain separate requirements.
+
 Selected ICE-pair RTT is cached between native ping responses. A new statistics request
 or collection sequence is not a new RTT measurement. Consume a privacy-reduced pair
 identity plus advancing cumulative total RTT/response counters once for RTT-only

@@ -589,6 +589,7 @@ private struct RTTFixture {
     var responses: UInt64
     var observation: WebRTCRoundTripTimeObservation?
     var strict = true
+    private var elapsedMicroseconds: Double = 0
     private var nextSequence: UInt64 = 0
     private var packets: UInt64 = 0
     private var delay: Double = 0
@@ -619,6 +620,7 @@ private struct RTTFixture {
         isCaptureActive: Bool = true
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         now = now.advanced(by: .milliseconds(afterMilliseconds))
+        elapsedMicroseconds += Double(afterMilliseconds) * 1_000
         nextSequence = sequence ?? (nextSequence + 1)
         if advancesPackets {
             packets += 100
@@ -634,6 +636,8 @@ private struct RTTFixture {
             requireRoundTripTimeObservation: strict,
             outboundVideoPacketsSent: packets,
             outboundVideoTotalPacketSendDelaySeconds: delay,
+            // Native report collection advances independently of the cached RTT measurement.
+            nativeReportTimestampMicroseconds: 10_000_000 + elapsedMicroseconds,
             observedAt: now
         )
     }

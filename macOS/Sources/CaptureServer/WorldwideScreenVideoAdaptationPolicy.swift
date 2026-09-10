@@ -249,6 +249,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         WorldwideScreenVideoAdaptationTier?
     private(set) var applicationLimitedProbeBestQualifiedTier:
         WorldwideScreenVideoAdaptationTier?
+    private(set) var applicationLimitedProbeConfirmedTier:
+        WorldwideScreenVideoAdaptationTier?
+    private var applicationLimitedProbeQualificationObservedAt:
+        ContinuousClock.Instant?
     private(set) var applicationLimitedProbeMaximumTotalRTPBitrateBps: Int?
     private(set) var promotionCapacityContinuity: PromotionCapacityContinuity?
     private(set) var automaticSuspensionPressureSampleCount = 0
@@ -338,9 +342,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
               let applicationLimitedProbeMaximumTotalRTPBitrateBps else {
             return ordinaryRecommendation
         }
-        // A capacity probe raises libwebrtc's peer-wide BWE ceiling in bounded steps while keeping
-        // scale and frame cadence stable. The global-ceiling path can initiate or extend a native
-        // probe without requiring ALR; the 2x bound prevents its padding burst from starving audio.
+        // A capacity probe raises libwebrtc's peer-wide BWE ceiling in bounded steps. Geometry
+        // changes require separate ordinary-report qualification. This path can extend a native
+        // probe without requiring ALR; the requested budget retains its existing 2x bound.
         return WorldwideScreenVideoEncodingRecommendation(
             tier: currentTier,
             maximumBitrateBps: maximumTierVideoBitrateBps,
@@ -448,7 +452,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         floorRecoveryVisibilityIsReserved = false
         floorRecoveryVisibilityIsActive = false
         floorRecoveryFirstWitness = nil
-        if floorRecoveryProbeIsActive {
+        if floorRecoveryProbeIsActive || applicationLimitedProbeConfirmedTier != nil {
             revertApplicationLimitedProbeIfActive()
         }
     }
@@ -482,6 +486,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     /// reauthorize RTT health. The service's statistics epoch owns partial-window reset/fencing.
     mutating func invalidateRoundTripTimeObservation() {
         floorRecoveryFirstWitness = nil
+        if applicationLimitedProbeConfirmedTier != nil {
+            revertApplicationLimitedProbeIfActive()
+        }
+        applicationLimitedProbeHealthySampleCount = 0
         revokeRoundTripTimeHealth()
         permitsInitialRoundTripTimeReference = false
     }
@@ -551,6 +559,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             evaluation.identity = .rejectedOrder
             evaluation.reason = .rejectedOrder
             floorRecoveryFirstWitness = nil
+            applicationLimitedProbeHealthySampleCount = 0
             // Native request ordering is part of the evidence boundary. Unordered metadata may
             // expire a wall-clock lease, but cannot change BWE/queue/RTT measurement state.
             revokeRoundTripTimeHealth()
@@ -569,6 +578,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 evaluation.identity = .rejectedOrder
                 evaluation.reason = .rejectedOrder
                 floorRecoveryFirstWitness = nil
+                applicationLimitedProbeHealthySampleCount = 0
                 return expireApplicationLimitedProbeWithoutReport(
                     peerGeneration: generation,
                     isCaptureActive: isCaptureActive,
@@ -580,6 +590,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 evaluation.identity = .rejectedOrder
                 evaluation.reason = .rejectedOrder
                 floorRecoveryFirstWitness = nil
+                applicationLimitedProbeHealthySampleCount = 0
                 // A slower fallback request may finish after a newer fast-lane report. Reject
                 // the entire older report, including BWE/queue/cap changes, before consuming it.
                 roundTripTimeDisposition = .reordered
@@ -1249,17 +1260,36 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     : nil
             }
 
-            if strictUpgradeEvidenceIsHealthy,
+            var intermediateGeometryChanged = false
+            let emptyReportPreservesWitness = !probeDeadlineExpired
+                && usesNativeRoundTripTimeEvidence
+                && floorRecoveryReportIsFresh
+                && strictUpgradeEvidenceIsHealthy
+                && packetQueueObservation == .noNewPackets
+                && applicationLimitedProbeHealthySampleCount > 0
+                && applicationLimitedProbeBestQualifiedTier.map {
+                    capacitySustainableTier.rawValue <= $0.rawValue
+                } == true
+                && applicationLimitedProbeQualificationObservedAt.map {
+                    let age = $0.duration(to: observedAt)
+                    return age >= .zero && age <= Self.lowDelayPacketQueueObservationValidity
+                } == true
+            if !probeDeadlineExpired,
+               strictUpgradeEvidenceIsHealthy,
+               !usesNativeRoundTripTimeEvidence
+                || (floorRecoveryReportIsFresh && averagePacketSendDelaySeconds != nil),
                let qualifiedTier = probeQualifiedTier {
-                if applicationLimitedProbeBestQualifiedTier == qualifiedTier {
-                    if applicationLimitedProbeHealthySampleCount < Int.max {
-                        applicationLimitedProbeHealthySampleCount += 1
-                    }
-                } else {
-                    applicationLimitedProbeBestQualifiedTier = qualifiedTier
-                    applicationLimitedProbeHealthySampleCount = 1
+                if let confirmed = observeApplicationLimitedProbeQualification(
+                    tier: qualifiedTier, observedAt: observedAt
+                ), confirmed.rawValue < currentTier.rawValue {
+                    let highWatermark = capacityProbeBandwidthHighWatermark
+                    currentTier = confirmed
+                    applicationLimitedProbeConfirmedTier = confirmed
+                    resetQueueEvidenceForTierTransition()
+                    capacityProbeBandwidthHighWatermark = highWatermark
+                    intermediateGeometryChanged = true
                 }
-            } else {
+            } else if !emptyReportPreservesWitness {
                 applicationLimitedProbeHealthySampleCount = 0
             }
 
@@ -1312,7 +1342,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 finishApplicationLimitedProbe(revertingTo: probeOriginTier)
                 return isCaptureActive ? currentRecommendation : nil
             }
-            return isCaptureActive && didResetForNewPeer
+            return isCaptureActive && (didResetForNewPeer || intermediateGeometryChanged)
                 ? currentRecommendation
                 : nil
         }
@@ -1627,6 +1657,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         }
         automaticResumeProbeRestoration = nil
         currentTier = .audioPriority
+        applicationLimitedProbeConfirmedTier = nil
+        applicationLimitedProbeQualificationObservedAt = nil
         resetQueueEvidenceForTierTransition()
         healthyUpgradeSampleCount = 0
         bandwidthOnlyDowngradeSampleCount = 0
@@ -1804,12 +1836,16 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private func applicationLimitedProbeCollapseThreshold(
         for origin: WorldwideScreenVideoAdaptationTier
     ) -> Double {
+        let confirmedThreshold = applicationLimitedProbeConfirmedTier.map {
+            requiredOutgoingBitrateBps(for: $0)
+        } ?? 0
         if origin == .audioPriority, let seed = floorRecoveryProbeSeedBandwidthBps {
-            return seed * Self.applicationLimitedProbeImmediateAbortRatio
+            return max(confirmedThreshold, seed * Self.applicationLimitedProbeImmediateAbortRatio)
         }
         // Sender headroom is not codec demand: at 50 Mbps the nominal high-tier ceiling
         // would make even the full 16.2 Mbps probe budget look like a capacity collapse.
         return max(
+            confirmedThreshold,
             requiredOutgoingBitrateBps(for: .audioPriority),
             Double(Self.baselineReferenceVideoBitrateBps(for: origin))
                 * Self.applicationLimitedProbeImmediateAbortRatio
@@ -1900,6 +1936,50 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 * Self.applicationLimitedSaturationRatio
     }
 
+    private mutating func observeApplicationLimitedProbeQualification(
+        tier: WorldwideScreenVideoAdaptationTier,
+        observedAt: ContinuousClock.Instant
+    ) -> WorldwideScreenVideoAdaptationTier? {
+        guard usesNativeRoundTripTimeEvidence else {
+            applicationLimitedProbeQualificationObservedAt = nil
+            if applicationLimitedProbeBestQualifiedTier == tier {
+                applicationLimitedProbeHealthySampleCount = min(
+                    Self.requiredHealthyUpgradeSampleCount,
+                    applicationLimitedProbeHealthySampleCount + 1
+                )
+            } else {
+                applicationLimitedProbeHealthySampleCount = 1
+            }
+            applicationLimitedProbeBestQualifiedTier = tier
+            return nil
+        }
+        var precedingTier: WorldwideScreenVideoAdaptationTier?
+        if applicationLimitedProbeHealthySampleCount > 0,
+           let previousAt = applicationLimitedProbeQualificationObservedAt {
+            let age = previousAt.duration(to: observedAt)
+            if age >= .zero && age < .milliseconds(Self.sampleIntervalMilliseconds) {
+                if let previousTier = applicationLimitedProbeBestQualifiedTier,
+                   tier.rawValue > previousTier.rawValue {
+                    applicationLimitedProbeHealthySampleCount = 0
+                    applicationLimitedProbeBestQualifiedTier = nil
+                    applicationLimitedProbeQualificationObservedAt = nil
+                }
+                return nil
+            }
+            if age >= .milliseconds(Self.sampleIntervalMilliseconds),
+               age <= Self.lowDelayPacketQueueObservationValidity {
+                precedingTier = applicationLimitedProbeBestQualifiedTier
+            }
+        }
+        applicationLimitedProbeQualificationObservedAt = observedAt
+        applicationLimitedProbeBestQualifiedTier = tier
+        applicationLimitedProbeHealthySampleCount = precedingTier == tier ? 2 : 1
+        guard let precedingTier else { return nil }
+        // Improving capacity still proves the lower tier twice; the newest higher tier
+        // remains a single witness, while the same discovery deadline keeps running.
+        return precedingTier.rawValue > tier.rawValue ? precedingTier : tier
+    }
+
     private mutating func beginApplicationLimitedProbe(
         from originTier: WorldwideScreenVideoAdaptationTier,
         availableOutgoingBitrateBps: Double,
@@ -1913,6 +1993,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         floorRecoveryProbeSeedBandwidthBps = nil
         let currentCeiling = currentRecommendation.maximumTotalRTPBitrateBps
         applicationLimitedProbeOriginTier = originTier
+        applicationLimitedProbeConfirmedTier = nil
+        applicationLimitedProbeQualificationObservedAt = nil
         applicationLimitedProbeBestQualifiedTier = nil
         applicationLimitedProbeHealthySampleCount = 0
         let probeCeiling = boundedApplicationLimitedProbeCeiling(
@@ -1953,6 +2035,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         applicationLimitedProbeOriginTier = nil
         applicationLimitedProbeBestQualifiedTier = nil
         applicationLimitedProbeMaximumTotalRTPBitrateBps = nil
+        applicationLimitedProbeConfirmedTier = nil
+        applicationLimitedProbeQualificationObservedAt = nil
         applicationLimitedProbeHealthySampleCount = 0
         applicationLimitedProbeGraceSamplesRemaining = 0
         applicationLimitedProbeDeadline = nil
@@ -2015,7 +2099,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private mutating func finishApplicationLimitedProbe(
         revertingTo originTier: WorldwideScreenVideoAdaptationTier
     ) {
-        if applicationLimitedProbeHealthySampleCount
+        if let confirmed = applicationLimitedProbeConfirmedTier {
+            completeApplicationLimitedProbe(committing: confirmed)
+        } else if applicationLimitedProbeHealthySampleCount
             >= Self.requiredHealthyUpgradeSampleCount,
            let qualifiedTier = applicationLimitedProbeBestQualifiedTier {
             completeApplicationLimitedProbe(committing: qualifiedTier)
@@ -2033,6 +2119,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         currentTier = applicationLimitedProbeOriginTier
         resetQueueEvidenceForTierTransition()
         self.applicationLimitedProbeOriginTier = nil
+        applicationLimitedProbeConfirmedTier = nil
+        applicationLimitedProbeQualificationObservedAt = nil
         applicationLimitedProbeBestQualifiedTier = nil
         applicationLimitedProbeMaximumTotalRTPBitrateBps = nil
         applicationLimitedProbeHealthySampleCount = 0
@@ -2070,6 +2158,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         currentTier = originTier
         resetQueueEvidenceForTierTransition()
         applicationLimitedProbeOriginTier = nil
+        applicationLimitedProbeConfirmedTier = nil
+        applicationLimitedProbeQualificationObservedAt = nil
         applicationLimitedProbeBestQualifiedTier = nil
         applicationLimitedProbeMaximumTotalRTPBitrateBps = nil
         applicationLimitedProbeHealthySampleCount = 0
@@ -2098,6 +2188,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
 
     private mutating func resetPathMeasurements() {
         floorRecoveryFirstWitness = nil
+        applicationLimitedProbeConfirmedTier = nil
+        applicationLimitedProbeQualificationObservedAt = nil
         if floorRecoveryProbeIsActive {
             floorRecoveryProbeWasCancelled = true
         }

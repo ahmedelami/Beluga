@@ -822,12 +822,11 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             availableOutgoingBitrateBps: Double,
             elapsedMilliseconds: Int
         )] = [
-            (800_000, 2_000),
-            (1_600_000, 2_500),
-            (4_100_000, 3_000),
-            (8_200_000, 3_500),
+            (1_600_000, 2_000),
+            (4_100_000, 2_500),
+            (8_200_000, 3_000),
+            (50_000_000, 3_500),
             (50_000_000, 4_000),
-            (50_000_000, 4_500),
         ]
         for sample in chainedProbeSamples {
             packetsSent += 100
@@ -878,13 +877,12 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 .audioPriority,
                 .audioPriority,
                 .audioPriority,
-                .audioPriority,
                 .full,
             ]
         )
         XCTAssertEqual(
             appliedProbeCaps.map(\.maximumTotalRTPBitrateBps),
-            [800_000, 1_600_000, 3_200_000, 8_200_000, 16_200_001]
+            [800_000, 3_200_000, 8_200_000, 16_200_001]
         )
         XCTAssertTrue(
             appliedProbeCaps.allSatisfy { appliedProbe in

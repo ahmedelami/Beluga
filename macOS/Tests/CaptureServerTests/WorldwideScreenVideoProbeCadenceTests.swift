@@ -3,6 +3,314 @@ import WebRTCTransport
 @testable import CaptureServer
 
 final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
+    func testImprovingOrdinaryQualifiersExposeIntersectionWithoutEndingDiscovery() throws {
+        var fixture = CapacityCadenceFixture()
+        let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+        let origin = fixture.policy.applicationLimitedProbeOriginTier
+        _ = fixture.normal(bandwidth: 1_179_360)
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        let firstCap = try XCTUnwrap(fixture.policy.applicationLimitedProbeMaximumTotalRTPBitrateBps)
+
+        let visible = fixture.normal(bandwidth: 2_111_466)
+        XCTAssertEqual(visible?.tier, .survival, "Survival is qualified by both reports; critical is qualified only once.")
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 4)
+        XCTAssertEqual(fixture.policy.currentRecommendation.maximumFramesPerSecond, 5)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, origin)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        let intermediateCap = try XCTUnwrap(fixture.policy.applicationLimitedProbeMaximumTotalRTPBitrateBps)
+        XCTAssertGreaterThanOrEqual(intermediateCap, firstCap)
+        XCTAssertLessThanOrEqual(intermediateCap, 2 * 2_111_466)
+
+        _ = fixture.fast(bandwidth: 4_222_932)
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeMaximumTotalRTPBitrateBps, intermediateCap,
+                       "A geometry transition resets the queue lease; a fast sample cannot authorize more capacity yet.")
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, origin)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        _ = fixture.normal(bandwidth: 4_222_932, afterMilliseconds: 300)
+        XCTAssertGreaterThan(fixture.policy.applicationLimitedProbeMaximumTotalRTPBitrateBps ?? 0, intermediateCap,
+                             "Fresh measured ordinary queue evidence resumes the same bounded discovery.")
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, origin)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        _ = fixture.normal(bandwidth: 8_445_864)
+        _ = fixture.normal(bandwidth: 15_390_000)
+        XCTAssertEqual(fixture.policy.currentTier, .high, "One full-capacity witness must not expose full geometry.")
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, origin)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+
+        _ = fixture.normal(bandwidth: 15_390_000)
+        XCTAssertEqual(fixture.policy.currentTier, .full)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+        XCTAssertEqual(fixture.policy.currentRecommendation.maximumFramesPerSecond, 60)
+        XCTAssertLessThan(fixture.now, deadline)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeDeadline)
+    }
+
+    func testProbeQualificationUsesOrdinaryIntersectionNotFastWitnesses() {
+        var fixture = CapacityCadenceFixture()
+        _ = fixture.normal(bandwidth: 1_179_360)
+        for bandwidth in [2_111_466.0, 4_222_932] {
+            _ = fixture.fast(bandwidth: bandwidth)
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+            XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 1)
+        }
+        let visible = fixture.normal(bandwidth: 8_445_864, afterMilliseconds: 100)
+        XCTAssertEqual(visible?.tier, .survival, "Only the two ordinary reports qualify visible quality.")
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertNotNil(fixture.policy.applicationLimitedProbeOriginTier)
+    }
+
+    func testProbeQualificationRejectsCachedMissingOrRegressingNativeWitnesses() {
+        for invalid in 0..<5 {
+            var fixture = CapacityCadenceFixture()
+            _ = fixture.normal(bandwidth: 950_000)
+            let timestamp = fixture.nativeTimestamp
+            let invalidTimestamp: Double?
+            switch invalid {
+            case 0: invalidTimestamp = nil
+            case 1: invalidTimestamp = timestamp
+            case 2: invalidTimestamp = timestamp - 1
+            case 3: invalidTimestamp = .nan
+            default: invalidTimestamp = .infinity
+            }
+            _ = fixture.normal(bandwidth: 950_000, timestamp: .value(invalidTimestamp))
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority, "A new request number cannot turn a cached/invalid native report into the second witness.")
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 12)
+        }
+    }
+
+    func testProbeQualificationHonorsFiveHundredToFifteenHundredMillisecondWindow() {
+        for gap in [499, 1_501] {
+            var fixture = CapacityCadenceFixture()
+            _ = fixture.normal(bandwidth: 950_000)
+            _ = fixture.normal(bandwidth: 950_000, afterMilliseconds: gap)
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority, "Two reports outside the evidence window do not qualify geometry; gap=\(gap).")
+        }
+        for gap in [500, 1_500] {
+            var fixture = CapacityCadenceFixture()
+            _ = fixture.normal(bandwidth: 950_000)
+            XCTAssertEqual(fixture.normal(bandwidth: 950_000, afterMilliseconds: gap)?.tier, .survival)
+            XCTAssertEqual(fixture.policy.currentTier, .survival)
+        }
+    }
+
+    func testEarlyCapacityLossCannotBridgeTwoQualificationWitnesses() {
+        var fixture = CapacityCadenceFixture()
+        _ = fixture.normal(bandwidth: 950_000)
+        _ = fixture.normal(bandwidth: 600_000, afterMilliseconds: 250)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 0)
+        _ = fixture.normal(bandwidth: 950_000, afterMilliseconds: 250)
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 1)
+        _ = fixture.normal(bandwidth: 950_000)
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+    }
+
+    func testUnhealthyOrMissingOrdinaryWitnessBreaksProbeQualificationWindow() {
+        for invalid in InvalidQualificationWitness.allCases {
+            var fixture = CapacityCadenceFixture()
+            _ = fixture.normal(bandwidth: 950_000)
+            let deadline = fixture.policy.applicationLimitedProbeDeadline
+            if invalid == .missingRTT { fixture.observation = .unavailable }
+            _ = fixture.normal(
+                bandwidth: invalid == .missingBandwidth ? nil : 950_000,
+                queueDelay: invalid == .neutralQueue ? 0.0348 : 0.001,
+                includeQueue: invalid != .missingQueue
+            )
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+            if invalid == .missingRTT { fixture.advanceRTT(by: 0.005) }
+            _ = fixture.normal(bandwidth: 950_000)
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority, "A healthy report after \(invalid) is a new first witness, not a bridge over missing evidence.")
+            if fixture.policy.applicationLimitedProbeOriginTier != nil {
+                XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+            }
+        }
+    }
+
+    func testIntermediateQualificationCannotRenewOriginalProbeDeadline() throws {
+        var fixture = CapacityCadenceFixture()
+        let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+        _ = fixture.normal(bandwidth: 1_179_360)
+        _ = fixture.normal(bandwidth: 2_111_466)
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        let speculativeCap = fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps
+        let expired = fixture.policy.expireApplicationLimitedProbeWithoutReport(
+            peerGeneration: 1, isCaptureActive: true, observedAt: deadline
+        )
+        XCTAssertEqual(expired?.tier, .survival, "Expiry removes discovery capacity without erasing already-qualified visible quality.")
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeDeadline)
+        XCTAssertLessThan(fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps, speculativeCap)
+    }
+
+    func testIntermediateProbeMayFinishAtRepeatedQualifiedPlateau() {
+        var fixture = CapacityCadenceFixture()
+        _ = fixture.normal(bandwidth: 1_179_360)
+        _ = fixture.normal(bandwidth: 2_111_466)
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertNotNil(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.normal(bandwidth: 2_111_466)
+        XCTAssertEqual(fixture.policy.currentTier, .critical)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeDeadline)
+        XCTAssertLessThanOrEqual(fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps, 2_111_466)
+    }
+
+    func testEmptyOrdinaryReportPreservesButDoesNotCountAsQualificationWitness() throws {
+        var fixture = CapacityCadenceFixture()
+        let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+        _ = fixture.normal(bandwidth: 950_000)
+        _ = fixture.normal(bandwidth: 950_000, advancesPackets: false)
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 1)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        _ = fixture.normal(bandwidth: 950_000)
+        XCTAssertEqual(fixture.policy.currentTier, .survival,
+                       "Measured reports 1 second apart remain the two witnesses for a 1 fps sender.")
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+    }
+
+    func testEmptyOrdinaryReportsCannotRenewQualificationWitnessLifetime() throws {
+        var fixture = CapacityCadenceFixture()
+        let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+        _ = fixture.normal(bandwidth: 950_000)
+        for gap in [500, 500, 500] {
+            _ = fixture.normal(bandwidth: 950_000, afterMilliseconds: gap, advancesPackets: false)
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+            XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 1)
+            XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        }
+        _ = fixture.normal(bandwidth: 950_000, afterMilliseconds: 1, advancesPackets: false)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 0)
+        _ = fixture.normal(bandwidth: 950_000)
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority,
+                       "A measured report after the original 1.5 second window is only a new first witness.")
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 1)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+    }
+
+    func testEmptyReportWithLowerCapacityOrResetQueueBreaksQualificationWitness() {
+        for resetsQueue in [false, true] {
+            var fixture = CapacityCadenceFixture()
+            _ = fixture.normal(bandwidth: 950_000)
+            if resetsQueue {
+                fixture.packets = 0
+                fixture.delay = 0
+            }
+            _ = fixture.normal(bandwidth: resetsQueue ? 950_000 : 600_000, advancesPackets: false)
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+            XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 0)
+            _ = fixture.normal(bandwidth: 950_000)
+            XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+            XCTAssertEqual(fixture.policy.applicationLimitedProbeHealthySampleCount, 1)
+        }
+    }
+
+    func testConfirmedIntermediateRevokedByCapacityLossOnBothCollectionLanes() throws {
+        for floorOrigin in [false, true] {
+            for capacityOnly in [false, true] {
+                var fixture = try confirmedProbeFixture(floorOrigin: floorOrigin)
+                let origin = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+                let confirmed = try XCTUnwrap(fixture.policy.applicationLimitedProbeConfirmedTier)
+                let originalDeadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+                let failures = fixture.policy.applicationLimitedProbeFailureCount
+                if capacityOnly {
+                    // Differing qualifiers retain the discovery, while this ordinary report
+                    // restores measured queue evidence after the visible geometry changed.
+                    fixture.advanceRTT(by: 0.005)
+                    _ = fixture.normal(bandwidth: floorOrigin ? 1_179_360 : 2_111_466)
+                    XCTAssertEqual(fixture.policy.applicationLimitedProbeConfirmedTier, confirmed)
+                    XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, origin)
+                    XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, originalDeadline)
+                    XCTAssertNotNil(fixture.policy.lastAveragePacketSendDelaySeconds)
+                }
+                // Both values exceed the old origin-only collapse threshold. Only the
+                // already-confirmed tier's codec requirement makes them negative evidence.
+                let insufficientBandwidth = floorOrigin ? 600_000.0 : 1_000_000.0
+                fixture.advanceRTT(by: 0.005)
+                if capacityOnly {
+                    _ = fixture.fast(bandwidth: insufficientBandwidth)
+                } else {
+                    _ = fixture.normal(bandwidth: insufficientBandwidth)
+                }
+                XCTAssertEqual(fixture.policy.currentTier, origin)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeConfirmedTier)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeDeadline)
+                XCTAssertGreaterThan(fixture.policy.applicationLimitedProbeFailureCount, failures)
+                XCTAssertFalse(fixture.policy.floorRecoveryProbeIsActive)
+                if floorOrigin { XCTAssertTrue(fixture.policy.floorRecoveryAttemptConsumed) }
+            }
+        }
+    }
+
+    func testHideBoundariesRetireConfirmedOrdinaryAndFloorOriginProbes() throws {
+        for floorOrigin in [false, true] {
+            for invalidateRTT in [false, true] {
+                var fixture = try confirmedProbeFixture(floorOrigin: floorOrigin)
+                let origin = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+                let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+                XCTAssertNotNil(fixture.policy.applicationLimitedProbeConfirmedTier)
+                if invalidateRTT {
+                    fixture.policy.invalidateRoundTripTimeObservation()
+                } else {
+                    fixture.policy.endFloorRecoveryVisibility()
+                }
+                XCTAssertEqual(fixture.policy.currentTier, origin)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeConfirmedTier)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeMaximumTotalRTPBitrateBps)
+                XCTAssertNil(fixture.policy.applicationLimitedProbeDeadline)
+                XCTAssertFalse(fixture.policy.floorRecoveryProbeIsActive)
+                if floorOrigin {
+                    XCTAssertTrue(fixture.policy.floorRecoveryAttemptConsumed)
+                    XCTAssertTrue(fixture.policy.floorRecoveryProbeWasCancelled)
+                }
+                _ = fixture.policy.expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: 1, isCaptureActive: false, observedAt: deadline
+                )
+                XCTAssertEqual(fixture.policy.currentTier, origin,
+                               "A late timeout cannot restore a confirmed tier retired by Hide.")
+                XCTAssertNil(fixture.policy.applicationLimitedProbeConfirmedTier)
+            }
+        }
+    }
+
+    func testFailedIntermediateApplyRetainsOnlyPriorConfirmedGeometry() throws {
+        var fixture = try confirmedProbeFixture(floorOrigin: true)
+        let applied = fixture.policy
+        _ = fixture.normal(bandwidth: 4_222_932)
+        let rejected = fixture.policy
+        XCTAssertEqual(applied.applicationLimitedProbeConfirmedTier, .survival)
+        XCTAssertEqual(rejected.applicationLimitedProbeConfirmedTier, .critical)
+        fixture.policy = applied
+        fixture.policy.retainFloorRecoveryAttemptConsumption(from: rejected)
+        fixture.policy.retainCapacityProbeObservationIdentity(from: rejected)
+        XCTAssertEqual(fixture.policy.currentTier, applied.currentTier)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeConfirmedTier, applied.applicationLimitedProbeConfirmedTier)
+        XCTAssertEqual(fixture.policy.currentRecommendation, applied.currentRecommendation)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, applied.applicationLimitedProbeDeadline)
+        XCTAssertTrue(fixture.policy.floorRecoveryAttemptConsumed)
+    }
+
+    func testReportAtOriginalDeadlineCannotQualifyAdditionalGeometry() throws {
+        var fixture = CapacityCadenceFixture()
+        let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+        fixture.advanceRTT(by: 0.005)
+        _ = fixture.normal(bandwidth: 1_179_360, afterMilliseconds: 2_500)
+        _ = fixture.normal(bandwidth: 2_111_466)
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeBestQualifiedTier, .critical)
+        _ = fixture.normal(bandwidth: 2_111_466)
+        XCTAssertEqual(fixture.now, deadline)
+        XCTAssertEqual(fixture.policy.currentTier, .survival)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeConfirmedTier)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+    }
+
     func testFastCapacityGrowthPreservesPrimaryEvidenceGeometryAndDeadline() throws {
         var fixture = CapacityCadenceFixture()
         let primary = PrimaryCadenceState(fixture.policy)
@@ -37,8 +345,14 @@ final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
         XCTAssertLessThanOrEqual(accelerated.fullCapMilliseconds, 1_000)
         XCTAssertLessThanOrEqual(accelerated.fullGeometryMilliseconds, 2_000)
         XCTAssertGreaterThanOrEqual(ordinary.fullCapMilliseconds, 2_000)
-        XCTAssertEqual(accelerated.visibleTiers, [.audioPriority, .full])
-        XCTAssertEqual(ordinary.visibleTiers, [.audioPriority, .full])
+        XCTAssertEqual(accelerated.visibleTiers, [.audioPriority, .constrained, .full])
+        XCTAssertEqual(ordinary.visibleTiers, [.audioPriority, .survival, .critical, .constrained, .balanced, .full])
+        XCTAssertLessThanOrEqual(accelerated.firstImprovedGeometryMilliseconds, 1_000)
+        XCTAssertLessThanOrEqual(ordinary.firstImprovedGeometryMilliseconds, 1_000)
+        XCTAssertLessThan(accelerated.firstImprovedGeometryMilliseconds, accelerated.fullGeometryMilliseconds)
+        XCTAssertLessThan(ordinary.firstImprovedGeometryMilliseconds, ordinary.fullGeometryMilliseconds)
+        XCTAssertLessThanOrEqual(ordinary.fullGeometryMilliseconds, 3_000)
+        print("CAPACITY_INTERSECTION_REPLAY acceleratedFirst=\(accelerated.firstImprovedGeometryMilliseconds) acceleratedFull=\(accelerated.fullGeometryMilliseconds) ordinaryFirst=\(ordinary.firstImprovedGeometryMilliseconds) ordinaryFull=\(ordinary.fullGeometryMilliseconds)")
     }
 
     func testFastReportsCannotStartAProbeOrOperateInactiveCapture() {
@@ -424,6 +738,46 @@ final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
         XCTAssertEqual(WorldwideScreenVideoAdaptationPolicy.promotionCapacityContinuityDuration, .seconds(2))
     }
 
+    private func confirmedProbeFixture(floorOrigin: Bool) throws -> CapacityCadenceFixture {
+        var fixture = CapacityCadenceFixture(startProbe: !floorOrigin)
+        fixture.policy.beginFloorRecoveryVisibility(peerGeneration: 1, showEpoch: 1)
+        fixture.policy.activateFloorRecoveryVisibility(peerGeneration: 1, showEpoch: 1)
+        if floorOrigin {
+            _ = fixture.normal(bandwidth: 100_000, afterMilliseconds: 0)
+            for (bandwidth, queueDelay) in [(100_000.0, 0.001), (251_000, 0.001),
+                                           (262_000, 0.492), (276_000, 0.943), (292_000, 0.470),
+                                           (304_000, 0.001), (331_000, 0.001)] {
+                fixture.advanceRTT(by: 0.005)
+                _ = fixture.normal(bandwidth: bandwidth, queueDelay: queueDelay)
+            }
+            XCTAssertTrue(fixture.policy.floorRecoveryProbeIsActive)
+            XCTAssertTrue(fixture.policy.floorRecoveryAttemptConsumed)
+        } else {
+            _ = fixture.normal(bandwidth: 950_000)
+            _ = fixture.normal(bandwidth: 950_000)
+            XCTAssertEqual(fixture.policy.currentTier, .survival)
+            for _ in 0..<3 where fixture.policy.applicationLimitedProbeOriginTier == nil {
+                fixture.advanceRTT(by: 0.005)
+                _ = fixture.normal(bandwidth: 900_000)
+            }
+            XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, .survival)
+            XCTAssertFalse(fixture.policy.floorRecoveryProbeIsActive)
+        }
+        let origin = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        let deadline = try XCTUnwrap(fixture.policy.applicationLimitedProbeDeadline)
+        _ = fixture.fast(bandwidth: floorOrigin ? 600_000 : 1_700_000)
+        fixture.advanceRTT(by: 0.005)
+        _ = fixture.normal(bandwidth: floorOrigin ? 1_179_360 : 2_111_466)
+        fixture.advanceRTT(by: 0.005)
+        _ = fixture.normal(bandwidth: floorOrigin ? 2_111_466 : 4_222_932)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeConfirmedTier, floorOrigin ? .survival : .critical)
+        XCTAssertEqual(fixture.policy.currentTier, floorOrigin ? .survival : .critical)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeOriginTier, origin)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeDeadline, deadline)
+        XCTAssertEqual(fixture.policy.floorRecoveryProbeIsActive, floorOrigin)
+        return fixture
+    }
+
     private func assertFailedAtOrigin(_ fixture: CapacityCadenceFixture, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(fixture.policy.currentTier, .audioPriority, file: file, line: line)
         XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 12, file: file, line: line)
@@ -445,6 +799,7 @@ final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
         let fullCap = fixture.policy.recommendation(for: .full).maximumTotalRTPBitrateBps
         var fullCapMilliseconds: Int?
         var fullGeometryMilliseconds: Int?
+        var firstImprovedGeometryMilliseconds: Int?
         var visibleTiers: [WorldwideScreenVideoAdaptationTier] = [.audioPriority]
         var cadence = WorldwideScreenVideoSamplingCadence(startedAt: fixture.now)
         cadence.setCapacityProbeEnabled(accelerated, at: fixture.now)
@@ -470,6 +825,9 @@ final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
             }
             if fixture.policy.currentTier != visibleTiers.last {
                 visibleTiers.append(fixture.policy.currentTier)
+                if firstImprovedGeometryMilliseconds == nil {
+                    firstImprovedGeometryMilliseconds = elapsed
+                }
             }
             if fixture.policy.currentTier == .full {
                 XCTAssertTrue(normalSample)
@@ -480,6 +838,7 @@ final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
         return CapacityRampResult(
             fullCapMilliseconds: try XCTUnwrap(fullCapMilliseconds),
             fullGeometryMilliseconds: try XCTUnwrap(fullGeometryMilliseconds),
+            firstImprovedGeometryMilliseconds: try XCTUnwrap(firstImprovedGeometryMilliseconds),
             visibleTiers: visibleTiers
         )
     }
@@ -488,6 +847,7 @@ final class WorldwideScreenVideoProbeCadenceTests: XCTestCase {
 private struct CapacityRampResult {
     let fullCapMilliseconds: Int
     let fullGeometryMilliseconds: Int
+    let firstImprovedGeometryMilliseconds: Int
     let visibleTiers: [WorldwideScreenVideoAdaptationTier]
 }
 
@@ -498,6 +858,10 @@ private enum InvalidCapacityRTT: CaseIterable {
 
 private enum InvalidCapacityQueue: CaseIterable {
     case gray, softPressure, missing, nan, packetReset, delayReset
+}
+
+private enum InvalidQualificationWitness: CaseIterable {
+    case missingBandwidth, missingRTT, neutralQueue, missingQueue
 }
 
 private enum CapacityTimestamp {
@@ -597,14 +961,19 @@ private struct CapacityCadenceFixture {
         }
     }
 
-    mutating func normal(bandwidth: Double?, rtt: Double? = 0.005, queueDelay: Double = 0.001, afterMilliseconds: Int = 500, sequence: CapacitySequence = .advancing) -> WorldwideScreenVideoEncodingRecommendation? {
-        let collection = prepare(afterMilliseconds: afterMilliseconds, queueDelay: queueDelay, advancesPackets: true, sequence: sequence)
+    mutating func normal(bandwidth: Double?, rtt: Double? = 0.005, queueDelay: Double = 0.001, afterMilliseconds: Int = 500, sequence: CapacitySequence = .advancing, timestamp: CapacityTimestamp = .clock, advancesPackets: Bool = true, includeQueue: Bool = true) -> WorldwideScreenVideoEncodingRecommendation? {
+        let collection = prepare(afterMilliseconds: afterMilliseconds, queueDelay: queueDelay, advancesPackets: advancesPackets, sequence: sequence)
+        let reportTimestamp: Double?
+        switch timestamp {
+        case .clock: reportTimestamp = nativeTimestamp
+        case .value(let value): reportTimestamp = value
+        }
         return policy.update(peerGeneration: peer, isCaptureActive: true,
             availableOutgoingBitrateBps: bandwidth, currentRoundTripTimeSeconds: rtt,
             roundTripTimeObservation: observation, collectionSequence: collection,
             requireRoundTripTimeObservation: true, selectedRoute: route,
-            outboundVideoPacketsSent: packets, outboundVideoTotalPacketSendDelaySeconds: delay,
-            nativeReportTimestampMicroseconds: nativeTimestamp, observedAt: now)
+            outboundVideoPacketsSent: includeQueue ? packets : nil, outboundVideoTotalPacketSendDelaySeconds: includeQueue ? delay : nil,
+            nativeReportTimestampMicroseconds: reportTimestamp, observedAt: now)
     }
 
     mutating func fast(bandwidth: Double?, rtt: Double? = 0.005, queueDelay: Double = 0.001, afterMilliseconds: Int = 200, timestamp: CapacityTimestamp = .clock, sequence: CapacitySequence = .advancing, advancesPackets: Bool = true, includeQueue: Bool = true, isCaptureActive: Bool = true) -> WorldwideScreenVideoEncodingRecommendation? {
