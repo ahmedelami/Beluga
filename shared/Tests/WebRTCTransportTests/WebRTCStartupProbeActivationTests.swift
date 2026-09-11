@@ -162,13 +162,21 @@ final class WebRTCStartupProbeActivationTests: XCTestCase {
             let deadline = started.advanced(by: .milliseconds(3500))
             _ = try await host.applyScreenVideoEncodingLimits(raised)
             var capacityAdvanced = false, nativeFeedback = false, activeCluster = false
-            var receiverAdvanced = false
+            var receiverAdvanced = false, nativeTimingPreserved = false
             var firstCapacityDelay: Duration?
             while ContinuousClock.now < deadline {
                 drain()
                 let newEvents = nativeEvents.filter { $0.sequence > watermark }
                 activeCluster = activeCluster || newEvents.contains { $0.kind == .clusterCreated && $0.bitrateBps == 1_538_822 && $0.isActive == true }
                 nativeFeedback = nativeFeedback || newEvents.contains { $0.kind == .probeSucceeded && ($0.bitrateBps ?? 0) >= 1_000_000 && ($0.receiveBitrateBps ?? 0) >= 1_000_000 }
+                nativeTimingPreserved = nativeTimingPreserved || newEvents.contains { event in
+                    guard event.kind == .probeSucceeded,
+                          (event.bitrateBps ?? 0) >= 1_000_000,
+                          (event.receiveBitrateBps ?? 0) >= 1_000_000,
+                          case .microseconds(let send)? = event.sendInterval,
+                          case .microseconds(let receive)? = event.receiveInterval else { return false }
+                    return (1...1_000_000).contains(send) && (1...1_000_000).contains(receive)
+                }
                 let remaining = ContinuousClock.now.duration(to: deadline)
                 guard remaining > .zero else { break }
                 if let report = await host.screenVideoStatisticsSnapshot(timeout: min(.milliseconds(250), remaining)),
@@ -192,7 +200,7 @@ final class WebRTCStartupProbeActivationTests: XCTestCase {
                 XCTAssertEqual(audio.admInputCallbackCount, 0)
                 XCTAssertEqual(audio.customDeviceDeliveredFrames, 0)
                 XCTAssertEqual(audio.customDeviceRenderInvocations, 0)
-                if capacityAdvanced && nativeFeedback && activeCluster && receiverAdvanced { break }
+                if capacityAdvanced && nativeFeedback && nativeTimingPreserved && activeCluster && receiverAdvanced { break }
                 let sleepRemaining = ContinuousClock.now.duration(to: deadline)
                 if sleepRemaining > .zero { try await Task.sleep(for: min(.milliseconds(100), sleepRemaining)) }
             }
@@ -206,12 +214,13 @@ final class WebRTCStartupProbeActivationTests: XCTestCase {
             let restoredCap = await host.maximumTotalRTPBitrateBpsForTesting()
             XCTAssertEqual(restoredCap, 486_001)
             print("STARTUP_PROBE baselineBps=\(baselineBWE) activeCluster=\(activeCluster) "
-                + "feedback=\(nativeFeedback) capacityAdvanced=\(capacityAdvanced) "
+                + "feedback=\(nativeFeedback) timingPreserved=\(nativeTimingPreserved) capacityAdvanced=\(capacityAdvanced) "
                 + "firstCapacityDelay=\(String(describing: firstCapacityDelay)) "
                 + "receiverAdvanced=\(receiverAdvanced) decodedBefore=\(before.count) "
                 + "decodedAfter=\(renderer.snapshot().count)")
             XCTAssertTrue(activeCluster, "The real production initializer must make the raised cluster immediately eligible.")
             XCTAssertTrue(nativeFeedback, "A created cluster is not actual successful native probe feedback.")
+            XCTAssertTrue(nativeTimingPreserved, "Actual SDK callbacks must retain both finite probe intervals through the collector.")
             XCTAssertTrue(capacityAdvanced, "Tiny-packet capacity must advance by the original 3.5-second deadline.")
             XCTAssertTrue(receiverAdvanced, "Fresh bandwidth must coincide with actual unchanged-geometry receiver delivery.")
             let errors = await state.errors

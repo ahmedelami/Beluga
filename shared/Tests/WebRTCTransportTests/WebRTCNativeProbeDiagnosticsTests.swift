@@ -23,23 +23,106 @@ final class WebRTCNativeProbeDiagnosticsTests: XCTestCase {
         XCTAssertNil(inactive.clusterID)
     }
 
-    func testEstimatorResultsPreserveOnlyTypedRatesAndClusterNumber() throws {
+    func testEstimatorResultsPreserveTypedRatesIntervalsAndClusterNumber() throws {
         let success = try XCTUnwrap(WebRTCNativeProbeLogParser.parse(successful))
         XCTAssertEqual(success, ParsedNativeProbeEvent(
             kind: .probeSucceeded, bitrateBps: 1_200_000,
-            receiveBitrateBps: 960_000, clusterID: 7
+            receiveBitrateBps: 960_000, sendInterval: .microseconds(20_000),
+            receiveInterval: .microseconds(25_000), clusterID: 7
         ))
         let invalidInterval = try XCTUnwrap(WebRTCNativeProbeLogParser.parse(
             "(probe_bitrate_estimator.cc:114): Probing unsuccessful, invalid send/receive interval [cluster id: 8] [send interval: 0 us] [receive interval: -inf ms]"
         ))
-        XCTAssertEqual(invalidInterval, ParsedNativeProbeEvent(kind: .invalidInterval, clusterID: 8))
+        XCTAssertEqual(invalidInterval, ParsedNativeProbeEvent(
+            kind: .invalidInterval, sendInterval: .microseconds(0),
+            receiveInterval: .negativeInfinity, clusterID: 8
+        ))
         let ratio = try XCTUnwrap(WebRTCNativeProbeLogParser.parse(
             "(probe_bitrate_estimator.cc:143): Probing unsuccessful, receive/send ratio too high [cluster id: 9] [send: 3000 bytes / 20 ms = 1200 kbps] [receive: 3000 bytes / 10 ms = 2400 kbps ] [ratio: 2400 kbps / 1200 kbps = 2 > kMaxValidRatio (2)]"
         ))
         XCTAssertEqual(ratio, ParsedNativeProbeEvent(
             kind: .invalidRatio, bitrateBps: 1_200_000,
-            receiveBitrateBps: 2_400_000, clusterID: 9
+            receiveBitrateBps: 2_400_000, sendInterval: .microseconds(20_000),
+            receiveInterval: .microseconds(10_000), clusterID: 9
         ))
+    }
+
+    private func intervalFailure(send: String, receive: String) -> String {
+        "(probe_bitrate_estimator.cc:114): Probing unsuccessful, invalid send/receive interval "
+            + "[cluster id: 8] [send interval: \(send)] [receive interval: \(receive)]"
+    }
+
+    func testFiniteIntervalsPreserveUnitsSignAndNativeOneSecondBoundary() throws {
+        let cases: [(String, Int64)] = [
+            ("0 us", 0), ("-1 us", -1), ("250 us", 250),
+            ("12 ms", 12_000), ("-12 ms", -12_000), ("1 s", 1_000_000),
+            ("1000 ms", 1_000_000), ("1000001 us", 1_000_001),
+            ("2 s", 2_000_000), ("-2 s", -2_000_000),
+            ("9223372036854775 ms", 9_223_372_036_854_775_000),
+            ("-9223372036854775 ms", -9_223_372_036_854_775_000)
+        ]
+        for (token, value) in cases {
+            let event = try XCTUnwrap(WebRTCNativeProbeLogParser.parse(
+                intervalFailure(send: token, receive: token)
+            ), token)
+            XCTAssertEqual(event.sendInterval, .microseconds(value), token)
+            XCTAssertEqual(event.receiveInterval, .microseconds(value), token)
+            XCTAssertEqual(event.sendInterval?.diagnosticToken, String(value))
+        }
+    }
+
+    func testInfiniteIntervalsRemainDistinctFromZeroAndUnknown() throws {
+        let event = try XCTUnwrap(WebRTCNativeProbeLogParser.parse(
+            intervalFailure(send: "+inf ms", receive: "-inf ms")
+        ))
+        XCTAssertEqual(event.sendInterval, .positiveInfinity)
+        XCTAssertEqual(event.receiveInterval, .negativeInfinity)
+        XCTAssertEqual(event.sendInterval?.diagnosticToken, "positiveInfinity")
+        XCTAssertEqual(event.receiveInterval?.diagnosticToken, "negativeInfinity")
+        XCTAssertEqual(WebRTCNativeProbeInterval.microseconds(0).diagnosticToken, "0")
+        XCTAssertEqual(WebRTCNativeProbeInterval.microseconds(Int64.min).diagnosticToken, String(Int64.min))
+        XCTAssertEqual(WebRTCNativeProbeInterval.microseconds(Int64.max).diagnosticToken, String(Int64.max))
+        let nonEstimator = try XCTUnwrap(WebRTCNativeProbeLogParser.parse(created))
+        XCTAssertNil(nonEstimator.sendInterval)
+        XCTAssertNil(nonEstimator.receiveInterval)
+    }
+
+    func testMalformedOrOverflowingIntervalsCannotBecomeZeroInfinityOrRetainedText() {
+        let collector = WebRTCNativeProbeDiagnosticCollector(startedAtUptimeNanoseconds: 0)
+        for token in [
+            "9223372036854776 ms", "-9223372036854776 ms", "9223372036855 s",
+            "999999999999999999 s", "18446744073709551616 us",
+            "NaN ms", "inf ms", "+inf s", "-inf us", "+1 ms", "1.5 ms",
+            "1e3 us", "1  ms", "1\tms", "0 us] private=secret [ignored: 0 us"
+        ] {
+            for message in [intervalFailure(send: token, receive: "20 ms"),
+                            intervalFailure(send: "20 ms", receive: token)] {
+                XCTAssertNil(WebRTCNativeProbeLogParser.parse(message), token)
+                collector.record(message, observedAtUptimeNanoseconds: 1)
+            }
+        }
+        XCTAssertTrue(collector.drain().events.isEmpty)
+        XCTAssertNil(WebRTCNativeProbeLogParser.parse(
+            successful.replacingOccurrences(of: "20 ms", with: "9223372036854776 ms")
+        ))
+    }
+
+    func testCollectorRetainsBothIntervalsThroughThePublicEventCopyAndDrain() throws {
+        let collector = WebRTCNativeProbeDiagnosticCollector(startedAtUptimeNanoseconds: 0)
+        collector.record(successful, observedAtUptimeNanoseconds: 1_000_000)
+        collector.record(intervalFailure(send: "0 us", receive: "+inf ms"),
+                         observedAtUptimeNanoseconds: 2_000_000)
+        let batch = collector.drain()
+        XCTAssertEqual(batch.events.count, 2)
+        let first = try XCTUnwrap(batch.events.first)
+        let last = try XCTUnwrap(batch.events.last)
+        XCTAssertEqual(first.sendInterval, .microseconds(20_000))
+        XCTAssertEqual(first.receiveInterval, .microseconds(25_000))
+        XCTAssertEqual(last.sendInterval, .microseconds(0))
+        XCTAssertEqual(last.receiveInterval, .positiveInfinity)
+        XCTAssertEqual(batch.events.map(\.sequence), [1, 2])
+        XCTAssertEqual(batch.events.map(\.clusterID), [7, 8])
+        XCTAssertTrue(collector.drain().events.isEmpty)
     }
 
     func testControllerEventsUseKnownReasonsAndNormalizeNativeRateUnits() throws {

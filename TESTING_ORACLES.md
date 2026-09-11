@@ -189,6 +189,16 @@ presentation evidence. Bind live timing to the installed host and one acknowledg
 Show request, distinguish host-receipt timing from actual display timing, and retain
 intermediate reversals. Full-resolution reports do not alone prove perceived clarity.
 
+Retain native estimator send/receive intervals as checked signed microseconds or
+explicit positive/negative infinity, never coerced zero or unbounded native text.
+Exercise unit conversion, zero/negative values, the one-second boundary, overflow,
+malformed inputs, and both collector-copy fields. An actual pinned-SDK callback
+must preserve successful finite intervals in a fresh native process. Keep legacy
+observer compatibility while accepting the complete new field pair; partial,
+duplicate or unknown fields must fail closed. A missing-field-copy mutation must
+fail the behavioral collector/native oracle. These process-scoped intervals explain
+native feedback rejection; they do not identify a peer or prove receiver display time.
+
 Mac native probing must not wait indefinitely for a large media packet when a
 low-detail screencast produces only small RTP packets. Exercise the actual
 production peer initializer in a fresh process, with continuous tiny frames,

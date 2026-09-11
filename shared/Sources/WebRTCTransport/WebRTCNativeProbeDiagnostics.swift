@@ -19,6 +19,20 @@ public enum WebRTCNativeProbeBlockReason: String, Equatable, Sendable {
     case zeroNetworkEstimate
 }
 
+public enum WebRTCNativeProbeInterval: Equatable, Sendable {
+    case microseconds(Int64)
+    case positiveInfinity
+    case negativeInfinity
+
+    public var diagnosticToken: String {
+        switch self {
+        case .microseconds(let value): String(value)
+        case .positiveInfinity: "positiveInfinity"
+        case .negativeInfinity: "negativeInfinity"
+        }
+    }
+}
+
 /// Native logging has process scope, not peer ownership. Age starts when this collector starts,
 /// not at connection establishment; no field identifies an endpoint or contains native log text.
 public struct WebRTCNativeProbeEvent: Equatable, Sendable {
@@ -28,6 +42,8 @@ public struct WebRTCNativeProbeEvent: Equatable, Sendable {
     public let isActive: Bool?
     public let bitrateBps: UInt64?
     public let receiveBitrateBps: UInt64?
+    public let sendInterval: WebRTCNativeProbeInterval?
+    public let receiveInterval: WebRTCNativeProbeInterval?
     public let minimumBytes: UInt64?
     public let minimumPackets: UInt64?
     public let clusterID: UInt64?
@@ -74,6 +90,8 @@ struct ParsedNativeProbeEvent: Equatable, Sendable {
     var isActive: Bool? = nil
     var bitrateBps: UInt64? = nil
     var receiveBitrateBps: UInt64? = nil
+    var sendInterval: WebRTCNativeProbeInterval? = nil
+    var receiveInterval: WebRTCNativeProbeInterval? = nil
     var minimumBytes: UInt64? = nil
     var minimumPackets: UInt64? = nil
     var clusterID: UInt64? = nil
@@ -120,6 +138,8 @@ final class WebRTCNativeProbeDiagnosticCollector: @unchecked Sendable {
                 isActive: parsed.isActive,
                 bitrateBps: parsed.bitrateBps,
                 receiveBitrateBps: parsed.receiveBitrateBps,
+                sendInterval: parsed.sendInterval,
+                receiveInterval: parsed.receiveInterval,
                 minimumBytes: parsed.minimumBytes,
                 minimumPackets: parsed.minimumPackets,
                 clusterID: parsed.clusterID,
@@ -151,6 +171,7 @@ enum WebRTCNativeProbeLogParser {
     private static let rate = #"([0-9]{1,15}) (bps|kbps)"#
     private static let anyRate = #"(?:[0-9]{1,15} (?:bps|kbps)|[+-]inf bps)"#
     private static let interval = #"(?:-?[0-9]{1,18} (?:us|ms|s)|[+-]inf ms)"#
+    private static let capturedInterval = "(" + interval + ")"
     private static let decimal = #"[0-9]{1,18}(?:\.[0-9]{1,18})?(?:e[+-]?[0-9]{1,3})?"#
     private static let cluster = expression(
         #"Probe cluster \(bitrate_bps:min bytes:min packets\): \("# + rate
@@ -158,17 +179,17 @@ enum WebRTCNativeProbeLogParser {
     )
     private static let success = expression(
         #"Probing successful \[cluster id: ([0-9]{1,10})\] \[send: [0-9]{1,15} bytes / "#
-            + interval + " = " + rate + #" \] \[receive: [0-9]{1,15} bytes / "#
-            + interval + " = " + rate + #"\]"#
+            + capturedInterval + " = " + rate + #" \] \[receive: [0-9]{1,15} bytes / "#
+            + capturedInterval + " = " + rate + #"\]"#
     )
     private static let invalidInterval = expression(
         #"Probing unsuccessful, invalid send/receive interval \[cluster id: ([0-9]{1,10})\] \[send interval: "#
-            + interval + #"\] \[receive interval: "# + interval + #"\]"#
+            + capturedInterval + #"\] \[receive interval: "# + capturedInterval + #"\]"#
     )
     private static let invalidRatio = expression(
         #"Probing unsuccessful, receive/send ratio too high \[cluster id: ([0-9]{1,10})\] \[send: [0-9]{1,15} bytes / "#
-            + interval + " = " + rate + #"\] \[receive: [0-9]{1,15} bytes / "#
-            + interval + " = " + rate + #" \] \[ratio: "# + anyRate + " / "
+            + capturedInterval + " = " + rate + #"\] \[receive: [0-9]{1,15} bytes / "#
+            + capturedInterval + " = " + rate + #" \] \[ratio: "# + anyRate + " / "
             + anyRate + " = " + decimal + #" > kMaxValidRatio \("# + decimal + #"\)\]"#
     )
     private static let measured = expression(
@@ -230,8 +251,13 @@ enum WebRTCNativeProbeLogParser {
                 return result(fields, kind: .probeSucceeded)
             }
             if body.hasPrefix("Probing unsuccessful, invalid send/receive interval "),
-               let fields = fields(invalidInterval, in: body), let id = UInt64(fields[0]) {
-                return ParsedNativeProbeEvent(kind: .invalidInterval, clusterID: id)
+               let fields = fields(invalidInterval, in: body), let id = UInt64(fields[0]),
+               let sendInterval = probeInterval(fields[1]),
+               let receiveInterval = probeInterval(fields[2]) {
+                return ParsedNativeProbeEvent(
+                    kind: .invalidInterval, sendInterval: sendInterval,
+                    receiveInterval: receiveInterval, clusterID: id
+                )
             }
             if body.hasPrefix("Probing unsuccessful, receive/send ratio too high "),
                let fields = fields(invalidRatio, in: body) {
@@ -267,11 +293,30 @@ enum WebRTCNativeProbeLogParser {
         _ fields: [String], kind: WebRTCNativeProbeEventKind
     ) -> ParsedNativeProbeEvent? {
         guard let id = UInt64(fields[0]),
-              let send = bitrate(fields[1], unit: fields[2]),
-              let receive = bitrate(fields[3], unit: fields[4]) else { return nil }
+              let sendInterval = probeInterval(fields[1]),
+              let send = bitrate(fields[2], unit: fields[3]),
+              let receiveInterval = probeInterval(fields[4]),
+              let receive = bitrate(fields[5], unit: fields[6]) else { return nil }
         return ParsedNativeProbeEvent(
-            kind: kind, bitrateBps: send, receiveBitrateBps: receive, clusterID: id
+            kind: kind, bitrateBps: send, receiveBitrateBps: receive,
+            sendInterval: sendInterval, receiveInterval: receiveInterval, clusterID: id
         )
+    }
+
+    private static func probeInterval(_ token: String) -> WebRTCNativeProbeInterval? {
+        if token == "+inf ms" { return .positiveInfinity }
+        if token == "-inf ms" { return .negativeInfinity }
+        let parts = token.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 2, let value = Int64(parts[0]) else { return nil }
+        let multiplier: Int64
+        switch parts[1] {
+        case "us": multiplier = 1
+        case "ms": multiplier = 1_000
+        case "s": multiplier = 1_000_000
+        default: return nil
+        }
+        let (microseconds, overflow) = value.multipliedReportingOverflow(by: multiplier)
+        return overflow ? nil : .microseconds(microseconds)
     }
 
     private static func positive(_ value: String) -> UInt64? {

@@ -2676,6 +2676,8 @@ actor WorldwideScreenService {
                     + "active=\(event.isActive.map(String.init) ?? "unknown") "
                     + "sendBps=\(event.bitrateBps.map(String.init) ?? "unknown") "
                     + "receiveBps=\(event.receiveBitrateBps.map(String.init) ?? "unknown") "
+                    + "sendIntervalUs=\(event.sendInterval?.diagnosticToken ?? "unknown") "
+                    + "receiveIntervalUs=\(event.receiveInterval?.diagnosticToken ?? "unknown") "
                     + "minimumBytes=\(event.minimumBytes.map(String.init) ?? "unknown") "
                     + "minimumPackets=\(event.minimumPackets.map(String.init) ?? "unknown") "
                     + "cluster=\(event.clusterID.map(String.init) ?? "unknown") "
