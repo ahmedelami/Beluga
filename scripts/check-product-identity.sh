@@ -750,7 +750,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_CONFIGURATION="TestFlight"' 1 \
   'side-by-side TestFlight configuration guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_BUILD_NUMBER="72"' 1 \
+  'EXPECTED_BUILD_NUMBER="73"' 1 \
   'side-by-side TestFlight build-number guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'PRIVATE_TEMPORARY_ROOT="/private/tmp"' 1 \
@@ -1296,7 +1296,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'function resolve_pinned_package_dependencies() {' 1 \
   'side-by-side TestFlight one-time native package resolution'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_PACKAGE_MANIFEST_SHA256="375ee94b787f2cc9f4ba176e6a81ecb7e09eba56b7faf82a210f2ae1d149b1af"' 1 \
+  'EXPECTED_PACKAGE_MANIFEST_SHA256="443fe7a76bfbe8cda2d193c047cc04122c01479f8763ccd9e2d5871b7e504f82"' 1 \
   'side-by-side TestFlight exact package manifest pin'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_PACKAGE_RESOLVED_STATE="absent"' 1 \

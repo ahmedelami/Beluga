@@ -16,7 +16,7 @@ readonly EXPECTED_BUNDLE_IDENTIFIER="com.elamin.opensteamer"
 readonly PROTECTED_BUNDLE_IDENTIFIER="com.elamin.AudioStreamer"
 readonly EXPECTED_SCHEME="opensteamerTestFlight"
 readonly EXPECTED_CONFIGURATION="TestFlight"
-readonly EXPECTED_BUILD_NUMBER="72"
+readonly EXPECTED_BUILD_NUMBER="73"
 readonly EXPECTED_SHORT_VERSION="0.1.0"
 readonly EXPECTED_TEAM_ID="MSMG8CJLB3"
 readonly EXPECTED_ARCHIVE_SIGNING_IDENTITY="Apple Development: Ahmed Elamin (92LVX32M8K)"
@@ -107,7 +107,7 @@ readonly -i APP_STORE_PROCESSING_WAIT_POLL_SECONDS=5
 readonly -i APP_STORE_PROCESSING_TERMINATION_GRACE_SECONDS=5
 readonly PACKAGE_MANIFEST_PATH="${REPOSITORY_ROOT}/Package.swift"
 readonly PACKAGE_RESOLVED_PATH="${REPOSITORY_ROOT}/Package.resolved"
-readonly EXPECTED_PACKAGE_MANIFEST_SHA256="375ee94b787f2cc9f4ba176e6a81ecb7e09eba56b7faf82a210f2ae1d149b1af"
+readonly EXPECTED_PACKAGE_MANIFEST_SHA256="443fe7a76bfbe8cda2d193c047cc04122c01479f8763ccd9e2d5871b7e504f82"
 readonly EXPECTED_PACKAGE_RESOLVED_STATE="absent"
 readonly VENDOR_ARCHIVE_PATH="${REPOSITORY_ROOT}/shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"
 # Replaced only after the actual patched slices and complete ZIP pass artifact verification.
