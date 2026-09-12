@@ -850,6 +850,8 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
         XCTAssertFalse(capability.supportsPrimaryDrag)
         XCTAssertFalse(capability.supportsScroll)
         XCTAssertFalse(capability.supportsFocusedWindowResize)
+        XCTAssertFalse(capability.supportsFocusedWindowMove)
+        XCTAssertFalse(capability.supportsFocusedWindowMoveScaleRebinding)
         XCTAssertEqual(capability.protocolVersion, WebRTCInputCapability.currentProtocolVersion)
     }
 
@@ -859,7 +861,9 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
             screenRequestID: 11,
             supportsPrimaryDrag: true,
             supportsScroll: true,
-            supportsFocusedWindowResize: true
+            supportsFocusedWindowResize: true,
+            supportsFocusedWindowMove: true,
+            supportsFocusedWindowMoveScaleRebinding: true
         )
 
         let data = try JSONEncoder().encode(capability)
@@ -868,6 +872,8 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
         XCTAssertEqual(object["supportsPrimaryDrag"] as? Bool, true)
         XCTAssertEqual(object["supportsScroll"] as? Bool, true)
         XCTAssertEqual(object["supportsFocusedWindowResize"] as? Bool, true)
+        XCTAssertEqual(object["supportsFocusedWindowMove"] as? Bool, true)
+        XCTAssertEqual(object["supportsFocusedWindowMoveScaleRebinding"] as? Bool, true)
         XCTAssertEqual(try JSONDecoder().decode(WebRTCInputCapability.self, from: data), capability)
     }
 

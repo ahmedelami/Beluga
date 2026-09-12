@@ -178,6 +178,14 @@ real window, with before/after AX bounds and pixels plus uninterrupted keyboard 
 Move requires a distinct advertised capability, mode-bound target generation and feedback.
 Exercise an explicit safe selection, hold-and-drag originating outside the selected window,
 exactly one commit, no normal click/scroll/primary-drag leakage, and pending/cancelled gestures.
+Exercise the separately advertised scale-rebinding capability with an idle selected Move target:
+a decoded-size change must block input until that exact size is presented, then preserve the same
+generation only for exact integer aspect equality while the host capture transform is unchanged.
+Prove exact-aspect decoded rebinding succeeds without a host-geometry update, and rounded aspect,
+any host capture/framebuffer transition, unadvertised peers, and focused-window Resize all remain
+fail-closed. Mutants that remove the new capability gate, use tolerant floating-point aspect
+matching, accept a changed host transform, or retire the safe target during the bounded client
+presentation gap must fail.
 The production controller must write only position, preserve size and exact secure/editable
 focus, clamp translation to the display, observe actual readback, and issue a fresh successor.
 Cover wrong-mode/stale target, changed frame/focus/geometry/permission, constrained or failed

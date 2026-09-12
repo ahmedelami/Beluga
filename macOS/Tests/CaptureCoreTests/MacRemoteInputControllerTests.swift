@@ -3059,6 +3059,136 @@ final class MacRemoteInputControllerTests: XCTestCase {
         XCTAssertEqual(system.windowPositionWrites.count, 1)
     }
 
+    func testMoveTargetAcceptsExactAspectDecodedScaleWithUnchangedHostGeometry() throws {
+        let system = MockMacRemoteInputSystem()
+        let window = system.makeResizableWindow(
+            frame: CGRect(x: 240, y: 240, width: 640, height: 400)
+        )
+        system.currentFocusedWindow = window
+        let controller = armedController(system: system)
+        let generation = try XCTUnwrap(controller.requestFocusedWindowMoveTarget(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            viewerVideoSize: .init(width: 1_920, height: 1_080)
+        ).windowResizeFeedback?.target.generation)
+        let moved = controller.commitFocusedWindowMove(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            targetGeneration: generation,
+            start: .init(x: 0.05, y: 0.9),
+            end: .init(x: 0.15, y: 0.8),
+            viewerVideoSize: .init(width: 1_536, height: 864)
+        )
+        XCTAssertEqual(moved.result, .accepted(.none))
+        XCTAssertEqual(moved.windowResizeFeedback?.committedTargetGeneration, generation)
+        XCTAssertNotEqual(moved.windowResizeFeedback?.target.generation, generation)
+        XCTAssertEqual(
+            system.windowFrame(window),
+            CGRect(x: 432, y: 132, width: 640, height: 400)
+        )
+        XCTAssertEqual(system.windowPositionWrites.count, 1)
+        XCTAssertTrue(system.windowSizeWrites.isEmpty)
+    }
+
+    func testMoveScaleRebindingRejectsRoundedAspectAndConsumesTarget() throws {
+        let system = MockMacRemoteInputSystem()
+        let window = system.makeResizableWindow(
+            frame: CGRect(x: 240, y: 240, width: 640, height: 400)
+        )
+        system.currentFocusedWindow = window
+        let controller = armedController(system: system)
+        let generation = try XCTUnwrap(controller.requestFocusedWindowMoveTarget(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            viewerVideoSize: .init(width: 1_920, height: 1_080)
+        ).windowResizeFeedback?.target.generation)
+
+        XCTAssertEqual(controller.commitFocusedWindowMove(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            targetGeneration: generation,
+            start: .init(x: 0.05, y: 0.9),
+            end: .init(x: 0.15, y: 0.8),
+            viewerVideoSize: .init(width: 1_536, height: 865)
+        ).result, .rejected(.windowUnavailable))
+        XCTAssertEqual(controller.commitFocusedWindowMove(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            targetGeneration: generation,
+            start: .init(x: 0.05, y: 0.9),
+            end: .init(x: 0.15, y: 0.8),
+            viewerVideoSize: .init(width: 1_920, height: 1_080)
+        ).result, .rejected(.windowUnavailable))
+        XCTAssertTrue(system.windowPositionWrites.isEmpty)
+        XCTAssertTrue(system.windowSizeWrites.isEmpty)
+    }
+
+    func testMoveTargetCannotReviveAfterHostCaptureGeometryDetour() throws {
+        let system = MockMacRemoteInputSystem()
+        let clock = MockMacRemoteInputClock()
+        let window = system.makeResizableWindow(
+            frame: CGRect(x: 240, y: 240, width: 640, height: 400)
+        )
+        system.currentFocusedWindow = window
+        let controller = armedController(system: system, clock: clock)
+        let generation = try XCTUnwrap(controller.requestFocusedWindowMoveTarget(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            viewerVideoSize: .init(width: 1_920, height: 1_080)
+        ).windowResizeFeedback?.target.generation)
+        let changedGeometry = try XCTUnwrap(ScreenVideoFrameGeometry(
+            surfaceWidth: 1_536,
+            surfaceHeight: 864,
+            contentRect: CGRect(x: 0, y: 0, width: 1_536, height: 864),
+            contentScale: 1,
+            scaleFactor: 1
+        ))
+
+        controller.updateScreenVideoFrameGeometry(changedGeometry)
+        clock.advance(by: 0.750)
+        controller.updateScreenVideoFrameGeometry(changedGeometry)
+        let originalGeometry = try XCTUnwrap(fullFrameGeometry(for: try XCTUnwrap(system.bounds)))
+        controller.updateScreenVideoFrameGeometry(originalGeometry)
+        clock.advance(by: 0.750)
+        controller.updateScreenVideoFrameGeometry(originalGeometry)
+
+        XCTAssertEqual(controller.commitFocusedWindowMove(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            targetGeneration: generation,
+            start: .init(x: 0.05, y: 0.9),
+            end: .init(x: 0.15, y: 0.8),
+            viewerVideoSize: .init(width: 1_920, height: 1_080)
+        ).result, .rejected(.windowUnavailable))
+        XCTAssertTrue(system.windowPositionWrites.isEmpty)
+        XCTAssertTrue(system.windowSizeWrites.isEmpty)
+    }
+
+    func testResizeTargetDoesNotUseMoveScaleRebinding() throws {
+        let system = MockMacRemoteInputSystem()
+        let window = system.makeResizableWindow(
+            frame: CGRect(x: 240, y: 240, width: 640, height: 400)
+        )
+        system.currentFocusedWindow = window
+        let controller = armedController(system: system)
+        let generation = try XCTUnwrap(controller.requestFocusedWindowResizeTarget(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            viewerVideoSize: .init(width: 1_920, height: 1_080)
+        ).windowResizeFeedback?.target.generation)
+
+        XCTAssertEqual(controller.commitFocusedWindowResize(
+            screenRequestID: showID,
+            inputSessionID: sessionID,
+            targetGeneration: generation,
+            start: .init(x: 0.2, y: 0.3),
+            end: .init(x: 0.3, y: 0.4),
+            viewerVideoSize: .init(width: 1_536, height: 864)
+        ).result, .rejected(.windowUnavailable))
+        XCTAssertTrue(system.windowPositionWrites.isEmpty)
+        XCTAssertTrue(system.windowSizeWrites.isEmpty)
+    }
+
     func testMoveClampsToDisplayEdgeThenKeepsFreshAuthorityForInwardDrag() throws {
         let system = MockMacRemoteInputSystem()
         system.bounds = CGRect(x: -1920, y: -1080, width: 1920, height: 1080)

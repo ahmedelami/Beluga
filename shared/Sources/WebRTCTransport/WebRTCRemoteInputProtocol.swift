@@ -15,6 +15,7 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
     public let supportsScroll: Bool
     public let supportsFocusedWindowResize: Bool
     public let supportsFocusedWindowMove: Bool
+    public let supportsFocusedWindowMoveScaleRebinding: Bool
 
     public init(
         inputSessionID: UUID,
@@ -24,7 +25,8 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         supportsPrimaryDrag: Bool = false,
         supportsScroll: Bool = false,
         supportsFocusedWindowResize: Bool = false,
-        supportsFocusedWindowMove: Bool = false
+        supportsFocusedWindowMove: Bool = false,
+        supportsFocusedWindowMoveScaleRebinding: Bool = false
     ) {
         self.protocolVersion = protocolVersion
         self.inputSessionID = inputSessionID
@@ -34,6 +36,8 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         self.supportsScroll = supportsScroll
         self.supportsFocusedWindowResize = supportsFocusedWindowResize
         self.supportsFocusedWindowMove = supportsFocusedWindowMove
+        self.supportsFocusedWindowMoveScaleRebinding =
+            supportsFocusedWindowMoveScaleRebinding
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -45,6 +49,7 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         case supportsScroll
         case supportsFocusedWindowResize
         case supportsFocusedWindowMove
+        case supportsFocusedWindowMoveScaleRebinding
     }
 
     public init(from decoder: any Decoder) throws {
@@ -73,6 +78,13 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         } else {
             false
         }
+        let supportsFocusedWindowMoveScaleRebinding = if container.contains(
+            .supportsFocusedWindowMoveScaleRebinding
+        ) {
+            try container.decode(Bool.self, forKey: .supportsFocusedWindowMoveScaleRebinding)
+        } else {
+            false
+        }
         guard protocolVersion == Self.currentProtocolVersion,
               inputSessionID != Self.zeroUUID,
               screenRequestID > 0,
@@ -91,7 +103,9 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
             supportsPrimaryDrag: supportsPrimaryDrag,
             supportsScroll: supportsScroll,
             supportsFocusedWindowResize: supportsFocusedWindowResize,
-            supportsFocusedWindowMove: supportsFocusedWindowMove
+            supportsFocusedWindowMove: supportsFocusedWindowMove,
+            supportsFocusedWindowMoveScaleRebinding:
+                supportsFocusedWindowMoveScaleRebinding
         )
     }
 
@@ -111,6 +125,10 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         try container.encode(supportsScroll, forKey: .supportsScroll)
         try container.encode(supportsFocusedWindowResize, forKey: .supportsFocusedWindowResize)
         try container.encode(supportsFocusedWindowMove, forKey: .supportsFocusedWindowMove)
+        try container.encode(
+            supportsFocusedWindowMoveScaleRebinding,
+            forKey: .supportsFocusedWindowMoveScaleRebinding
+        )
     }
 
     var isValid: Bool {

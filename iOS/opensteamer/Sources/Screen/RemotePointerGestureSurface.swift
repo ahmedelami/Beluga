@@ -111,6 +111,7 @@ struct RemotePointerGestureStateMachine: Equatable {
     private(set) var initialTimestamp: TimeInterval?
     private var previousScrollLocation: CGPoint?
     private var resizeTargetAtBegin: RemotePointerResizeTarget?
+    private var crossedMovementThresholdBeforeHold = false
 
     init(
         allowsScroll: Bool,
@@ -148,6 +149,7 @@ struct RemotePointerGestureStateMachine: Equatable {
         initialLocation = location
         currentLocation = location
         initialTimestamp = timestamp
+        crossedMovementThresholdBeforeHold = false
         switch interactionMode {
         case .standard:
             resizeTargetAtBegin = nil
@@ -200,8 +202,17 @@ struct RemotePointerGestureStateMachine: Equatable {
                             end: location
                         ),
                     ]
-                case .focusedWindowMove, .focusedWindowMovePending,
-                     .focusedWindowResizePending:
+                case .focusedWindowMove:
+                    guard resizeTargetAtBegin != nil else {
+                        phase = .suppressed
+                        return []
+                    }
+                    crossedMovementThresholdBeforeHold = true
+                    // A selected Move target owns this touch. Keep its hold deadline armed even
+                    // after early finger travel so a late main-run-loop timer (or a natural
+                    // drag-then-hold motion) cannot suppress the gesture before it is recognized.
+                    return advanceHoldDeadlineIfNeeded(timestamp: timestamp)
+                case .focusedWindowMovePending, .focusedWindowResizePending:
                     phase = .suppressed
                     return []
                 }
@@ -256,9 +267,7 @@ struct RemotePointerGestureStateMachine: Equatable {
     mutating func holdDeadlineReached() -> [RemotePointerGestureEvent] {
         guard shouldScheduleHoldDeadline,
               let initialLocation,
-              let currentLocation,
-              distance(from: initialLocation, to: currentLocation)
-                < Self.movementThreshold else {
+              let currentLocation else {
             return []
         }
         if case .focusedWindowMove = interactionMode, let resizeTargetAtBegin {
@@ -268,6 +277,10 @@ struct RemotePointerGestureStateMachine: Equatable {
                 start: initialLocation,
                 end: currentLocation
             )]
+        }
+        guard distance(from: initialLocation, to: currentLocation)
+                < Self.movementThreshold else {
+            return []
         }
         phase = .primaryDrag
         return [.primaryDragArmed(initialLocation)]
@@ -283,6 +296,13 @@ struct RemotePointerGestureStateMachine: Equatable {
             currentLocation = location
             phase = .finished
             if interactionMode.isFocusedWindowInteraction {
+                // A quick swipe with an already-selected Move target is neither a new selection
+                // nor a move. Only the hold deadline can promote it into Move mode.
+                if case .focusedWindowMove = interactionMode,
+                   resizeTargetAtBegin != nil,
+                   crossedMovementThresholdBeforeHold {
+                    break
+                }
                 events.append(.focusedWindowSelection(location))
             } else {
                 events.append(.tap(location))

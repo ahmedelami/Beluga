@@ -734,6 +734,27 @@ final class WorldwideRemoteInputLifecycleTests: XCTestCase {
     }
 
     @MainActor
+    func testResumeCoverZeroSizeRevokesPointerGeometryUntilNextPresentedFrame() {
+        XCTAssertTrue(
+            WorldwideScreenViewerView.videoSizeCallbackRevokesPresentedGeometry(.zero)
+        )
+        XCTAssertFalse(
+            WorldwideScreenViewerView.videoSizeCallbackRevokesPresentedGeometry(
+                CGSize(width: 540, height: 1_170)
+            )
+        )
+        let coveredReset = WorldwideScreenViewerView.remoteInputPresentationAvailability(
+            remoteInputAvailable: true,
+            renderedVideoSize: nil,
+            allowsPresentation: true,
+            screenMediaIsCovered: true,
+            scenePhase: .active
+        )
+        XCTAssertFalse(coveredReset.keyboard)
+        XCTAssertFalse(coveredReset.pointer)
+    }
+
+    @MainActor
     func testKeyboardContinuityDoesNotCrossPrivacyOrAuthorizationBoundaries() {
         for availability in [
             WorldwideScreenViewerView.remoteInputPresentationAvailability(
@@ -846,7 +867,11 @@ final class WorldwideRemoteInputLifecycleTests: XCTestCase {
     func testAdaptiveFormatTransitionKeepsLastFrameVisibleWhileRevokingTouch() {
         let videoView = WebRTCRemoteVideoView(frame: .zero)
         var publishedSizes: [CGSize] = []
+        var invalidations: [WebRTCVideoPresentationInvalidation] = []
         videoView.onVideoSizeChanged = { publishedSizes.append($0) }
+        videoView.onVideoPresentationInvalidated = { _, invalidation in
+            invalidations.append(invalidation)
+        }
         videoView.debugInstallPresentedFrameForPrivacyCoverTests()
 
         videoView.debugBeginFormatTransitionForContinuityTests()
@@ -854,12 +879,14 @@ final class WorldwideRemoteInputLifecycleTests: XCTestCase {
         XCTAssertFalse(videoView.debugPresentationCoverIsVisible)
         XCTAssertTrue(videoView.debugHasCurrentPresentedFrame)
         XCTAssertEqual(publishedSizes, [.zero])
+        XCTAssertEqual(invalidations, [.formatTransition])
 
         videoView.debugInvalidateGeometryForContinuityTests()
 
         XCTAssertTrue(videoView.debugPresentationCoverIsVisible)
         XCTAssertFalse(videoView.debugHasCurrentPresentedFrame)
         XCTAssertEqual(publishedSizes, [.zero, .zero])
+        XCTAssertEqual(invalidations, [.formatTransition, .invalidGeometry])
     }
 
     @MainActor
@@ -2214,6 +2241,56 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         }
         XCTAssertNotNil(cachedObservation)
         XCTAssertNotEqual(binding, replacementBinding)
+    }
+
+    func testPresentationEventLedgerSynthesizesFormatAndKeepsInvalidGeometrySticky() {
+        let ledger = WebRTCVideoPresentationEventLedger(bindingGeneration: 44)
+        ledger.record(
+            dimensionGeneration: 2,
+            invalidation: .invalidGeometry
+        )
+        ledger.recordFormatTransitionIfAbsent(dimensionGeneration: 3)
+
+        let events = ledger.takeInvalidations(through: 3)
+        XCTAssertEqual(events.map { $0.0 }, [
+            .init(bindingGeneration: 44, dimensionGeneration: 2),
+            .init(bindingGeneration: 44, dimensionGeneration: 3),
+        ])
+        XCTAssertEqual(events.map { $0.1 }, [
+            .invalidGeometry,
+            .formatTransition,
+        ])
+        XCTAssertTrue(ledger.takeInvalidations(through: 3).isEmpty)
+
+        // Publication can win its MainActor race; it synthesizes the same-token boundary once.
+        ledger.recordFormatTransitionIfAbsent(dimensionGeneration: 4)
+        let synthesized = ledger.takeInvalidations(through: 4)
+        XCTAssertEqual(synthesized.map { $0.0 }, [
+            .init(bindingGeneration: 44, dimensionGeneration: 4),
+        ])
+        XCTAssertEqual(synthesized.map { $0.1 }, [.formatTransition])
+
+        // Even if a newer valid format drains first, a late lower-generation malformed geometry
+        // remains fatal and is delivered once rather than disappearing behind the high-water.
+        ledger.recordFormatTransitionIfAbsent(dimensionGeneration: 6)
+        XCTAssertEqual(
+            ledger.takeInvalidations(through: 6).map { $0.1 },
+            [.formatTransition]
+        )
+        ledger.record(
+            dimensionGeneration: 5,
+            invalidation: .invalidGeometry
+        )
+        let lateFatal = ledger.takeInvalidations(through: 6)
+        XCTAssertEqual(lateFatal.map { $0.0 }, [
+            .init(bindingGeneration: 44, dimensionGeneration: 5),
+        ])
+        XCTAssertEqual(lateFatal.map { $0.1 }, [.invalidGeometry])
+        ledger.record(
+            dimensionGeneration: 5,
+            invalidation: .invalidGeometry
+        )
+        XCTAssertTrue(ledger.takeInvalidations(through: 6).isEmpty)
     }
 
     func testDelayedNativeSizeCallbackCannotRevokePresentedGeneration() throws {
@@ -4765,6 +4842,361 @@ final class WorldwideFocusedWindowMoveLifecycleTests: XCTestCase {
     }
 
     @MainActor
+    func testAcceptedMoveTargetRebindsOnlyAfterExactPresentedScaledFrame() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let staleToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 7, dimensionGeneration: 1
+        )
+        let scaledToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 7, dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: scaledToken,
+            for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentedVideoSize,
+            .zero
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?.target,
+            fixture.target
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        let suspended = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(suspended.mode, .move)
+        XCTAssertEqual(suspended.target, fixture.target)
+        XCTAssertEqual(suspended.awaitingPresentedVideoSize, scaledSize)
+        XCTAssertEqual(suspended.binding.viewerVideoSize, fixture.videoSize)
+
+        // Neither stale callbacks nor direct attempts can commit during the presentation fence.
+        fixture.commit(fixture.target.generation)
+        fixture.commit(fixture.target.generation, videoSize: scaledSize)
+        fixture.viewModel.focusedWindowMoveVideoFrameDidPresent(
+            size: fixture.videoSize,
+            token: staleToken,
+            for: fixture.presentation.lease
+        )
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [
+            .selectWindowForMove(at: .init(x: 0.75, y: 0.25))
+        ])
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentedVideoSize,
+            scaledSize
+        )
+
+        fixture.viewModel.focusedWindowMoveVideoFrameDidPresent(
+            size: scaledSize,
+            token: scaledToken,
+            for: fixture.presentation.lease
+        )
+        let rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(rebound.awaitingPresentedVideoSize)
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertEqual(rebound.target, fixture.target)
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+
+        fixture.commit(fixture.target.generation, videoSize: scaledSize)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.last, .commitFocusedWindowMove(
+            targetGeneration: fixture.target.generation,
+            start: .init(x: 0.95, y: 0.95),
+            end: .init(x: 0.8, y: 0.8)
+        ))
+        XCTAssertEqual(fixture.videoSizes.last, .init(width: 1_536, height: 864))
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveScaleRebindNeedsNoNativeSizeCallbackAndIgnoresDelayedOne() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 11, dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: token, for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowMoveVideoFrameDidPresent(
+            size: scaledSize, token: token, for: fixture.presentation.lease
+        )
+
+        var rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertEqual(rebound.target, fixture.target)
+        XCTAssertNil(rebound.awaitingPresentationToken)
+
+        // A delayed LiveKit size callback cannot fence or hide the already-proven presentation.
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize, for: fixture.presentation.lease
+        )
+        rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertNil(rebound.awaitingPresentationToken)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMovePresentationFenceRejectsModeSwitchUsingStaleVideoSize() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 11, dimensionGeneration: 3
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: token, for: fixture.presentation.lease
+        )
+
+        XCTAssertFalse(fixture.beginResize())
+        let preserved = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(preserved.mode, .move)
+        XCTAssertEqual(preserved.target, fixture.target)
+        XCTAssertEqual(preserved.awaitingPresentationToken, token)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [
+            .selectWindowForMove(at: .init(x: 0.75, y: 0.25))
+        ])
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveFormatTransitionRequiresSelectedIdleTargetAndValidGeometry() async throws {
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 12, dimensionGeneration: 2
+        )
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginMove())
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition, token: token, for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            await fixture.close()
+        }
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition, token: token, for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            await fixture.close()
+        }
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginResize())
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition, token: token, for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            await fixture.close()
+        }
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            fixture.acceptSelection()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .invalidGeometry, token: token, for: fixture.presentation.lease
+            )
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition,
+                token: .init(bindingGeneration: 12, dimensionGeneration: 3),
+                for: fixture.presentation.lease
+            )
+            fixture.viewModel.focusedWindowMoveVideoFrameDidPresent(
+                size: .init(width: 1_536, height: 864),
+                token: .init(bindingGeneration: 12, dimensionGeneration: 3),
+                for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                fixture.focusGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testMovePresentationTimeoutIsBoundToExactTransitionGeneration() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        let oldToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 13, dimensionGeneration: 2
+        )
+        let newToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 13, dimensionGeneration: 3
+        )
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: oldToken, for: fixture.presentation.lease
+        )
+        let oldFence = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        let oldRebindingID = try XCTUnwrap(oldFence.presentationRebindingID)
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: newToken, for: fixture.presentation.lease
+        )
+        let newFence = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        let newRebindingID = try XCTUnwrap(newFence.presentationRebindingID)
+
+        fixture.viewModel.focusedWindowMovePresentationTimeoutDidFire(
+            interactionID: oldFence.id,
+            lease: oldFence.binding.lease,
+            awaitedSize: .zero,
+            token: oldToken,
+            rebindingID: oldRebindingID
+        )
+        XCTAssertTrue(fixture.viewModel.focusedWindowInteractionState.isActive)
+
+        fixture.viewModel.focusedWindowMovePresentationTimeoutDidFire(
+            interactionID: newFence.id,
+            lease: newFence.binding.lease,
+            awaitedSize: .zero,
+            token: newToken,
+            rebindingID: newRebindingID
+        )
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        XCTAssertEqual(
+            fixture.viewModel.debugRemoteInputState.focusGeneration,
+            fixture.focusGeneration
+        )
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveScaleRebindRejectsLegacyOrDifferentAspectGeometry() async throws {
+        for (index, supportsScaleRebinding) in [false, true].enumerated() {
+            let fixture = try MoveLifecycleFixture(
+                supportsScaleRebinding: supportsScaleRebinding
+            )
+            let token = WebRTCVideoPresentationToken(
+                bindingGeneration: 8,
+                dimensionGeneration: UInt64(index + 1)
+            )
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            fixture.acceptSelection()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition,
+                token: token,
+                for: fixture.presentation.lease
+            )
+            if supportsScaleRebinding {
+                XCTAssertTrue(fixture.viewModel.focusedWindowInteractionState.isActive)
+            }
+            fixture.viewModel.screenVideoPresentationGeometryDidChange(
+                to: supportsScaleRebinding
+                    ? .init(width: 1_600, height: 1_000)
+                    : .init(width: 1_536, height: 864),
+                for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                fixture.focusGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRapidMoveScaleChangesWaitForNewestPresentedSize() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let firstToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 9, dimensionGeneration: 2
+        )
+        let newestToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 9, dimensionGeneration: 3
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: firstToken, for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize, for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: newestToken, for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: fixture.videoSize, for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowMoveVideoFrameDidPresent(
+            size: scaledSize, token: firstToken, for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentedVideoSize,
+            fixture.videoSize
+        )
+        fixture.viewModel.focusedWindowMoveVideoFrameDidPresent(
+            size: fixture.videoSize, token: newestToken, for: fixture.presentation.lease
+        )
+        let rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(rebound.awaitingPresentedVideoSize)
+        XCTAssertEqual(rebound.binding.viewerVideoSize, fixture.videoSize)
+        XCTAssertEqual(rebound.target, fixture.target)
+        await fixture.close()
+    }
+
+    @MainActor
     func testFrameTrackAndContainerChangesRetireMoveWithoutLosingSecureTyping() async throws {
         for boundary in 0 ..< 3 {
             let fixture = try MoveLifecycleFixture()
@@ -4773,8 +5205,10 @@ final class WorldwideFocusedWindowMoveLifecycleTests: XCTestCase {
             await fixture.drain()
             switch boundary {
             case 0:
-                fixture.viewModel.screenVideoPresentationGeometryDidChange(
-                    to: .init(width: 2_560, height: 1_440), for: fixture.presentation.lease
+                fixture.viewModel.screenVideoPresentationDidInvalidate(
+                    .formatTransition,
+                    token: .init(bindingGeneration: 10, dimensionGeneration: 2),
+                    for: fixture.presentation.lease
                 )
             case 1:
                 fixture.viewModel.debugReplaceFocusedWindowResizeTrackForTests()
@@ -4869,11 +5303,17 @@ private final class MoveLifecycleFixture {
     var actions: [WebRTCInputAction] = []
     var videoSizes: [WebRTCInputVideoSize?] = []
 
-    init(supportsMove: Bool = true, supportsResize: Bool = true) throws {
+    init(
+        supportsMove: Bool = true,
+        supportsResize: Bool = true,
+        supportsScaleRebinding: Bool = false
+    ) throws {
         peer = try WebRTCPeer(configuration: .init(role: .viewer, iceServers: []))
         presentation = viewModel.debugInstallActiveScreenPresentationForTests(
             peer: peer, screenRequestID: focusGeneration,
-            supportsFocusedWindowResize: supportsResize, supportsFocusedWindowMove: supportsMove
+            supportsFocusedWindowResize: supportsResize,
+            supportsFocusedWindowMove: supportsMove,
+            supportsFocusedWindowMoveScaleRebinding: supportsScaleRebinding
         )
         capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
         viewModel.debugSetRemoteKeyboardFocusForTests(focusGeneration, secure: true)
@@ -4904,11 +5344,11 @@ private final class MoveLifecycleFixture {
         )
     }
 
-    func commit(_ generation: UUID) {
+    func commit(_ generation: UUID, videoSize: CGSize? = nil) {
         viewModel.commitFocusedWindowMove(
             targetGeneration: generation, startNormalizedPoint: .init(x: 0.95, y: 0.95),
             endNormalizedPoint: .init(x: 0.8, y: 0.8), for: presentation.lease,
-            containerSize: containerSize, viewerVideoSize: videoSize
+            containerSize: containerSize, viewerVideoSize: videoSize ?? self.videoSize
         )
     }
 

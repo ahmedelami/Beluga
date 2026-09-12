@@ -438,8 +438,8 @@ enum FocusedWindowInteractionMode: Equatable {
     case move
 }
 
-/// Exact viewer geometry and ownership under which one focused-window interaction exists.
-/// A target is never allowed to cross any member of this binding.
+/// Current viewer geometry and exact ownership under which one focused-window interaction exists.
+/// Only an advertised, presented, exact-aspect Move scale transition may replace the geometry.
 struct FocusedWindowResizeBinding: Equatable {
     let lease: WorldwideScreenPresentationLease
     let inputSessionID: UUID
@@ -517,9 +517,17 @@ enum FocusedWindowResizePendingOperation: Equatable {
 struct FocusedWindowResizeInteraction: Equatable {
     let id: UUID
     let mode: FocusedWindowInteractionMode
-    let binding: FocusedWindowResizeBinding
+    var binding: FocusedWindowResizeBinding
     var target: WebRTCWindowResizeTarget?
     var pending: FocusedWindowResizePendingOperation?
+    /// A decoded size has changed, but Metal has not yet presented a frame with that exact size.
+    /// The semantic Move selection may survive; every pointer gesture remains fenced meanwhile.
+    var awaitingPresentedVideoSize: CGSize? = nil
+    /// Renderer binding plus decoded-dimension generation that opened the format fence.
+    var awaitingPresentationToken: WebRTCVideoPresentationToken? = nil
+    /// Unique identity for the bounded presentation fence. Size can repeat across A -> B -> A,
+    /// so dimensions alone cannot keep a stale timeout from cancelling the newest transition.
+    var presentationRebindingID: UUID? = nil
 }
 
 enum FocusedWindowResizeState: Equatable {
@@ -1258,6 +1266,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         "The previous iPhone audio session is still retiring. Try reconnecting in a moment."
     /// Never outrun the host's 60 Hz scroll budget during a sustained gesture.
     static let remoteScrollFlushInterval: Duration = .milliseconds(17)
+    private static let focusedWindowMovePresentationTimeout: Duration = .seconds(5)
 
     private struct MacHostedCallAnswerForwardedBinding: Equatable {
         let peerIdentity: ObjectIdentifier
@@ -1581,6 +1590,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var remoteScrollFlushTask: Task<Void, Never>?
     private var remoteScrollSendAuthorization: WebRTCInputSendAuthorization?
     private var focusedWindowResizeSendAuthorization: WebRTCInputSendAuthorization?
+    private var focusedWindowMovePresentationTimeoutTask: Task<Void, Never>?
     private var remoteInputLifecycleSendAuthorization:
         WebRTCInputSendAuthorization?
     private var applicationInputIsSuspended = false
@@ -1846,6 +1856,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         let remoteMediaCommandOwner = remoteMediaCommandOwner
         audioTransactionEventTask?.cancel()
         remoteMediaRefreshTask?.cancel()
+        focusedWindowMovePresentationTimeoutTask?.cancel()
         NotificationCenter.default.removeObserver(self)
         if let remoteMediaCommandOwner {
             Task { @MainActor in
@@ -4249,8 +4260,14 @@ final class WorldwideSessionViewModel: ObservableObject {
         to size: CGSize,
         for lease: WorldwideScreenPresentationLease
     ) {
-        if focusedWindowResizeState.interaction?.binding.lease == lease {
+        if let interaction = focusedWindowResizeState.interaction,
+           interaction.binding.lease == lease,
+           interaction.mode == .resize {
+            // Resize never survives a decoded-size callback. Unlike Move, it has no negotiated
+            // scale-rebinding exception and its queued target request must be retired at once.
             cancelFocusedWindowResize()
+        } else {
+            recordFocusedWindowMoveAnnouncedVideoSize(size, for: lease)
         }
         guard let attempt = screenMediaViewerAttempt,
               screenMediaViewerAttemptIsCurrent(attempt),
@@ -4293,6 +4310,194 @@ final class WorldwideSessionViewModel: ObservableObject {
                 notifyPeer: true
             )
         }
+    }
+
+    /// The native renderer distinguishes a recoverable decoded-format transition from malformed
+    /// geometry. Only the former may keep an idle Move selection behind a presentation fence.
+    func screenVideoPresentationDidInvalidate(
+        _ invalidation: WebRTCVideoPresentationInvalidation,
+        token: WebRTCVideoPresentationToken,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        switch invalidation {
+        case .formatTransition:
+            beginFocusedWindowMoveFormatTransition(token: token, for: lease)
+        case .invalidGeometry:
+            if focusedWindowResizeState.interaction?.binding.lease == lease {
+                cancelFocusedWindowResize()
+            }
+        }
+    }
+
+    /// A typed renderer-format boundary may preserve only a selected, idle Move target. A native
+    /// size callback alone is never an authorization event.
+    private func beginFocusedWindowMoveFormatTransition(
+        token: WebRTCVideoPresentationToken,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard var interaction = focusedWindowResizeState.interaction,
+              interaction.binding.lease == lease else {
+            return
+        }
+        guard interaction.mode == .move,
+              interaction.pending == nil,
+              focusedWindowResizeInteractionIsCurrent(interaction),
+              interaction.target != nil,
+              remoteInputCapability?
+                .supportsFocusedWindowMoveScaleRebinding == true else {
+            cancelFocusedWindowResize()
+            return
+        }
+        beginFocusedWindowMovePresentationFence(
+            for: &interaction,
+            awaiting: .zero,
+            token: token
+        )
+    }
+
+    /// Records the renderer's optional native size hint only inside an already-authorized format
+    /// fence. Delayed size callbacks after presentation are harmless and cannot hide input again.
+    private func recordFocusedWindowMoveAnnouncedVideoSize(
+        _ size: CGSize,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard size != .zero,
+              var interaction = focusedWindowResizeState.interaction,
+              interaction.binding.lease == lease,
+              let token = interaction.awaitingPresentationToken else {
+            return
+        }
+        guard interaction.mode == .move,
+              interaction.pending == nil,
+              interaction.target != nil,
+              focusedWindowResizeInteractionIsCurrent(interaction),
+              remoteInputCapability?
+                .supportsFocusedWindowMoveScaleRebinding == true,
+              let oldSize = Self.remoteInputVideoSize(
+                  from: interaction.binding.viewerVideoSize
+              ),
+              let newSize = Self.remoteInputVideoSize(from: size),
+              Self.hasExactlyEqualAspectRatio(oldSize, newSize) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        beginFocusedWindowMovePresentationFence(
+            for: &interaction,
+            awaiting: size,
+            token: token
+        )
+    }
+
+    /// Installs a new Move coordinate binding only after the renderer proves that exact decoded
+    /// size reached the screen. A late frame from an older rapid transition cannot reopen input.
+    func focusedWindowMoveVideoFrameDidPresent(
+        size: CGSize,
+        token: WebRTCVideoPresentationToken,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard var interaction = focusedWindowResizeState.interaction,
+              interaction.mode == .move,
+              interaction.binding.lease == lease,
+              interaction.pending == nil else {
+            return
+        }
+        guard let awaitedToken = interaction.awaitingPresentationToken else {
+            // A differing presentation without its typed format event is never allowed to rebind.
+            if interaction.binding.viewerVideoSize != size {
+                cancelFocusedWindowResize()
+            }
+            return
+        }
+        guard awaitedToken == token else {
+            if awaitedToken.bindingGeneration == token.bindingGeneration,
+               token.dimensionGeneration > awaitedToken.dimensionGeneration {
+                cancelFocusedWindowResize()
+            }
+            return
+        }
+        if let awaitedSize = interaction.awaitingPresentedVideoSize,
+           awaitedSize != .zero,
+           awaitedSize != size {
+            cancelFocusedWindowResize()
+            return
+        }
+        guard
+              focusedWindowResizeInteractionIsCurrent(interaction),
+              let oldSize = Self.remoteInputVideoSize(
+                  from: interaction.binding.viewerVideoSize
+              ),
+              let newSize = Self.remoteInputVideoSize(from: size),
+              interaction.target != nil,
+              remoteInputCapability?.supportsFocusedWindowMoveScaleRebinding == true,
+              Self.hasExactlyEqualAspectRatio(oldSize, newSize),
+              let binding = focusedWindowResizeBinding(
+                  mode: .move,
+                  for: lease,
+                  containerSize: interaction.binding.containerSize,
+                  viewerVideoSize: size
+              ) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        focusedWindowMovePresentationTimeoutTask?.cancel()
+        focusedWindowMovePresentationTimeoutTask = nil
+        interaction.binding = binding
+        interaction.awaitingPresentedVideoSize = nil
+        interaction.awaitingPresentationToken = nil
+        interaction.presentationRebindingID = nil
+        focusedWindowResizeState = .active(interaction)
+    }
+
+    private func beginFocusedWindowMovePresentationFence(
+        for interaction: inout FocusedWindowResizeInteraction,
+        awaiting size: CGSize,
+        token: WebRTCVideoPresentationToken
+    ) {
+        focusedWindowMovePresentationTimeoutTask?.cancel()
+        let rebindingID = UUID()
+        interaction.awaitingPresentedVideoSize = size
+        interaction.awaitingPresentationToken = token
+        interaction.presentationRebindingID = rebindingID
+        focusedWindowResizeState = .active(interaction)
+        let interactionID = interaction.id
+        let lease = interaction.binding.lease
+        focusedWindowMovePresentationTimeoutTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(
+                    for: Self.focusedWindowMovePresentationTimeout
+                )
+            } catch {
+                return
+            }
+            self?.focusedWindowMovePresentationTimeoutDidFire(
+                interactionID: interactionID,
+                lease: lease,
+                awaitedSize: size,
+                token: token,
+                rebindingID: rebindingID
+            )
+        }
+    }
+
+    /// Retires only the exact stalled presentation generation. Keyboard authorization is owned
+    /// independently and remains intact.
+    func focusedWindowMovePresentationTimeoutDidFire(
+        interactionID: UUID,
+        lease: WorldwideScreenPresentationLease,
+        awaitedSize: CGSize,
+        token: WebRTCVideoPresentationToken,
+        rebindingID: UUID
+    ) {
+        guard let interaction = focusedWindowResizeState.interaction,
+              interaction.id == interactionID,
+              interaction.binding.lease == lease,
+              interaction.awaitingPresentedVideoSize == awaitedSize,
+              interaction.awaitingPresentationToken == token,
+              interaction.presentationRebindingID == rebindingID else {
+            return
+        }
+        focusedWindowMovePresentationTimeoutTask = nil
+        cancelFocusedWindowResize()
     }
 
     func focusedWindowResizeContainerGeometryDidChange(
@@ -5495,6 +5700,12 @@ final class WorldwideSessionViewModel: ObservableObject {
         containerSize: CGSize,
         viewerVideoSize: CGSize
     ) -> Bool {
+        // During a decoded-format fence, the old binding exists only so the active Move control
+        // can remain available as a Done action. It must never authorize a different mode using
+        // stale presentation geometry.
+        if focusedWindowResizeState.interaction?.awaitingPresentationToken != nil {
+            return false
+        }
         guard let binding = focusedWindowResizeBinding(
             mode: mode,
             for: lease,
@@ -5695,6 +5906,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     /// Revokes focused-window work. Keyboard focus and ordinary text packets remain
     /// owned by their independent authenticated generations.
     func cancelFocusedWindowResize() {
+        focusedWindowMovePresentationTimeoutTask?.cancel()
+        focusedWindowMovePresentationTimeoutTask = nil
         focusedWindowResizeSendAuthorization?.revoke()
         focusedWindowResizeSendAuthorization = nil
         remoteInputQueue.removeAll(where: {
@@ -5788,7 +6001,15 @@ final class WorldwideSessionViewModel: ObservableObject {
         containerSize: CGSize,
         viewerVideoSize: CGSize
     ) -> FocusedWindowResizeInteraction? {
-        guard let interaction = focusedWindowResizeState.interaction,
+        guard let interaction = focusedWindowResizeState.interaction else {
+            return nil
+        }
+        // A stale gesture callback may arrive while the decoded-size transition is waiting for
+        // its first presented frame. Ignore it without tearing down the preserved Move selection.
+        guard interaction.awaitingPresentedVideoSize == nil else {
+            return nil
+        }
+        guard
               interaction.binding.lease == lease,
               interaction.binding.containerSize == containerSize,
               interaction.binding.viewerVideoSize == viewerVideoSize,
@@ -6171,6 +6392,14 @@ final class WorldwideSessionViewModel: ObservableObject {
         guard (2 ... 32_768).contains(width),
               (2 ... 32_768).contains(height) else { return nil }
         return WebRTCInputVideoSize(width: Int(width), height: Int(height))
+    }
+
+    private static func hasExactlyEqualAspectRatio(
+        _ lhs: WebRTCInputVideoSize,
+        _ rhs: WebRTCInputVideoSize
+    ) -> Bool {
+        Int64(lhs.width) * Int64(rhs.height)
+            == Int64(rhs.width) * Int64(lhs.height)
     }
 
     private func beginRemotePointerIntent() -> UInt64 {
@@ -11702,7 +11931,8 @@ final class WorldwideSessionViewModel: ObservableObject {
         screenRequestID: UInt64 = 1,
         supportsScroll: Bool = false,
         supportsFocusedWindowResize: Bool = false,
-        supportsFocusedWindowMove: Bool = false
+        supportsFocusedWindowMove: Bool = false,
+        supportsFocusedWindowMoveScaleRebinding: Bool = false
     ) -> WorldwideScreenPresentationDebugFixture {
         debugInstallScreenSessionForTests(
             peer: newPeer,
@@ -11719,7 +11949,9 @@ final class WorldwideSessionViewModel: ObservableObject {
             supportsPrimaryDrag: true,
             supportsScroll: supportsScroll,
             supportsFocusedWindowResize: supportsFocusedWindowResize,
-            supportsFocusedWindowMove: supportsFocusedWindowMove
+            supportsFocusedWindowMove: supportsFocusedWindowMove,
+            supportsFocusedWindowMoveScaleRebinding:
+                supportsFocusedWindowMoveScaleRebinding
         )
         let authorization = WebRTCInputAuthorization()
         debugFocusedWindowResizeTrackOwner = supportsFocusedWindowResize || supportsFocusedWindowMove
@@ -11746,7 +11978,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     func debugReplaceRemoteInputCapabilityForTests(
         inputSessionID: UUID = UUID(),
         supportsFocusedWindowResize: Bool = true,
-        supportsFocusedWindowMove: Bool = false
+        supportsFocusedWindowMove: Bool = false,
+        supportsFocusedWindowMoveScaleRebinding: Bool = false
     ) -> WebRTCInputAuthorization? {
         guard let current = remoteInputCapability else { return nil }
         let replacement = WebRTCInputCapability(
@@ -11757,7 +11990,9 @@ final class WorldwideSessionViewModel: ObservableObject {
             supportsPrimaryDrag: current.supportsPrimaryDrag,
             supportsScroll: current.supportsScroll,
             supportsFocusedWindowResize: supportsFocusedWindowResize,
-            supportsFocusedWindowMove: supportsFocusedWindowMove
+            supportsFocusedWindowMove: supportsFocusedWindowMove,
+            supportsFocusedWindowMoveScaleRebinding:
+                supportsFocusedWindowMoveScaleRebinding
         )
         let authorization = WebRTCInputAuthorization()
         installRemoteInputCapability(
@@ -13015,6 +13250,7 @@ private struct RemoteInputRequestScope: Hashable {
     let supportsScroll: Bool
     let supportsFocusedWindowResize: Bool
     let supportsFocusedWindowMove: Bool
+    let supportsFocusedWindowMoveScaleRebinding: Bool
 
     init(
         sessionGeneration: UUID,
@@ -13031,6 +13267,8 @@ private struct RemoteInputRequestScope: Hashable {
         supportsScroll = capability.supportsScroll
         supportsFocusedWindowResize = capability.supportsFocusedWindowResize
         supportsFocusedWindowMove = capability.supportsFocusedWindowMove
+        supportsFocusedWindowMoveScaleRebinding =
+            capability.supportsFocusedWindowMoveScaleRebinding
     }
 }
 

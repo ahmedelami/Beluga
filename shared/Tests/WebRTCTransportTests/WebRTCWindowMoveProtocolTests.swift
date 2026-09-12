@@ -10,17 +10,38 @@ final class WebRTCWindowMoveProtocolTests: XCTestCase {
          .commitFocusedWindowMove(targetGeneration: generation, start: .init(x: 0.1, y: 0.8), end: .init(x: 0.7, y: 0.2))]
     }
 
-    func testMoveCapabilityIsAdditiveAndStrict() throws {
-        let current = WebRTCInputCapability(inputSessionID: session, screenRequestID: 1, supportsFocusedWindowMove: true)
+    func testMoveCapabilitiesAreAdditiveAndStrict() throws {
+        let current = WebRTCInputCapability(
+            inputSessionID: session,
+            screenRequestID: 1,
+            supportsFocusedWindowMove: true,
+            supportsFocusedWindowMoveScaleRebinding: true
+        )
         let data = try JSONEncoder().encode(current)
         XCTAssertEqual(try JSONDecoder().decode(WebRTCInputCapability.self, from: data), current)
-        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        object.removeValue(forKey: "supportsFocusedWindowMove")
-        let legacy = try JSONDecoder().decode(WebRTCInputCapability.self, from: JSONSerialization.data(withJSONObject: object))
-        XCTAssertFalse(legacy.supportsFocusedWindowMove)
-        for invalid in [NSNull(), 1, "true"] as [Any] {
-            object["supportsFocusedWindowMove"] = invalid
-            XCTAssertThrowsError(try JSONDecoder().decode(WebRTCInputCapability.self, from: JSONSerialization.data(withJSONObject: object)))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        for keyPath in [
+            \WebRTCInputCapability.supportsFocusedWindowMove,
+            \WebRTCInputCapability.supportsFocusedWindowMoveScaleRebinding
+        ] {
+            let key = keyPath == \WebRTCInputCapability.supportsFocusedWindowMove
+                ? "supportsFocusedWindowMove"
+                : "supportsFocusedWindowMoveScaleRebinding"
+            var legacyObject = object
+            legacyObject.removeValue(forKey: key)
+            let legacy = try JSONDecoder().decode(
+                WebRTCInputCapability.self,
+                from: JSONSerialization.data(withJSONObject: legacyObject)
+            )
+            XCTAssertFalse(legacy[keyPath: keyPath])
+            for invalid in [NSNull(), 1, "true"] as [Any] {
+                var invalidObject = object
+                invalidObject[key] = invalid
+                XCTAssertThrowsError(try JSONDecoder().decode(
+                    WebRTCInputCapability.self,
+                    from: JSONSerialization.data(withJSONObject: invalidObject)
+                ))
+            }
         }
     }
 

@@ -40,6 +40,12 @@ public struct MacRemoteInputVideoSize: Equatable, Sendable {
     var isValid: Bool {
         (2 ... 32_768).contains(width) && (2 ... 32_768).contains(height)
     }
+
+    func hasExactlySameAspectRatio(as other: MacRemoteInputVideoSize) -> Bool {
+        guard isValid, other.isValid else { return false }
+        return Int64(width) * Int64(other.height)
+            == Int64(other.width) * Int64(height)
+    }
 }
 
 /// Snapshot of the macOS grants needed to synthesize and target remote input.
@@ -1292,8 +1298,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
                   target.generation == targetGeneration,
                   target.screenRequestID == screenRequestID,
                   target.inputSessionID == inputSessionID,
-                  target.viewerVideoSize == context.viewerVideoSize,
-                  target.frameGeometry.hasSameInputTransform(as: context.frameGeometry),
+                  target.hasCompatibleCoordinateBinding(with: context),
                   MacRemoteWindowResizeGeometry.approximatelyEqual(
                       target.displayBounds,
                       context.displayBounds
@@ -1398,11 +1403,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                   finalTarget.generation == target.generation,
                   finalTarget.screenRequestID == screenRequestID,
                   finalTarget.inputSessionID == inputSessionID,
-                  finalTarget.viewerVideoSize == finalContext.viewerVideoSize,
+                  finalTarget.hasCompatibleCoordinateBinding(with: finalContext),
                   finalTarget.viewerVideoSize == target.viewerVideoSize,
-                  finalTarget.frameGeometry.hasSameInputTransform(
-                      as: finalContext.frameGeometry
-                  ),
                   finalTarget.frameGeometry.hasSameInputTransform(
                       as: target.frameGeometry
                   ),
@@ -2525,6 +2527,17 @@ private struct AuthorizedWindowResizeTarget: Sendable {
     let viewerVideoSize: MacRemoteInputVideoSize
     let screenRequestID: UInt64
     let inputSessionID: UUID
+
+    func hasCompatibleCoordinateBinding(with context: MacRemoteWindowResizeContext) -> Bool {
+        switch operation {
+        case .resize:
+            viewerVideoSize == context.viewerVideoSize
+                && frameGeometry.hasSameInputTransform(as: context.frameGeometry)
+        case .move:
+            viewerVideoSize.hasExactlySameAspectRatio(as: context.viewerVideoSize)
+                && frameGeometry.hasSameInputTransform(as: context.frameGeometry)
+        }
+    }
 }
 
 private struct MacRemoteWindowResizeContext: Sendable {

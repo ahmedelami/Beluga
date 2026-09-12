@@ -839,22 +839,110 @@ final class AspectFitCoordinateMapperTests: XCTestCase {
         XCTAssertEqual(machine.end(at: end, timestamp: 0.7), [])
     }
 
-    func testMoveModeSwipeBeforeHoldNeverScrollsClicksOrMoves() {
-        for target in [nil, RemotePointerResizeTarget(
+    func testMoveModeSwipeBeforeSelectionNeverScrollsClicksOrMoves() {
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: nil)
+        )
+        XCTAssertEqual(machine.begin(at: .zero, timestamp: 0), [])
+        XCTAssertEqual(machine.move(to: CGPoint(x: 12, y: 0), timestamp: 0.1), [])
+        XCTAssertEqual(machine.phase, .suppressed)
+        XCTAssertFalse(machine.shouldScheduleHoldDeadline)
+        XCTAssertEqual(machine.holdDeadlineReached(), [])
+        XCTAssertEqual(machine.end(at: CGPoint(x: 25, y: 10), timestamp: 0.7), [])
+    }
+
+    func testMoveModeSelectedTargetQuickSwipeBeforeHoldDoesNothing() {
+        let target = RemotePointerResizeTarget(
             generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
-        )] {
-            var machine = RemotePointerGestureStateMachine(
-                allowsScroll: true,
-                allowsPrimaryDrag: true,
-                interactionMode: .focusedWindowMove(target: target)
-            )
-            XCTAssertEqual(machine.begin(at: .zero, timestamp: 0), [])
-            XCTAssertEqual(machine.move(to: CGPoint(x: 12, y: 0), timestamp: 0.1), [])
-            XCTAssertEqual(machine.phase, .suppressed)
-            XCTAssertFalse(machine.shouldScheduleHoldDeadline)
-            XCTAssertEqual(machine.holdDeadlineReached(), [])
-            XCTAssertEqual(machine.end(at: CGPoint(x: 25, y: 10), timestamp: 0.7), [])
-        }
+        )
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: target)
+        )
+        XCTAssertEqual(machine.begin(at: .zero, timestamp: 0), [])
+        XCTAssertEqual(machine.move(to: CGPoint(x: 12, y: 0), timestamp: 0.1), [])
+        XCTAssertEqual(machine.phase, .tracking)
+        XCTAssertTrue(machine.shouldScheduleHoldDeadline)
+        XCTAssertEqual(machine.end(at: CGPoint(x: 25, y: 10), timestamp: 0.2), [])
+        XCTAssertEqual(machine.phase, .finished)
+    }
+
+    func testMoveModeSelectedTargetOutAndBackSwipeBeforeHoldDoesNotReselect() {
+        let target = RemotePointerResizeTarget(
+            generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
+        )
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: target)
+        )
+
+        XCTAssertEqual(machine.begin(at: .zero, timestamp: 0), [])
+        XCTAssertEqual(machine.move(to: CGPoint(x: 20, y: 0), timestamp: 0.1), [])
+        XCTAssertEqual(machine.move(to: CGPoint(x: 2, y: 0), timestamp: 0.15), [])
+        XCTAssertEqual(machine.end(at: CGPoint(x: 2, y: 0), timestamp: 0.2), [])
+        XCTAssertEqual(machine.phase, .finished)
+    }
+
+    func testMoveModeSelectedTargetEarlyDragSurvivesDelayedHoldTimerAndCommits() {
+        let target = RemotePointerResizeTarget(
+            generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
+        )
+        let start = CGPoint(x: 2, y: 3)
+        let early = CGPoint(x: 15, y: 3)
+        let armed = CGPoint(x: 24, y: 10)
+        let end = CGPoint(x: 40, y: 20)
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: target)
+        )
+
+        XCTAssertEqual(machine.begin(at: start, timestamp: 0), [])
+        XCTAssertEqual(machine.move(to: early, timestamp: 0.1), [])
+        XCTAssertEqual(machine.phase, .tracking)
+        XCTAssertTrue(machine.shouldScheduleHoldDeadline)
+        XCTAssertEqual(machine.move(to: armed, timestamp: 0.35), [
+            .focusedWindowMovePreview(
+                targetGeneration: target.generation, start: start, end: armed
+            ),
+        ])
+        XCTAssertEqual(machine.phase, .focusedWindowMove)
+        XCTAssertEqual(machine.end(at: end, timestamp: 0.6), [
+            .focusedWindowMovePreview(
+                targetGeneration: target.generation, start: start, end: end
+            ),
+            .focusedWindowMoveCommit(
+                targetGeneration: target.generation, start: start, end: end
+            ),
+        ])
+    }
+
+    func testMoveModeSelectedTargetEndAfterDelayedHoldDeadlineCommits() {
+        let target = RemotePointerResizeTarget(
+            generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
+        )
+        let start = CGPoint(x: 2, y: 3)
+        let end = CGPoint(x: 40, y: 20)
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: target)
+        )
+
+        XCTAssertEqual(machine.begin(at: start, timestamp: 0), [])
+        XCTAssertEqual(machine.end(at: end, timestamp: 0.4), [
+            .focusedWindowMovePreview(
+                targetGeneration: target.generation, start: start, end: end
+            ),
+            .focusedWindowMoveCommit(
+                targetGeneration: target.generation, start: start, end: end
+            ),
+        ])
+        XCTAssertEqual(machine.phase, .finished)
     }
 
     func testMoveModeHoldWithoutDragDoesNotCommitOrClick() {

@@ -4648,7 +4648,8 @@ actor WorldwideScreenService {
             supportsPrimaryDrag: true,
             supportsScroll: true,
             supportsFocusedWindowResize: true,
-            supportsFocusedWindowMove: true
+            supportsFocusedWindowMove: true,
+            supportsFocusedWindowMoveScaleRebinding: true
         )
     }
 

@@ -14,6 +14,8 @@ final class WorldwideFocusedWindowMoveDispatchTests: XCTestCase {
         ]
         let old = WebRTCInputCapability(inputSessionID: session, screenRequestID: 3, supportsFocusedWindowResize: true)
         let current = WorldwideScreenService.remoteInputCapability(inputSessionID: session, screenRequestID: 3)
+        XCTAssertFalse(old.supportsFocusedWindowMoveScaleRebinding)
+        XCTAssertTrue(current.supportsFocusedWindowMoveScaleRebinding)
         let spy = WindowMoveDispatchSpy()
         for (index, action) in actions.enumerated() {
             XCTAssertFalse(WorldwideScreenService.remoteInputActionIsSupported(action, capability: old))

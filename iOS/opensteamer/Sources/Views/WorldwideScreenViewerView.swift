@@ -38,19 +38,39 @@ struct WorldwideScreenViewerView: View {
                                 screenMediaFence?.forceCover == true
                                     ? screenMediaFence?.coverID
                                     : nil,
-                            // Any decoded-size transition clears touch immediately. Size callbacks
-                            // precede presentation and therefore cannot authorize the new mapping.
+                            // Any decoded-size transition clears touch immediately. Callback order
+                            // is not authoritative; only a matching Metal presentation can rebind.
                             onVideoSizeChanged: { size in
-                                focusedWindowResizeGhostFrame = nil
-                                viewModel.cancelFocusedWindowResize()
-                                viewModel.discardPendingRemoteScrolls()
-                                videoRenderObservation = nil
+                                if Self.videoSizeCallbackRevokesPresentedGeometry(size) {
+                                    focusedWindowResizeGhostFrame = nil
+                                    viewModel.discardPendingRemoteScrolls()
+                                    videoRenderObservation = nil
+                                    return
+                                }
                                 viewModel.screenVideoPresentationGeometryDidChange(
                                     to: size,
                                     for: lease
                                 )
                             },
-                            onVideoFrameRendered: { observation in
+                            onVideoPresentationInvalidated: { token, invalidation in
+                                focusedWindowResizeGhostFrame = nil
+                                viewModel.discardPendingRemoteScrolls()
+                                videoRenderObservation = nil
+                                viewModel.screenVideoPresentationDidInvalidate(
+                                    invalidation,
+                                    token: token,
+                                    for: lease
+                                )
+                            },
+                            onVideoFrameRendered: { observation, token in
+                                viewModel.focusedWindowMoveVideoFrameDidPresent(
+                                    size: CGSize(
+                                        width: observation.width,
+                                        height: observation.height
+                                    ),
+                                    token: token,
+                                    for: lease
+                                )
                                 if videoRenderObservation.map({
                                     observation.frameCount > $0.frameCount
                                 }) != false {
@@ -184,7 +204,6 @@ struct WorldwideScreenViewerView: View {
                                     },
                                     onConfigurationInvalidated: {
                                         focusedWindowResizeGhostFrame = nil
-                                        viewModel.cancelFocusedWindowResize()
                                         viewModel.discardPendingRemoteScrolls()
                                     }
                                 )
@@ -664,12 +683,14 @@ struct WorldwideScreenViewerView: View {
 
     @ViewBuilder
     private func focusedWindowControls(containerSize: CGSize) -> some View {
-        if remoteInputPresentationAvailability.pointer,
-           let renderedVideoSize {
+        if remoteInputPresentationAvailability.keyboard,
+           let controlVideoSize = renderedVideoSize
+                ?? viewModel.focusedWindowResizeState.interaction?.binding.viewerVideoSize {
             VStack(alignment: .trailing, spacing: 8) {
                 if let interaction = viewModel.focusedWindowResizeState.interaction,
                    interaction.mode == .move {
                     Text(interaction.pending != nil
+                        || interaction.awaitingPresentedVideoSize != nil
                         ? "Updating window…"
                         : interaction.target == nil
                             ? "Tap a window to select it"
@@ -682,8 +703,16 @@ struct WorldwideScreenViewerView: View {
                         .accessibilityIdentifier("worldwideFocusedWindowMoveHint")
                 }
                 HStack(spacing: 10) {
-                    focusedWindowButton(mode: .move, containerSize: containerSize, videoSize: renderedVideoSize)
-                    focusedWindowButton(mode: .resize, containerSize: containerSize, videoSize: renderedVideoSize)
+                    focusedWindowButton(
+                        mode: .move,
+                        containerSize: containerSize,
+                        videoSize: controlVideoSize
+                    )
+                    focusedWindowButton(
+                        mode: .resize,
+                        containerSize: containerSize,
+                        videoSize: controlVideoSize
+                    )
                 }
             }
             .padding(.horizontal, 16)
@@ -698,10 +727,14 @@ struct WorldwideScreenViewerView: View {
         videoSize: CGSize
     ) -> some View {
         let isActive = viewModel.focusedWindowResizeState.interaction?.mode == mode
+        let isPresentationFenced = viewModel.focusedWindowResizeState.interaction?
+            .awaitingPresentationToken != nil
         let isAvailable = mode == .move
             ? viewModel.isFocusedWindowMoveAvailable
             : viewModel.isFocusedWindowResizeAvailable
-        if isActive || isAvailable {
+        // While Move awaits a newly presented resolution, retain only its Done action. The
+        // fallback video size is deliberately not permission to start another interaction mode.
+        if isActive || (isAvailable && !isPresentationFenced) {
             Button {
                 focusedWindowResizeGhostFrame = nil
                 if isActive {
@@ -814,7 +847,7 @@ struct WorldwideScreenViewerView: View {
               binding.viewerVideoSize == videoSize else {
             return pendingMode
         }
-        if interaction.pending != nil {
+        if interaction.pending != nil || interaction.awaitingPresentedVideoSize != nil {
             return pendingMode
         }
         guard let target = interaction.target,
@@ -906,6 +939,13 @@ struct WorldwideScreenViewerView: View {
             keyboard: keyboard,
             pointer: keyboard && renderedVideoSize != nil
         )
+    }
+
+    /// Native cover/freshness resets report zero without a typed decoder-format event. They must
+    /// still revoke pointer geometry while leaving the independently authenticated keyboard and
+    /// any safely fenced Move selection to their own lifecycle owners.
+    static func videoSizeCallbackRevokesPresentedGeometry(_ size: CGSize) -> Bool {
+        size == .zero
     }
 
     private var keepsRemoteScreenRendererMounted: Bool {

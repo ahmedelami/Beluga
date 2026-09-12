@@ -389,6 +389,12 @@ manual IP addresses, router configuration, or public TCP ports.
   Move mode requires an explicit safe window-selection tap, then hold-and-drag may start
   anywhere in the visible remote image. Bind its target and feedback to Move independently
   of Resize, preserve window size, and mutate only AX position with fenced readback.
+  A host may separately advertise Move scale rebinding. Only then may an idle selected Move
+  target survive a same-session decoded-size transition: block gestures until the new frame is
+  presented, require exact integer aspect equality and an unchanged host capture transform,
+  and retain the exact target generation, AX element, focus, frame, display, and session fences.
+  Host capture/framebuffer transitions, focused-window Resize, and peers missing that additive
+  capability remain exact-size fail-closed.
   Never implement Move using a primary drag or a resize commit. Revoke its one-shot target
   on stale focus/frame/geometry, mode change, or session/scene/permission loss without
   dismissing an exactly preserved editable or secure keyboard focus.
