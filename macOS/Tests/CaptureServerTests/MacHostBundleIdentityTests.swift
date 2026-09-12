@@ -210,7 +210,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         )
         XCTAssertEqual(mediaPositive.status, 0, mediaPositive.diagnostic)
         try assertMediaContractMutationsRejected(app: app, verifier: verifier)
-        try assertLegacyBundleContractRemainsExact(app: app, verifier: verifier)
+        try assertLegacyBundleContractRemainsExact(app: app, belugaVerifier: verifier)
         let noncanonicalRuntimeMode = try run(
             executable: verifier,
             arguments: ["--installed-runtime", app.path]
@@ -218,7 +218,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         XCTAssertNotEqual(noncanonicalRuntimeMode.status, 0, noncanonicalRuntimeMode.diagnostic)
         XCTAssertTrue(
             noncanonicalRuntimeMode.standardError.contains(
-                "--installed-runtime is restricted to '/Applications/Beluga Host.app'"
+                "--installed-runtime is restricted to '/Applications/opensteamer Host.app'"
             ),
             noncanonicalRuntimeMode.diagnostic
         )
@@ -708,6 +708,10 @@ final class MacHostBundleIdentityTests: XCTestCase {
             "framework pristine pre-sign version A layout differs",
             "framework post-sign version A layout differs",
             "framework architectures '$framework_arches' do not contain host slice",
+            "--jobs 2",
+            "--product OpensteamerMediaBridge",
+            "--entitlements \"$MEDIA_AUTOMATION_ENTITLEMENTS\"",
+            "VERIFY_ARGUMENTS=(--media-integration-v1 \"$APP_DIR\")",
         ] {
             XCTAssertTrue(builder.contains(required), "Builder lacks \(required)")
         }
@@ -747,7 +751,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         }
         XCTAssertTrue(
             verifier.contains(
-                "INSTALLED_RUNTIME_APP_PATH=\"/Applications/Beluga Host.app\""
+                "INSTALLED_RUNTIME_APP_PATH=\"/Applications/opensteamer Host.app\""
             )
         )
         XCTAssertTrue(verifier.contains("${#MACL_HEX} -eq 144"))
@@ -764,7 +768,13 @@ final class MacHostBundleIdentityTests: XCTestCase {
             options: [], format: nil
         ) as? [String: Any])
         XCTAssertEqual(info["NSAppleEventsUsageDescription"] as? String,
-            "opensteamer reads playback information and controls Chrome and Music when you enable media integration.")
+            "Beluga reads playback information and controls Chrome and Music when you enable media integration.")
+        XCTAssertEqual(info["OpensteamerMediaIntegrationVersion"] as? Int, 1)
+        let manifest = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: app.appendingPathComponent(manifestPath))
+        ) as? [String: Any])
+        XCTAssertEqual(manifest["path"] as? String,
+            "/Applications/opensteamer Host.app/Contents/MacOS/OpensteamerMediaBridge")
 
         for (name, relative, diagnostic) in [
             ("missing-media-bridge", bridgePath, "media bridge executable is not a real regular file"),
@@ -969,7 +979,8 @@ final class MacHostBundleIdentityTests: XCTestCase {
         }
     }
 
-    private func assertLegacyBundleContractRemainsExact(app: URL, verifier: URL) throws {
+    private func assertLegacyBundleContractRemainsExact(app: URL, belugaVerifier: URL) throws {
+        let verifier = repositoryRoot.appendingPathComponent("macOS/scripts/verify-mac-host-bundle.sh")
         let parent = app.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("legacy-contract")
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
         let legacy = parent.appendingPathComponent("opensteamer Host.app")
@@ -977,11 +988,19 @@ final class MacHostBundleIdentityTests: XCTestCase {
         XCTAssertEqual(clone.status, 0, clone.diagnostic)
         try FileManager.default.removeItem(at: legacy.appendingPathComponent("Contents/MacOS/OpensteamerMediaBridge"))
         try FileManager.default.removeItem(at: legacy.appendingPathComponent("Contents/Resources/org.example.opensteamer.media.json"))
+        try FileManager.default.removeItem(at: legacy.appendingPathComponent("Contents/Resources/AppIcon.icns"))
         try editPlist(legacy.appendingPathComponent("Contents/Info.plist")) {
             $0.removeValue(forKey: "OpensteamerMediaIntegrationVersion")
             $0.removeValue(forKey: "NSAppleEventsUsageDescription")
+            $0.removeValue(forKey: "CFBundleIconFile")
+            $0["CFBundleName"] = "opensteamer Host"
+            $0["CFBundleDisplayName"] = "opensteamer Host"
         }
         try signCode(legacy, identifier: "com.elamin.AudioStreamer.CaptureServer")
+        let wrongArtifactRole = try run(executable: belugaVerifier, arguments: [legacy.path])
+        XCTAssertNotEqual(wrongArtifactRole.status, 0, wrongArtifactRole.diagnostic)
+        XCTAssertTrue(wrongArtifactRole.standardError.contains("bundle basename: expected 'Beluga Host.app'"),
+                      wrongArtifactRole.diagnostic)
         let positive = try run(executable: verifier, arguments: [legacy.path])
         XCTAssertEqual(positive.status, 0, positive.diagnostic)
         let downgrade = try run(executable: verifier, arguments: ["--media-integration-v1", legacy.path])
@@ -1034,7 +1053,7 @@ final class MacHostBundleIdentityTests: XCTestCase {
         let parent = app.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("mutant-\(name)")
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        let mutant = parent.appendingPathComponent("Beluga Host.app")
+        let mutant = parent.appendingPathComponent(app.lastPathComponent)
         let clone = try run(
             executable: URL(fileURLWithPath: "/bin/cp"),
             arguments: ["-cR", app.path, mutant.path]
