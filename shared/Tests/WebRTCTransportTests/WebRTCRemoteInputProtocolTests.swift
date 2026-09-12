@@ -571,7 +571,7 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
         XCTAssertEqual(snapshot.admittedRequestEventCount, 1)
         XCTAssertEqual(snapshot.sentFeedbackHistoryCount, 1)
         XCTAssertEqual(snapshot.capturedControlData.count, 2)
-        XCTAssertEqual(snapshot.capturedControlData[0], snapshot.capturedControlData[1])
+        // Replay re-encodes the retained feedback; JSON key ordering is not semantic.
         XCTAssertEqual(
             try snapshot.capturedControlData.map {
                 try JSONDecoder().decode(ControlChannelMessage.self, from: $0)

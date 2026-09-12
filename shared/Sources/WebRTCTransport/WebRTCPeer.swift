@@ -193,6 +193,9 @@ enum WebRTCInputRequestActionBinding: Equatable, Sendable {
     case focusedWindowResizeTargetRequest
     case focusedWindowSelection
     case focusedWindowResizeCommit(targetGeneration: UUID)
+    case focusedWindowMoveTargetRequest
+    case focusedWindowMoveSelection
+    case focusedWindowMoveCommit(targetGeneration: UUID)
     case text
     case backspace
     case returnKey
@@ -211,6 +214,12 @@ enum WebRTCInputRequestActionBinding: Equatable, Sendable {
             self = .focusedWindowSelection
         case .commitFocusedWindowResize(let targetGeneration, _, _):
             self = .focusedWindowResizeCommit(targetGeneration: targetGeneration)
+        case .requestFocusedWindowMoveTarget:
+            self = .focusedWindowMoveTargetRequest
+        case .selectWindowForMove:
+            self = .focusedWindowMoveSelection
+        case .commitFocusedWindowMove(let targetGeneration, _, _):
+            self = .focusedWindowMoveCommit(targetGeneration: targetGeneration)
         case .insertText:
             self = .text
         case .backspace:
@@ -224,8 +233,21 @@ enum WebRTCInputRequestActionBinding: Equatable, Sendable {
         switch feedback.result {
         case .rejected:
             // Rejections are terminal but intentionally carry no new target authority.
-            return feedback.windowResize == nil
+            return feedback.windowResize == nil && feedback.windowMove == nil
         case .accepted:
+            if let move = feedback.windowMove {
+                guard feedback.windowResize == nil else { return false }
+                switch self {
+                case .focusedWindowMoveTargetRequest:
+                    return move.kind == .targetAcquired && move.committedTargetGeneration == nil
+                case .focusedWindowMoveSelection:
+                    return move.kind == .windowSelected && move.committedTargetGeneration == nil
+                case .focusedWindowMoveCommit(let generation):
+                    return move.kind == .moveCommitted && move.committedTargetGeneration == generation
+                default:
+                    return false
+                }
+            }
             switch (self, feedback.windowResize) {
             case (.tap, nil), (.primaryDrag, nil), (.scroll, nil),
                  (.text, nil), (.backspace, nil), (.returnKey, nil):
@@ -5090,7 +5112,8 @@ public actor WebRTCPeer {
         rejectionReason: WebRTCInputRejectionReason? = nil,
         screenFormatChanging: Bool = false,
         focus: WebRTCInputFocus = .none,
-        windowResize: WebRTCWindowResizeFeedback? = nil
+        windowResize: WebRTCWindowResizeFeedback? = nil,
+        windowMove: WebRTCWindowMoveFeedback? = nil
     ) throws {
         try ensureOpen()
         guard role == .host else { throw WebRTCTransportError.invalidRole }
@@ -5121,7 +5144,8 @@ public actor WebRTCPeer {
             rejectionReason: rejectionReason,
             screenFormatChanging: screenFormatChanging,
             focus: focus,
-            windowResize: windowResize
+            windowResize: windowResize,
+            windowMove: windowMove
         )
         guard request.permits(feedback) else {
             throw WebRTCTransportError.invalidInputRequest
@@ -10599,6 +10623,10 @@ public actor WebRTCPeer {
              .selectWindowForResize,
              .commitFocusedWindowResize:
             capability.supportsFocusedWindowResize
+        case .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
+            capability.supportsFocusedWindowMove
         case .tap, .insertText, .backspace, .returnKey:
             true
         }

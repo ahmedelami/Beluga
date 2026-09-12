@@ -799,6 +799,135 @@ final class AspectFitCoordinateMapperTests: XCTestCase {
         XCTAssertEqual(machine.end(at: CGPoint(x: 60, y: 30), timestamp: 0.2), [])
     }
 
+    func testMoveModeTapSelectsWithoutClickAndNeedsSelectionBeforeHolding() {
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: nil)
+        )
+        let point = CGPoint(x: 50, y: 60)
+        XCTAssertEqual(machine.begin(at: point, timestamp: 0), [])
+        XCTAssertFalse(machine.shouldScheduleHoldDeadline)
+        XCTAssertEqual(machine.holdDeadlineReached(), [])
+        XCTAssertEqual(machine.end(at: point, timestamp: 0.1), [.focusedWindowSelection(point)])
+    }
+
+    func testMoveModeHoldOutsideWindowMovesSelectedTargetWithoutPrimaryDragCapability() {
+        let target = RemotePointerResizeTarget(
+            generation: UUID(),
+            viewFrame: CGRect(x: 100, y: 200, width: 120, height: 120)
+        )
+        let start = CGPoint(x: 30, y: 40)
+        let end = CGPoint(x: 65, y: 80)
+        XCTAssertFalse(target.contains(start))
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true,
+            allowsPrimaryDrag: false,
+            interactionMode: .focusedWindowMove(target: target)
+        )
+        XCTAssertEqual(machine.begin(at: start, timestamp: 0), [])
+        XCTAssertTrue(machine.shouldScheduleHoldDeadline)
+        XCTAssertEqual(machine.move(to: start, timestamp: 0.34), [])
+        XCTAssertEqual(machine.holdDeadlineReached(), [
+            .focusedWindowMovePreview(targetGeneration: target.generation, start: start, end: start),
+        ])
+        XCTAssertEqual(machine.phase, .focusedWindowMove)
+        XCTAssertEqual(machine.end(at: end, timestamp: 0.6), [
+            .focusedWindowMovePreview(targetGeneration: target.generation, start: start, end: end),
+            .focusedWindowMoveCommit(targetGeneration: target.generation, start: start, end: end),
+        ])
+        XCTAssertEqual(machine.end(at: end, timestamp: 0.7), [])
+    }
+
+    func testMoveModeSwipeBeforeHoldNeverScrollsClicksOrMoves() {
+        for target in [nil, RemotePointerResizeTarget(
+            generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
+        )] {
+            var machine = RemotePointerGestureStateMachine(
+                allowsScroll: true,
+                allowsPrimaryDrag: true,
+                interactionMode: .focusedWindowMove(target: target)
+            )
+            XCTAssertEqual(machine.begin(at: .zero, timestamp: 0), [])
+            XCTAssertEqual(machine.move(to: CGPoint(x: 12, y: 0), timestamp: 0.1), [])
+            XCTAssertEqual(machine.phase, .suppressed)
+            XCTAssertFalse(machine.shouldScheduleHoldDeadline)
+            XCTAssertEqual(machine.holdDeadlineReached(), [])
+            XCTAssertEqual(machine.end(at: CGPoint(x: 25, y: 10), timestamp: 0.7), [])
+        }
+    }
+
+    func testMoveModeHoldWithoutDragDoesNotCommitOrClick() {
+        let target = RemotePointerResizeTarget(
+            generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
+        )
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true, allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMove(target: target)
+        )
+        _ = machine.begin(at: .zero, timestamp: 0)
+        _ = machine.holdDeadlineReached()
+        XCTAssertEqual(machine.end(at: .zero, timestamp: 1), [
+            .focusedWindowMovePreview(targetGeneration: target.generation, start: .zero, end: .zero),
+            .focusedWindowMoveCancelled,
+        ])
+    }
+
+    func testMoveModePendingRejectsAllGestures() {
+        var machine = RemotePointerGestureStateMachine(
+            allowsScroll: true, allowsPrimaryDrag: true,
+            interactionMode: .focusedWindowMovePending
+        )
+        XCTAssertEqual(machine.begin(at: .zero, timestamp: 0), [])
+        XCTAssertFalse(machine.shouldScheduleHoldDeadline)
+        XCTAssertEqual(machine.holdDeadlineReached(), [])
+        XCTAssertEqual(machine.end(at: CGPoint(x: 100, y: 100), timestamp: 1), [])
+    }
+
+    func testMoveModeCancelledAndMalformedGesturesNeverCommit() {
+        let target = RemotePointerResizeTarget(
+            generation: UUID(), viewFrame: CGRect(x: 10, y: 10, width: 100, height: 100)
+        )
+        for malformed in [false, true] {
+            var machine = RemotePointerGestureStateMachine(
+                allowsScroll: true, allowsPrimaryDrag: true,
+                interactionMode: .focusedWindowMove(target: target)
+            )
+            _ = machine.begin(at: .zero, timestamp: 0)
+            _ = machine.holdDeadlineReached()
+            let events = malformed
+                ? machine.move(to: CGPoint(x: CGFloat.nan, y: 1), timestamp: 0.5)
+                : machine.cancel()
+            XCTAssertEqual(events, [.focusedWindowMoveCancelled])
+            XCTAssertEqual(machine.end(at: CGPoint(x: 50, y: 50), timestamp: 0.8), [])
+        }
+    }
+
+    func testMoveGeometryOutsideWindowKeepsSizeAndMatchesScaledHostPreview() throws {
+        let frame = CGRect(x: 0.4, y: 0.3, width: 0.5, height: 0.6)
+        let start = CGPoint(x: 0.05, y: 0.05)
+        let end = CGPoint(x: 0.35, y: 0.2)
+        let normalized = try XCTUnwrap(FocusedWindowMoveGeometry.proposedFrame(
+            original: frame, start: start, end: end,
+            displayBounds: CGRect(x: 0, y: 0, width: 1, height: 1)
+        ))
+        let hostBounds = CGRect(x: -1440, y: -900, width: 1080, height: 1920)
+        func hostPoint(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: hostBounds.minX + point.x * hostBounds.width,
+                    y: hostBounds.minY + point.y * hostBounds.height)
+        }
+        let hostFrame = CGRect(origin: hostPoint(frame.origin), size: CGSize(
+            width: frame.width * hostBounds.width, height: frame.height * hostBounds.height
+        ))
+        let actual = try XCTUnwrap(FocusedWindowMoveGeometry.proposedFrame(
+            original: hostFrame, start: hostPoint(start), end: hostPoint(end), displayBounds: hostBounds
+        ))
+        XCTAssertEqual(normalized.size, frame.size)
+        XCTAssertEqual(actual.size, hostFrame.size)
+        XCTAssertEqual(actual.minX, hostPoint(normalized.origin).x, accuracy: 0.000_001)
+        XCTAssertEqual(actual.minY, hostPoint(normalized.origin).y, accuracy: 0.000_001)
+    }
+
     @MainActor
     func testResizeTargetUpdateKeepsOneRecognizerWithoutOwnershipInvalidation() {
         let trackIdentity = NSObject()

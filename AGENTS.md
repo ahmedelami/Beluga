@@ -362,9 +362,9 @@ manual IP addresses, router configuration, or public TCP ports.
   or Active-for-Hide acknowledgement closes the peer fail closed. Do not expose even
   retained remote frames unless the scene is active and the current Show is confirmed.
 - Only atomic primary taps, atomic primary drags, bounded incremental scroll deltas,
-  focused-window target/selection/resize commits, bounded committed text, Backspace,
+  focused-window target/selection/resize/move commits, bounded committed text, Backspace,
   and Return belong in the input protocol. Primary drag, scroll, and focused-window
-  resize are explicitly advertised optional capabilities. Focused-window resize uses
+  resize/move are independently advertised optional capabilities. Focused-window resize uses
   a separate one-shot, session-bound target generation and mandatory viewer-frame
   geometry; it never reuses primary drag or editable-focus authorization. For primary drag,
   the iPhone sends one bounded start/end action only
@@ -386,6 +386,12 @@ manual IP addresses, router configuration, or public TCP ports.
   uncertain. Resize-mode selection may focus only a safe top-level window without clicking
   its controls. Its iPhone preview and host commit must share the same midpoint and drag-delta
   geometry, and resize-only transitions must not dismiss an exactly preserved editable focus.
+  Move mode requires an explicit safe window-selection tap, then hold-and-drag may start
+  anywhere in the visible remote image. Bind its target and feedback to Move independently
+  of Resize, preserve window size, and mutate only AX position with fenced readback.
+  Never implement Move using a primary drag or a resize commit. Revoke its one-shot target
+  on stale focus/frame/geometry, mode change, or session/scene/permission loss without
+  dismissing an exactly preserved editable or secure keyboard focus.
   The Mac must revalidate Accessibility focus identity, secure classification, and
   a host-issued focus generation before every keyboard event. An exact enabled secure
   AX text field may receive a fresh generation-bound remote keyboard capability without

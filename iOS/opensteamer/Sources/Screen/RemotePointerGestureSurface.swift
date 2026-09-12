@@ -17,8 +17,10 @@ enum RemotePointerGestureInteractionMode: Equatable {
     case standard
     case focusedWindowResize(target: RemotePointerResizeTarget?)
     case focusedWindowResizePending
+    case focusedWindowMove(target: RemotePointerResizeTarget?)
+    case focusedWindowMovePending
 
-    var isFocusedWindowResize: Bool {
+    var isFocusedWindowInteraction: Bool {
         if case .standard = self { return false }
         return true
     }
@@ -71,6 +73,7 @@ enum RemotePointerGesturePhase: Equatable {
     case scrolling
     case primaryDrag
     case focusedWindowResize
+    case focusedWindowMove
     case suppressed
     case finished
     case cancelled
@@ -88,6 +91,9 @@ enum RemotePointerGestureEvent: Equatable {
     case focusedWindowResizePreview(targetGeneration: UUID, start: CGPoint, end: CGPoint)
     case focusedWindowResizeCommit(targetGeneration: UUID, start: CGPoint, end: CGPoint)
     case focusedWindowResizeCancelled
+    case focusedWindowMovePreview(targetGeneration: UUID, start: CGPoint, end: CGPoint)
+    case focusedWindowMoveCommit(targetGeneration: UUID, start: CGPoint, end: CGPoint)
+    case focusedWindowMoveCancelled
 }
 
 /// The sole tap / scroll / drag classifier used by both production recognition and tests.
@@ -117,7 +123,15 @@ struct RemotePointerGestureStateMachine: Equatable {
     }
 
     var shouldScheduleHoldDeadline: Bool {
-        phase == .tracking && allowsPrimaryDrag && interactionMode == .standard
+        guard phase == .tracking else { return false }
+        switch interactionMode {
+        case .standard:
+            return allowsPrimaryDrag
+        case .focusedWindowMove:
+            return resizeTargetAtBegin != nil
+        default:
+            return false
+        }
     }
 
     mutating func begin(
@@ -139,7 +153,10 @@ struct RemotePointerGestureStateMachine: Equatable {
             resizeTargetAtBegin = nil
         case .focusedWindowResize(let target):
             resizeTargetAtBegin = target?.contains(location) == true ? target : nil
-        case .focusedWindowResizePending:
+        case .focusedWindowMove(let target):
+            // Move owns the selected window, not the content beneath this touch.
+            resizeTargetAtBegin = target
+        case .focusedWindowResizePending, .focusedWindowMovePending:
             phase = .suppressed
             return []
         }
@@ -154,6 +171,7 @@ struct RemotePointerGestureStateMachine: Equatable {
         guard location.x.isFinite,
               location.y.isFinite,
               timestamp.isFinite else {
+            if phase == .focusedWindowMove { return cancel() }
             return suppressIfTracking()
         }
 
@@ -182,12 +200,13 @@ struct RemotePointerGestureStateMachine: Equatable {
                             end: location
                         ),
                     ]
-                case .focusedWindowResizePending:
+                case .focusedWindowMove, .focusedWindowMovePending,
+                     .focusedWindowResizePending:
                     phase = .suppressed
                     return []
                 }
             }
-            if interactionMode == .standard {
+            if shouldScheduleHoldDeadline {
                 return advanceHoldDeadlineIfNeeded(timestamp: timestamp)
             }
             return []
@@ -218,20 +237,37 @@ struct RemotePointerGestureStateMachine: Equatable {
                 ),
             ]
 
+        case .focusedWindowMove:
+            currentLocation = location
+            guard let resizeTargetAtBegin, let initialLocation else { return [] }
+            return [
+                .focusedWindowMovePreview(
+                    targetGeneration: resizeTargetAtBegin.generation,
+                    start: initialLocation,
+                    end: location
+                ),
+            ]
+
         case .idle, .suppressed, .finished, .cancelled:
             return []
         }
     }
 
     mutating func holdDeadlineReached() -> [RemotePointerGestureEvent] {
-        guard phase == .tracking,
-              interactionMode == .standard,
-              allowsPrimaryDrag,
+        guard shouldScheduleHoldDeadline,
               let initialLocation,
               let currentLocation,
               distance(from: initialLocation, to: currentLocation)
                 < Self.movementThreshold else {
             return []
+        }
+        if case .focusedWindowMove = interactionMode, let resizeTargetAtBegin {
+            phase = .focusedWindowMove
+            return [.focusedWindowMovePreview(
+                targetGeneration: resizeTargetAtBegin.generation,
+                start: initialLocation,
+                end: currentLocation
+            )]
         }
         phase = .primaryDrag
         return [.primaryDragArmed(initialLocation)]
@@ -246,7 +282,7 @@ struct RemotePointerGestureStateMachine: Equatable {
         case .tracking:
             currentLocation = location
             phase = .finished
-            if interactionMode.isFocusedWindowResize {
+            if interactionMode.isFocusedWindowInteraction {
                 events.append(.focusedWindowSelection(location))
             } else {
                 events.append(.tap(location))
@@ -276,6 +312,20 @@ struct RemotePointerGestureStateMachine: Equatable {
                 )
             }
 
+        case .focusedWindowMove:
+            currentLocation = location
+            phase = .finished
+            if let initialLocation, let resizeTargetAtBegin,
+               movementExceededThreshold(at: location) {
+                events.append(.focusedWindowMoveCommit(
+                    targetGeneration: resizeTargetAtBegin.generation,
+                    start: initialLocation,
+                    end: location
+                ))
+            } else {
+                events.append(.focusedWindowMoveCancelled)
+            }
+
         case .suppressed:
             phase = .finished
 
@@ -291,6 +341,8 @@ struct RemotePointerGestureStateMachine: Equatable {
             events = [.scrollCancelled]
         } else if phase == .focusedWindowResize {
             events = [.focusedWindowResizeCancelled]
+        } else if phase == .focusedWindowMove {
+            events = [.focusedWindowMoveCancelled]
         } else {
             events = []
         }
@@ -303,7 +355,7 @@ struct RemotePointerGestureStateMachine: Equatable {
     private mutating func advanceHoldDeadlineIfNeeded(
         timestamp: TimeInterval
     ) -> [RemotePointerGestureEvent] {
-        guard allowsPrimaryDrag,
+        guard shouldScheduleHoldDeadline,
               let initialTimestamp,
               max(0, timestamp - initialTimestamp) >= Self.holdDuration else {
             return []
@@ -366,6 +418,9 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
     let onFocusedWindowResizePreview: @MainActor (UUID, CGPoint, CGPoint) -> Void
     let onFocusedWindowResizeCommit: @MainActor (UUID, CGPoint, CGPoint) -> Void
     let onFocusedWindowResizeCancelled: @MainActor () -> Void
+    let onFocusedWindowMovePreview: @MainActor (UUID, CGPoint, CGPoint) -> Void
+    let onFocusedWindowMoveCommit: @MainActor (UUID, CGPoint, CGPoint) -> Void
+    let onFocusedWindowMoveCancelled: @MainActor () -> Void
     let onConfigurationInvalidated: @MainActor () -> Void
 
     init(
@@ -384,6 +439,13 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
             _, _, _ in
         },
         onFocusedWindowResizeCancelled: @escaping @MainActor () -> Void = {},
+        onFocusedWindowMovePreview: @escaping @MainActor (UUID, CGPoint, CGPoint) -> Void = {
+            _, _, _ in
+        },
+        onFocusedWindowMoveCommit: @escaping @MainActor (UUID, CGPoint, CGPoint) -> Void = {
+            _, _, _ in
+        },
+        onFocusedWindowMoveCancelled: @escaping @MainActor () -> Void = {},
         onConfigurationInvalidated: @escaping @MainActor () -> Void
     ) {
         self.configuration = configuration
@@ -397,6 +459,9 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
         self.onFocusedWindowResizePreview = onFocusedWindowResizePreview
         self.onFocusedWindowResizeCommit = onFocusedWindowResizeCommit
         self.onFocusedWindowResizeCancelled = onFocusedWindowResizeCancelled
+        self.onFocusedWindowMovePreview = onFocusedWindowMovePreview
+        self.onFocusedWindowMoveCommit = onFocusedWindowMoveCommit
+        self.onFocusedWindowMoveCancelled = onFocusedWindowMoveCancelled
         self.onConfigurationInvalidated = onConfigurationInvalidated
     }
 
@@ -435,6 +500,9 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
         private var onFocusedWindowResizePreview: @MainActor (UUID, CGPoint, CGPoint) -> Void
         private var onFocusedWindowResizeCommit: @MainActor (UUID, CGPoint, CGPoint) -> Void
         private var onFocusedWindowResizeCancelled: @MainActor () -> Void
+        private var onFocusedWindowMovePreview: @MainActor (UUID, CGPoint, CGPoint) -> Void
+        private var onFocusedWindowMoveCommit: @MainActor (UUID, CGPoint, CGPoint) -> Void
+        private var onFocusedWindowMoveCancelled: @MainActor () -> Void
         private var onConfigurationInvalidated: @MainActor () -> Void
         private weak var installedView: UIView?
         private var activeScrollID: UUID?
@@ -459,6 +527,9 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
             onFocusedWindowResizePreview = surface.onFocusedWindowResizePreview
             onFocusedWindowResizeCommit = surface.onFocusedWindowResizeCommit
             onFocusedWindowResizeCancelled = surface.onFocusedWindowResizeCancelled
+            onFocusedWindowMovePreview = surface.onFocusedWindowMovePreview
+            onFocusedWindowMoveCommit = surface.onFocusedWindowMoveCommit
+            onFocusedWindowMoveCancelled = surface.onFocusedWindowMoveCancelled
             onConfigurationInvalidated = surface.onConfigurationInvalidated
         }
 
@@ -508,6 +579,9 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
             onFocusedWindowResizePreview = surface.onFocusedWindowResizePreview
             onFocusedWindowResizeCommit = surface.onFocusedWindowResizeCommit
             onFocusedWindowResizeCancelled = surface.onFocusedWindowResizeCancelled
+            onFocusedWindowMovePreview = surface.onFocusedWindowMovePreview
+            onFocusedWindowMoveCommit = surface.onFocusedWindowMoveCommit
+            onFocusedWindowMoveCancelled = surface.onFocusedWindowMoveCancelled
             onConfigurationInvalidated = surface.onConfigurationInvalidated
         }
 
@@ -557,6 +631,15 @@ struct RemotePointerGestureSurface: UIViewRepresentable {
 
                 case .focusedWindowResizeCancelled:
                     onFocusedWindowResizeCancelled()
+
+                case .focusedWindowMovePreview(let generation, let start, let end):
+                    onFocusedWindowMovePreview(generation, start, end)
+
+                case .focusedWindowMoveCommit(let generation, let start, let end):
+                    onFocusedWindowMoveCommit(generation, start, end)
+
+                case .focusedWindowMoveCancelled:
+                    onFocusedWindowMoveCancelled()
                 }
             }
         }
@@ -718,7 +801,7 @@ private final class UnifiedRemotePointerGestureRecognizer: UIGestureRecognizer {
 
     private func updateContinuousRecognizerState() {
         switch machine.phase {
-        case .scrolling, .primaryDrag, .focusedWindowResize:
+        case .scrolling, .primaryDrag, .focusedWindowResize, .focusedWindowMove:
             if state == .possible {
                 state = .began
             } else if state == .began || state == .changed {

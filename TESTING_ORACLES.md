@@ -173,6 +173,25 @@ they do not establish how a real application settles delayed Accessibility chang
 A physical resize claim still requires the matching installed host and a disposable
 real window, with before/after AX bounds and pixels plus uninterrupted keyboard focus.
 
+## Focused-window move boundary
+
+Move requires a distinct advertised capability, mode-bound target generation and feedback.
+Exercise an explicit safe selection, hold-and-drag originating outside the selected window,
+exactly one commit, no normal click/scroll/primary-drag leakage, and pending/cancelled gestures.
+The production controller must write only position, preserve size and exact secure/editable
+focus, clamp translation to the display, observe actual readback, and issue a fresh successor.
+Cover wrong-mode/stale target, changed frame/focus/geometry/permission, constrained or failed
+position writes, and lost authorization. Unknown state must not authorize blind rollback.
+An outward drag already clamped at a display edge is a no-op: perform no AX writes,
+revalidate ownership and issue a fresh target so the next inward drag remains usable.
+Do not confuse that with a setter ignoring a genuinely changed proposal, which must fail.
+Behavioral mutations must reject a forbidden size write and acceptance of stale authority.
+Signed iOS lifecycle tests must retire selection/commit feedback across mode, scene, track,
+frame, Show and input-session replacement without dismissing preserved keyboard focus.
+These deterministic proofs are not a physical move claim: that still requires the matching
+deployed host and iPhone build, a disposable real window, before/after bounds and pixels,
+and uninterrupted typing.
+
 ## Screen startup quality boundary
 
 Replay promotion-cap contraction and the recorded adverse queue, RTT, and bandwidth

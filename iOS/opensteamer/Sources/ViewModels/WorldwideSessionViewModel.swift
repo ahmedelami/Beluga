@@ -433,7 +433,12 @@ struct WorldwideScreenPresentationLease: Identifiable, Equatable, Sendable {
     }
 }
 
-/// Exact viewer geometry and ownership under which one focused-window resize interaction exists.
+enum FocusedWindowInteractionMode: Equatable {
+    case resize
+    case move
+}
+
+/// Exact viewer geometry and ownership under which one focused-window interaction exists.
 /// A target is never allowed to cross any member of this binding.
 struct FocusedWindowResizeBinding: Equatable {
     let lease: WorldwideScreenPresentationLease
@@ -446,19 +451,23 @@ struct FocusedWindowResizeBinding: Equatable {
 
 enum FocusedWindowResizePendingOperation: Equatable {
     case targetRequest(operationID: UUID, focusGeneration: UInt64?, focusIsSecure: Bool)
-    case selection(operationID: UUID, focusGeneration: UInt64?, focusIsSecure: Bool)
+    case selection(
+        operationID: UUID, focusGeneration: UInt64?, focusIsSecure: Bool,
+        mode: FocusedWindowInteractionMode = .resize
+    )
     case commit(
         operationID: UUID,
         consumedTargetGeneration: UUID,
         focusGeneration: UInt64?,
-        focusIsSecure: Bool
+        focusIsSecure: Bool,
+        mode: FocusedWindowInteractionMode = .resize
     )
 
     var operationID: UUID {
         switch self {
         case .targetRequest(let operationID, _, _),
-             .selection(let operationID, _, _),
-             .commit(let operationID, _, _, _):
+             .selection(let operationID, _, _, _),
+             .commit(let operationID, _, _, _, _):
             operationID
         }
     }
@@ -466,8 +475,8 @@ enum FocusedWindowResizePendingOperation: Equatable {
     var focusGeneration: UInt64? {
         switch self {
         case .targetRequest(_, let focusGeneration, _),
-             .selection(_, let focusGeneration, _),
-             .commit(_, _, let focusGeneration, _):
+             .selection(_, let focusGeneration, _, _),
+             .commit(_, _, let focusGeneration, _, _):
             focusGeneration
         }
     }
@@ -475,19 +484,29 @@ enum FocusedWindowResizePendingOperation: Equatable {
     var focusIsSecure: Bool {
         switch self {
         case .targetRequest(_, _, let secure),
-             .selection(_, _, let secure),
-             .commit(_, _, _, let secure):
+             .selection(_, _, let secure, _),
+             .commit(_, _, _, let secure, _):
             secure
+        }
+    }
+
+    var mode: FocusedWindowInteractionMode {
+        switch self {
+        case .targetRequest: .resize
+        case .selection(_, _, _, let mode), .commit(_, _, _, _, let mode): mode
         }
     }
 
     func matches(_ action: WebRTCInputAction) -> Bool {
         switch (self, action) {
         case (.targetRequest, .requestFocusedWindowResizeTarget),
-             (.selection, .selectWindowForResize):
+             (.selection(_, _, _, .resize), .selectWindowForResize),
+             (.selection(_, _, _, .move), .selectWindowForMove):
             true
-        case (.commit(_, let consumedGeneration, _, _),
-              .commitFocusedWindowResize(let actionGeneration, _, _)):
+        case (.commit(_, let consumedGeneration, _, _, .resize),
+              .commitFocusedWindowResize(let actionGeneration, _, _)),
+             (.commit(_, let consumedGeneration, _, _, .move),
+              .commitFocusedWindowMove(let actionGeneration, _, _)):
             consumedGeneration == actionGeneration
         default:
             false
@@ -497,6 +516,7 @@ enum FocusedWindowResizePendingOperation: Equatable {
 
 struct FocusedWindowResizeInteraction: Equatable {
     let id: UUID
+    let mode: FocusedWindowInteractionMode
     let binding: FocusedWindowResizeBinding
     var target: WebRTCWindowResizeTarget?
     var pending: FocusedWindowResizePendingOperation?
@@ -1336,6 +1356,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     @Published private(set) var focusedInputIsSecure = false
     @Published private(set) var focusedWindowResizeState: FocusedWindowResizeState = .inactive
 
+    var focusedWindowInteractionState: FocusedWindowResizeState { focusedWindowResizeState }
+
     private var signaling: RendezvousSignalingClient?
     private var peer: WebRTCPeer? {
         didSet {
@@ -1878,6 +1900,18 @@ final class WorldwideSessionViewModel: ObservableObject {
     var isFocusedWindowResizeAvailable: Bool {
         isRemoteInputAvailable
             && remoteInputCapability?.supportsFocusedWindowResize == true
+    }
+
+    var isFocusedWindowMoveAvailable: Bool {
+        isRemoteInputAvailable
+            && remoteInputCapability?.supportsFocusedWindowMove == true
+    }
+
+    private func focusedWindowInteractionIsAvailable(_ mode: FocusedWindowInteractionMode) -> Bool {
+        switch mode {
+        case .resize: isFocusedWindowResizeAvailable
+        case .move: isFocusedWindowMoveAvailable
+        }
     }
 
     var canResumeAudioPlayback: Bool {
@@ -4273,6 +4307,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         cancelFocusedWindowResize()
     }
 
+    func focusedWindowInteractionContainerGeometryDidChange(
+        to containerSize: CGSize,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        focusedWindowResizeContainerGeometryDidChange(to: containerSize, for: lease)
+    }
+
     private func receiveScreenMediaSuspension(
         _ notice: WebRTCScreenMediaSuspensionNotice,
         sourcePeer: WebRTCPeer,
@@ -5432,7 +5473,30 @@ final class WorldwideSessionViewModel: ObservableObject {
         containerSize: CGSize,
         viewerVideoSize: CGSize
     ) -> Bool {
+        beginFocusedWindowInteraction(
+            .resize, for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    @discardableResult
+    func beginFocusedWindowMove(
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> Bool {
+        beginFocusedWindowInteraction(
+            .move, for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    private func beginFocusedWindowInteraction(
+        _ mode: FocusedWindowInteractionMode,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> Bool {
         guard let binding = focusedWindowResizeBinding(
+            mode: mode,
             for: lease,
             containerSize: containerSize,
             viewerVideoSize: viewerVideoSize
@@ -5445,32 +5509,63 @@ final class WorldwideSessionViewModel: ObservableObject {
         discardPendingRemoteScrolls()
         retireRemotePointerIntentPreservingKeyboardFocus()
         let interactionID = UUID()
-        let operation = FocusedWindowResizePendingOperation.targetRequest(
-            operationID: UUID(),
-            focusGeneration: focusedInputGeneration,
-            focusIsSecure: focusedInputIsSecure
-        )
+        // Move requires an explicit safe selection before any target can be committed.
+        let operation: FocusedWindowResizePendingOperation? = mode == .resize
+            ? .targetRequest(
+                operationID: UUID(),
+                focusGeneration: focusedInputGeneration,
+                focusIsSecure: focusedInputIsSecure
+            )
+            : nil
         focusedWindowResizeState = .active(
             FocusedWindowResizeInteraction(
                 id: interactionID,
+                mode: mode,
                 binding: binding,
                 target: nil,
                 pending: operation
             )
         )
         let sendAuthorization = currentFocusedWindowResizeSendAuthorization()
-        enqueueRemoteInput(
-            .requestFocusedWindowResizeTarget,
-            viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
-            sendAuthorization: sendAuthorization,
-            focusedWindowResizeInteractionID: interactionID,
-            focusedWindowResizeOperation: operation
-        )
+        if let operation {
+            enqueueRemoteInput(
+                .requestFocusedWindowResizeTarget,
+                viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
+                sendAuthorization: sendAuthorization,
+                focusedWindowResizeInteractionID: interactionID,
+                focusedWindowResizeOperation: operation
+            )
+        }
         return focusedWindowResizeState.interaction?.id == interactionID
             && sendAuthorization.isValid
     }
 
     func selectWindowForFocusedResize(
+        at normalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        selectWindowForFocusedInteraction(
+            .resize, at: normalizedPoint, for: lease,
+            containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    func selectWindowForFocusedMove(
+        at normalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        selectWindowForFocusedInteraction(
+            .move, at: normalizedPoint, for: lease,
+            containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    private func selectWindowForFocusedInteraction(
+        _ mode: FocusedWindowInteractionMode,
         at normalizedPoint: CGPoint,
         for lease: WorldwideScreenPresentationLease,
         containerSize: CGSize,
@@ -5482,6 +5577,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                   containerSize: containerSize,
                   viewerVideoSize: viewerVideoSize
               ),
+              interaction.mode == mode,
               interaction.pending == nil,
               let sendAuthorization = focusedWindowResizeSendAuthorization,
               sendAuthorization.isValid else {
@@ -5491,18 +5587,17 @@ final class WorldwideSessionViewModel: ObservableObject {
         let operation = FocusedWindowResizePendingOperation.selection(
             operationID: UUID(),
             focusGeneration: focusedInputGeneration,
-            focusIsSecure: focusedInputIsSecure
+            focusIsSecure: focusedInputIsSecure,
+            mode: mode
         )
         interaction.target = nil
         interaction.pending = operation
         focusedWindowResizeState = .active(interaction)
+        let point = WebRTCNormalizedPoint(
+            x: Double(normalizedPoint.x), y: Double(normalizedPoint.y)
+        )
         enqueueRemoteInput(
-            .selectWindowForResize(
-                at: WebRTCNormalizedPoint(
-                    x: Double(normalizedPoint.x),
-                    y: Double(normalizedPoint.y)
-                )
-            ),
+            mode == .resize ? .selectWindowForResize(at: point) : .selectWindowForMove(at: point),
             viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
             sendAuthorization: sendAuthorization,
             focusedWindowResizeInteractionID: interaction.id,
@@ -5518,6 +5613,37 @@ final class WorldwideSessionViewModel: ObservableObject {
         containerSize: CGSize,
         viewerVideoSize: CGSize
     ) {
+        commitFocusedWindowInteraction(
+            .resize, targetGeneration: targetGeneration,
+            startNormalizedPoint: startNormalizedPoint, endNormalizedPoint: endNormalizedPoint,
+            for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    func commitFocusedWindowMove(
+        targetGeneration: UUID,
+        startNormalizedPoint: CGPoint,
+        endNormalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        commitFocusedWindowInteraction(
+            .move, targetGeneration: targetGeneration,
+            startNormalizedPoint: startNormalizedPoint, endNormalizedPoint: endNormalizedPoint,
+            for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    private func commitFocusedWindowInteraction(
+        _ mode: FocusedWindowInteractionMode,
+        targetGeneration: UUID,
+        startNormalizedPoint: CGPoint,
+        endNormalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
         guard Self.isValidNormalizedRemoteInputPoint(startNormalizedPoint),
               Self.isValidNormalizedRemoteInputPoint(endNormalizedPoint),
               var interaction = currentFocusedWindowResizeInteraction(
@@ -5525,6 +5651,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                   containerSize: containerSize,
                   viewerVideoSize: viewerVideoSize
               ),
+              interaction.mode == mode,
               interaction.pending == nil,
               interaction.target?.generation == targetGeneration,
               let sendAuthorization = focusedWindowResizeSendAuthorization,
@@ -5536,24 +5663,24 @@ final class WorldwideSessionViewModel: ObservableObject {
             operationID: UUID(),
             consumedTargetGeneration: targetGeneration,
             focusGeneration: focusedInputGeneration,
-            focusIsSecure: focusedInputIsSecure
+            focusIsSecure: focusedInputIsSecure,
+            mode: mode
         )
         // The consumed generation is one-shot. Feedback may install only a fresh successor.
         interaction.target = nil
         interaction.pending = operation
         focusedWindowResizeState = .active(interaction)
+        let start = WebRTCNormalizedPoint(
+            x: Double(startNormalizedPoint.x), y: Double(startNormalizedPoint.y)
+        )
+        let end = WebRTCNormalizedPoint(
+            x: Double(endNormalizedPoint.x), y: Double(endNormalizedPoint.y)
+        )
+        let action: WebRTCInputAction = mode == .resize
+            ? .commitFocusedWindowResize(targetGeneration: targetGeneration, start: start, end: end)
+            : .commitFocusedWindowMove(targetGeneration: targetGeneration, start: start, end: end)
         enqueueRemoteInput(
-            .commitFocusedWindowResize(
-                targetGeneration: targetGeneration,
-                start: WebRTCNormalizedPoint(
-                    x: Double(startNormalizedPoint.x),
-                    y: Double(startNormalizedPoint.y)
-                ),
-                end: WebRTCNormalizedPoint(
-                    x: Double(endNormalizedPoint.x),
-                    y: Double(endNormalizedPoint.y)
-                )
-            ),
+            action,
             viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
             sendAuthorization: sendAuthorization,
             focusedWindowResizeInteractionID: interaction.id,
@@ -5561,7 +5688,11 @@ final class WorldwideSessionViewModel: ObservableObject {
         )
     }
 
-    /// Revokes only focused-window resize work. Keyboard focus and ordinary text packets remain
+    func cancelFocusedWindowInteraction() {
+        cancelFocusedWindowResize()
+    }
+
+    /// Revokes focused-window work. Keyboard focus and ordinary text packets remain
     /// owned by their independent authenticated generations.
     func cancelFocusedWindowResize() {
         focusedWindowResizeSendAuthorization?.revoke()
@@ -5626,14 +5757,14 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     private func focusedWindowResizeBinding(
+        mode: FocusedWindowInteractionMode,
         for lease: WorldwideScreenPresentationLease,
         containerSize: CGSize,
         viewerVideoSize: CGSize
     ) -> FocusedWindowResizeBinding? {
         guard remoteInputIsAvailable(for: lease),
-              isFocusedWindowResizeAvailable,
+              focusedWindowInteractionIsAvailable(mode),
               let capability = remoteInputCapability,
-              capability.supportsFocusedWindowResize,
               let trackIdentity = focusedWindowResizeTrackIdentity(for: lease),
               containerSize.width.isFinite,
               containerSize.height.isFinite,
@@ -5673,7 +5804,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     ) -> Bool {
         let binding = interaction.binding
         return remoteInputIsAvailable(for: binding.lease)
-            && isFocusedWindowResizeAvailable
+            && focusedWindowInteractionIsAvailable(interaction.mode)
             && remoteInputCapability?.inputSessionID == binding.inputSessionID
             && remoteInputCapability?.screenRequestID == binding.screenRequestID
             && focusedWindowResizeTrackIdentity(for: binding.lease)
@@ -6137,7 +6268,10 @@ final class WorldwideSessionViewModel: ObservableObject {
         case .tap, .primaryDrag, .scroll,
              .requestFocusedWindowResizeTarget,
              .selectWindowForResize,
-             .commitFocusedWindowResize:
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
             return true
         case .insertText(_, let generation),
              .backspace(let generation),
@@ -6262,9 +6396,10 @@ final class WorldwideSessionViewModel: ObservableObject {
                 }
                 if let transportError = error as? WebRTCTransportError,
                    transportError == .invalidInputRequest {
-                    if queued.focusedWindowResizeOperation != nil {
+                    if let operation = queued.focusedWindowResizeOperation {
                         cancelFocusedWindowResize()
-                        lastDiagnostic = "The focused-window resize request was not valid."
+                        let mode = operation.mode == .resize ? "resize" : "move"
+                        lastDiagnostic = "The focused-window \(mode) request was not valid."
                     } else {
                         clearRemoteKeyboardFocus()
                         remoteInputQueue.removeAll(where: { $0.action.requiresRemoteFocus })
@@ -10462,14 +10597,14 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         switch pending.kind {
         case .pointer:
-            guard feedback.windowResize == nil else {
+            guard feedback.windowResize == nil, feedback.windowMove == nil else {
                 invalidateRemoteInputState()
                 return
             }
             applyRemoteInputFocus(feedback.focus)
 
         case .keyboard(let generation):
-            guard feedback.windowResize == nil else {
+            guard feedback.windowResize == nil, feedback.windowMove == nil else {
                 invalidateRemoteInputState()
                 return
             }
@@ -10485,7 +10620,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
     }
 
-    /// A locally canceled resize can never restore its target or preview. Its authenticated host
+    /// A locally canceled window interaction can never restore its target or preview. Its host
     /// result still carries authoritative focus and terminal permission/session state, so retain
     /// only enough bounded correlation to apply those revocations exactly once.
     private func handleRetiredFocusedWindowResizeFeedback(
@@ -10505,9 +10640,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             return
         }
 
-        guard let resize = feedback.windowResize,
-              Self.focusedWindowResizeTargetIsValid(resize.target),
-              Self.focusedWindowResizeFeedback(resize, matches: operation),
+        guard Self.focusedWindowFeedbackTarget(feedback, matches: operation) != nil,
               Self.focusedWindowResizeFocus(
                   feedback.focus,
                   matches: operation.focusGeneration,
@@ -10516,7 +10649,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             revokeRemoteKeyboardFocusIfOwned(
                 by: operation.focusGeneration
             )
-            lastDiagnostic = "The Mac returned mismatched focused-window resize feedback."
+            lastDiagnostic = Self.mismatchedFocusedWindowFeedbackDiagnostic(operation.mode)
             return
         }
         applyRetiredFocusedWindowResizeFocusRevocation(
@@ -10526,7 +10659,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         )
     }
 
-    /// Late feedback for locally canceled resize work may revoke the exact focus generation that
+    /// Late feedback for locally canceled window work may revoke the exact focus generation that
     /// existed when the request was sent, but it can never install or resurrect editable focus.
     private func applyRetiredFocusedWindowResizeFocusRevocation(
         _ focus: WebRTCInputFocus,
@@ -10562,10 +10695,9 @@ final class WorldwideSessionViewModel: ObservableObject {
             return
         }
         guard focusedWindowResizeInteractionIsCurrent(interaction),
-              let resize = feedback.windowResize,
-              Self.focusedWindowResizeTargetIsValid(resize.target),
-              Self.focusedWindowResizeFeedback(
-                  resize,
+              interaction.mode == operation.mode,
+              let target = Self.focusedWindowFeedbackTarget(
+                  feedback,
                   matches: operation
               ),
               Self.focusedWindowResizeFocus(
@@ -10575,13 +10707,13 @@ final class WorldwideSessionViewModel: ObservableObject {
               ) else {
             clearRemoteKeyboardFocus()
             cancelFocusedWindowResize()
-            lastDiagnostic = "The Mac returned mismatched focused-window resize feedback."
+            lastDiagnostic = Self.mismatchedFocusedWindowFeedbackDiagnostic(operation.mode)
             return
         }
 
         applyRemoteInputFocus(feedback.focus)
         interaction.pending = nil
-        interaction.target = resize.target
+        interaction.target = target
         focusedWindowResizeState = .active(interaction)
     }
 
@@ -10607,22 +10739,51 @@ final class WorldwideSessionViewModel: ObservableObject {
         cancelFocusedWindowResize()
     }
 
-    private static func focusedWindowResizeFeedback(
-        _ feedback: WebRTCWindowResizeFeedback,
+    private static func mismatchedFocusedWindowFeedbackDiagnostic(
+        _ mode: FocusedWindowInteractionMode
+    ) -> String {
+        let operation = mode == .resize ? "resize" : "move"
+        return "The Mac returned mismatched focused-window \(operation) feedback."
+    }
+
+    private static func focusedWindowFeedbackTarget(
+        _ feedback: WebRTCInputFeedback,
         matches operation: FocusedWindowResizePendingOperation
-    ) -> Bool {
+    ) -> WebRTCWindowResizeTarget? {
+        let target: WebRTCWindowResizeTarget
+        let committedGeneration: UUID?
+        let isTargetRequest: Bool
+        let isSelection: Bool
+        let isCommit: Bool
+        switch operation.mode {
+        case .resize:
+            guard let resize = feedback.windowResize, feedback.windowMove == nil else { return nil }
+            target = resize.target
+            committedGeneration = resize.committedTargetGeneration
+            isTargetRequest = resize.kind == .targetAcquired
+            isSelection = resize.kind == .windowSelected
+            isCommit = resize.kind == .resizeCommitted
+        case .move:
+            guard let move = feedback.windowMove, feedback.windowResize == nil else { return nil }
+            target = move.target
+            committedGeneration = move.committedTargetGeneration
+            isTargetRequest = move.kind == .targetAcquired
+            isSelection = move.kind == .windowSelected
+            isCommit = move.kind == .moveCommitted
+        }
+        guard focusedWindowResizeTargetIsValid(target) else { return nil }
+        let matches: Bool
         switch operation {
         case .targetRequest:
-            return feedback.kind == .targetAcquired
-                && feedback.committedTargetGeneration == nil
+            matches = isTargetRequest && committedGeneration == nil
         case .selection:
-            return feedback.kind == .windowSelected
-                && feedback.committedTargetGeneration == nil
-        case .commit(_, let consumedTargetGeneration, _, _):
-            return feedback.kind == .resizeCommitted
-                && feedback.committedTargetGeneration == consumedTargetGeneration
-                && feedback.target.generation != consumedTargetGeneration
+            matches = isSelection && committedGeneration == nil
+        case .commit(_, let consumedTargetGeneration, _, _, _):
+            matches = isCommit
+                && committedGeneration == consumedTargetGeneration
+                && target.generation != consumedTargetGeneration
         }
+        return matches ? target : nil
     }
 
     private static func focusedWindowResizeFocus(
@@ -11540,7 +11701,8 @@ final class WorldwideSessionViewModel: ObservableObject {
         leaseID: UUID = UUID(),
         screenRequestID: UInt64 = 1,
         supportsScroll: Bool = false,
-        supportsFocusedWindowResize: Bool = false
+        supportsFocusedWindowResize: Bool = false,
+        supportsFocusedWindowMove: Bool = false
     ) -> WorldwideScreenPresentationDebugFixture {
         debugInstallScreenSessionForTests(
             peer: newPeer,
@@ -11556,10 +11718,11 @@ final class WorldwideSessionViewModel: ObservableObject {
             screenRequestID: screenRequestID,
             supportsPrimaryDrag: true,
             supportsScroll: supportsScroll,
-            supportsFocusedWindowResize: supportsFocusedWindowResize
+            supportsFocusedWindowResize: supportsFocusedWindowResize,
+            supportsFocusedWindowMove: supportsFocusedWindowMove
         )
         let authorization = WebRTCInputAuthorization()
-        debugFocusedWindowResizeTrackOwner = supportsFocusedWindowResize
+        debugFocusedWindowResizeTrackOwner = supportsFocusedWindowResize || supportsFocusedWindowMove
             ? NSObject()
             : nil
         remoteInputCapability = capability
@@ -11582,7 +11745,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     @discardableResult
     func debugReplaceRemoteInputCapabilityForTests(
         inputSessionID: UUID = UUID(),
-        supportsFocusedWindowResize: Bool = true
+        supportsFocusedWindowResize: Bool = true,
+        supportsFocusedWindowMove: Bool = false
     ) -> WebRTCInputAuthorization? {
         guard let current = remoteInputCapability else { return nil }
         let replacement = WebRTCInputCapability(
@@ -11592,7 +11756,8 @@ final class WorldwideSessionViewModel: ObservableObject {
             maxMessageBytes: current.maxMessageBytes,
             supportsPrimaryDrag: current.supportsPrimaryDrag,
             supportsScroll: current.supportsScroll,
-            supportsFocusedWindowResize: supportsFocusedWindowResize
+            supportsFocusedWindowResize: supportsFocusedWindowResize,
+            supportsFocusedWindowMove: supportsFocusedWindowMove
         )
         let authorization = WebRTCInputAuthorization()
         installRemoteInputCapability(
@@ -12783,7 +12948,10 @@ private extension WebRTCInputAction {
         switch self {
         case .requestFocusedWindowResizeTarget,
              .selectWindowForResize,
-             .commitFocusedWindowResize:
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
             true
         case .tap, .primaryDrag, .scroll,
              .insertText, .backspace, .returnKey:
@@ -12798,6 +12966,9 @@ private extension WebRTCInputAction {
         case .requestFocusedWindowResizeTarget,
              .selectWindowForResize,
              .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove,
              .insertText,
              .backspace,
              .returnKey:
@@ -12810,7 +12981,10 @@ private extension WebRTCInputAction {
         case .tap, .primaryDrag, .scroll,
              .requestFocusedWindowResizeTarget,
              .selectWindowForResize,
-             .commitFocusedWindowResize:
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
             false
         case .insertText, .backspace, .returnKey:
             true
@@ -12840,6 +13014,7 @@ private struct RemoteInputRequestScope: Hashable {
     let supportsPrimaryDrag: Bool
     let supportsScroll: Bool
     let supportsFocusedWindowResize: Bool
+    let supportsFocusedWindowMove: Bool
 
     init(
         sessionGeneration: UUID,
@@ -12855,6 +13030,7 @@ private struct RemoteInputRequestScope: Hashable {
         supportsPrimaryDrag = capability.supportsPrimaryDrag
         supportsScroll = capability.supportsScroll
         supportsFocusedWindowResize = capability.supportsFocusedWindowResize
+        supportsFocusedWindowMove = capability.supportsFocusedWindowMove
     }
 }
 
@@ -12886,11 +13062,14 @@ enum PendingRemoteInputKind: Equatable {
             self = .pointer
         case .requestFocusedWindowResizeTarget,
              .selectWindowForResize,
-             .commitFocusedWindowResize:
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
             precondition(
                 focusedWindowResizeInteractionID != nil
                     && focusedWindowResizeOperation?.matches(action) == true,
-                "Resize actions require exact interaction metadata."
+                "Focused-window actions require exact interaction metadata."
             )
             self = .focusedWindowResize(
                 interactionID: focusedWindowResizeInteractionID!,

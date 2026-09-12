@@ -4563,3 +4563,373 @@ private final class MainActorCountGate {
         }
     }
 }
+
+final class WorldwideFocusedWindowMoveLifecycleTests: XCTestCase {
+    @MainActor
+    func testMoveCancelledDuringSuspendedSendAppliesLateTerminalFeedback() async throws {
+        let fixture = try MoveLifecycleFixture()
+        let started = expectation(description: "move selection send suspended")
+        let gate = NonCooperativeAsyncGate()
+        fixture.viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            started.fulfill()
+            await gate.wait()
+            return 1
+        }
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fulfillment(of: [started], timeout: 2)
+        fixture.viewModel.cancelFocusedWindowInteraction()
+        fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 1, screenRequestID: fixture.capability.screenRequestID,
+            inputSessionID: fixture.capability.inputSessionID, result: .rejected,
+            rejectionReason: .accessibilityPermissionRequired,
+            focus: .editable(generation: fixture.focusGeneration, secure: true)
+        ))
+        XCTAssertTrue(fixture.presentation.authorization.isValid)
+        await gate.open()
+        await fixture.drain()
+        XCTAssertFalse(fixture.presentation.authorization.isValid)
+        XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveRequiresItsOwnCapabilityAndExplicitSelection() async throws {
+        let legacy = try MoveLifecycleFixture(supportsMove: false)
+        XCTAssertTrue(legacy.viewModel.isFocusedWindowResizeAvailable)
+        XCTAssertFalse(legacy.viewModel.isFocusedWindowMoveAvailable)
+        XCTAssertFalse(legacy.beginMove())
+        legacy.select()
+        await legacy.drain()
+        XCTAssertTrue(legacy.actions.isEmpty)
+        await legacy.close()
+
+        let fixture = try MoveLifecycleFixture(supportsResize: false)
+        XCTAssertFalse(fixture.viewModel.isFocusedWindowResizeAvailable)
+        XCTAssertTrue(fixture.beginMove())
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.mode, .move)
+        XCTAssertNil(fixture.viewModel.focusedWindowInteractionState.interaction?.target)
+        fixture.commit(fixture.target.generation)
+        fixture.viewModel.sendRemoteTap(
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5), viewerVideoSize: fixture.videoSize
+        )
+        fixture.viewModel.sendRemotePrimaryDrag(
+            startNormalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            endNormalizedPoint: CGPoint(x: 0.6, y: 0.6), viewerVideoSize: fixture.videoSize
+        )
+        await fixture.drain()
+        XCTAssertTrue(fixture.actions.isEmpty)
+
+        fixture.select()
+        fixture.select()
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [.selectWindowForMove(at: .init(x: 0.75, y: 0.25))])
+        XCTAssertEqual(fixture.videoSizes, [.init(width: 1_920, height: 1_080)])
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveConsumesTargetOnceAndKeepsExactSecureKeyboardFocus() async throws {
+        let fixture = try MoveLifecycleFixture()
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.target, fixture.target)
+
+        // A drag can begin anywhere in the remote image, including outside the selected window.
+        fixture.commit(fixture.target.generation)
+        fixture.commit(fixture.target.generation)
+        XCTAssertNil(fixture.viewModel.focusedWindowInteractionState.interaction?.target)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [
+            .selectWindowForMove(at: .init(x: 0.75, y: 0.25)),
+            .commitFocusedWindowMove(
+                targetGeneration: fixture.target.generation,
+                start: .init(x: 0.95, y: 0.95), end: .init(x: 0.8, y: 0.8)
+            )
+        ])
+        let successor = WebRTCWindowMoveTarget(
+            generation: UUID(), normalizedFrame: .init(x: 0.1, y: 0.1, width: 0.5, height: 0.4)
+        )
+        fixture.deliver(
+            id: 2,
+            move: .init(
+                kind: .moveCommitted, committedTargetGeneration: fixture.target.generation,
+                target: successor
+            )
+        )
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.target, successor)
+        fixture.commit(fixture.target.generation)
+        fixture.viewModel.sendRemoteText("A", focusGeneration: fixture.focusGeneration)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.count, 3)
+        XCTAssertEqual(fixture.actions.last, .insertText("A", focusGeneration: fixture.focusGeneration))
+        fixture.viewModel.cancelFocusedWindowInteraction()
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        XCTAssertTrue(fixture.presentation.authorization.isValid)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testModeSwitchRetiresPendingSelectionAndRejectsCrossModeCommit() async throws {
+        let fixture = try MoveLifecycleFixture()
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+        let resizeID = try XCTUnwrap(fixture.viewModel.focusedWindowInteractionState.interaction?.id)
+        fixture.acceptSelection()
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.id, resizeID)
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.mode, .resize)
+        XCTAssertNil(fixture.viewModel.focusedWindowInteractionState.interaction?.target)
+        fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 2, screenRequestID: fixture.capability.screenRequestID,
+            inputSessionID: fixture.capability.inputSessionID, result: .accepted,
+            focus: .editable(generation: fixture.focusGeneration, secure: true),
+            windowResize: .init(kind: .targetAcquired, target: fixture.target)
+        ))
+        fixture.commit(fixture.target.generation)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.count, 2)
+        XCTAssertTrue(fixture.beginMove())
+        fixture.viewModel.commitFocusedWindowResize(
+            targetGeneration: fixture.target.generation,
+            startNormalizedPoint: .init(x: 0.1, y: 0.1),
+            endNormalizedPoint: .init(x: 0.2, y: 0.2),
+            for: fixture.presentation.lease,
+            containerSize: fixture.containerSize, viewerVideoSize: fixture.videoSize
+        )
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.count, 2)
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveFeedbackRejectsResizePayloadWrongKindAndSecureDowngrade() async throws {
+        for invalidPayload in 0 ..< 3 {
+            let fixture = try MoveLifecycleFixture()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            if invalidPayload == 0 {
+                fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+                    id: 1, screenRequestID: fixture.capability.screenRequestID,
+                    inputSessionID: fixture.capability.inputSessionID, result: .accepted,
+                    focus: .editable(generation: fixture.focusGeneration, secure: true),
+                    windowResize: .init(kind: .windowSelected, target: fixture.target)
+                ))
+            } else {
+                fixture.deliver(
+                    id: 1,
+                    move: .init(
+                        kind: invalidPayload == 1 ? .targetAcquired : .windowSelected,
+                        target: fixture.target
+                    ),
+                    secure: invalidPayload != 2
+                )
+            }
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+            XCTAssertEqual(fixture.viewModel.lastDiagnostic, "The Mac returned mismatched focused-window move feedback.")
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRetiredMoveFeedbackCannotResurrectTargetOrDowngradeSecureFocus() async throws {
+        for secure in [true, false] {
+            let fixture = try MoveLifecycleFixture()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            fixture.viewModel.cancelFocusedWindowInteraction()
+            fixture.deliver(id: 1, move: .init(kind: .windowSelected, target: fixture.target), secure: secure)
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                secure ? fixture.focusGeneration : nil
+            )
+            XCTAssertEqual(fixture.viewModel.focusedInputIsSecure, secure)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.pendingActionCount, 0)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testFrameTrackAndContainerChangesRetireMoveWithoutLosingSecureTyping() async throws {
+        for boundary in 0 ..< 3 {
+            let fixture = try MoveLifecycleFixture()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            switch boundary {
+            case 0:
+                fixture.viewModel.screenVideoPresentationGeometryDidChange(
+                    to: .init(width: 2_560, height: 1_440), for: fixture.presentation.lease
+                )
+            case 1:
+                fixture.viewModel.debugReplaceFocusedWindowResizeTrackForTests()
+            default:
+                fixture.viewModel.focusedWindowInteractionContainerGeometryDidChange(
+                    to: .init(width: 844, height: 390), for: fixture.presentation.lease
+                )
+            }
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            fixture.acceptSelection()
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testSceneHideDisconnectCapabilityAndRecoveryRevokeMoveAndFocus() async throws {
+        for boundary in 0 ..< 6 {
+            let fixture = try MoveLifecycleFixture()
+            fixture.viewModel.handleAppBecameActive()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            switch boundary {
+            case 0:
+                fixture.viewModel.handleAppBecameInactive()
+            case 1:
+                fixture.viewModel.retireScreenPresentationLease(fixture.presentation.lease)
+            case 2:
+                fixture.viewModel.disconnect()
+            case 3:
+                fixture.viewModel.debugReplaceRemoteInputCapabilityForTests(
+                    supportsFocusedWindowResize: true, supportsFocusedWindowMove: false
+                )
+            case 4:
+                fixture.viewModel.debugInstallScreenMediaCancellationObserver { _, _ in }
+                fixture.viewModel.debugDeliverScreenMediaSuspensionForTests(
+                    .init(screenRequestID: fixture.focusGeneration, suspensionGeneration: 1),
+                    sourcePeer: fixture.peer
+                )
+            default:
+                fixture.viewModel.handleAppEnteredBackground()
+            }
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+            XCTAssertFalse(fixture.viewModel.focusedInputIsSecure)
+            if boundary == 0 {
+                fixture.acceptSelection()
+                XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+                XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            }
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRetiredMovePermissionRejectionStillRevokesInput() async throws {
+        let fixture = try MoveLifecycleFixture()
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.viewModel.cancelFocusedWindowInteraction()
+        fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 1, screenRequestID: fixture.capability.screenRequestID,
+            inputSessionID: fixture.capability.inputSessionID, result: .rejected,
+            rejectionReason: .accessibilityPermissionRequired,
+            focus: .editable(generation: fixture.focusGeneration, secure: true)
+        ))
+        XCTAssertFalse(fixture.presentation.authorization.isValid)
+        XCTAssertFalse(fixture.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        await fixture.close()
+    }
+}
+
+@MainActor
+private final class MoveLifecycleFixture {
+    let viewModel = WorldwideSessionViewModel()
+    let peer: WebRTCPeer
+    let presentation: WorldwideScreenPresentationDebugFixture
+    let capability: WebRTCInputCapability
+    let focusGeneration: UInt64 = 701
+    let containerSize = CGSize(width: 390, height: 844)
+    let videoSize = CGSize(width: 1_920, height: 1_080)
+    let target = WebRTCWindowMoveTarget(
+        generation: UUID(), normalizedFrame: .init(x: 0.2, y: 0.2, width: 0.5, height: 0.4)
+    )
+    var actions: [WebRTCInputAction] = []
+    var videoSizes: [WebRTCInputVideoSize?] = []
+
+    init(supportsMove: Bool = true, supportsResize: Bool = true) throws {
+        peer = try WebRTCPeer(configuration: .init(role: .viewer, iceServers: []))
+        presentation = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer, screenRequestID: focusGeneration,
+            supportsFocusedWindowResize: supportsResize, supportsFocusedWindowMove: supportsMove
+        )
+        capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        viewModel.debugSetRemoteKeyboardFocusForTests(focusGeneration, secure: true)
+        viewModel.debugInstallRemoteInputSender { [weak self] _, action, size, _, _, _ in
+            guard let self else { return 0 }
+            actions.append(action)
+            videoSizes.append(size)
+            return UInt64(actions.count)
+        }
+    }
+
+    func beginMove() -> Bool {
+        viewModel.beginFocusedWindowMove(
+            for: presentation.lease, containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func beginResize() -> Bool {
+        viewModel.beginFocusedWindowResize(
+            for: presentation.lease, containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func select() {
+        viewModel.selectWindowForFocusedMove(
+            at: .init(x: 0.75, y: 0.25), for: presentation.lease,
+            containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func commit(_ generation: UUID) {
+        viewModel.commitFocusedWindowMove(
+            targetGeneration: generation, startNormalizedPoint: .init(x: 0.95, y: 0.95),
+            endNormalizedPoint: .init(x: 0.8, y: 0.8), for: presentation.lease,
+            containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func acceptSelection() {
+        deliver(id: 1, move: .init(kind: .windowSelected, target: target))
+    }
+
+    func deliver(id: UInt64, move: WebRTCWindowMoveFeedback, secure: Bool = true) {
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: id, screenRequestID: capability.screenRequestID,
+            inputSessionID: capability.inputSessionID, result: .accepted,
+            focus: .editable(generation: focusGeneration, secure: secure), windowMove: move
+        ))
+    }
+
+    func drain() async {
+        for _ in 0 ..< 40 { await Task.yield() }
+    }
+
+    func close() async {
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+}
