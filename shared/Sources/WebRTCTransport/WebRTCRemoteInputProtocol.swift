@@ -14,6 +14,7 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
     public let supportsPrimaryDrag: Bool
     public let supportsScroll: Bool
     public let supportsFocusedWindowResize: Bool
+    public let supportsFocusedWindowResizeScaleRebinding: Bool
     public let supportsFocusedWindowMove: Bool
     public let supportsFocusedWindowMoveScaleRebinding: Bool
     public let supportsFocusedWindowMoveRecoverableOffscreen: Bool
@@ -26,6 +27,7 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         supportsPrimaryDrag: Bool = false,
         supportsScroll: Bool = false,
         supportsFocusedWindowResize: Bool = false,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false,
         supportsFocusedWindowMove: Bool = false,
         supportsFocusedWindowMoveScaleRebinding: Bool = false,
         supportsFocusedWindowMoveRecoverableOffscreen: Bool = false
@@ -37,6 +39,8 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         self.supportsPrimaryDrag = supportsPrimaryDrag
         self.supportsScroll = supportsScroll
         self.supportsFocusedWindowResize = supportsFocusedWindowResize
+        self.supportsFocusedWindowResizeScaleRebinding =
+            supportsFocusedWindowResizeScaleRebinding
         self.supportsFocusedWindowMove = supportsFocusedWindowMove
         self.supportsFocusedWindowMoveScaleRebinding =
             supportsFocusedWindowMoveScaleRebinding
@@ -52,6 +56,7 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         case supportsPrimaryDrag
         case supportsScroll
         case supportsFocusedWindowResize
+        case supportsFocusedWindowResizeScaleRebinding
         case supportsFocusedWindowMove
         case supportsFocusedWindowMoveScaleRebinding
         case supportsFocusedWindowMoveRecoverableOffscreen
@@ -75,6 +80,13 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         }
         let supportsFocusedWindowResize = if container.contains(.supportsFocusedWindowResize) {
             try container.decode(Bool.self, forKey: .supportsFocusedWindowResize)
+        } else {
+            false
+        }
+        let supportsFocusedWindowResizeScaleRebinding = if container.contains(
+            .supportsFocusedWindowResizeScaleRebinding
+        ) {
+            try container.decode(Bool.self, forKey: .supportsFocusedWindowResizeScaleRebinding)
         } else {
             false
         }
@@ -115,6 +127,8 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
             supportsPrimaryDrag: supportsPrimaryDrag,
             supportsScroll: supportsScroll,
             supportsFocusedWindowResize: supportsFocusedWindowResize,
+            supportsFocusedWindowResizeScaleRebinding:
+                supportsFocusedWindowResizeScaleRebinding,
             supportsFocusedWindowMove: supportsFocusedWindowMove,
             supportsFocusedWindowMoveScaleRebinding:
                 supportsFocusedWindowMoveScaleRebinding,
@@ -138,6 +152,10 @@ public struct WebRTCInputCapability: Codable, Equatable, Sendable {
         try container.encode(supportsPrimaryDrag, forKey: .supportsPrimaryDrag)
         try container.encode(supportsScroll, forKey: .supportsScroll)
         try container.encode(supportsFocusedWindowResize, forKey: .supportsFocusedWindowResize)
+        try container.encode(
+            supportsFocusedWindowResizeScaleRebinding,
+            forKey: .supportsFocusedWindowResizeScaleRebinding
+        )
         try container.encode(supportsFocusedWindowMove, forKey: .supportsFocusedWindowMove)
         try container.encode(
             supportsFocusedWindowMoveScaleRebinding,

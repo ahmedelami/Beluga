@@ -750,7 +750,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_CONFIGURATION="TestFlight"' 1 \
   'side-by-side TestFlight configuration guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_BUILD_NUMBER="76"' 1 \
+  'EXPECTED_BUILD_NUMBER="77"' 1 \
   'side-by-side TestFlight build-number guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'PRIVATE_TEMPORARY_ROOT="/private/tmp"' 1 \
@@ -2202,7 +2202,7 @@ assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
   'dataStore: WorldwideKeychainDataStore()' 1 \
   'explicit opensteamer pairing-store composition'
 assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
-  'fflush(stdout)' 1 'immediate one-time pairing-code flush'
+  'fflush(stdout)' 2 'immediate primary and secondary one-time pairing-code flushes'
 if require_directory macOS/Sources; then
   PROTECTED_PAIRING_SOURCE_MATCHES=$(find "$ROOT/macOS/Sources" -type f -name '*.swift' \
     -exec grep -lF -- \

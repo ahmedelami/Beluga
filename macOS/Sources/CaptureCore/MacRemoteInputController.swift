@@ -112,6 +112,7 @@ public final class MacRemoteInputPreparedActivation: @unchecked Sendable {
     fileprivate let ownershipClaim: MacRemoteInputOwnershipClaim
     fileprivate let initialFrameGeometry: ScreenVideoFrameGeometry?
     fileprivate let authoritativeDisplayBounds: CGRect?
+    fileprivate let supportsFocusedWindowResizeScaleRebinding: Bool
     fileprivate let revokeAuthorization: @Sendable () -> Void
     /// Accessed only while the owning controller's lock is held.
     fileprivate var isConsumed = false
@@ -125,6 +126,7 @@ public final class MacRemoteInputPreparedActivation: @unchecked Sendable {
         ownershipClaim: MacRemoteInputOwnershipClaim,
         initialFrameGeometry: ScreenVideoFrameGeometry?,
         authoritativeDisplayBounds: CGRect?,
+        supportsFocusedWindowResizeScaleRebinding: Bool,
         revokeAuthorization: @escaping @Sendable () -> Void
     ) {
         self.controllerID = controllerID
@@ -135,6 +137,8 @@ public final class MacRemoteInputPreparedActivation: @unchecked Sendable {
         self.ownershipClaim = ownershipClaim
         self.initialFrameGeometry = initialFrameGeometry
         self.authoritativeDisplayBounds = authoritativeDisplayBounds
+        self.supportsFocusedWindowResizeScaleRebinding =
+            supportsFocusedWindowResizeScaleRebinding
         self.revokeAuthorization = revokeAuthorization
     }
 }
@@ -464,6 +468,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
         ownershipClaim: MacRemoteInputOwnershipClaim,
         initialFrameGeometry: ScreenVideoFrameGeometry? = nil,
         authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false,
         revokeAuthorization: @escaping @Sendable () -> Void
     ) -> MacRemoteInputPrepareResult {
         var incumbentAuthorizationRevocation: (@Sendable () -> Void)?
@@ -510,6 +515,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                     ownershipClaim: ownershipClaim,
                     initialFrameGeometry: initialFrameGeometry,
                     authoritativeDisplayBounds: validatedAuthoritativeBounds,
+                    supportsFocusedWindowResizeScaleRebinding:
+                        supportsFocusedWindowResizeScaleRebinding,
                     revokeAuthorization: revokeAuthorization
                 )
             )
@@ -570,6 +577,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                     ownerToken: activation.ownerToken,
                     ownershipClaimGeneration: activation.ownershipClaim.generation,
                     authoritativeDisplayBounds: activation.authoritativeDisplayBounds,
+                    supportsFocusedWindowResizeScaleRebinding:
+                        activation.supportsFocusedWindowResizeScaleRebinding,
                     revokeAuthorization: activation.revokeAuthorization
                 )
                 highestSuccessfullyArmedClaimGeneration =
@@ -624,7 +633,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
         ownerToken: MacRemoteInputOwnerToken,
         ownershipClaim: MacRemoteInputOwnershipClaim,
         initialFrameGeometry: ScreenVideoFrameGeometry? = nil,
-        authoritativeDisplayBounds: CGRect? = nil
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false
     ) -> MacRemoteInputArmResult {
         withLock {
             return armLocked(
@@ -635,6 +645,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                 ownershipClaim: ownershipClaim,
                 initialFrameGeometry: initialFrameGeometry,
                 authoritativeDisplayBounds: authoritativeDisplayBounds,
+                supportsFocusedWindowResizeScaleRebinding:
+                    supportsFocusedWindowResizeScaleRebinding,
                 clearsFrameGeometry: true
             )
         }
@@ -648,7 +660,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
         inputSessionID: UUID,
         ownerToken: MacRemoteInputOwnerToken,
         initialFrameGeometry: ScreenVideoFrameGeometry? = nil,
-        authoritativeDisplayBounds: CGRect? = nil
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false
     ) -> MacRemoteInputArmResult {
         withLock {
             let ownershipClaim = reserveOwnershipClaimLocked(
@@ -662,6 +675,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                 ownershipClaim: ownershipClaim,
                 initialFrameGeometry: initialFrameGeometry,
                 authoritativeDisplayBounds: authoritativeDisplayBounds,
+                supportsFocusedWindowResizeScaleRebinding:
+                    supportsFocusedWindowResizeScaleRebinding,
                 clearsFrameGeometry: true
             )
         }
@@ -674,7 +689,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
         displayID: UInt32,
         screenRequestID: UInt64,
         inputSessionID: UUID,
-        authoritativeDisplayBounds: CGRect? = nil
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false
     ) -> MacRemoteInputArmResult {
         withLock {
             let ownershipClaim = reserveOwnershipClaimLocked(
@@ -688,6 +704,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
                 ownershipClaim: ownershipClaim,
                 initialFrameGeometry: nil,
                 authoritativeDisplayBounds: authoritativeDisplayBounds,
+                supportsFocusedWindowResizeScaleRebinding:
+                    supportsFocusedWindowResizeScaleRebinding,
                 clearsFrameGeometry: false
             )
         }
@@ -702,6 +720,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
         ownershipClaim: MacRemoteInputOwnershipClaim,
         initialFrameGeometry: ScreenVideoFrameGeometry?,
         authoritativeDisplayBounds: CGRect?,
+        supportsFocusedWindowResizeScaleRebinding: Bool,
         clearsFrameGeometry: Bool
     ) -> MacRemoteInputArmResult {
         guard !isPermanentlyInvalidated else {
@@ -753,6 +772,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
             ownerToken: ownerToken,
             ownershipClaimGeneration: ownershipClaim.generation,
             authoritativeDisplayBounds: validatedAuthoritativeBounds,
+            supportsFocusedWindowResizeScaleRebinding:
+                supportsFocusedWindowResizeScaleRebinding,
             revokeAuthorization: nil
         )
         highestSuccessfullyArmedClaimGeneration = ownershipClaim.generation
@@ -3008,6 +3029,7 @@ private struct ActiveSession: Sendable {
     let ownerToken: MacRemoteInputOwnerToken
     let ownershipClaimGeneration: UInt64
     var authoritativeDisplayBounds: CGRect?
+    let supportsFocusedWindowResizeScaleRebinding: Bool
     let revokeAuthorization: (@Sendable () -> Void)?
 }
 
@@ -3074,7 +3096,15 @@ private struct AuthorizedWindowResizeTarget: Sendable {
     func hasCompatibleCoordinateBinding(with context: MacRemoteWindowResizeContext) -> Bool {
         switch operation {
         case .resize:
-            viewerVideoSize == context.viewerVideoSize
+            (
+                viewerVideoSize == context.viewerVideoSize
+                    || (
+                        context.session.supportsFocusedWindowResizeScaleRebinding
+                            && viewerVideoSize.hasExactlySameAspectRatio(
+                                as: context.viewerVideoSize
+                            )
+                    )
+            )
                 && frameGeometry.hasSameInputTransform(as: context.frameGeometry)
         case .move:
             viewerVideoSize.hasExactlySameAspectRatio(as: context.viewerVideoSize)

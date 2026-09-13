@@ -27,7 +27,9 @@ final class WorldwideFocusedWindowResizeDispatchTests: XCTestCase {
         ]
 
         XCTAssertFalse(legacy.supportsFocusedWindowResize)
+        XCTAssertFalse(legacy.supportsFocusedWindowResizeScaleRebinding)
         XCTAssertTrue(current.supportsFocusedWindowResize)
+        XCTAssertTrue(current.supportsFocusedWindowResizeScaleRebinding)
         for action in actions {
             XCTAssertFalse(
                 WorldwideScreenService.remoteInputActionIsSupported(

@@ -63,7 +63,7 @@ struct WorldwideScreenViewerView: View {
                                 )
                             },
                             onVideoFrameRendered: { observation, token in
-                                viewModel.focusedWindowMoveVideoFrameDidPresent(
+                                viewModel.focusedWindowInteractionVideoFrameDidPresent(
                                     size: CGSize(
                                         width: observation.width,
                                         height: observation.height
@@ -748,13 +748,15 @@ struct WorldwideScreenViewerView: View {
         videoSize: CGSize
     ) -> some View {
         let isActive = viewModel.focusedWindowResizeState.interaction?.mode == mode
-        let isPresentationFenced = viewModel.focusedWindowResizeState.interaction?
-            .awaitingPresentationToken != nil
+        let isPresentationFenced = viewModel.focusedWindowResizeState.interaction.map {
+            $0.awaitingPresentationToken != nil || $0.awaitingPresentedVideoSize != nil
+        } == true
         let isAvailable = mode == .move
             ? viewModel.isFocusedWindowMoveAvailable
             : viewModel.isFocusedWindowResizeAvailable
-        // While Move awaits a newly presented resolution, retain only its Done action. The
-        // fallback video size is deliberately not permission to start another interaction mode.
+        // While a focused-window interaction awaits a newly presented resolution, retain only its
+        // Done action. The fallback video size is deliberately not permission to start another
+        // interaction mode.
         if isActive || (isAvailable && !isPresentationFenced) {
             Button {
                 focusedWindowResizeGhostFrame = nil

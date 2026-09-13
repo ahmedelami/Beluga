@@ -4472,6 +4472,10 @@ actor WorldwideScreenService {
 
         let inputSessionID = UUID()
         let authorization = WebRTCInputAuthorization()
+        let capability = Self.remoteInputCapability(
+            inputSessionID: inputSessionID,
+            screenRequestID: screenRequestID
+        )
         switch remoteInputController.prepareArm(
             displayID: captureDisplayID,
             screenRequestID: screenRequestID,
@@ -4480,15 +4484,13 @@ actor WorldwideScreenService {
             ownershipClaim: ownershipClaim,
             initialFrameGeometry: initialFrameGeometry,
             authoritativeDisplayBounds: captureAuthoritativeDisplayBounds,
+            supportsFocusedWindowResizeScaleRebinding:
+                capability.supportsFocusedWindowResizeScaleRebinding,
             revokeAuthorization: {
                 authorization.revoke()
             }
         ) {
         case .prepared(let activation):
-            let capability = Self.remoteInputCapability(
-                inputSessionID: inputSessionID,
-                screenRequestID: screenRequestID
-            )
             activeInputCapability = capability
             activeInputAuthorization = authorization
             logger.info("Worldwide remote input is prepared for this screen session")
@@ -4814,6 +4816,7 @@ actor WorldwideScreenService {
             supportsPrimaryDrag: true,
             supportsScroll: true,
             supportsFocusedWindowResize: true,
+            supportsFocusedWindowResizeScaleRebinding: true,
             supportsFocusedWindowMove: true,
             supportsFocusedWindowMoveScaleRebinding: true,
             supportsFocusedWindowMoveRecoverableOffscreen: true

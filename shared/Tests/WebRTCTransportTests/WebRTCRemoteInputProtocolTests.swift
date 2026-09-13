@@ -850,6 +850,7 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
         XCTAssertFalse(capability.supportsPrimaryDrag)
         XCTAssertFalse(capability.supportsScroll)
         XCTAssertFalse(capability.supportsFocusedWindowResize)
+        XCTAssertFalse(capability.supportsFocusedWindowResizeScaleRebinding)
         XCTAssertFalse(capability.supportsFocusedWindowMove)
         XCTAssertFalse(capability.supportsFocusedWindowMoveScaleRebinding)
         XCTAssertEqual(capability.protocolVersion, WebRTCInputCapability.currentProtocolVersion)
@@ -862,6 +863,7 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
             supportsPrimaryDrag: true,
             supportsScroll: true,
             supportsFocusedWindowResize: true,
+            supportsFocusedWindowResizeScaleRebinding: true,
             supportsFocusedWindowMove: true,
             supportsFocusedWindowMoveScaleRebinding: true
         )
@@ -872,9 +874,24 @@ final class WebRTCRemoteInputProtocolTests: XCTestCase {
         XCTAssertEqual(object["supportsPrimaryDrag"] as? Bool, true)
         XCTAssertEqual(object["supportsScroll"] as? Bool, true)
         XCTAssertEqual(object["supportsFocusedWindowResize"] as? Bool, true)
+        XCTAssertEqual(
+            object["supportsFocusedWindowResizeScaleRebinding"] as? Bool,
+            true
+        )
         XCTAssertEqual(object["supportsFocusedWindowMove"] as? Bool, true)
         XCTAssertEqual(object["supportsFocusedWindowMoveScaleRebinding"] as? Bool, true)
         XCTAssertEqual(try JSONDecoder().decode(WebRTCInputCapability.self, from: data), capability)
+
+        for invalid in [NSNull(), 1, "true"] as [Any] {
+            var invalidObject = object
+            invalidObject["supportsFocusedWindowResizeScaleRebinding"] = invalid
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(
+                    WebRTCInputCapability.self,
+                    from: JSONSerialization.data(withJSONObject: invalidObject)
+                )
+            )
+        }
     }
 
     func testAllInputActionsRoundTrip() throws {
