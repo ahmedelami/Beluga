@@ -3414,7 +3414,7 @@ enum MacRemoteWindowEnabledState: Equatable, Sendable {
             self = .unsupported
         } else if error == .success, let value,
                   CFGetTypeID(value) == CFBooleanGetTypeID() {
-            self = CFBooleanGetValue(value as! CFBoolean) ? .enabled : .disabled
+            self = CFBooleanGetValue((value as! CFBoolean)) ? .enabled : .disabled
         } else {
             self = .unavailable
         }
