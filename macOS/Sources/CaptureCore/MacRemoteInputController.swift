@@ -2274,7 +2274,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
             : MacRemoteWindowResizeGeometry.contains(frame, in: displayBounds, tolerance: 0.5)
         return system.role(of: window) == "AXWindow"
             && system.subrole(of: window) == "AXStandardWindow"
-            && system.isEnabled(window) == true
+            && system.windowEnabledState(window).permitsStandardWindowInteraction
             && system.isWindowMinimized(window) == false
             && system.isWindowFullScreen(window) == false
             && system.isWindowModal(window) == false
@@ -3402,6 +3402,29 @@ final class MacRemoteAccessibilityElement: @unchecked Sendable {
     }
 }
 
+/// AXEnabled is optional for windows; an unsupported attribute is distinct from a failed read.
+enum MacRemoteWindowEnabledState: Equatable, Sendable {
+    case enabled
+    case disabled
+    case unsupported
+    case unavailable
+
+    init(error: AXError, value: CFTypeRef?) {
+        if error == .attributeUnsupported {
+            self = .unsupported
+        } else if error == .success, let value,
+                  CFGetTypeID(value) == CFBooleanGetTypeID() {
+            self = CFBooleanGetValue(value as! CFBoolean) ? .enabled : .disabled
+        } else {
+            self = .unavailable
+        }
+    }
+
+    var permitsStandardWindowInteraction: Bool {
+        self == .enabled || self == .unsupported
+    }
+}
+
 /// Narrow system boundary for permission, AX inspection, and synthetic event posting.
 protocol MacRemoteInputSystem: Sendable {
     func permissionStatus(promptIfNeeded: Bool) -> MacRemoteInputPermissionStatus
@@ -3413,6 +3436,7 @@ protocol MacRemoteInputSystem: Sendable {
     func role(of element: MacRemoteAccessibilityElement) -> String?
     func subrole(of element: MacRemoteAccessibilityElement) -> String?
     func isEnabled(_ element: MacRemoteAccessibilityElement) -> Bool?
+    func windowEnabledState(_ window: MacRemoteAccessibilityElement) -> MacRemoteWindowEnabledState
     func isEditable(_ element: MacRemoteAccessibilityElement) -> Bool?
     func isValueSettable(_ element: MacRemoteAccessibilityElement) -> Bool
     func focusedElement() -> MacRemoteAccessibilityElement?
@@ -3500,6 +3524,14 @@ private struct CoreGraphicsMacRemoteInputSystem: MacRemoteInputSystem {
 
     func isEnabled(_ element: MacRemoteAccessibilityElement) -> Bool? {
         (copyAttribute(kAXEnabledAttribute as CFString, from: element) as? NSNumber)?.boolValue
+    }
+
+    func windowEnabledState(_ window: MacRemoteAccessibilityElement) -> MacRemoteWindowEnabledState {
+        let axWindow = window.rawValue as! AXUIElement
+        AXUIElementSetMessagingTimeout(axWindow, 0.2)
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(axWindow, kAXEnabledAttribute as CFString, &value)
+        return MacRemoteWindowEnabledState(error: error, value: value)
     }
 
     func isEditable(_ element: MacRemoteAccessibilityElement) -> Bool? {
