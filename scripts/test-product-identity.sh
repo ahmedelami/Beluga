@@ -2820,7 +2820,8 @@ require_rejection "$CASE" 'explicit opensteamer pairing-store composition'
 
 CASE=$(new_case mac-pairing-code-flush)
 replace_once "$CASE/macOS/Sources/CaptureServer/CaptureServerMain.swift" \
-  'fflush(stdout)' '/* missing pairing-code flush */'
+  $'fflush(stdout)\nfflush(stdout)' \
+  $'/* missing primary pairing-code flush */\nfflush(stdout)'
 require_rejection "$CASE" 'immediate primary and secondary one-time pairing-code flushes'
 
 CASE=$(new_case mac-runtime-lock-namespace)
