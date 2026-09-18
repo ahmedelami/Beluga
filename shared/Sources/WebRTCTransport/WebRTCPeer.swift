@@ -1588,6 +1588,13 @@ public struct WebRTCIOSAudioTransactionDeviceBinding:
     public let observationRegistrationGeneration: UInt64
 }
 
+/// A completed same-device ADM queue marker. This proves ordering only, not permission to
+/// activate audio, and cannot authorize a transaction or substitute for its terminal receipt.
+public struct WebRTCIOSAudioSystemEventFenceReceipt: Equatable, Sendable {
+    public let binding: WebRTCIOSAudioTransactionDeviceBinding
+    public let systemAudioGeneration: UInt64
+}
+
 /// Dedicated lossless stream for reducer authority. Keeping these receipts out of the general
 /// bounded WebRTC event stream prevents unrelated signaling/statistics bursts from dropping or
 /// reordering native audio evidence.
@@ -1890,6 +1897,20 @@ public final class WebRTCIOSAudioTransactionStager: @unchecked Sendable {
             appOperationTagGeneration: tagGeneration
         )
         return true
+    }
+
+    /// The native entry point validates the immutable device binding under its registration
+    /// lock, then enqueues onto that device's ADM. No actor-owned native reference escapes.
+    fileprivate func fenceSystemAudioEvents(
+        expectedBinding: WebRTCIOSAudioTransactionDeviceBinding,
+        completion: @escaping @Sendable (UInt64) -> Void
+    ) {
+        device.fenceSystemAudioEvents(
+            expectedDeviceInstanceGeneration: expectedBinding.deviceInstanceGeneration,
+            expectedObservationRegistrationGeneration:
+                expectedBinding.observationRegistrationGeneration,
+            completion: completion
+        )
     }
 }
 
@@ -2987,6 +3008,10 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
 
     public func debugRecoveryStagedBeforeInterruptionEndForTesting() -> [String: NSNumber] {
         native.debugRecoveryStagedBeforeInterruptionEndForTesting()
+    }
+
+    public func debugSystemAudioEventFenceForTesting() -> [String: NSNumber] {
+        native.debugSystemAudioEventFenceForTesting()
     }
 
     public func debugRetryAfterFailedInitialPlayoutForTesting()
@@ -7751,6 +7776,36 @@ public actor WebRTCPeer {
         }
         return iOSAudioTransactionStager.requestRecovery(
             authorization: authorization
+        )
+    }
+
+    /// The caller must first leave the main-thread interruption-notification fanout so the
+    /// native observer has submitted its ended event. The marker then follows that event on
+    /// this exact device's ADM queue; diagnostics and category drains are not substitutes.
+    public func awaitIOSAudioSystemEventFence(
+        expectedBinding: WebRTCIOSAudioTransactionDeviceBinding
+    ) async -> WebRTCIOSAudioSystemEventFenceReceipt? {
+        guard !Task.isCancelled,
+              !isClosed,
+              iOSAudioTransactionDeviceBinding == expectedBinding,
+              let stager = iOSAudioTransactionStager else { return nil }
+        let systemGeneration: UInt64? = await WebRTCBoundedCallback.value(
+            timeout: .seconds(2)
+        ) { [stager, expectedBinding] resolve in
+            stager.fenceSystemAudioEvents(
+                expectedBinding: expectedBinding,
+                completion: resolve
+            )
+        }
+        guard !Task.isCancelled,
+              !isClosed,
+              iOSAudioTransactionDeviceBinding == expectedBinding,
+              iOSAudioTransactionStager === stager,
+              let systemGeneration,
+              systemGeneration != 0 else { return nil }
+        return WebRTCIOSAudioSystemEventFenceReceipt(
+            binding: expectedBinding,
+            systemAudioGeneration: systemGeneration
         )
     }
 

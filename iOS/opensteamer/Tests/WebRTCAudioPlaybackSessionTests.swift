@@ -1761,6 +1761,20 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
                              try value("tagGeneration").uint64Value)
     }
 
+    func testSystemAudioEventFenceIsFIFOObservationalAndBoundToLiveDevice() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugSystemAudioEventFenceForTesting()
+        for key in ["fifoQueued", "endedBeforeCompletion", "completionOutsideLock", "fenceCompletedOnce",
+                    "fenceNoAudioSideEffects", "freshStagingAfterFenceSurvives", "pendingTagPreserved",
+                    "preservedTagStillUsable", "wrongDevice", "wrongRegistration", "missingDelegate",
+                    "uninitialized", "invalidRegistration", "queuedDeviceChange", "queuedRegistrationReplacement",
+                    "queuedRegistrationInvalidation", "queuedDelegateReplacement", "queuedTermination",
+                    "queuedReinitialization"] {
+            XCTAssertTrue(try XCTUnwrap(result[key], "Missing native result: \(key)").boolValue, key)
+        }
+    }
+
     // MARK: - Connected hosted-call playout recovery
 
     func testStartupConnectedCallArmIsQuiescentUntilFirstStartPlayout() {

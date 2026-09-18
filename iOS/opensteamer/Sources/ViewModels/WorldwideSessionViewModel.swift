@@ -1713,6 +1713,9 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var debugIOSPlayoutRecoveryRequester: (
         @MainActor (WebRTCPeer, WebRTCIOSPlayoutRecoveryAuthorization) async -> Void
     )?
+    private var debugIOSAudioSystemEventFenceRequester: (
+        @MainActor (WebRTCPeer, WebRTCIOSAudioTransactionDeviceBinding) async -> Bool
+    )?
     private var debugIOSHostedCallPlayoutRecoveryRequester: (
         @MainActor (
             WebRTCPeer,
@@ -7158,6 +7161,37 @@ final class WorldwideSessionViewModel: ObservableObject {
         peer sourcePeer: WebRTCPeer,
         generation: UUID
     ) {
+        audioLifecycle.onInterruptionEndNativeFenceRequested = {
+            [weak self, weak sourcePeer] in
+            guard let self, let sourcePeer,
+                  !Task.isCancelled,
+                  generation == self.sessionGeneration,
+                  self.peer === sourcePeer,
+                  let binding = sourcePeer.iOSAudioTransactionDeviceBinding else {
+                return false
+            }
+            let completed: Bool
+            #if DEBUG
+            if let requester = self.debugIOSAudioSystemEventFenceRequester {
+                completed = await requester(sourcePeer, binding)
+            } else {
+                let receipt = await sourcePeer.awaitIOSAudioSystemEventFence(
+                    expectedBinding: binding
+                )
+                completed = receipt?.binding == binding
+            }
+            #else
+            let receipt = await sourcePeer.awaitIOSAudioSystemEventFence(
+                expectedBinding: binding
+            )
+            completed = receipt?.binding == binding
+            #endif
+            return completed
+                && !Task.isCancelled
+                && generation == self.sessionGeneration
+                && self.peer === sourcePeer
+                && sourcePeer.iOSAudioTransactionDeviceBinding == binding
+        }
         audioLifecycle.onPlayoutRecoveryTransactionStagingRequested = {
             [weak self, weak sourcePeer] context, inputRequired in
             guard let self, let sourcePeer,
@@ -11630,6 +11664,14 @@ final class WorldwideSessionViewModel: ObservableObject {
         ) async -> Void
     ) {
         debugIOSPlayoutRecoveryRequester = requester
+    }
+
+    func debugSetIOSAudioSystemEventFenceRequester(
+        _ requester: (
+            @MainActor (WebRTCPeer, WebRTCIOSAudioTransactionDeviceBinding) async -> Bool
+        )?
+    ) {
+        debugIOSAudioSystemEventFenceRequester = requester
     }
 
     func debugInstallIOSHostedCallPlayoutRecoveryRequester(

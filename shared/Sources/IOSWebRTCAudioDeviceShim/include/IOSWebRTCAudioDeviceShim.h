@@ -775,6 +775,7 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting;
 - (BOOL)debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRecoveryStagedBeforeInterruptionEndForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugSystemAudioEventFenceForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting;
@@ -899,6 +900,22 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
                                               deviceTeardownHandler:
     (ASIOSAudioCategoryDeviceTeardownHandler _Nullable)deviceTeardownHandler
     NS_SWIFT_NAME(observeAudioCategoryChanges(_:drainHandler:deviceTeardownHandler:));
+
+/// Enqueues an observational marker on this exact device's ADM queue without blocking the caller.
+/// Call only after the main-thread notification fanout returns, so every native observer has
+/// enqueued its system event first. A nonzero completion value is the system-audio generation
+/// after all earlier ADM work; zero rejects a missing, replaced, or retired device/registration.
+/// The callback runs outside native locks on the caller or ADM thread. A caller must bound its
+/// wait if the worker cannot execute the marker, then revalidate its own session/lifecycle owner.
+/// This does not drain category receipts, retire tags, open gates, or authorize recovery, and it
+/// makes no guarantee about system events arriving after the marker.
+- (void)fenceSystemAudioEventsForExpectedDeviceInstanceGeneration:
+                (uint64_t)expectedDeviceInstanceGeneration
+                          expectedObservationRegistrationGeneration:
+                (uint64_t)expectedObservationRegistrationGeneration
+                                                         completion:
+                (void (^)(uint64_t systemAudioGeneration))completion
+    NS_SWIFT_NAME(fenceSystemAudioEvents(expectedDeviceInstanceGeneration:expectedObservationRegistrationGeneration:completion:));
 
 /// Stages an opaque app operation tag for exactly one native audio-policy transaction.
 ///

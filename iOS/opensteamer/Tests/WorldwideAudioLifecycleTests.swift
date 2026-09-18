@@ -4413,6 +4413,11 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         async throws {
         let fixture = makeFixture()
         fixture.playback.requiresRuntimePlayoutProof = true
+        let interruptionEndFenced = expectation(description: "interruption ended before call recovery")
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            interruptionEndFenced.fulfill()
+            return true
+        }
         let viewModel = WorldwideSessionViewModel(
             audioLifecycle: fixture.controller
         )
@@ -4511,6 +4516,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
 
         fixture.events.onInterruptionBegan?(.default)
         fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [interruptionEndFenced], timeout: 2)
         isPostCallRecovery.value = true
         fixture.callActivity.setCallSnapshot(
             nonEndedCallCount: 0,
@@ -4990,6 +4996,11 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         async throws {
         let fixture = makeFixture()
         fixture.playback.requiresRuntimePlayoutProof = true
+        let interruptionEndFenced = expectation(description: "interruption ended before cleanup recovery")
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            interruptionEndFenced.fulfill()
+            return true
+        }
         let viewModel = WorldwideSessionViewModel(
             audioLifecycle: fixture.controller
         )
@@ -5071,6 +5082,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         )
         fixture.events.onInterruptionBegan?(.default)
         fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [interruptionEndFenced], timeout: 2)
         isPostCallRecovery.value = true
         fixture.callActivity.setCallSnapshot(
             nonEndedCallCount: 0,
@@ -13078,6 +13090,243 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         XCTAssertEqual(fixture.controller.snapshot.stateText, "Playing")
         XCTAssertTrue(fixture.background.publications.last?.isPlaying ?? false)
         XCTAssertTrue(fixture.remoteAudio.isEnabled)
+    }
+
+    func testInterruptionRecoveryWaitsForNativeEventFence() async {
+        let fixture = makeFixture()
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        let fence = AudioNonCooperativeGate<Bool>()
+        let entered = expectation(description: "native interruption fence entered")
+        let recovered = expectation(description: "recovery after native interruption fence")
+        let recoveryCount = fixture.playback.recoverCount
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            entered.fulfill()
+            return await fence.wait()
+        }
+        fixture.controller.onPlaybackRecoveryRequested = {
+            recovered.fulfill()
+        }
+
+        fixture.events.onInterruptionBegan?(.default)
+        fixture.events.onInterruptionEnded?(true)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        XCTAssertFalse(fixture.controller.audioRecoveryRequiresSessionReconnect)
+
+        await fence.open(true)
+        await fulfillment(of: [recovered], timeout: 2)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount + 1)
+        XCTAssertTrue(fixture.controller.snapshot.isPlaying)
+        XCTAssertFalse(fixture.controller.audioRecoveryRequiresSessionReconnect)
+        fixture.controller.stop()
+    }
+
+    func testFailedInterruptionFenceDoesNotRecover() async {
+        let fixture = makeFixture()
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        let returned = expectation(description: "native interruption fence rejected")
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            returned.fulfill()
+            return false
+        }
+        let recoveryCount = fixture.playback.recoverCount
+
+        fixture.events.onInterruptionBegan?(.default)
+        fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [returned], timeout: 2)
+
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        XCTAssertFalse(fixture.controller.snapshot.isPlaying)
+        XCTAssertTrue(fixture.controller.audioRecoveryRequiresSessionReconnect)
+        fixture.controller.stop()
+    }
+
+    func testProductionInterruptionRecoveryFailsClosedWithoutNativeFence() async {
+        let fixture = makeFixture()
+        fixture.playback.requiresRuntimePlayoutProof = true
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        fixture.controller.updateRuntimePlayout(isReady: true)
+        let recoveryCount = fixture.playback.recoverCount
+        var stagedCount = 0
+        fixture.controller.onPlayoutRecoveryTransactionStagingRequested = { _, _ in
+            stagedCount += 1
+            return nil
+        }
+        fixture.events.onInterruptionBegan?(.default)
+        fixture.events.onInterruptionEnded?(true)
+        // Drain the MainActor's queued notification continuation, if one was created.
+        let drained = expectation(description: "main notification continuation drained")
+        Task { @MainActor in drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 2)
+        XCTAssertEqual(stagedCount, 0)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        XCTAssertFalse(fixture.controller.snapshot.isPlaying)
+        fixture.controller.stop()
+    }
+
+    func testViewModelInterruptionFenceRejectsSessionChangedDuringAwait() async throws {
+        let fixture = makeFixture()
+        fixture.controller.prepare(serverName: "Mac mini")
+        let viewModel = WorldwideSessionViewModel(audioLifecycle: fixture.controller)
+        let peer = try makeAudioRacePeer()
+        XCTAssertTrue(viewModel.debugInstallScreenSessionForTests(
+            peer: peer, bindAudioTransactionDevice: true
+        ))
+        let fence = AudioNonCooperativeGate<Bool>()
+        let entered = expectation(description: "exact peer fence entered")
+        viewModel.debugSetIOSAudioSystemEventFenceRequester { sourcePeer, binding in
+            XCTAssertTrue(sourcePeer === peer)
+            XCTAssertEqual(binding, peer.iOSAudioTransactionDeviceBinding)
+            entered.fulfill()
+            return await fence.wait()
+        }
+        let request = try XCTUnwrap(fixture.controller.onInterruptionEndNativeFenceRequested)
+        let result = Task { @MainActor in await request() }
+        await fulfillment(of: [entered], timeout: 2)
+        // Keep the peer pointer but replace the owning session to test the independent epoch fence.
+        XCTAssertTrue(viewModel.debugInstallScreenSessionForTests(peer: peer, generation: UUID()))
+        await fence.open(true)
+        let accepted = await result.value
+        XCTAssertFalse(accepted)
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    func testLateInterruptionFenceCannotCrossNewInterruptionOrPreparedLifetime() async {
+        for boundary in ["new-interruption", "stop", "stop-and-prepare", "media-lost"] {
+            let fixture = makeFixture()
+            fixture.controller.prepare(serverName: "Mac mini")
+            fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+            fixture.controller.transportBecameHealthy()
+            let fence = AudioNonCooperativeGate<Bool>()
+            let entered = expectation(description: "fence entered before \(boundary)")
+            let returned = expectation(description: "stale fence returned after \(boundary)")
+            fixture.controller.onInterruptionEndNativeFenceRequested = {
+                entered.fulfill()
+                let result = await fence.wait()
+                returned.fulfill()
+                return result
+            }
+            fixture.events.onInterruptionBegan?(.default)
+            fixture.events.onInterruptionEnded?(true)
+            await fulfillment(of: [entered], timeout: 2)
+
+            switch boundary {
+            case "new-interruption":
+                fixture.events.onInterruptionBegan?(.default)
+            case "stop":
+                fixture.controller.stop()
+            case "stop-and-prepare":
+                fixture.controller.stop()
+                fixture.controller.prepare(serverName: "Replacement Mac")
+            default:
+                fixture.events.onMediaServicesLost?()
+            }
+            let recoveryCount = fixture.playback.recoverCount
+            await fence.open(true)
+            await fulfillment(of: [returned], timeout: 2)
+            XCTAssertEqual(fixture.playback.recoverCount, recoveryCount, boundary)
+            XCTAssertFalse(fixture.remoteAudio.isEnabled, boundary)
+            fixture.controller.stop()
+        }
+    }
+
+    func testDuplicateInterruptionEndRequiresLatestNativeFence() async {
+        let fixture = makeFixture()
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        let firstFence = AudioNonCooperativeGate<Bool>()
+        let latestFence = AudioNonCooperativeGate<Bool>()
+        let firstEntered = expectation(description: "first end fence entered")
+        let latestEntered = expectation(description: "latest end fence entered")
+        let firstReturned = expectation(description: "retired end fence returned")
+        let recovered = expectation(description: "latest end recovered")
+        var fenceCount = 0
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            fenceCount += 1
+            if fenceCount == 1 {
+                firstEntered.fulfill()
+                let result = await firstFence.wait()
+                firstReturned.fulfill()
+                return result
+            }
+            latestEntered.fulfill()
+            return await latestFence.wait()
+        }
+        fixture.controller.onPlaybackRecoveryRequested = { recovered.fulfill() }
+        let recoveryCount = fixture.playback.recoverCount
+        fixture.events.onInterruptionBegan?(.default)
+        fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [firstEntered], timeout: 2)
+        fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [latestEntered], timeout: 2)
+        await firstFence.open(true)
+        await fulfillment(of: [firstReturned], timeout: 2)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        await latestFence.open(true)
+        await fulfillment(of: [recovered], timeout: 2)
+        XCTAssertEqual(fenceCount, 2)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount + 1)
+        fixture.controller.stop()
+    }
+
+    func testDuplicateResumeHintCannotUndoEarlierNoResumeHint() async {
+        let fixture = makeFixture()
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        let returned = expectation(description: "latest end fence completed")
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            returned.fulfill()
+            return true
+        }
+        let recoveryCount = fixture.playback.recoverCount
+        fixture.events.onInterruptionBegan?(.default)
+        fixture.events.onInterruptionEnded?(false)
+        fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [returned], timeout: 2)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        XCTAssertTrue(fixture.controller.snapshot.requiresExplicitResume)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        fixture.controller.stop()
+    }
+
+    func testCallBeginningDuringInterruptionFencePreventsOrdinaryRecovery() async {
+        let fixture = makeFixture()
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        let fence = AudioNonCooperativeGate<Bool>()
+        let entered = expectation(description: "fence before call")
+        let returned = expectation(description: "fence after call")
+        fixture.controller.onInterruptionEndNativeFenceRequested = {
+            entered.fulfill()
+            let result = await fence.wait()
+            returned.fulfill()
+            return result
+        }
+        fixture.events.onInterruptionBegan?(.unavailable)
+        fixture.events.onInterruptionEnded?(true)
+        await fulfillment(of: [entered], timeout: 2)
+        fixture.callActivity.setCallSnapshot(nonEndedCallCount: 1, connectedNonEndedCallCount: 1)
+        let recoveryCount = fixture.playback.recoverCount
+        await fence.open(true)
+        await fulfillment(of: [returned], timeout: 2)
+        XCTAssertEqual(fixture.playback.recoverCount, recoveryCount)
+        XCTAssertFalse(fixture.remoteAudio.isEnabled)
+        fixture.controller.stop()
     }
 
     func testInterruptionWithResumeHintRecoversAndUnmutes() {
@@ -21324,6 +21573,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
     ) async throws {
         let fixture = makeFixture()
         fixture.playback.requiresRuntimePlayoutProof = true
+        fixture.controller.onInterruptionEndNativeFenceRequested = { true }
         let viewModel = WorldwideSessionViewModel(audioLifecycle: fixture.controller)
         let peer = try makeAudioRacePeer()
         let generation = UUID(

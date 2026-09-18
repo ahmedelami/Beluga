@@ -268,6 +268,9 @@ final class WorldwideAudioLifecycleController {
     /// has delivered interruption-ended with a resume hint.
     var onHostedCallPlayoutRecoveryResumed:
         ((WebRTCIOSHostedCallPlayoutAuthorization) -> Void)?
+    /// Runs after the main-thread notification fanout, then waits behind the exact current
+    /// device's queued system events. This is ordering evidence, never recovery authority.
+    var onInterruptionEndNativeFenceRequested: (() async -> Bool)?
 
     private let playback: any WorldwideAudioPlaybackManaging
     private let backgroundPlayback: any BackgroundPlaybackCoordinating
@@ -315,6 +318,23 @@ final class WorldwideAudioLifecycleController {
     private var currentStartupConnectedCallScope: UUID?
     private var currentInterruptionReason:
         AudioSessionInterruptionBeganReason?
+    private struct InterruptionEndTicket: Equatable {
+        let id: UUID
+        let preparedLifetime: UUID
+        let interruptionGeneration: UUID
+        let deviceBinding: WebRTCIOSAudioTransactionDeviceBinding?
+    }
+    private var preparedLifetime = UUID()
+    /// Unlike the hosted-policy epoch, this identity survives an ended event and CallKit cleanup.
+    /// Only a new began notification or a new prepared lifetime may replace it.
+    private var interruptionGeneration = UUID()
+    private var interruptionEndTicket: InterruptionEndTicket?
+    private var interruptionEndFenceTask: Task<Void, Never>?
+    private var interruptionEndFenceIsPending = false
+    private var interruptionEndFenceHasFailed = false
+    private var interruptionEndResumeAllowed: Bool?
+    private static let interruptionEndFenceFailureDiagnostic =
+        "The current iPhone audio device did not verify its interruption-end ordering fence."
     private var hostedCallPolicy: HostedCallPolicy?
     private var hostedCallPolicyWasIssuedForCurrentInterruption = false
     private var hostedCallPolicyIsClosedForCurrentInterruption = false
@@ -585,6 +605,7 @@ final class WorldwideAudioLifecycleController {
     }
 
     var audioRecoveryRequiresSessionReconnect: Bool {
+        if interruptionEndFenceHasFailed { return true }
         if deferredRecoveryAdmissionFence != nil { return true }
         if case .requiresSessionReconnect =
             deferredOutputOnlyRecoveryDisposition {
@@ -652,6 +673,7 @@ final class WorldwideAudioLifecycleController {
         }
 
         self.serverName = serverName
+        resetInterruptionEndFenceLifetime()
         isPrepared = true
         playbackIsReady = false
         runtimePlayoutIsReady = !playback.requiresRuntimePlayoutProof
@@ -1007,6 +1029,7 @@ final class WorldwideAudioLifecycleController {
     func stop() {
         guard isPrepared else { return }
 
+        resetInterruptionEndFenceLifetime()
         let hadActiveCall = isCallActive
         revokeHostedCallPolicy()
         retireExpectedAudioCategoryTransitionForBoundary()
@@ -3943,6 +3966,9 @@ final class WorldwideAudioLifecycleController {
         reason: AudioSessionInterruptionBeganReason
     ) {
         guard isPrepared else { return }
+        cancelInterruptionEndFence()
+        interruptionGeneration = UUID()
+        interruptionEndResumeAllowed = nil
         revokeMicrophonePlaybackPauseResume()
         let predecessorOperationID =
             currentAudioCategoryTransitionOperationID
@@ -3984,9 +4010,124 @@ final class WorldwideAudioLifecycleController {
 
     private func interruptionEnded(shouldResume: Bool) {
         guard isPrepared else { return }
+        // A duplicate with a resume hint cannot overturn an earlier missing/false hint, even
+        // while that earlier fence is still queued. Apply the privacy latch synchronously.
+        let resumeAllowed = (interruptionEndResumeAllowed ?? true) && shouldResume
+        interruptionEndResumeAllowed = resumeAllowed
+        if !resumeAllowed {
+            requiresExplicitResume = true
+            revokeMicrophonePlaybackPauseResume()
+        }
+        let fence = onInterruptionEndNativeFenceRequested
+        let requiresFence = fence != nil
+            || playback.requiresRuntimePlayoutProof
+            || onPlayoutRecoveryTransactionStagingRequested != nil
+            || onTransactionalPlaybackRecoveryRequested != nil
+        guard requiresFence else {
+            // Controller-only legacy fixtures have no native ADM or transactional recovery.
+            completeInterruptionEnded(shouldResume: resumeAllowed, ticket: nil)
+            return
+        }
+
+        interruptionEndFenceTask?.cancel()
+        let ticket = InterruptionEndTicket(
+            id: UUID(),
+            preparedLifetime: preparedLifetime,
+            interruptionGeneration: interruptionGeneration,
+            deviceBinding: audioTransactionDeviceBinding
+        )
+        interruptionEndTicket = ticket
+        interruptionEndFenceIsPending = true
+        remoteAudioControl?.setEnabled(false)
+        // Do not call the VM's snapshot/reconciliation callback from this ingress: a duplicate
+        // ended event could otherwise stage microphone teardown C before the same native ended
+        // observer has run. Native notification ingress closes realtime input independently.
+        guard ownsInterruptionEndTicket(ticket) else { return }
+        // Never enqueue the ADM marker inside the interruption notification callback: its
+        // later native observer must first enqueue the matching ended operation. A new task
+        // cannot enter this main actor until the current main-thread fanout returns.
+        interruptionEndFenceTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled,
+                  self.ownsInterruptionEndTicket(ticket) else { return }
+            guard let fence else {
+                self.failInterruptionEndFence(ticket)
+                return
+            }
+            let completed = await fence()
+            guard !Task.isCancelled,
+                  self.ownsInterruptionEndTicket(ticket) else { return }
+            self.interruptionEndFenceTask = nil
+            guard completed else {
+                self.failInterruptionEndFence(ticket)
+                return
+            }
+            self.completeInterruptionEnded(
+                shouldResume: self.interruptionEndResumeAllowed == true,
+                ticket: ticket
+            )
+        }
+    }
+
+    private func ownsInterruptionEndTicket(_ ticket: InterruptionEndTicket) -> Bool {
+        isPrepared
+            && interruptionEndTicket == ticket
+            && preparedLifetime == ticket.preparedLifetime
+            && interruptionGeneration == ticket.interruptionGeneration
+            && audioTransactionDeviceBinding == ticket.deviceBinding
+    }
+
+    private func cancelInterruptionEndFence() {
+        interruptionEndFenceTask?.cancel()
+        interruptionEndFenceTask = nil
+        interruptionEndTicket = nil
+        interruptionEndFenceIsPending = false
+        interruptionEndFenceHasFailed = false
+    }
+
+    private func resetInterruptionEndFenceLifetime() {
+        cancelInterruptionEndFence()
+        preparedLifetime = UUID()
+        interruptionGeneration = UUID()
+        interruptionEndResumeAllowed = nil
+    }
+
+    private func failInterruptionEndFence(_ ticket: InterruptionEndTicket) {
+        guard ownsInterruptionEndTicket(ticket) else { return }
+        interruptionEndFenceTask = nil
+        interruptionEndFenceHasFailed = true
+        playbackIsReady = false
+        runtimePlayoutIsReady = false
+        remoteAudioControl?.setEnabled(false)
+        revokeHostedCallPolicy()
+        playbackErrorText =
+            "Screen and control are still available. Reconnect this session to restore iPhone audio."
+        playbackDiagnosticText = Self.interruptionEndFenceFailureDiagnostic
+        // Keep the pending fence closed. No timer, stats callback, or manual audio switch may
+        // manufacture successful ordering evidence after a missing/failed native completion.
+        publishSnapshot()
+    }
+
+    private func completeInterruptionEnded(
+        shouldResume: Bool,
+        ticket: InterruptionEndTicket?
+    ) {
+        guard isPrepared else { return }
+        if let ticket, !ownsInterruptionEndTicket(ticket) { return }
         let preservedInitializedWebRTCAudioDevice =
             currentInterruptionReason == .default
         synchronizeLiveCallStateIfNeeded()
+        // A synchronous CallKit read can reenter lifecycle callbacks, start another interruption,
+        // or replace the session. Never clear that newer boundary with an older fence result.
+        if let ticket {
+            guard ownsInterruptionEndTicket(ticket) else { return }
+            interruptionEndFenceIsPending = false
+            if interruptionEndFenceHasFailed,
+               playbackDiagnosticText == Self.interruptionEndFenceFailureDiagnostic {
+                playbackErrorText = nil
+                playbackDiagnosticText = nil
+            }
+            interruptionEndFenceHasFailed = false
+        }
         microphoneInterruptionIsActive = false
         callEpochHasSeenInterruption = false
         let replacementChallenge = callActivitySnapshot.hasNonEndedCall
@@ -3995,6 +4136,7 @@ final class WorldwideAudioLifecycleController {
         publishMicrophoneCallDispositionIfChanged()
         onMacHostedCallChallengeChanged?(replacementChallenge)
         scheduleMacHostedCallPreflightRetryIfNeeded()
+        if let ticket, !ownsInterruptionEndTicket(ticket) { return }
 
         if hostedInterruptionEndedAwaitingCallEnd {
             publishSnapshot()
@@ -4028,6 +4170,7 @@ final class WorldwideAudioLifecycleController {
         hostedCallPolicyWasIssuedForCurrentInterruption = false
         hostedCallPolicyIsClosedForCurrentInterruption = false
         onAudioProofInvalidated?(false)
+        if let ticket, !ownsInterruptionEndTicket(ticket) { return }
         if preservedInitializedWebRTCAudioDevice {
             playback.prepareManualAudioDisabled()
         }
@@ -4050,7 +4193,8 @@ final class WorldwideAudioLifecycleController {
         }
         recoverPlayback(
             context: "Audio interruption recovery failed",
-            proofAlreadyInvalidated: true
+            proofAlreadyInvalidated: true,
+            interruptionEndTicket: ticket
         )
     }
 
@@ -4607,10 +4751,13 @@ final class WorldwideAudioLifecycleController {
         preservingEstablishedMicrophoneAuthorization:
             WebRTCIOSMicrophoneAuthorization? = nil,
         explicitMicrophoneResumeBoundaryID: UUID? = nil,
-        coalesceCurrentLiveRecovery: Bool = false
+        coalesceCurrentLiveRecovery: Bool = false,
+        interruptionEndTicket: InterruptionEndTicket? = nil
     ) -> Bool {
         guard isPrepared else { return false }
         synchronizeLiveCallStateIfNeeded()
+        if let interruptionEndTicket,
+           !ownsInterruptionEndTicket(interruptionEndTicket) { return false }
         let microphoneResumeBoundaryIsCurrent: Bool
         if let explicitMicrophoneResumeBoundaryID {
             if requiresExplicitResume,
@@ -4625,7 +4772,8 @@ final class WorldwideAudioLifecycleController {
         } else {
             microphoneResumeBoundaryIsCurrent = !requiresExplicitResume
         }
-        guard !isInterrupted,
+        guard !interruptionEndFenceIsPending,
+              !isInterrupted,
               hostedCallPolicy == nil,
               microphoneResumeBoundaryIsCurrent,
               !waitsForConnectedCallToEndBeforeRecovery,
@@ -5310,6 +5458,7 @@ final class WorldwideAudioLifecycleController {
         let currentTransition = expectedAudioCategoryTransition
             ?? completedAudioCategoryTransition
         return microphoneCallDisposition != .blocked
+            && !interruptionEndFenceIsPending
             && !microphoneInterruptionIsActive
             && currentTransition?.purpose != .outputOnlyMicrophone
             && pendingDeferredRecovery == nil
@@ -5629,6 +5778,7 @@ final class WorldwideAudioLifecycleController {
     /// proof. Background/Now Playing status still waits for `runtimePlayoutIsReady` above.
     private var shouldEnableRemoteAudio: Bool {
         isPrepared
+            && !interruptionEndFenceIsPending
             && playbackIsReady
             && hasRemoteAudio
             && transportIsHealthy
