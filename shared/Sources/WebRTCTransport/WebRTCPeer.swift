@@ -3197,6 +3197,10 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         native.debugMarkInterruptionEndedFailClosedForTesting()
     }
 
+    public func debugQueueInterruptionEndedForTesting() {
+        native.debugQueueInterruptionEndedForTesting()
+    }
+
     public func debugMarkHealthyPlayoutForTesting() {
         native.debugMarkHealthyPlayoutForTesting()
     }

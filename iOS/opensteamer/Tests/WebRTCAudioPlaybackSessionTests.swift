@@ -1693,6 +1693,54 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertFalse(accepted.remoteIOCreated)
     }
 
+    func testRecoveryBeforeNativeInterruptionEndNeedsFreshAuthorizationAfterEnd() {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        harness.debugMarkHealthyPlayoutForTesting()
+        harness.debugMarkInterruptedFailClosedForTesting()
+        let baseline = harness.diagnostics
+        let configurationCount = harness.configurationOperationCount
+        XCTAssertEqual(baseline.failureCode, 17)
+        XCTAssertFalse(baseline.sessionActive)
+
+        // NotificationCenter can deliver the main-queue Swift observer before
+        // the native observer queues its interruption-ended operation.
+        let earlyAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
+        harness.queueRecovery(authorization: earlyAuthorization)
+        harness.debugQueueInterruptionEndedForTesting()
+        XCTAssertEqual(harness.queuedOperationCount, 2)
+
+        XCTAssertTrue(harness.runNextQueuedOperation())
+        let rejected = harness.diagnostics
+        XCTAssertEqual(earlyAuthorization.terminalOutcome, .rejected)
+        XCTAssertEqual(earlyAuthorization.terminalGeneration, earlyAuthorization.generation)
+        XCTAssertEqual(rejected.failureCode, 17)
+        XCTAssertEqual(rejected.authorizationRejectionCount, baseline.authorizationRejectionCount + 1)
+        XCTAssertEqual(rejected.rebuildCount, baseline.rebuildCount)
+        XCTAssertEqual(harness.configurationOperationCount, configurationCount)
+        XCTAssertFalse(rejected.sessionActive)
+        XCTAssertFalse(rejected.inputBusEnabled)
+
+        XCTAssertTrue(harness.runNextQueuedOperation())
+        let ended = harness.diagnostics
+        XCTAssertEqual(ended.failureCode, 18)
+        XCTAssertTrue(ended.recoveryRequired)
+        XCTAssertFalse(ended.sessionActive)
+        XCTAssertFalse(ended.inputBusEnabled)
+        XCTAssertEqual(harness.queuedOperationCount, 0)
+        XCTAssertEqual(earlyAuthorization.terminalOutcome, .rejected)
+
+        let freshAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
+        harness.queueRecovery(authorization: freshAuthorization)
+        XCTAssertTrue(harness.runNextQueuedOperation())
+        let recovered = harness.diagnostics
+        XCTAssertTrue(freshAuthorization.hasAcceptedTerminalOutcome)
+        XCTAssertEqual(recovered.rebuildCount, baseline.rebuildCount + 1)
+        XCTAssertTrue(recovered.sessionActive)
+        XCTAssertFalse(recovered.inputBusEnabled)
+        XCTAssertEqual(recovered.failureCode, 0)
+    }
+
     // MARK: - Connected hosted-call playout recovery
 
     func testStartupConnectedCallArmIsQuiescentUntilFirstStartPlayout() {

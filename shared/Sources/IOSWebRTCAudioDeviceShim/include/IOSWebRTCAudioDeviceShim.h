@@ -828,6 +828,7 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 - (BOOL)debugStartPlayoutForTesting;
 - (void)debugMarkInterruptedFailClosedForTesting;
 - (void)debugMarkInterruptionEndedFailClosedForTesting;
+- (void)debugQueueInterruptionEndedForTesting;
 - (void)debugMarkHealthyPlayoutForTesting;
 - (void)debugMarkRouteLossForTesting;
 - (void)debugAttemptFailureOverwriteForTesting;

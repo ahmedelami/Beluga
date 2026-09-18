@@ -6029,6 +6029,13 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
     [self.device debugMarkInterruptionEndedFailClosedForTesting];
 }
 
+- (void)debugQueueInterruptionEndedForTesting {
+    [self.device
+        closeRealtimeRouteGatesAndRetireExpectedMicrophoneRouteChangeForSystemEvent];
+    [self.device scheduleSystemEvent:ASSystemAudioEventInterruptionEnded
+                        routeReason:AVAudioSessionRouteChangeReasonUnknown];
+}
+
 - (void)debugMarkHealthyPlayoutForTesting {
     [self.device debugMarkHealthyPlayoutForTesting];
 }
