@@ -5364,6 +5364,73 @@ static uint64_t ASAllocatePlayoutRecoveryAuthorizationGeneration(void) {
     return [self.device debugAppAudioPolicyCarrierOrderingForTesting];
 }
 
+- (NSDictionary<NSString *, NSNumber *> *)debugRecoveryStagedBeforeInterruptionEndForTesting {
+    [self.device debugMarkHealthyPlayoutForTesting];
+    [self.device debugMarkInterruptedFailClosedForTesting];
+    ASIOSStereoPlayoutDiagnostics baseline = self.device.diagnostics;
+    ASIOSStereoPlayoutRecoveryAuthorization *authorization =
+        [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+    BOOL targetBound = [authorization bindRequestedInputRequired:NO];
+    uint64_t tagGeneration = [self.device
+        stageAppAudioPolicyOperationWithIdentifier:[NSUUID UUID]
+        authorityEpoch:1
+        operationRevision:1
+        recoveryAuthorization:authorization
+        nativeTransactionIdentifier:0
+        inputRequired:NO];
+
+    // Model synchronous Swift staging, followed by native ended handling,
+    // followed by the later proof task's exact B submission. Unlike the
+    // adverse queue-order test, ended executes before B, not after it.
+    [self debugQueueInterruptionEndedForTesting];
+    BOOL endedRan = [self runNextQueuedOperation];
+    ASIOSStereoPlayoutDiagnostics afterEnd = self.device.diagnostics;
+    [self.device requestPlayoutRecoveryWithAuthorization:authorization
+        appOperationTagGeneration:tagGeneration];
+    BOOL recoveryRan = [self runNextQueuedOperation];
+    ASIOSStereoPlayoutDiagnostics rejected = self.device.diagnostics;
+
+    ASIOSStereoPlayoutRecoveryAuthorization *freshAuthorization =
+        [[ASIOSStereoPlayoutRecoveryAuthorization alloc] init];
+    BOOL freshTargetBound =
+        [freshAuthorization bindRequestedInputRequired:NO];
+    uint64_t freshTagGeneration = [self.device
+        stageAppAudioPolicyOperationWithIdentifier:[NSUUID UUID]
+        authorityEpoch:1
+        operationRevision:2
+        recoveryAuthorization:freshAuthorization
+        nativeTransactionIdentifier:0
+        inputRequired:NO];
+    [self.device requestPlayoutRecoveryWithAuthorization:freshAuthorization
+        appOperationTagGeneration:freshTagGeneration];
+    BOOL freshRecoveryRan = [self runNextQueuedOperation];
+    ASIOSStereoPlayoutDiagnostics recovered = self.device.diagnostics;
+    return @{
+        @"targetBound": @(targetBound),
+        @"tagGeneration": @(tagGeneration),
+        @"endedRan": @(endedRan),
+        @"afterEndFailure": @(afterEnd.failureCode),
+        @"recoveryRan": @(recoveryRan),
+        @"rejected": @(authorization.terminalOutcome
+            == ASIOSStereoPlayoutRecoveryTerminalOutcomeRejected),
+        @"terminalMatchesAuthorization": @(authorization.terminalGeneration
+            == authorization.generation),
+        @"rejectionCountDelta": @(rejected.recoveryAuthorizationRejectionCount
+            - baseline.recoveryAuthorizationRejectionCount),
+        @"noRebuild": @(rejected.recoveryRebuildCount
+            == baseline.recoveryRebuildCount),
+        @"remainedClosed": @(!rejected.sessionActive && !rejected.inputBusEnabled),
+        @"freshTargetBound": @(freshTargetBound),
+        @"freshTagGeneration": @(freshTagGeneration),
+        @"freshRecoveryRan": @(freshRecoveryRan),
+        @"freshAccepted": @(freshAuthorization.terminalOutcome
+            == ASIOSStereoPlayoutRecoveryTerminalOutcomeAccepted),
+        @"freshPolicyMatches": @(freshAuthorization.policyMatchesRequestedTarget),
+        @"freshSessionActive": @(recovered.sessionActive),
+        @"inputRemainedClosed": @(!recovered.inputBusEnabled),
+    };
+}
+
 - (BOOL)debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting {
     [self.device debugMarkHealthyPlayoutForTesting];
     ASIOSStereoPlayoutRecoveryAuthorization *authorization =

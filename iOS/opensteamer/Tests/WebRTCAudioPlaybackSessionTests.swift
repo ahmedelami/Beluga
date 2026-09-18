@@ -1703,8 +1703,8 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertEqual(baseline.failureCode, 17)
         XCTAssertFalse(baseline.sessionActive)
 
-        // NotificationCenter can deliver the main-queue Swift observer before
-        // the native observer queues its interruption-ended operation.
+        // Inject an adverse native queue order directly. This characterizes
+        // fail-closed behavior, not production AVAudioSession notification order.
         let earlyAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
         harness.queueRecovery(authorization: earlyAuthorization)
         harness.debugQueueInterruptionEndedForTesting()
@@ -1739,6 +1739,26 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(recovered.sessionActive)
         XCTAssertFalse(recovered.inputBusEnabled)
         XCTAssertEqual(recovered.failureCode, 0)
+    }
+
+    func testRecoveryStagedBeforeNativeInterruptionEndLosesExactTagBeforeExecution() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRecoveryStagedBeforeInterruptionEndForTesting()
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+        for key in ["targetBound", "endedRan", "recoveryRan", "rejected",
+                    "terminalMatchesAuthorization", "noRebuild", "remainedClosed",
+                    "freshTargetBound", "freshRecoveryRan", "freshAccepted",
+                    "freshPolicyMatches", "freshSessionActive", "inputRemainedClosed"] {
+            XCTAssertTrue(try value(key).boolValue, key)
+        }
+        XCTAssertGreaterThan(try value("tagGeneration").uint64Value, 0)
+        XCTAssertEqual(try value("afterEndFailure").intValue, 18)
+        XCTAssertEqual(try value("rejectionCountDelta").intValue, 1)
+        XCTAssertGreaterThan(try value("freshTagGeneration").uint64Value,
+                             try value("tagGeneration").uint64Value)
     }
 
     // MARK: - Connected hosted-call playout recovery

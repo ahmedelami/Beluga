@@ -774,6 +774,7 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 - (NSDictionary<NSString *, NSNumber *> *)debugOutputOnlyPolicyRepairForTesting;
 - (BOOL)debugAppAudioPolicyCarrierOrderingForTesting;
 - (BOOL)debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugRecoveryStagedBeforeInterruptionEndForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting;

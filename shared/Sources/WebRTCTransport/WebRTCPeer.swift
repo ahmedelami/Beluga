@@ -2985,6 +2985,10 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         native.debugAcceptedRecoveryRetiresUnconsumedStagedTagForTesting()
     }
 
+    public func debugRecoveryStagedBeforeInterruptionEndForTesting() -> [String: NSNumber] {
+        native.debugRecoveryStagedBeforeInterruptionEndForTesting()
+    }
+
     public func debugRetryAfterFailedInitialPlayoutForTesting()
         -> [String: NSNumber]
     {
