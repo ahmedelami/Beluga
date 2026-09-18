@@ -8241,6 +8241,264 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         await session.peer.close()
     }
 
+    func testAutomaticMicrophoneRequestsDeferredPermissionAfterInterruptionRecovery() async throws {
+        let session = try makeAutomaticMicrophonePolicyFixture(
+            provenance: .authenticatedPairedCoordinatorHandoff
+        )
+        let permissionRequested = expectation(
+            description: "deferred microphone permission requested after recovery"
+        )
+        let microphoneCommitted = expectation(
+            description: "microphone committed after deferred permission"
+        )
+        var permissionRequestCount = 0
+        var enableCount = 0
+        var nativeAuthorization: WebRTCIOSMicrophoneAuthorization?
+        var disableCount = 0
+        session.viewModel.debugInstallIPhoneMicrophonePermissionRequester {
+            permissionRequestCount += 1
+            permissionRequested.fulfill()
+            return true
+        }
+        session.viewModel.debugInstallIPhoneMicrophoneNativeHandlers(
+            enable: { authorization in
+                enableCount += 1
+                nativeAuthorization = authorization
+            },
+            disable: { authorization, _ in
+                disableCount += 1
+                if authorization == nil || nativeAuthorization === authorization {
+                    nativeAuthorization = nil
+                }
+                return true
+            }
+        )
+        session.viewModel.debugInstallIPhoneMicrophoneDidCommitObserver { authorization in
+            XCTAssertTrue(nativeAuthorization === authorization)
+            microphoneCommitted.fulfill()
+        }
+        // Native admission is simulated, so its successor playout proof must observe matching
+        // duplex diagnostics instead of the intentionally unconfigured race-test peer.
+        installProductionShapedIOSRecoveryHarness(on: session.viewModel, peer: session.peer)
+
+        session.fixture.events.onInterruptionBegan?(.unavailable)
+        session.viewModel.handleAppBecameActive()
+        await session.viewModel
+            .debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+
+        XCTAssertTrue(session.viewModel.microphoneIntentEnabled)
+        XCTAssertEqual(permissionRequestCount, 0)
+        XCTAssertEqual(enableCount, 0)
+        XCTAssertFalse(session.viewModel.isMicrophoneSending)
+
+        // The app and transport remain healthy throughout recovery. No extra foreground,
+        // transport, or manual-toggle event is available to restart deferred permission.
+        session.fixture.events.onInterruptionEnded?(true)
+        XCTAssertTrue(session.fixture.controller.microphoneActivationIsAllowed())
+        await fulfillment(
+            of: [permissionRequested, microphoneCommitted],
+            timeout: 2
+        )
+
+        XCTAssertEqual(permissionRequestCount, 1)
+        XCTAssertEqual(enableCount, 1)
+        let authorization = try XCTUnwrap(
+            session.viewModel.debugIPhoneMicrophoneAuthorizationForTests
+        )
+        XCTAssertTrue(nativeAuthorization === authorization)
+        XCTAssertTrue(authorization.isValid)
+        XCTAssertEqual(disableCount, 0)
+        XCTAssertTrue(session.viewModel.isMicrophoneSending)
+        XCTAssertEqual(session.viewModel.microphoneStateText, "On")
+
+        session.viewModel.disconnect()
+        await session.peer.close()
+    }
+
+    func testDeferredMicrophonePermissionCoalescesSnapshotsAndDenialDoesNotRetry() async throws {
+        let session = try makeAutomaticMicrophonePolicyFixture(
+            provenance: .authenticatedPairedCoordinatorHandoff
+        )
+        let permissionRequested = expectation(description: "one deferred permission request")
+        let permissionResolved = expectation(description: "deferred permission denied")
+        let permissionGate = AudioNonCooperativeGate<Bool>()
+        var permissionRequestCount = 0
+        session.viewModel.debugInstallIPhoneMicrophonePermissionRequester {
+            permissionRequestCount += 1
+            permissionRequested.fulfill()
+            return await permissionGate.wait()
+        }
+        session.viewModel.debugInstallIPhoneMicrophonePermissionResolutionObserver {
+            XCTAssertFalse($0)
+            permissionResolved.fulfill()
+        }
+        session.fixture.events.onInterruptionBegan?(.unavailable)
+        session.viewModel.handleAppBecameActive()
+        await session.viewModel
+            .debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        session.fixture.events.onInterruptionEnded?(true)
+        for _ in 0..<3 {
+            session.fixture.controller.updateRuntimePlayout(isReady: true)
+        }
+        await fulfillment(of: [permissionRequested], timeout: 2)
+        await permissionGate.waitUntilBlocked()
+        for _ in 0..<3 {
+            session.fixture.controller.updateRuntimePlayout(isReady: true)
+        }
+        await session.viewModel.debugDeferredIPhoneMicrophonePermissionTaskForTests?.value
+        XCTAssertEqual(permissionRequestCount, 1)
+
+        await permissionGate.open(false)
+        await fulfillment(of: [permissionResolved], timeout: 2)
+        for _ in 0..<3 {
+            session.fixture.controller.updateRuntimePlayout(isReady: true)
+        }
+        await session.viewModel.debugDeferredIPhoneMicrophonePermissionTaskForTests?.value
+        XCTAssertEqual(permissionRequestCount, 1)
+        XCTAssertFalse(session.viewModel.microphoneIntentEnabled)
+        XCTAssertFalse(session.viewModel.isMicrophoneSending)
+        XCTAssertEqual(session.viewModel.microphoneStateText, "Permission denied")
+
+        session.viewModel.disconnect()
+        await session.peer.close()
+    }
+
+    func testDeferredMicrophonePermissionCannotCrossRevocationBoundaries() async throws {
+        for boundary in ["manualOff", "background", "replacement", "transport", "denial", "noResume"] {
+            let session = try makeAutomaticMicrophonePolicyFixture(
+                provenance: .authenticatedPairedCoordinatorHandoff
+            )
+            var permissionRequestCount = 0
+            var replacementPeer: WebRTCPeer?
+            session.viewModel.debugInstallIPhoneMicrophonePermissionRequester {
+                permissionRequestCount += 1
+                return false
+            }
+            session.fixture.events.onInterruptionBegan?(.unavailable)
+            session.viewModel.handleAppBecameActive()
+            await session.viewModel
+                .debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+            session.fixture.events.onInterruptionEnded?(boundary != "noResume")
+            let deferredPermission =
+                session.viewModel.debugDeferredIPhoneMicrophonePermissionTaskForTests
+
+            switch boundary {
+            case "manualOff":
+                session.viewModel.toggleIPhoneMicrophone()
+            case "background":
+                session.viewModel.handleAppEnteredBackground()
+            case "replacement":
+                let replacement = try makeAudioRacePeer()
+                replacementPeer = replacement
+                session.viewModel.debugInstallScreenSessionForTests(peer: replacement)
+            case "transport":
+                session.viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+            case "denial":
+                session.viewModel.debugDenyIPhoneMicrophonePermissionForTests()
+            case "noResume":
+                XCTAssertTrue(session.fixture.controller.snapshot.requiresExplicitResume)
+            default:
+                XCTFail("Unexpected boundary")
+            }
+
+            await deferredPermission?.value
+            XCTAssertEqual(permissionRequestCount, 0, "Queued permission crossed \(boundary)")
+            XCTAssertFalse(session.viewModel.isMicrophoneSending)
+            XCTAssertNil(session.viewModel.debugIPhoneMicrophoneAuthorizationForTests)
+            session.viewModel.disconnect()
+            await session.peer.close()
+            if let replacementPeer {
+                await replacementPeer.close()
+            }
+        }
+    }
+
+    func testDeferredMicrophonePermissionRechecksIntentAfterReentrantCallStateRead() async throws {
+        let session = try makeAutomaticMicrophonePolicyFixture(
+            provenance: .authenticatedPairedCoordinatorHandoff
+        )
+        var permissionRequestCount = 0
+        var reentrantReadCount = 0
+        session.viewModel.debugInstallIPhoneMicrophonePermissionRequester {
+            permissionRequestCount += 1
+            return false
+        }
+        session.fixture.events.onInterruptionBegan?(.unavailable)
+        session.viewModel.handleAppBecameActive()
+        await session.viewModel
+            .debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        session.fixture.events.onInterruptionEnded?(true)
+        session.fixture.callActivity.onLiveSnapshotRead = {
+            session.fixture.callActivity.onLiveSnapshotRead = nil
+            reentrantReadCount += 1
+            session.viewModel.toggleIPhoneMicrophone()
+        }
+
+        await session.viewModel.debugDeferredIPhoneMicrophonePermissionTaskForTests?.value
+        XCTAssertEqual(reentrantReadCount, 1)
+        XCTAssertEqual(permissionRequestCount, 0)
+        XCTAssertFalse(session.viewModel.microphoneIntentEnabled)
+        XCTAssertFalse(session.viewModel.isMicrophoneSending)
+        session.viewModel.disconnect()
+        await session.peer.close()
+    }
+
+    func testQueuedMicrophonePermissionDoesNotPromptAfterRevocation() async throws {
+        for boundary in ["manualOff", "transport", "background", "interruption"] {
+            let session = try makeAutomaticMicrophonePolicyFixture(
+                provenance: .authenticatedPairedCoordinatorHandoff
+            )
+            let resumedPermissionRequested = boundary == "manualOff"
+                ? nil : expectation(description: "permission resumes after \(boundary)")
+            var permissionRequestCount = 0
+            session.viewModel.debugInstallIPhoneMicrophonePermissionRequester {
+                permissionRequestCount += 1
+                resumedPermissionRequested?.fulfill()
+                return false
+            }
+            session.fixture.controller.transportBecameHealthy()
+            session.viewModel.handleAppBecameActive()
+            let permissionTask = try XCTUnwrap(
+                session.viewModel.debugIPhoneMicrophonePermissionTaskForTests
+            )
+            switch boundary {
+            case "manualOff":
+                session.viewModel.toggleIPhoneMicrophone()
+            case "transport":
+                session.viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+            case "background":
+                session.viewModel.handleAppEnteredBackground()
+            case "interruption":
+                session.fixture.events.onInterruptionBegan?(.unavailable)
+            default:
+                XCTFail("Unexpected boundary")
+            }
+            await permissionTask.value
+
+            XCTAssertEqual(permissionRequestCount, 0, "Permission request crossed \(boundary)")
+            XCTAssertFalse(session.viewModel.isMicrophoneSending)
+            switch boundary {
+            case "manualOff":
+                XCTAssertFalse(session.viewModel.microphoneIntentEnabled)
+            case "transport":
+                await session.viewModel
+                    .debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+            case "background":
+                session.viewModel.handleAppBecameActive()
+            case "interruption":
+                session.fixture.events.onInterruptionEnded?(true)
+            default:
+                XCTFail("Unexpected boundary")
+            }
+            if let resumedPermissionRequested {
+                await fulfillment(of: [resumedPermissionRequested], timeout: 2)
+                XCTAssertEqual(permissionRequestCount, 1)
+            }
+            session.viewModel.disconnect()
+            await session.peer.close()
+        }
+    }
+
     func testAutomaticMicrophoneDefersWhileAppIsInactive() async throws {
         let session = try makeAutomaticMicrophonePolicyFixture(
             provenance: .authenticatedPairedCoordinatorHandoff
@@ -15827,7 +16085,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         XCTAssertFalse(fixture.remoteAudio.isEnabled)
         XCTAssertEqual(
             fixture.controller.snapshot.errorText,
-            "The iPhone audio route changed outside opensteamer’s authorized microphone policy."
+            "The iPhone audio route changed outside Beluga’s authorized microphone policy."
         )
 
         let recoverCountBeforeFreshRetry = fixture.playback.recoverCount
@@ -23183,8 +23441,10 @@ private final class CallActivityStub: WorldwideCallActivityObserving {
     private(set) var snapshot: WorldwideCallActivitySnapshot
     private var stagedLiveSnapshot:
         WorldwideCallActivitySnapshot?
+    var onLiveSnapshotRead: (() -> Void)?
     var liveSnapshot: WorldwideCallActivitySnapshot {
-        stagedLiveSnapshot ?? snapshot
+        onLiveSnapshotRead?()
+        return stagedLiveSnapshot ?? snapshot
     }
     var onSnapshotChanged:
         ((WorldwideCallActivitySnapshot) -> Void)?

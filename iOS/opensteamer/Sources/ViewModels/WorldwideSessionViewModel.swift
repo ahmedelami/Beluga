@@ -1544,6 +1544,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var microphoneOutputOnlyToken:
         WebRTCIOSOutputOnlyMicrophoneToken?
     private var microphonePermissionTask: Task<Void, Never>?
+    private var microphonePermissionReconciliationTask: Task<Void, Never>?
+    private var microphonePermissionReconciliationID: UUID?
     private var microphoneTask: Task<Void, Never>?
     /// Exact view-model ownership for an asynchronous native output-only teardown. A route-loss
     /// retry queues behind this task so recovery cannot race the retiring RemoteIO write.
@@ -1585,6 +1587,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var sessionGeneration = UUID() {
         didSet {
             if oldValue != sessionGeneration {
+                cancelDeferredIPhoneMicrophonePermission()
                 audioClientDiagnosticsTask?.cancel()
                 audioClientDiagnosticsTask = nil
                 audioDiagnosticsSampleTask?.cancel()
@@ -1790,6 +1793,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             updateAudioDiagnosticsPolicyFacts()
             audioDiagnostics.playbackChanged(snapshot, at: Self.audioDiagnosticsNow())
             reconcileIPhoneMicrophone(for: snapshot)
+            scheduleDeferredIPhoneMicrophonePermissionIfNeeded()
         }
         audioLifecycle.onDiagnosticsAuthorityFailure = { [weak self] decision in
             guard let self else { return }
@@ -1877,6 +1881,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     deinit {
+        microphonePermissionReconciliationTask?.cancel()
         audioClientDiagnosticsTask?.cancel()
         audioDiagnosticsSampleTask?.cancel()
         let remoteMediaCommandOwner = remoteMediaCommandOwner
@@ -2682,14 +2687,76 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneError = nil
     }
 
+    private func cancelDeferredIPhoneMicrophonePermission() {
+        microphonePermissionReconciliationTask?.cancel()
+        microphonePermissionReconciliationTask = nil
+        microphonePermissionReconciliationID = nil
+    }
+
+    private func scheduleDeferredIPhoneMicrophonePermissionIfNeeded() {
+        guard sessionOwnsAudio,
+              microphoneIntentEnabled,
+              !microphonePermissionGranted,
+              microphonePermissionTask == nil,
+              microphonePermissionReconciliationTask == nil,
+              applicationIsActive,
+              canViewScreen,
+              !recoveryProofRequired,
+              audioLifecycle.snapshot.errorText == nil,
+              let expectedPeer = peer else { return }
+
+        let reconciliationID = UUID()
+        let expectedSessionGeneration = sessionGeneration
+        let expectedPermissionOperationGeneration =
+            microphonePermissionOperationGeneration
+        microphonePermissionReconciliationID = reconciliationID
+        // A recovered lifecycle snapshot can unblock the first permission request. Wait until
+        // its synchronous publication finishes; keep one owner through any reentrant CallKit read.
+        microphonePermissionReconciliationTask = Task { @MainActor [weak self, weak expectedPeer] in
+            guard let self,
+                  self.microphonePermissionReconciliationID == reconciliationID else { return }
+            defer {
+                if self.microphonePermissionReconciliationID == reconciliationID {
+                    self.microphonePermissionReconciliationTask = nil
+                    self.microphonePermissionReconciliationID = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  let expectedPeer,
+                  self.peer === expectedPeer,
+                  self.sessionGeneration == expectedSessionGeneration,
+                  self.microphonePermissionOperationGeneration
+                    == expectedPermissionOperationGeneration,
+                  self.sessionOwnsAudio,
+                  self.microphoneIntentEnabled,
+                  !self.microphonePermissionGranted,
+                  self.microphonePermissionTask == nil,
+                  self.applicationIsActive,
+                  self.canViewScreen,
+                  !self.recoveryProofRequired,
+                  self.audioLifecycle.snapshot.errorText == nil else { return }
+            self.continueIPhoneMicrophoneEnablementIfPossible()
+        }
+    }
+
     private func continueIPhoneMicrophoneEnablementIfPossible() {
+        let expectedSessionGeneration = sessionGeneration
+        let expectedPeer = peer
+        let expectedPermissionOperationGeneration =
+            microphonePermissionOperationGeneration
         guard microphoneIntentEnabled else { return }
         guard !microphoneAwaitsPostCallRecovery else {
             microphoneStateText = "Paused — restoring microphone"
             return
         }
-        guard !microphoneIsBlockedByCall,
-              audioLifecycle.microphoneActivationIsAllowed() else {
+        let activationIsAllowed = !microphoneIsBlockedByCall
+            && audioLifecycle.microphoneActivationIsAllowed()
+        guard sessionGeneration == expectedSessionGeneration,
+              peer === expectedPeer,
+              microphonePermissionOperationGeneration
+                == expectedPermissionOperationGeneration,
+              microphoneIntentEnabled else { return }
+        guard activationIsAllowed else {
             microphoneStateText = microphoneActivationBlockedStateText
             return
         }
@@ -2708,14 +2775,43 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         microphoneStateText = "Requesting permission"
         let permissionGeneration = UUID()
-        let expectedSessionGeneration = sessionGeneration
         microphonePermissionOperationGeneration = permissionGeneration
         microphonePermissionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.microphonePermissionOperationGeneration == permissionGeneration,
+                  self.sessionGeneration == expectedSessionGeneration,
+                  self.peer === expectedPeer,
+                  self.microphoneIntentEnabled else { return }
+            guard self.applicationIsActive else {
+                self.microphonePermissionTask = nil
+                self.microphoneStateText = "Paused — waiting for app"
+                return
+            }
+            let activationIsAllowed = !self.microphoneIsBlockedByCall
+                && self.audioLifecycle.microphoneActivationIsAllowed()
+            guard !Task.isCancelled,
+                  self.microphonePermissionOperationGeneration == permissionGeneration,
+                  self.sessionGeneration == expectedSessionGeneration,
+                  self.peer === expectedPeer,
+                  self.microphoneIntentEnabled else { return }
+            guard self.applicationIsActive, activationIsAllowed else {
+                self.microphonePermissionTask = nil
+                self.microphoneStateText = self.applicationIsActive
+                    ? self.microphoneActivationBlockedStateText
+                    : "Paused — waiting for app"
+                return
+            }
+            guard self.canViewScreen, !self.recoveryProofRequired else {
+                self.microphonePermissionTask = nil
+                self.microphoneStateText = "Paused — waiting for healthy connection"
+                return
+            }
             let granted = await self.requestIPhoneMicrophonePermission()
             guard !Task.isCancelled,
                   self.microphonePermissionOperationGeneration == permissionGeneration,
                   self.sessionGeneration == expectedSessionGeneration,
+                  self.peer === expectedPeer,
                   self.microphoneIntentEnabled else {
                 return
             }
@@ -3370,6 +3466,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
 
         if !preserveIntent {
+            cancelDeferredIPhoneMicrophonePermission()
             microphoneIntentEnabled = false
             microphoneAdmissionFailedSessionGeneration = nil
             microphoneAdmissionDeferredUntilTransportProof = nil
@@ -7771,6 +7868,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     private func tearDown(reason: RemoteSessionEndReason) {
+        cancelDeferredIPhoneMicrophonePermission()
         let retiringSessionOwnedAudio = sessionOwnsAudio
         invalidateRawMicrophoneOracle()
         ordinaryPlayoutLivenessTracker.reset()
@@ -11416,6 +11514,14 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     func debugCacheIPhoneMicrophonePermissionForTests() {
         microphonePermissionGranted = true
+    }
+
+    var debugDeferredIPhoneMicrophonePermissionTaskForTests: Task<Void, Never>? {
+        microphonePermissionReconciliationTask
+    }
+
+    var debugIPhoneMicrophonePermissionTaskForTests: Task<Void, Never>? {
+        microphonePermissionTask
     }
 
     func debugIOSPlayoutInputPolicyMatchesForTests(
