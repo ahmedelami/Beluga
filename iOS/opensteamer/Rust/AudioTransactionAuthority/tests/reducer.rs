@@ -36,6 +36,137 @@ const fn input_target() -> Target {
     }
 }
 
+const fn ordinary_raw_input_target() -> Target {
+    Target {
+        options: Target::ORDINARY_RAW_MICROPHONE_OPTIONS,
+        ..input_target()
+    }
+}
+
+#[test]
+fn ordinary_raw_microphone_effective_sharing_preserves_requested_and_observed_values() {
+    for effective_policy in [0, 1] {
+        let mut reducer = AuthorityReducer::new(1).unwrap();
+        let target = ordinary_raw_input_target();
+        let (operation, proof) = arm(&mut reducer, 1, target, 0);
+        let mut receipt = observation_receipt(
+            operation, target, 1,
+            NativeObservationReceipt::DISPOSITION_EXPECTED_CURRENT_APP_OPERATION,
+        );
+        receipt.observed_target.route_sharing_policy = effective_policy;
+        assert_eq!(receipt.expected_target.route_sharing_policy, 0);
+        assert_eq!(
+            reducer.observe(receipt),
+            Decision::ObservationAccepted { operation, proof }
+        );
+        // Even accepted policy evidence cannot complete a microphone operation by itself.
+        assert_eq!(
+            reducer.resolve_proof(proof, ProofOutcome::Accepted),
+            Decision::WaitingForNativeAcknowledgement(operation)
+        );
+        assert_eq!(
+            reducer.acknowledge_native(native_receipt(operation, NativeOutcome::Rejected, true)),
+            Decision::FailedClosed(Some(operation))
+        );
+        assert_eq!(receipt.observed_target.route_sharing_policy, effective_policy);
+    }
+}
+
+#[test]
+fn ordinary_raw_microphone_profile_rejects_other_policies_and_all_tuple_or_owner_changes() {
+    let mutations: &[fn(&mut NativeObservationReceipt)] = &[
+        |r| r.observed_target.route_sharing_policy = -1,
+        |r| r.observed_target.route_sharing_policy = 2,
+        |r| r.observed_target.route_sharing_policy = 3,
+        |r| r.observed_target.route_sharing_policy = i64::MAX,
+        |r| r.observed_target.options = 0,
+        |r| r.observed_target.mode = 2,
+        |r| r.observed_target.category = Target::CATEGORY_PLAYBACK,
+        |r| r.observed_target.input_required = 0,
+        |r| r.expected_target.route_sharing_policy = 1,
+        |r| r.app_operation.operation_revision += 1,
+        |r| r.app_operation.authority_epoch += 1,
+        |r| r.app_operation_tag_generation = 0,
+        |r| r.observed_configuration_generation += 1,
+        |r| r.observed_system_audio_generation += 1,
+        |r| r.device_instance_generation += 1,
+        |r| r.policy_tuple_is_exact = 0,
+        |r| r.transaction_evidence_is_exact = 0,
+    ];
+    for (index, mutate) in mutations.iter().enumerate() {
+        let mut reducer = AuthorityReducer::new(1).unwrap();
+        let target = ordinary_raw_input_target();
+        let (operation, _) = arm(&mut reducer, index as u64 + 1, target, 0);
+        let mut receipt = observation_receipt(
+            operation, target, 1,
+            NativeObservationReceipt::DISPOSITION_EXPECTED_CURRENT_APP_OPERATION,
+        );
+        receipt.observed_target.route_sharing_policy = 1;
+        mutate(&mut receipt);
+        assert_eq!(reducer.observe(receipt), Decision::FailedClosed(Some(operation)),
+                   "mutation {index} escaped the exact owner/tuple proof");
+    }
+}
+
+#[test]
+fn ordinary_microphone_sharing_profile_does_not_expand_other_targets() {
+    let strict_targets = [
+        output_target(),
+        Target { route_sharing_policy: 1, ..output_target() },
+        Target { options: 1, ..output_target() }, // Hosted-call MixWithOthers.
+        input_target(), // A different options tuple is not the ordinary raw profile.
+    ];
+    for (index, target) in strict_targets.into_iter().enumerate() {
+        let mut reducer = AuthorityReducer::new(1).unwrap();
+        let (operation, _) = arm(&mut reducer, index as u64 + 1, target, 0);
+        let mut receipt = observation_receipt(
+            operation, target, 1,
+            NativeObservationReceipt::DISPOSITION_EXPECTED_CURRENT_APP_OPERATION,
+        );
+        receipt.observed_target.route_sharing_policy = 1 - target.route_sharing_policy;
+        assert_eq!(reducer.observe(receipt), Decision::FailedClosed(Some(operation)));
+    }
+}
+
+#[test]
+fn later_ordinary_microphone_sharing_alias_requires_identical_transaction_provenance() {
+    for initial in [0, 1] {
+        let mut reducer = AuthorityReducer::new(1).unwrap();
+        let target = ordinary_raw_input_target();
+        let (operation, _) = arm(&mut reducer, 1, target, 0);
+        let mut first = observation_receipt(
+            operation, target, 1,
+            NativeObservationReceipt::DISPOSITION_EXPECTED_CURRENT_APP_OPERATION,
+        );
+        first.observed_target.route_sharing_policy = initial;
+        assert!(matches!(reducer.observe(first), Decision::ObservationAccepted { .. }));
+        let before = reducer.snapshot();
+        let mut later = first;
+        later.notification_sequence += 1;
+        later.observed_at_nanoseconds += 1;
+        later.observed_target.route_sharing_policy = 1 - initial;
+        assert_eq!(reducer.observe(later), Decision::Ignored {
+            reason: IgnoreReason::ExactDuplicate, operation: Some(operation), blocker: None,
+        });
+        assert_eq!(reducer.snapshot(), before);
+
+        let mut changed_identity = later;
+        changed_identity.app_operation_tag_generation += 1;
+        assert_eq!(reducer.observe(changed_identity), Decision::FailedClosed(Some(operation)));
+    }
+    let mut reducer = AuthorityReducer::new(1).unwrap();
+    let target = ordinary_raw_input_target();
+    let (operation, _) = arm(&mut reducer, 1, target, 0);
+    let first = observation_receipt(
+        operation, target, 1,
+        NativeObservationReceipt::DISPOSITION_EXPECTED_CURRENT_APP_OPERATION,
+    );
+    assert!(matches!(reducer.observe(first), Decision::ObservationAccepted { .. }));
+    let mut same_sequence_changed_value = first;
+    same_sequence_changed_value.observed_target.route_sharing_policy = 1;
+    assert_eq!(reducer.observe(same_sequence_changed_value), Decision::FailedClosed(Some(operation)));
+}
+
 fn arm(
     reducer: &mut AuthorityReducer,
     id: u64,

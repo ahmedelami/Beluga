@@ -198,7 +198,8 @@ struct IOSAudioDiagnosticsJournal {
             // native cause is replaced, and no policy identity is invented by enrichment.
             failureSnapshot = historical
             failureObservedAt = now
-        } else if let retainedContext = failureSnapshot?.native?.failureContext,
+        } else if !(failureSnapshot?.authorityFailureCode.map { (301...329).contains($0) } ?? false),
+                  let retainedContext = failureSnapshot?.native?.failureContext,
                   NativeFailureIdentity(retainedContext) == identity {
             var retained = agedFailureSnapshot(at: now)
             retained?.authorityFailureCode = rejection.code
@@ -211,6 +212,7 @@ struct IOSAudioDiagnosticsJournal {
 
     private static func isControllerOnlyPlaceholder(_ evidence: WebRTCAudioClientSnapshot?) -> Bool {
         guard let evidence else { return false }
+        if let code = evidence.authorityFailureCode, (301...329).contains(code) { return false }
         guard let native = evidence.native else { return true }
         return native.failureContext == nil && native.failureCode == 0
             && native.lastLifecycleStatus == 0 && native.lastPlayoutStatus == 0
@@ -289,13 +291,31 @@ struct IOSAudioDiagnosticsJournal {
 
     mutating func authorityFailure(_ decision: AudioTransactionDecision, at now: UInt64) {
         guard let code = Self.authorityFailureCode(decision) else { return }
+        if let existing = snapshot.authorityFailureCode,
+           code == 201 || (301...329).contains(existing) {
+            return
+        }
         snapshot.authorityFailureCode = code
         snapshot.authorization = .rejected
         fail(phase: .authorization, at: now)
     }
 
+    mutating func categoryObservationFailure(_ code: UInt16, at now: UInt64) {
+        guard (301...329).contains(code),
+              snapshot.authorityFailureCode == nil || snapshot.authorityFailureCode == 201 else { return }
+        snapshot.authorityFailureCode = code
+        snapshot.authorization = .rejected
+        if failureSnapshot?.audioPolicyID == snapshot.audioPolicyID,
+           failureSnapshot?.recoveryAttempt == snapshot.recoveryAttempt,
+           failureSnapshot?.authorityFailureCode == 201 {
+            failureSnapshot?.authorityFailureCode = code
+        }
+        fail(phase: .authorization, at: now)
+    }
+
     // Stable diagnostic codebook: reducer rejection 1...12, runtime 101...105,
-    // failed-closed 201. Unknown ABI values never become arbitrary wire strings.
+    // failed-closed 201; native category evidence 301...329. Unknown ABI values never
+    // become arbitrary wire strings. These bounded codes work with deployed v1 hosts.
     static func authorityFailureCode(_ decision: AudioTransactionDecision) -> UInt16? {
         switch decision {
         case .rejected(let reason):
@@ -1802,6 +1822,11 @@ final class WorldwideSessionViewModel: ObservableObject {
             guard let self else { return }
             updateAudioDiagnosticsPolicyFacts()
             audioDiagnostics.authorityFailure(decision, at: Self.audioDiagnosticsNow())
+        }
+        audioLifecycle.onDiagnosticsCategoryObservationFailure = { [weak self] code in
+            guard let self else { return }
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.categoryObservationFailure(code, at: Self.audioDiagnosticsNow())
         }
         audioLifecycle.onDiagnosticsBoundary = { [weak self] kind in
             guard let self else { return }
@@ -10054,6 +10079,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             && !diagnostics.categoryOptionsAreEmpty
             && diagnostics.categoryOptionsAreMixWithOthers
             && diagnostics.routeSharingPolicyIsDefault
+            && !diagnostics.routeSharingPolicyIsLongFormAudio
             && diagnostics.hasOutputRoute
             && diagnostics.hostedCallMode
             && diagnostics.audioUnitSubType == kAudioUnitSubType_RemoteIO

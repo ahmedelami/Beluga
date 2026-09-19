@@ -215,6 +215,7 @@ enum WorldwideIPhoneMicrophoneOutputOnlyCompletion {
 final class WorldwideAudioLifecycleController {
     var onSnapshotChanged: ((WorldwideAudioLifecycleSnapshot) -> Void)?
     var onDiagnosticsAuthorityFailure: ((AudioTransactionDecision) -> Void)?
+    var onDiagnosticsCategoryObservationFailure: ((UInt16) -> Void)?
     var onDiagnosticsBoundary: ((WebRTCAudioClientEventKind) -> Void)?
     /// The custom WebRTC audio device owns AVAudioSession/RemoteIO. App lifecycle and route
     /// policy call this only after reopening WebRTC's manual audio gate so the active peer can
@@ -443,6 +444,8 @@ final class WorldwideAudioLifecycleController {
             : normalCategoryOptionsRawValue
     }
 
+    /// The transaction target records the requested policy. Ordinary raw microphone duplex
+    /// requests default even when its explicitly supported effective policy is long-form.
     static func canonicalRouteSharingPolicy(
         category: String,
         mode: String,
@@ -3185,8 +3188,37 @@ final class WorldwideAudioLifecycleController {
         _ receipt: WebRTCIOSAudioCategoryObservationReceipt
     ) {
         guard isPrepared else { return }
+        let priorAuthority = audioTransactionAuthority.snapshot
+        let priorTransition = expectedAudioCategoryTransition
+        let decision = audioTransactionAuthority.observe(receipt)
+        if case let .failedClosed(operation) = decision,
+           let priorTransition,
+           let currentOperation = priorAuthority?.currentOperation,
+           priorTransition.transactionOperation == currentOperation,
+           operation == nil || operation == currentOperation {
+            let sharingPolicy = Self.canonicalRouteSharingPolicy(
+                category: priorTransition.category,
+                mode: priorTransition.mode,
+                categoryOptionsRawValue: priorTransition.categoryOptionsRawValue
+            )
+            let target = sharingPolicy.map {
+                AudioTransactionTarget(
+                    category: priorTransition.category,
+                    mode: priorTransition.mode,
+                    categoryOptionsRawValue: priorTransition.categoryOptionsRawValue,
+                    routeSharingPolicyRawValue: Int($0.rawValue),
+                    inputRequired: priorTransition.category == AVAudioSession.Category.playAndRecord.rawValue
+                )
+            }
+            // Capture immutable rejection evidence before retirement can clear its native tag.
+            onDiagnosticsCategoryObservationFailure?(
+                AudioTransactionAuthority.categoryObservationFailureCode(
+                    receipt: receipt, snapshot: priorAuthority, target: target
+                )
+            )
+        }
         handleAudioTransactionDecision(
-            audioTransactionAuthority.observe(receipt),
+            decision,
             context: "native category observation"
         )
     }

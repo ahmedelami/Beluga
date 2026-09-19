@@ -748,7 +748,7 @@ enum WebRTCIPhoneMicrophoneSenderStatisticsSampler {
               diagnostics.outputBusEnabled,
               !diagnostics.categoryOptionsAreEmpty,
               diagnostics.categoryOptionsAreIPhoneMicrophoneRouting,
-              diagnostics.routeSharingPolicyIsDefault,
+              diagnostics.ordinaryRawMicrophonePolicyMatches,
               diagnostics.hasOutputRoute,
               diagnostics.sampleRateIs48k,
               diagnostics.ioBufferDurationIsBounded,
@@ -2563,6 +2563,7 @@ public struct WebRTCIOSPlayoutRecoveryTestDiagnostics: Equatable, Sendable {
     public let categoryOptionsAreEmpty: Bool
     public let categoryOptionsAreIPhoneMicrophoneRouting: Bool
     public let routeSharingPolicyIsDefault: Bool
+    public var routeSharingPolicyIsLongFormAudio: Bool = false
     public let categoryOptionsAreMixWithOthers: Bool
     public let hasOutputRoute: Bool
     public let hostedCallMode: Bool
@@ -2879,6 +2880,7 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
             categoryOptionsAreIPhoneMicrophoneRouting:
                 value.categoryOptionsAreIPhoneMicrophoneRouting,
             routeSharingPolicyIsDefault: value.routeSharingPolicyIsDefault,
+            routeSharingPolicyIsLongFormAudio: value.routeSharingPolicyIsLongFormAudio,
             categoryOptionsAreMixWithOthers:
                 value.categoryOptionsAreMixWithOthers,
             hasOutputRoute: value.hasOutputRoute,
@@ -2940,8 +2942,16 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         native.debugRetainedFailureContextForTesting()
     }
 
+    public func debugRealSessionIsQuiescentForTesting() -> Bool {
+        native.debugRealSessionIsQuiescentForTesting()
+    }
+
     public func debugProbeRealSessionPolicySetterForTesting() -> [String: NSNumber] {
         native.debugProbeRealSessionPolicySetterForTesting()
+    }
+
+    public func debugProbeRealSessionPolicySetterScenarioForTesting(_ scenario: UInt) -> [String: NSNumber] {
+        native.debugProbeRealSessionPolicySetterScenarioForTesting(scenario)
     }
 
     public func debugBoundedDiagnosticsReadForTesting() -> [String: NSNumber] {
@@ -3272,6 +3282,17 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
 /// Runtime proof that iOS is using one app-owned conditional-duplex RemoteIO media path rather
 /// than WebRTC's call-oriented default audio device or a duplicate application renderer.
 public struct WebRTCIOSPlayoutDiagnostics: Sendable {
+    public var ordinaryRawMicrophonePolicyMatches: Bool {
+        WebRTCIOSOrdinaryRawMicrophonePolicy.matches(
+            categoryIsPlayAndRecord: categoryIsMediaPlayAndRecord,
+            modeIsDefault: modeIsDefault,
+            categoryOptionsAreIPhoneMicrophoneRouting: categoryOptionsAreIPhoneMicrophoneRouting,
+            routeSharingPolicyIsDefault: routeSharingPolicyIsDefault,
+            routeSharingPolicyIsLongFormAudio: routeSharingPolicyIsLongFormAudio,
+            hostedCallMode: hostedCallMode
+        )
+    }
+
     public let failureContext: WebRTCAudioClientFailureContext?
     public let initialized: Bool
     public let playoutInitialized: Bool
@@ -3592,6 +3613,10 @@ public actor WebRTCPeer {
 
     #if DEBUG && os(macOS)
     @TaskLocal private static var useHeadlessMacViewerAudioForTesting = false
+    #endif
+    #if DEBUG && os(iOS)
+    @TaskLocal private static var noHardwareIOSHostAudioDeviceForTesting:
+        (any LKRTCAudioDevice & Sendable)?
     #endif
 
     public nonisolated let events: AsyncStream<WebRTCTransportEvent>
@@ -4032,6 +4057,11 @@ public actor WebRTCPeer {
         let stereoPlayoutDevice: ASIOSStereoPlayoutAudioDevice?
         let audioDeviceRetirementHandle:
             WebRTCIOSAudioDeviceRetirementHandle?
+        #if DEBUG
+        let noHardwareHostDevice = Self.noHardwareIOSHostAudioDeviceForTesting
+        #else
+        let noHardwareHostDevice: (any LKRTCAudioDevice & Sendable)? = nil
+        #endif
         if configuration.role == .viewer,
            configuration.mediaTopology == .full {
             let ownedDevice = try WebRTCIOSAudioDeviceRetirementHandle
@@ -4048,13 +4078,24 @@ public actor WebRTCPeer {
         } else {
             stereoPlayoutDevice = nil
             audioDeviceRetirementHandle = nil
-            nativeFactory = LKRTCPeerConnectionFactory(
-                audioDeviceModuleType: .audioEngine,
-                bypassVoiceProcessing: true,
-                encoderFactory: encoderFactory,
-                decoderFactory: decoderFactory,
-                audioProcessingModule: nil
-            )
+            if let noHardwareHostDevice {
+                guard configuration.role == .host, configuration.mediaTopology == .full else {
+                    throw WebRTCTransportError.invalidRole
+                }
+                nativeFactory = LKRTCPeerConnectionFactory(
+                    encoderFactory: encoderFactory,
+                    decoderFactory: decoderFactory,
+                    audioDevice: noHardwareHostDevice
+                )
+            } else {
+                nativeFactory = LKRTCPeerConnectionFactory(
+                    audioDeviceModuleType: .audioEngine,
+                    bypassVoiceProcessing: true,
+                    encoderFactory: encoderFactory,
+                    decoderFactory: decoderFactory,
+                    audioProcessingModule: nil
+                )
+            }
         }
         iOSStereoPlayoutAudioDevice = stereoPlayoutDevice
         iOSAudioDiagnosticsSampler = stereoPlayoutDevice.map { WebRTCAudioDiagnosticsSampler(device: $0) }
@@ -4160,7 +4201,7 @@ public actor WebRTCPeer {
         #endif
 
         #if !os(macOS)
-        if configuration.role == .host {
+        if configuration.role == .host, noHardwareHostDevice == nil {
             let audioDeviceModule = nativeFactory.audioDeviceModule
             guard audioDeviceModule.setPlatformVoiceProcessingAllowed(false) == 0,
                   audioDeviceModule.setManualRenderingMode(true) == 0,
@@ -4257,9 +4298,9 @@ public actor WebRTCPeer {
                     throw WebRTCTransportError.audioTrackCreationFailed
                 }
                 #else
-                let audioCapturer = MacExternalAudioCapturer(
-                    audioDeviceModule: nativeFactory.audioDeviceModule
-                )
+                let audioCapturer: MacExternalAudioCapturer? = noHardwareHostDevice == nil
+                    ? MacExternalAudioCapturer(audioDeviceModule: nativeFactory.audioDeviceModule)
+                    : nil
                 #endif
                 let audioSource = nativeFactory.audioSource(with: nil)
                 let audioTrack = nativeFactory.audioTrack(
@@ -5256,6 +5297,21 @@ public actor WebRTCPeer {
     }
 
 #if DEBUG
+    #if os(iOS)
+    /// Replaces only the fixture host's hardware device. The viewer, negotiation, microphone
+    /// authorization, raw-processing proof, and sender statistics remain the production path.
+    nonisolated static func makeNoHardwareHostForTesting(
+        configuration: WebRTCTransportConfiguration,
+        audioDevice: any LKRTCAudioDevice & Sendable
+    ) throws -> WebRTCPeer {
+        guard configuration.role == .host, configuration.mediaTopology == .full else {
+            throw WebRTCTransportError.invalidRole
+        }
+        return try $noHardwareIOSHostAudioDeviceForTesting.withValue(audioDevice) {
+            try WebRTCPeer(configuration: configuration)
+        }
+    }
+    #endif
     #if os(macOS)
     nonisolated static func makeHeadlessViewerForTesting(
         configuration: WebRTCTransportConfiguration
@@ -8994,7 +9050,14 @@ public actor WebRTCPeer {
             && native.outputBusEnabled
             && !native.categoryOptionsAreEmpty
             && native.categoryOptionsAreIPhoneMicrophoneRouting
-            && native.routeSharingPolicyIsDefault
+            && WebRTCIOSOrdinaryRawMicrophonePolicy.matches(
+                categoryIsPlayAndRecord: native.categoryIsMediaPlayAndRecord,
+                modeIsDefault: native.modeIsDefault,
+                categoryOptionsAreIPhoneMicrophoneRouting: native.categoryOptionsAreIPhoneMicrophoneRouting,
+                routeSharingPolicyIsDefault: native.routeSharingPolicyIsDefault,
+                routeSharingPolicyIsLongFormAudio: native.routeSharingPolicyIsLongFormAudio,
+                hostedCallMode: native.hostedCallMode
+            )
             && sampleRateIs48k
             && ioBufferDurationIsBounded
             && outputChannelCountIsStereo
@@ -9043,6 +9106,8 @@ public actor WebRTCPeer {
                 native.categoryOptionsAreIPhoneMicrophoneRouting,
             routeSharingPolicyIsDefault:
                 native.routeSharingPolicyIsDefault,
+            routeSharingPolicyIsLongFormAudio:
+                native.routeSharingPolicyIsLongFormAudio,
             hasOutputRoute: native.hasOutputRoute,
             sampleRateIs48k: sampleRateIs48k,
             ioBufferDurationIsBounded:

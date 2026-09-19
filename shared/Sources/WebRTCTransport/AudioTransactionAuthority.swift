@@ -57,6 +57,23 @@ public struct AudioTransactionTarget: Equatable, Sendable {
         self.routeSharingPolicyRawValue = routeSharingPolicyRawValue
         self.inputRequired = inputRequired
     }
+
+    /// The target records the requested setter policy, never a normalized observation.
+    /// Ordinary raw duplex has one explicitly supported effective-policy profile because
+    /// iOS media controls can report long-form sharing even after a successful default request.
+    /// Every other target retains exact sharing-policy equality.
+    public func acceptsObservedRouteSharingPolicy(_ observed: Int) -> Bool {
+        if category == "AVAudioSessionCategoryPlayAndRecord",
+           mode == "AVAudioSessionModeDefault",
+           categoryOptionsRawValue == 40,
+           inputRequired,
+           routeSharingPolicyRawValue == 0 {
+            return WebRTCIOSOrdinaryRawMicrophonePolicy.effectiveSharingPolicyIsSupported(
+                rawValue: observed
+            )
+        }
+        return observed == routeSharingPolicyRawValue
+    }
 }
 
 public struct AudioTransactionSnapshot: Equatable, Sendable {
@@ -307,6 +324,144 @@ public final class AudioTransactionAuthority {
         return invoke { native, output in
             osata_authority_observe(native, receipt, output)
         }
+    }
+
+    /// Classifies immutable evidence only after `observe` returns `.failedClosed`.
+    /// Pass the snapshot and current target captured before that call. The first matching
+    /// predicate is a diagnostic fact, not a claim about notification origin or the exact
+    /// internal reducer branch. Phase, prior-observation and retained-operation details are
+    /// not exposed here; an otherwise unexplained failure remains 329. Never use this result
+    /// as authorization or to change the reducer decision.
+    ///
+    /// Stable v1 diagnostic codebook (all fit the existing authorityFailureCode field):
+    /// 301 untracked observation with a current operation; 302 expected but uncorrelated;
+    /// 303/304 unsupported expected/observed category; 305/306 nondefault expected/observed
+    /// mode; 307/308 expected/observed category-input mismatch; 309 snapshot unavailable;
+    /// 310 current operation absent; 311 receipt operation absent/invalid; 312 operation
+    /// mismatch; 313 device absent/mismatch; 314 current target unavailable; 315 expected
+    /// target mismatch; 316 options mismatch; 317 unsupported effective sharing policy; 318 configuration
+    /// generation absent/mismatch; 319 system generation absent/mismatch; 320 tag/native
+    /// transaction absent; 321 timestamp absent/expired; 322 sequence absent/not past its
+    /// transaction baseline; 323 sequence not past reducer observation; 324 sequence not
+    /// past GC watermark; 325 ingress state none/rejected; 326 policy tuple not exact;
+    /// 327 transaction evidence not exact; 328 unexpected disposition; 329 unexplained.
+    public static func categoryObservationFailureCode(
+        receipt: WebRTCIOSAudioCategoryObservationReceipt,
+        snapshot: AudioTransactionSnapshot?,
+        target: AudioTransactionTarget?
+    ) -> UInt16 {
+        if receipt.disposition == .unrelated,
+           receipt.transaction == nil,
+           snapshot?.currentOperation != nil {
+            return 301
+        }
+        if receipt.disposition == .expectedUncorrelatedTransaction {
+            return 302
+        }
+
+        let playbackCategory = "AVAudioSessionCategoryPlayback"
+        let microphoneCategory = "AVAudioSessionCategoryPlayAndRecord"
+        guard receipt.expectedCategory == playbackCategory
+                || receipt.expectedCategory == microphoneCategory else {
+            return 303
+        }
+        guard receipt.observedCategory == playbackCategory
+                || receipt.observedCategory == microphoneCategory else {
+            return 304
+        }
+        guard receipt.expectedMode == "AVAudioSessionModeDefault" else {
+            return 305
+        }
+        guard receipt.observedMode == "AVAudioSessionModeDefault" else {
+            return 306
+        }
+        guard (receipt.expectedCategory == microphoneCategory)
+                == receipt.inputRequired else {
+            return 307
+        }
+        guard (receipt.observedCategory == microphoneCategory)
+                == receipt.inputRequired else {
+            return 308
+        }
+        guard let snapshot else { return 309 }
+        guard let current = snapshot.currentOperation else { return 310 }
+        guard let transaction = receipt.transaction,
+              transaction.authorityEpoch != 0,
+              transaction.operationRevision != 0,
+              transaction.operationID != UUID(uuid: (
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+              )) else {
+            return 311
+        }
+        guard transaction.operationID == current.operationID,
+              transaction.operationRevision == current.operationRevision,
+              transaction.authorityEpoch == current.authorityEpoch else {
+            return 312
+        }
+        guard receipt.deviceInstanceGeneration != 0,
+              receipt.deviceInstanceGeneration
+                == snapshot.deviceInstanceGeneration else {
+            return 313
+        }
+        guard let target else { return 314 }
+        let expected = AudioTransactionTarget(
+            category: receipt.expectedCategory,
+            mode: receipt.expectedMode,
+            categoryOptionsRawValue: receipt.expectedCategoryOptionsRawValue,
+            routeSharingPolicyRawValue: receipt.expectedRouteSharingPolicyRawValue,
+            inputRequired: receipt.inputRequired
+        )
+        guard expected == target else { return 315 }
+        // Valid category/input binding and default mode above already prove those two
+        // observed tuple members equal the expected values.
+        guard receipt.observedCategoryOptionsRawValue
+                == receipt.expectedCategoryOptionsRawValue else {
+            return 316
+        }
+        guard expected.acceptsObservedRouteSharingPolicy(
+            receipt.observedRouteSharingPolicyRawValue
+        ) else {
+            return 317
+        }
+        guard receipt.transactionConfigurationGeneration != 0,
+              receipt.transactionConfigurationGeneration
+                == receipt.observedConfigurationGeneration else {
+            return 318
+        }
+        guard receipt.transactionSystemAudioGeneration != 0,
+              receipt.transactionSystemAudioGeneration
+                == receipt.observedSystemAudioGeneration else {
+            return 319
+        }
+        guard receipt.appOperationTagGeneration != 0,
+              receipt.nativeTransactionIdentifier != 0 else {
+            return 320
+        }
+        guard receipt.observedAtNanoseconds != 0,
+              receipt.transactionDeadlineNanoseconds != 0,
+              receipt.observedAtNanoseconds
+                <= receipt.transactionDeadlineNanoseconds else {
+            return 321
+        }
+        guard receipt.notificationSequence != 0,
+              receipt.notificationSequence
+                > receipt.transactionObserverSequenceBaseline else {
+            return 322
+        }
+        guard receipt.notificationSequence > snapshot.lastObservationSequence else {
+            return 323
+        }
+        guard receipt.notificationSequence > snapshot.gcWatermark else {
+            return 324
+        }
+        guard receipt.transactionStateAtIngress != .none,
+              receipt.transactionStateAtIngress != .rejected else {
+            return 325
+        }
+        guard receipt.policyTupleIsExact else { return 326 }
+        guard receipt.transactionEvidenceIsExact else { return 327 }
+        guard receipt.disposition == .expectedCurrentAppOperation else { return 328 }
+        return 329
     }
 
     public func resolveProof(

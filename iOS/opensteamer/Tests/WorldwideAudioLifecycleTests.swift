@@ -72,7 +72,54 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         }
     }
 
-    func testRuntimeRouteSharingPolicyRequiresExactlyOneCanonicalBit() {
+    func testOrdinaryRawMicrophoneProfileRequiresExactTupleAndSupportedEffectivePolicy() {
+        for rawValue in [-1, 0, 1, 2, 3, 97, Int.max] {
+            XCTAssertEqual(
+                WebRTCIOSOrdinaryRawMicrophonePolicy.effectiveSharingPolicyIsSupported(
+                    rawValue: rawValue
+                ),
+                rawValue == 0 || rawValue == 1
+            )
+            XCTAssertEqual(
+                inputAudioTransactionTarget.acceptsObservedRouteSharingPolicy(rawValue),
+                rawValue == 0 || rawValue == 1
+            )
+            XCTAssertEqual(
+                outputAudioTransactionTarget.acceptsObservedRouteSharingPolicy(rawValue),
+                rawValue == 1,
+                "Output-only playback must retain its single long-form target."
+            )
+        }
+        for isDefault in [false, true] {
+            for isLongForm in [false, true] {
+                for invalidField in ["none", "category", "mode", "options", "hosted"] {
+                    XCTAssertEqual(
+                        WebRTCIOSOrdinaryRawMicrophonePolicy.matches(
+                            categoryIsPlayAndRecord: invalidField != "category",
+                            modeIsDefault: invalidField != "mode",
+                            categoryOptionsAreIPhoneMicrophoneRouting: invalidField != "options",
+                            routeSharingPolicyIsDefault: isDefault,
+                            routeSharingPolicyIsLongFormAudio: isLongForm,
+                            hostedCallMode: invalidField == "hosted"
+                        ),
+                        invalidField == "none" && isDefault != isLongForm,
+                        "\(invalidField), default=\(isDefault), longForm=\(isLongForm)"
+                    )
+                }
+            }
+        }
+        let hostedTarget = AudioTransactionTarget(
+            category: AVAudioSession.Category.playback.rawValue,
+            mode: AVAudioSession.Mode.default.rawValue,
+            categoryOptionsRawValue: AVAudioSession.CategoryOptions.mixWithOthers.rawValue,
+            routeSharingPolicyRawValue: 0,
+            inputRequired: false
+        )
+        XCTAssertTrue(hostedTarget.acceptsObservedRouteSharingPolicy(0))
+        XCTAssertFalse(hostedTarget.acceptsObservedRouteSharingPolicy(1))
+    }
+
+    func testRuntimeRouteSharingPolicyRequiresOneSupportedProfileBit() {
         for input in [false, true] {
             for isDefault in [false, true] {
                 for isLongForm in [false, true] {
@@ -85,7 +132,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                         routeSharingPolicyIsLongFormAudio: isLongForm
                     )
                     let expected = input
-                        ? isDefault && !isLongForm
+                        ? isDefault != isLongForm
                         : isLongForm && !isDefault
                     XCTAssertEqual(
                         WorldwideAudioPlayoutOracleSnapshot.routeInvariantsHold(diagnostics),
@@ -109,9 +156,59 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                        "Hosted mix-with-others must not acquire ordinary playback proof.")
     }
 
-    func testLifecycleArmedOutputAndMicrophoneRejectTheOtherSharingPolicy() throws {
+    func testRawMicrophoneOraclePreservesActualSharingBitsAndAllAdmissionFences() {
+        let peerIdentity = NSObject()
+        let authorizationIdentity = NSObject()
+        let session = UUID()
+        let transport = UUID()
+        let policy = UUID()
+        let zero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        for isDefault in [false, true] {
+            for isLongForm in [false, true] {
+                for invalidField in [
+                    "none", "unpaired", "intent", "permission", "call", "transport",
+                    "session", "transportEpoch", "policyEpoch", "authorization",
+                    "staleAuthorization", "recordingGeneration", "builtInRoute",
+                ] {
+                    let statistics = rawMicrophoneSenderStatisticsForTests(
+                        sample: 1, recordingGeneration: 31,
+                        captureRouteIsBuiltInMicrophone: invalidField != "builtInRoute",
+                        routeSharingPolicyIsDefault: isDefault,
+                        routeSharingPolicyIsLongFormAudio: isLongForm,
+                        authorizationIsCurrent: invalidField != "staleAuthorization",
+                        authorizationIsValid: invalidField != "authorization",
+                        approvedRecordingGeneration: invalidField == "recordingGeneration" ? 32 : 31
+                    )
+                    XCTAssertEqual(statistics.sender.routeSharingPolicyIsDefault, isDefault)
+                    XCTAssertEqual(statistics.sender.routeSharingPolicyIsLongFormAudio, isLongForm)
+                    XCTAssertEqual(statistics.sender.ordinaryRawMicrophonePolicyMatches,
+                                   isDefault != isLongForm)
+                    let sample = WorldwideRawMicrophoneProofSample(
+                        sessionGeneration: invalidField == "session" ? zero : session,
+                        peerIdentity: ObjectIdentifier(peerIdentity),
+                        transportAuthorizationGeneration: invalidField == "transportEpoch" ? zero : transport,
+                        audioPolicyGeneration: invalidField == "policyEpoch" ? zero : policy,
+                        authorizationIdentity: ObjectIdentifier(authorizationIdentity),
+                        authenticatedPairedSession: invalidField != "unpaired",
+                        microphoneIntentIsCurrent: invalidField != "intent",
+                        microphonePermissionGranted: invalidField != "permission",
+                        callIsActive: invalidField == "call",
+                        transportIsHealthy: invalidField != "transport",
+                        statistics: statistics
+                    )
+                    XCTAssertEqual(
+                        WorldwideRawMicrophoneOracleEvaluator.hasValidState(sample),
+                        invalidField == "none" && isDefault != isLongForm,
+                        "\(invalidField), default=\(isDefault), longForm=\(isLongForm)"
+                    )
+                }
+            }
+        }
+    }
+
+    func testLifecycleArmedTargetsAcceptOnlyTheirSupportedEffectiveSharingPolicies() throws {
         for input in [false, true] {
-            for exactPolicy in [false, true] {
+            for observedPolicy in [-1, 0, 1, 2, 3, 97] {
                 let authority = AudioTransactionAuthority()
                 let fixture = makeFixture(audioTransactionAuthority: authority)
                 fixture.controller.prepare(serverName: "Mac mini")
@@ -125,25 +222,111 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                 }
                 let operation = try XCTUnwrap(fixture.controller.debugCurrentAudioTransactionOperationForTests)
                 let target = input ? inputAudioTransactionTarget : outputAudioTransactionTarget
-                let wrongPolicy = Int((input
-                    ? AVAudioSession.RouteSharingPolicy.longFormAudio
-                    : AVAudioSession.RouteSharingPolicy.default).rawValue)
+                let policyIsSupported = input
+                    ? observedPolicy == 0 || observedPolicy == 1
+                    : observedPolicy == 1
                 let decision = authority.observe(audioTransactionObservation(
                     for: operation, target: target, disposition: .expectedCurrentAppOperation,
                     sequence: 1,
-                    observedRouteSharingPolicyRawValue: exactPolicy ? target.routeSharingPolicyRawValue : wrongPolicy
+                    observedRouteSharingPolicyRawValue: observedPolicy
                 ))
-                if exactPolicy {
+                if policyIsSupported {
                     guard case .observationAccepted(let accepted, _) = decision else {
                         return XCTFail("Canonical policy did not match lifecycle's actual armed target: \(decision)")
                     }
                     XCTAssertEqual(accepted, operation)
                 } else {
                     XCTAssertEqual(decision, .failedClosed(operation),
-                                   "Same category/mode/options cannot excuse the other route-sharing policy.")
+                                   "Same category/mode/options cannot excuse unsupported policy \(observedPolicy).")
                 }
             }
         }
+    }
+
+    func testOrdinaryMicrophoneEffectivePolicyAliasesRetainExactObservationOwnership() throws {
+        for firstPolicy in [0, 1] {
+            let authority = AudioTransactionAuthority()
+            try bindAudioTransactionAuthority(authority)
+            let armed = try armAudioTransactionAuthority(authority, target: inputAudioTransactionTarget)
+            let first = audioTransactionObservation(
+                for: armed.operation, target: inputAudioTransactionTarget,
+                disposition: .expectedCurrentAppOperation, sequence: 1,
+                observedRouteSharingPolicyRawValue: firstPolicy
+            )
+            XCTAssertEqual(authority.observe(first), .observationAccepted(
+                operation: armed.operation, proof: armed.proof
+            ))
+            let acceptedState = authority.snapshot
+            for observation in [
+                first,
+                audioTransactionObservation(
+                    for: armed.operation, target: inputAudioTransactionTarget,
+                    disposition: .expectedCurrentAppOperation, sequence: 2,
+                    observedRouteSharingPolicyRawValue: 1 - firstPolicy
+                ),
+                audioTransactionObservation(
+                    for: armed.operation, target: inputAudioTransactionTarget,
+                    disposition: .expectedCurrentAppOperation, sequence: 3,
+                    observedRouteSharingPolicyRawValue: firstPolicy
+                ),
+            ] {
+                XCTAssertEqual(authority.observe(observation), .ignored(
+                    reason: .exactDuplicate, operation: armed.operation, blocker: nil
+                ))
+                XCTAssertEqual(authority.snapshot, acceptedState,
+                               "A compatible later readback must not create another proof or authority.")
+            }
+            XCTAssertEqual(authority.acknowledgeNative(acceptedRecoveryReceipt(for: armed.operation)),
+                           .nativeAcknowledged(armed.operation))
+            XCTAssertEqual(authority.resolveProof(armed.proof, succeeded: true), .completed(armed.operation))
+        }
+    }
+
+    func testLongFormMicrophoneObservationCannotBypassTransactionOrTupleFences() throws {
+        for invalidField in ["operation", "epoch", "authorization", "device", "category", "mode", "options"] {
+            let authority = AudioTransactionAuthority()
+            try bindAudioTransactionAuthority(authority)
+            let armed = try armAudioTransactionAuthority(authority, target: inputAudioTransactionTarget)
+            let observedOperation = AudioTransactionOperationReceipt(
+                operationID: invalidField == "operation" ? UUID() : armed.operation.operationID,
+                operationRevision: armed.operation.operationRevision,
+                authorityEpoch: armed.operation.authorityEpoch + (invalidField == "epoch" ? 1 : 0)
+            )
+            let receipt = audioTransactionObservation(
+                for: observedOperation, target: inputAudioTransactionTarget,
+                disposition: invalidField == "authorization" ? .unrelated : .expectedCurrentAppOperation,
+                deviceGeneration: invalidField == "device" ? 62 : 61,
+                sequence: 1,
+                observedRouteSharingPolicyRawValue: 1,
+                observedCategory: invalidField == "category" ? AVAudioSession.Category.playback.rawValue : nil,
+                observedMode: invalidField == "mode" ? AVAudioSession.Mode.voiceChat.rawValue : nil,
+                observedOptions: invalidField == "options" ? 0 : nil,
+                omitTransaction: invalidField == "authorization"
+            )
+            XCTAssertEqual(authority.observe(receipt), .failedClosed(armed.operation), invalidField)
+        }
+    }
+
+    func testRetiredLongFormMicrophoneObservationCannotAuthorizeSuccessor() throws {
+        let authority = AudioTransactionAuthority()
+        try bindAudioTransactionAuthority(authority)
+        let retired = try armAudioTransactionAuthority(authority, target: inputAudioTransactionTarget)
+        let snapshot = try XCTUnwrap(authority.snapshot)
+        guard case .boundaryApplied(let boundary) = authority.applyBoundary(
+            expectedReducerRevision: snapshot.reducerRevision,
+            observationHead: snapshot.lastObservationSequence
+        ) else { return XCTFail("Missing microphone retirement boundary") }
+        guard case .armed(let current, _, _) = authority.armSuccessor(
+            operationID: UUID(), target: inputAudioTransactionTarget,
+            boundary: boundary, observationHead: snapshot.lastObservationSequence
+        ) else { return XCTFail("Missing microphone successor") }
+        let before = authority.snapshot
+        XCTAssertEqual(authority.observe(audioTransactionObservation(
+            for: retired.operation, target: inputAudioTransactionTarget,
+            disposition: .expectedRetiredAppOperation, sequence: 1,
+            observedRouteSharingPolicyRawValue: 1
+        )), .ignored(reason: .retiredOperation, operation: current, blocker: retired.operation))
+        XCTAssertEqual(authority.snapshot, before)
     }
 
     func testCurrentGenerationOrdinaryWaveformProofRejectsDefaultOnlyPolicy() {
@@ -194,9 +377,172 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         XCTAssertEqual(authority.snapshot, beforeRetired)
         guard case .observationAccepted(let accepted, _) = authority.observe(audioTransactionObservation(
             for: current, target: inputAudioTransactionTarget,
-            disposition: .expectedCurrentAppOperation, sequence: 2
-        )) else { return XCTFail("Fresh default-policy microphone observation was not accepted") }
+            disposition: .expectedCurrentAppOperation, sequence: 2,
+            observedRouteSharingPolicyRawValue: 1
+        )) else { return XCTFail("Fresh supported microphone observation was not accepted") }
         XCTAssertEqual(accepted, current)
+    }
+
+    func testCategoryObservationFailureClassifierSeparatesPolicyAndProvenanceEvidence() throws {
+        let authority = AudioTransactionAuthority()
+        try bindAudioTransactionAuthority(authority)
+        let armed = try armAudioTransactionAuthority(authority, target: inputAudioTransactionTarget)
+        let snapshot = try XCTUnwrap(authority.snapshot)
+        let target = inputAudioTransactionTarget
+        func receipt(
+            disposition: WebRTCIOSAudioCategoryObservationDisposition = .expectedCurrentAppOperation,
+            state: WebRTCIOSAudioCategoryTransactionState = .consumed,
+            omitTransaction: Bool = false,
+            transaction: WebRTCIOSAudioTransactionContext? = nil,
+            tag: UInt64 = 3, device: UInt64 = 61, nativeTransaction: UInt64 = 5,
+            sequence: UInt64 = 1, baseline: UInt64 = 0,
+            configuration: UInt64 = 7, observedConfiguration: UInt64 = 7,
+            system: UInt64 = 11, observedSystem: UInt64 = 11,
+            observedAt: UInt64 = 101, deadline: UInt64 = 1_000,
+            observedCategory: String? = nil, observedMode: String? = nil,
+            expectedCategory: String? = nil, expectedMode: String? = nil,
+            expectedOptions: UInt? = nil, observedOptions: UInt? = nil,
+            observedSharing: Int? = nil,
+            policyExact: Bool = true, evidenceExact: Bool = true
+        ) -> WebRTCIOSAudioCategoryObservationReceipt {
+            WebRTCIOSAudioCategoryObservationReceipt(
+                disposition: disposition, transactionStateAtIngress: state,
+                transaction: omitTransaction ? nil : transaction ?? armed.operation.nativeContext,
+                appOperationTagGeneration: tag, deviceInstanceGeneration: device,
+                nativeTransactionIdentifier: nativeTransaction, notificationSequence: sequence,
+                transactionObserverSequenceBaseline: baseline,
+                transactionConfigurationGeneration: configuration,
+                observedConfigurationGeneration: observedConfiguration,
+                transactionSystemAudioGeneration: system, observedSystemAudioGeneration: observedSystem,
+                observedAtNanoseconds: observedAt, transactionDeadlineNanoseconds: deadline,
+                inputRequired: true,
+                observedCategory: observedCategory ?? target.category,
+                observedMode: observedMode ?? target.mode,
+                observedCategoryOptionsRawValue: observedOptions ?? target.categoryOptionsRawValue,
+                observedRouteSharingPolicyRawValue: observedSharing ?? target.routeSharingPolicyRawValue,
+                expectedCategory: expectedCategory ?? target.category,
+                expectedMode: expectedMode ?? target.mode,
+                expectedCategoryOptionsRawValue: expectedOptions ?? target.categoryOptionsRawValue,
+                expectedRouteSharingPolicyRawValue: target.routeSharingPolicyRawValue,
+                policyTupleIsExact: policyExact, transactionEvidenceIsExact: evidenceExact
+            )
+        }
+        func state(last: UInt64 = 0, watermark: UInt64 = 0, hasCurrent: Bool = true) -> AudioTransactionSnapshot {
+            AudioTransactionSnapshot(
+                reducerRevision: snapshot.reducerRevision, authorityEpoch: snapshot.authorityEpoch,
+                gcWatermark: watermark, lastObservationSequence: last,
+                retiredOperationRevisionWatermark: snapshot.retiredOperationRevisionWatermark,
+                tombstoneCount: snapshot.tombstoneCount,
+                deviceInstanceGeneration: snapshot.deviceInstanceGeneration,
+                observationRegistrationGeneration: snapshot.observationRegistrationGeneration,
+                currentOperation: hasCurrent ? snapshot.currentOperation : nil
+            )
+        }
+        let cases: [(String, UInt16, WebRTCIOSAudioCategoryObservationReceipt, AudioTransactionSnapshot?, AudioTransactionTarget?)] = [
+            ("untagged current operation", 301, receipt(disposition: .unrelated, omitTransaction: true), snapshot, target),
+            ("uncorrelated transaction", 302, receipt(disposition: .expectedUncorrelatedTransaction), snapshot, target),
+            ("unsupported expected category", 303, receipt(expectedCategory: "unrecognized"), snapshot, target),
+            ("unsupported observed category", 304, receipt(observedCategory: "unrecognized"), snapshot, target),
+            ("expected mode", 305, receipt(expectedMode: AVAudioSession.Mode.voiceChat.rawValue), snapshot, target),
+            ("observed mode", 306, receipt(observedMode: AVAudioSession.Mode.voiceChat.rawValue), snapshot, target),
+            ("expected input category", 307, receipt(expectedCategory: AVAudioSession.Category.playback.rawValue), snapshot, target),
+            ("observed input category", 308, receipt(observedCategory: AVAudioSession.Category.playback.rawValue), snapshot, target),
+            ("missing authority", 309, receipt(), nil, target),
+            ("no current operation", 310, receipt(), state(hasCurrent: false), target),
+            ("missing operation", 311, receipt(omitTransaction: true), snapshot, target),
+            ("invalid operation", 311, receipt(transaction: .init(operationID: UUID(), authorityEpoch: 0, operationRevision: 1)), snapshot, target),
+            ("different operation", 312, receipt(transaction: .init(operationID: UUID(), authorityEpoch: armed.operation.authorityEpoch, operationRevision: armed.operation.operationRevision)), snapshot, target),
+            ("missing device", 313, receipt(device: 0), snapshot, target),
+            ("different device", 313, receipt(device: 62), snapshot, target),
+            ("missing target", 314, receipt(), snapshot, nil),
+            ("different target", 315, receipt(expectedOptions: 0), snapshot, target),
+            ("observed options", 316, receipt(observedOptions: 0), snapshot, target),
+            ("observed sharing", 317, receipt(observedSharing: 2), snapshot, target),
+            ("zero configuration", 318, receipt(configuration: 0), snapshot, target),
+            ("different configuration", 318, receipt(observedConfiguration: 8), snapshot, target),
+            ("zero system", 319, receipt(system: 0), snapshot, target),
+            ("different system", 319, receipt(observedSystem: 12), snapshot, target),
+            ("missing tag", 320, receipt(tag: 0), snapshot, target),
+            ("missing native transaction", 320, receipt(nativeTransaction: 0), snapshot, target),
+            ("zero observed time", 321, receipt(observedAt: 0), snapshot, target),
+            ("expired observation", 321, receipt(observedAt: 1_001), snapshot, target),
+            ("zero sequence", 322, receipt(sequence: 0), snapshot, target),
+            ("transaction baseline", 322, receipt(baseline: 1), snapshot, target),
+            ("reducer sequence", 323, receipt(), state(last: 1), target),
+            ("drain watermark", 324, receipt(), state(watermark: 1), target),
+            ("no ingress state", 325, receipt(state: .none), snapshot, target),
+            ("rejected ingress", 325, receipt(state: .rejected), snapshot, target),
+            ("nonexact policy", 326, receipt(policyExact: false), snapshot, target),
+            ("nonexact transaction", 327, receipt(evidenceExact: false), snapshot, target),
+            ("noncurrent disposition", 328, receipt(disposition: .trackedPolicyMismatch), snapshot, target),
+            ("residual diagnostic only", 329, receipt(), snapshot, target),
+            ("supported long-form is not a sharing mismatch", 329, receipt(observedSharing: 1), snapshot, target),
+        ]
+        for (label, expected, observation, before, currentTarget) in cases {
+            XCTAssertEqual(AudioTransactionAuthority.categoryObservationFailureCode(
+                receipt: observation, snapshot: before, target: currentTarget
+            ), expected, label)
+        }
+        XCTAssertEqual(authority.snapshot, snapshot, "Classification must not mutate or authorize the reducer.")
+    }
+
+    func testCategoryObservationFailureDetailPrecedesGenericFailureAndIgnoresRetiredReceipts() throws {
+        let authority = AudioTransactionAuthority()
+        let fixture = makeFixture(audioTransactionAuthority: authority)
+        fixture.controller.prepare(serverName: "Mac mini")
+        XCTAssertTrue(fixture.controller.bindIOSAudioTransactionDevice(
+            .init(deviceInstanceGeneration: 61, observationRegistrationGeneration: 51)
+        ))
+        fixture.controller.onAudioTransactionDrainRequested = { _ in true }
+        XCTAssertGreaterThan(fixture.controller.beginMicrophoneTopologyTransition(isEnabled: true), 0)
+        let retired = try XCTUnwrap(fixture.controller.debugCurrentAudioTransactionOperationForTests)
+        fixture.controller.recordNativeAudioTransactionTag(3, for: retired.nativeContext)
+        XCTAssertGreaterThan(fixture.controller.beginMicrophoneTopologyTransition(isEnabled: true), 0)
+        let current = try XCTUnwrap(fixture.controller.debugCurrentAudioTransactionOperationForTests)
+        fixture.controller.recordNativeAudioTransactionTag(4, for: current.nativeContext)
+
+        let policy = UUID()
+        var journal = IOSAudioDiagnosticsJournal()
+        journal.reset(sessionID: UUID(), policyID: policy, at: 1)
+        var callbackOrder: [String] = []
+        fixture.controller.onDiagnosticsCategoryObservationFailure = { code in
+            callbackOrder.append("detail")
+            journal.categoryObservationFailure(code, at: 2)
+        }
+        fixture.controller.onDiagnosticsAuthorityFailure = { decision in
+            callbackOrder.append("generic")
+            journal.authorityFailure(decision, at: 3)
+        }
+        let oldObservation = audioTransactionObservation(
+            for: retired, target: inputAudioTransactionTarget,
+            disposition: .expectedRetiredAppOperation, sequence: 1
+        )
+        let beforeOld = authority.snapshot
+        fixture.controller.consumeIOSAudioCategoryObservation(oldObservation)
+        XCTAssertEqual(authority.snapshot, beforeOld)
+        XCTAssertTrue(callbackOrder.isEmpty)
+        XCTAssertNil(journal.snapshot.authorityFailureCode)
+
+        let wrongSharing = audioTransactionObservation(
+            for: current, target: inputAudioTransactionTarget,
+            disposition: .expectedCurrentAppOperation, sequence: 2,
+            observedRouteSharingPolicyRawValue: 2
+        )
+        fixture.controller.consumeIOSAudioCategoryObservation(wrongSharing)
+        XCTAssertEqual(callbackOrder, ["detail", "generic"])
+        XCTAssertEqual(journal.snapshot.authorityFailureCode, 317)
+        XCTAssertEqual(journal.failureSnapshot?.authorityFailureCode, 317)
+        XCTAssertEqual(journal.failureSnapshot?.audioPolicyID, policy)
+        XCTAssertFalse(fixture.controller.snapshot.isPlaying)
+        XCTAssertNil(fixture.controller.debugCurrentAudioTransactionOperationForTests)
+
+        let afterFailure = authority.snapshot
+        let retained = journal.failureSnapshot
+        fixture.controller.consumeIOSAudioCategoryObservation(oldObservation)
+        fixture.controller.consumeIOSAudioCategoryObservation(wrongSharing)
+        XCTAssertEqual(authority.snapshot, afterFailure)
+        XCTAssertEqual(callbackOrder, ["detail", "generic"], "Retired receipts cannot acquire a new diagnostic owner.")
+        XCTAssertEqual(journal.failureSnapshot, retained)
     }
 
     func testAudioTransactionAuthorityRoundTripsUUIDAndValidatedPredecessor()
@@ -13648,6 +13994,77 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         await peer.close()
     }
 
+    func testTransportUncertaintyClosesMicrophonePrivacyBeforeOutputOnlyOwnerReturns() async throws {
+        let fixture = makeFixture()
+        fixture.playback.requiresRuntimePlayoutProof = true
+        fixture.controller.prepare(serverName: "Mac mini")
+        fixture.controller.remoteAudioBecameAvailable(fixture.remoteAudio)
+        fixture.controller.transportBecameHealthy()
+        fixture.controller.updateRuntimePlayout(isReady: true)
+
+        let peer = try makeAudioRacePeer()
+        let authorization = WebRTCIOSMicrophoneAuthorization()
+        let ownerEpoch = UUID()
+        let nativePolicies = AudioLockedValues<Bool>()
+        let returnedTokens = AudioLockedValues<WebRTCIOSOutputOnlyMicrophoneToken>()
+        let handlerEntered = expectation(description: "output-only owner waits before arming C")
+        let handlerGate = AudioNonCooperativeGate<Void>()
+        await peer.debugInstallIPhoneMicrophonePolicyApplier { isEnabled in
+            nativePolicies.append(isEnabled)
+            return true
+        }
+        await peer.installIPhoneMicrophoneTransportSuspensionHandler { _ in
+            fixture.controller.transportBecameUncertain()
+            handlerEntered.fulfill()
+            await handlerGate.wait()
+            guard let token = fixture.controller.beginIPhoneMicrophoneOutputOnlyTransition(
+                ownerEpoch: ownerEpoch
+            ) else { return nil }
+            returnedTokens.append(token)
+            return token
+        }
+        await peer.debugInstallIPhoneMicrophoneAuthorizationForTransportUncertainty(authorization)
+        let before = await peer.debugIPhoneMicrophonePolicySnapshot
+        XCTAssertTrue(before.trackIsEnabled)
+        XCTAssertTrue(authorization.isValid)
+        let initialAdmission = authorization.debugBeginRealtimeAdmissionForTesting()
+        if initialAdmission { authorization.debugEndRealtimeAdmissionForTesting() }
+        XCTAssertTrue(initialAdmission)
+
+        let suspensionTask = Task { await peer.debugSimulateICETransportUncertainty() }
+        addTeardownBlock {
+            await handlerGate.open(())
+            await suspensionTask.value
+            await peer.close()
+        }
+        await fulfillment(of: [handlerEntered], timeout: 2)
+
+        let waiting = await peer.debugIPhoneMicrophonePolicySnapshot
+        let waitingAdmission = authorization.debugBeginRealtimeAdmissionForTesting()
+        if waitingAdmission { authorization.debugEndRealtimeAdmissionForTesting() }
+        XCTAssertFalse(authorization.isValid)
+        XCTAssertFalse(waitingAdmission, "Capture must close before the owner can supply C.")
+        XCTAssertFalse(waiting.trackIsEnabled)
+        XCTAssertNil(waiting.activeAuthorizationIdentity)
+        XCTAssertTrue(waiting.nativeTeardownPending)
+        XCTAssertEqual(waiting.nativeTeardownAuthorizationIdentity, ObjectIdentifier(authorization))
+        XCTAssertEqual(waiting.sequence, before.sequence)
+        XCTAssertNil(waiting.completionStamp)
+        XCTAssertTrue(returnedTokens.values.isEmpty)
+        XCTAssertTrue(nativePolicies.values.isEmpty)
+
+        await handlerGate.open(())
+        await suspensionTask.value
+        let after = await peer.debugIPhoneMicrophonePolicySnapshot
+        XCTAssertEqual(nativePolicies.values, [false])
+        XCTAssertEqual(returnedTokens.values.count, 1)
+        XCTAssertEqual(returnedTokens.values.first?.state, .succeeded)
+        XCTAssertEqual(after.completionStamp?.tokenID, returnedTokens.values.first?.tokenID)
+        XCTAssertFalse(after.trackIsEnabled)
+        XCTAssertFalse(after.nativeTeardownPending)
+        XCTAssertFalse(authorization.isValid)
+    }
+
     func testTransportHandlerRevokesArmedPublicTokenAndUsesSoleReplacementWriter() async throws {
         let fixture = makeFixture()
         fixture.playback.requiresRuntimePlayoutProof = true
@@ -14962,6 +15379,70 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
 
         XCTAssertEqual(nativePolicies.values, [false])
         await peer.close()
+    }
+
+    func testPublicOutputOnlyDisableClosesMicrophonePrivacyBeforeNativeAttemptForSuccessAndFailure() async throws {
+        for nativeSucceeds in [true, false] {
+            let fixture = makeFixture()
+            fixture.controller.prepare(serverName: "Mac mini")
+            let token = try XCTUnwrap(
+                fixture.controller.beginIPhoneMicrophoneOutputOnlyTransition(ownerEpoch: UUID())
+            )
+            let peer = try makeAudioRacePeer()
+            addTeardownBlock { await peer.close() }
+            let authorization = WebRTCIOSMicrophoneAuthorization()
+            let nativePolicies = AudioLockedValues<Bool>()
+            let authorizationWasValidAtNativeEntry = AudioLockedValues<Bool>()
+            let realtimeAdmissionAtNativeEntry = AudioLockedValues<Bool>()
+            let tokenStatesAtNativeEntry = AudioLockedValues<WebRTCIOSOutputOnlyMicrophoneTokenState>()
+            await peer.debugInstallIPhoneMicrophonePolicyApplier { isEnabled in
+                nativePolicies.append(isEnabled)
+                authorizationWasValidAtNativeEntry.append(authorization.isValid)
+                let admitted = authorization.debugBeginRealtimeAdmissionForTesting()
+                if admitted { authorization.debugEndRealtimeAdmissionForTesting() }
+                realtimeAdmissionAtNativeEntry.append(admitted)
+                tokenStatesAtNativeEntry.append(token.state)
+                return nativeSucceeds
+            }
+            await peer.debugInstallIPhoneMicrophoneAuthorizationForTransportUncertainty(authorization)
+            let before = await peer.debugIPhoneMicrophonePolicySnapshot
+            XCTAssertTrue(before.trackIsEnabled)
+            XCTAssertTrue(authorization.isValid)
+
+            let result = await peer.disableIPhoneMicrophone(
+                authorization: authorization, outputOnlyToken: token
+            )
+            let after = await peer.debugIPhoneMicrophonePolicySnapshot
+            let stamp = try XCTUnwrap(after.completionStamp)
+            XCTAssertEqual(result, nativeSucceeds)
+            XCTAssertEqual(nativePolicies.values, [false])
+            XCTAssertEqual(authorizationWasValidAtNativeEntry.values, [false])
+            XCTAssertEqual(realtimeAdmissionAtNativeEntry.values, [false])
+            XCTAssertEqual(tokenStatesAtNativeEntry.values, [.executing])
+            XCTAssertEqual(token.state, nativeSucceeds ? .succeeded : .failed)
+            XCTAssertFalse(authorization.isValid)
+            XCTAssertFalse(after.trackIsEnabled)
+            XCTAssertNil(after.activeAuthorizationIdentity)
+            XCTAssertEqual(after.nativeTeardownPending, !nativeSucceeds)
+            XCTAssertEqual(after.nativeTeardownAuthorizationIdentity,
+                           nativeSucceeds ? nil : ObjectIdentifier(authorization))
+            XCTAssertEqual(stamp.sequence, before.sequence + 1)
+            XCTAssertEqual(after.sequence, stamp.sequence)
+            XCTAssertEqual(stamp.kind, .outputOnlyDisable)
+            XCTAssertEqual(stamp.origin, .publicRequest)
+            XCTAssertEqual(stamp.tokenID, token.tokenID)
+            XCTAssertEqual(stamp.retiredAuthorizationIdentity, ObjectIdentifier(authorization))
+            XCTAssertEqual(stamp.nativeResult, nativeSucceeds)
+
+            let repeatedResult = await peer.disableIPhoneMicrophone(
+                authorization: authorization, outputOnlyToken: token
+            )
+            let repeated = await peer.debugIPhoneMicrophonePolicySnapshot
+            XCTAssertEqual(repeatedResult, nativeSucceeds)
+            XCTAssertEqual(repeated, after)
+            XCTAssertEqual(nativePolicies.values, [false], "A failed C must not trigger an unowned fallback write.")
+            await peer.close()
+        }
     }
 
     func testRepeatedOutputOnlyDisableAndPeerCloseAreExactSuccessfulNoOps() async throws {
@@ -19240,6 +19721,36 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         }
     }
 
+    func testHostedCallSteadyProofRejectsLongFormEvenWithAdvancingPCM() async throws {
+        for isDefault in [false, true] {
+            try await withHostedCallProofHarness { harness in
+                let state = try await driveHostedCallProofToReady(harness)
+                let authorization = state.start.authorization
+                harness.diagnostics.set(hostedCallIOSPlayoutDiagnostics(
+                    authorization: authorization,
+                    callbacks: 12, frames: 5_760,
+                    pcmNonzeroSampleCount: 10_561, pcmAbsoluteSampleSum: 10_561_000,
+                    routeSharingPolicyIsDefault: isDefault,
+                    routeSharingPolicyIsLongFormAudio: true
+                ))
+                await harness.viewModel.debugDriveIOSHostedCallStatisticsForTests(
+                    hostedCallStatisticsSnapshot(
+                        collectedAt: harness.admittedAt.addingTimeInterval(3),
+                        bytes: 1_200, packets: 12, jitterBufferEmittedCount: 120,
+                        totalSamplesReceived: 5_760, totalAudioEnergy: 1.2,
+                        totalSamplesDuration: 0.12
+                    ),
+                    from: harness.peer, generation: harness.generation
+                )
+                XCTAssertFalse(authorization.isValid)
+                XCTAssertFalse(harness.fixture.remoteAudio.isEnabled)
+                XCTAssertFalse(harness.viewModel.isRemoteAudioPlaying)
+                XCTAssertNil(harness.viewModel.worldwideHostedCallPlayoutOracle)
+                XCTAssertTrue(harness.viewModel.hasActiveSession)
+            }
+        }
+    }
+
     func testHostedCallSteadyStallFailsClosedWithCadenceAndRTPDiagnostic() async throws {
         try await withHostedCallProofHarness { harness in
             let state = try await driveHostedCallProofToReady(harness)
@@ -20473,7 +20984,12 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         counterSample: UInt64? = nil,
         recordingGeneration: UInt64,
         captureRouteIsBuiltInMicrophone: Bool = true,
-        captureRouteProofGeneration: UInt64 = 13
+        captureRouteProofGeneration: UInt64 = 13,
+        routeSharingPolicyIsDefault: Bool = true,
+        routeSharingPolicyIsLongFormAudio: Bool = false,
+        authorizationIsCurrent: Bool = true,
+        authorizationIsValid: Bool = true,
+        approvedRecordingGeneration: UInt64? = nil
     ) -> WebRTCIPhoneMicrophoneSenderStatistics {
         let counterSample = counterSample ?? sample
         let callbacks = counterSample * 100
@@ -20496,8 +21012,8 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                 trackIsEnabled: true,
                 rawProcessingIsLive: true,
                 transportIsHealthy: true,
-                authorizationIsCurrent: true,
-                authorizationIsValid: true,
+                authorizationIsCurrent: authorizationIsCurrent,
+                authorizationIsValid: authorizationIsValid,
                 senderIsAdmitted: true,
                 nativeDeviceIsOpen: true,
                 nativeDeviceGateIsOpen: true,
@@ -20513,7 +21029,8 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                 outputBusEnabled: true,
                 categoryOptionsAreEmpty: false,
                 categoryOptionsAreIPhoneMicrophoneRouting: true,
-                routeSharingPolicyIsDefault: true,
+                routeSharingPolicyIsDefault: routeSharingPolicyIsDefault,
+                routeSharingPolicyIsLongFormAudio: routeSharingPolicyIsLongFormAudio,
                 hasOutputRoute: true,
                 sampleRateIs48k: true,
                 ioBufferDurationIsBounded: true,
@@ -20525,7 +21042,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                 lastLifecycleStatus: 0,
                 recordingGeneration: recordingGeneration,
                 approvedRecordingGeneration:
-                    recordingGeneration,
+                    approvedRecordingGeneration ?? recordingGeneration,
                 realtimeAdmissionCount: callbacks,
                 deliveryCallbackCount: callbacks,
                 deliveredFrameCount: frames
@@ -22209,12 +22726,16 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         disposition: WebRTCIOSAudioCategoryObservationDisposition,
         deviceGeneration: UInt64 = 61,
         sequence: UInt64,
-        observedRouteSharingPolicyRawValue: Int? = nil
+        observedRouteSharingPolicyRawValue: Int? = nil,
+        observedCategory: String? = nil,
+        observedMode: String? = nil,
+        observedOptions: UInt? = nil,
+        omitTransaction: Bool = false
     ) -> WebRTCIOSAudioCategoryObservationReceipt {
         WebRTCIOSAudioCategoryObservationReceipt(
             disposition: disposition,
             transactionStateAtIngress: .consumed,
-            transaction: operation.nativeContext,
+            transaction: omitTransaction ? nil : operation.nativeContext,
             appOperationTagGeneration: 3,
             deviceInstanceGeneration: deviceGeneration,
             nativeTransactionIdentifier: 5,
@@ -22227,10 +22748,10 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             observedAtNanoseconds: 100 + sequence,
             transactionDeadlineNanoseconds: 1_000,
             inputRequired: target.inputRequired,
-            observedCategory: target.category,
-            observedMode: target.mode,
+            observedCategory: observedCategory ?? target.category,
+            observedMode: observedMode ?? target.mode,
             observedCategoryOptionsRawValue:
-                target.categoryOptionsRawValue,
+                observedOptions ?? target.categoryOptionsRawValue,
             observedRouteSharingPolicyRawValue:
                 observedRouteSharingPolicyRawValue ?? target.routeSharingPolicyRawValue,
             expectedCategory: target.category,
@@ -23278,7 +23799,9 @@ private func hostedCallIOSPlayoutDiagnostics(
     callbacks: UInt64 = 0,
     frames: UInt64 = 0,
     pcmNonzeroSampleCount: UInt64 = 0,
-    pcmAbsoluteSampleSum: UInt64 = 0
+    pcmAbsoluteSampleSum: UInt64 = 0,
+    routeSharingPolicyIsDefault: Bool = true,
+    routeSharingPolicyIsLongFormAudio: Bool = false
 ) -> WebRTCIOSPlayoutDiagnostics {
     guard let authorization else {
         return iosPlayoutDiagnostics(
@@ -23306,6 +23829,8 @@ private func hostedCallIOSPlayoutDiagnostics(
         failures: 0,
         categoryOptionsAreEmpty: false,
         categoryOptionsAreMixWithOthers: true,
+        routeSharingPolicyIsDefault: routeSharingPolicyIsDefault,
+        routeSharingPolicyIsLongFormAudio: routeSharingPolicyIsLongFormAudio,
         hasOutputRoute: true,
         hostedCallMode: true,
         hostedCallAuthorizationValid: authorization.isValid,
@@ -23946,6 +24471,139 @@ private final class AudioSessionEventsStub: AudioSessionEventMonitoring {
 
 final class IOSAudioDiagnosticsJournalTests: XCTestCase {
     private let second: UInt64 = 1_000_000_000
+
+    func testCategoryObservationFirstDetailSurvivesGenericAuthorityAndLaterDetails() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        journal.beginProof(recovery: true, at: second * 2)
+        journal.categoryObservationFailure(301, at: second * 3)
+        journal.authorityFailure(.failedClosed(nil), at: second * 3)
+        journal.categoryObservationFailure(317, at: second * 4)
+        journal.authorityFailure(.failedClosed(nil), at: second * 4)
+
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(buildNumber: 79), at: second * 5))
+        XCTAssertEqual(heartbeat.snapshot.authorityFailureCode, 301)
+        XCTAssertEqual(heartbeat.snapshot.authorization, .rejected)
+        XCTAssertEqual(heartbeat.snapshot.proofStage, .failed)
+        XCTAssertEqual(heartbeat.snapshot.failurePhase, .authorization)
+        XCTAssertEqual(heartbeat.failureSnapshot?.authorityFailureCode, 301)
+        XCTAssertEqual(heartbeat.failureSnapshot?.audioPolicyID, policy)
+        XCTAssertEqual(heartbeat.failureSnapshot?.recoveryAttempt, 1)
+        XCTAssertTrue(heartbeat.events.contains { $0.authorityFailureCode == 301 })
+        XCTAssertFalse(heartbeat.events.contains { $0.authorityFailureCode == 201 })
+
+        let bytes = try AudioClientDiagnosticsEnvelope(version: 1, negotiationID: UUID(), heartbeat: heartbeat).encoded()
+        XCTAssertLessThanOrEqual(bytes.count, 4096)
+        let decoded = try AudioClientDiagnosticsEnvelope.decode(bytes).heartbeat
+        XCTAssertEqual(decoded.snapshot.authorityFailureCode, 301)
+        XCTAssertEqual(decoded.failureSnapshot?.authorityFailureCode, 301)
+    }
+
+    func testCategoryObservationDetailResetsForFreshAttemptAndPolicyWithoutReplacingFirstFailure() {
+        var journal = IOSAudioDiagnosticsJournal()
+        let originalPolicy = UUID()
+        journal.reset(sessionID: UUID(), policyID: originalPolicy, at: second)
+        journal.beginProof(recovery: true, at: second * 2)
+        journal.categoryObservationFailure(301, at: second * 3)
+        journal.authorityFailure(.failedClosed(nil), at: second * 3)
+
+        journal.beginProof(recovery: true, at: second * 4)
+        XCTAssertNil(journal.snapshot.authorityFailureCode)
+        XCTAssertEqual(journal.snapshot.recoveryAttempt, 2)
+        journal.categoryObservationFailure(317, at: second * 5)
+        journal.authorityFailure(.failedClosed(nil), at: second * 5)
+        XCTAssertEqual(journal.snapshot.authorityFailureCode, 317)
+        XCTAssertEqual(journal.failureSnapshot?.authorityFailureCode, 301)
+        XCTAssertEqual(journal.failureSnapshot?.recoveryAttempt, 1)
+
+        let replacementPolicy = UUID()
+        journal.policyChanged(replacementPolicy, at: second * 6)
+        XCTAssertNil(journal.snapshot.authorityFailureCode)
+        journal.categoryObservationFailure(318, at: second * 7)
+        journal.authorityFailure(.failedClosed(nil), at: second * 7)
+        XCTAssertEqual(journal.snapshot.authorityFailureCode, 318)
+        XCTAssertEqual(journal.snapshot.audioPolicyID, replacementPolicy)
+        XCTAssertEqual(journal.failureSnapshot?.authorityFailureCode, 301)
+        XCTAssertEqual(journal.failureSnapshot?.audioPolicyID, originalPolicy)
+        XCTAssertTrue(journal.events.contains {
+            $0.authorityFailureCode == 317 && $0.recoveryAttempt == 2 && $0.audioPolicyID == originalPolicy
+        })
+        XCTAssertTrue(journal.events.contains {
+            $0.authorityFailureCode == 318 && $0.audioPolicyID == replacementPolicy
+        })
+    }
+
+    func testCorrelatedCategoryFailureSurvivesLaterUncorrelatedNativeTargetRejection() throws {
+        for replacePolicy in [false, true] {
+            var journal = IOSAudioDiagnosticsJournal()
+            let failedPolicy = UUID()
+            journal.reset(sessionID: UUID(), policyID: failedPolicy, at: second)
+            journal.beginProof(recovery: true, at: second * 2)
+            journal.categoryObservationFailure(301, at: second * 3)
+            journal.authorityFailure(.failedClosed(nil), at: second * 3)
+            XCTAssertNil(journal.failureSnapshot?.native,
+                         "The first correlated receipt can arrive before a native diagnostics sample.")
+            XCTAssertEqual(journal.failureSnapshot?.authorityFailureCode, 301)
+
+            let currentPolicy = replacePolicy ? UUID() : failedPolicy
+            if replacePolicy {
+                journal.policyChanged(currentPolicy, at: second * 4)
+                journal.beginProof(recovery: true, at: second * 4)
+            }
+            // This native context is historical and has no Swift operation/policy identity.
+            // Keep its separate event, but do not promote it over a correlated receipt cause.
+            journal.observeNative(try targetRejectionNative(), policyID: currentPolicy, at: second * 5)
+            let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(buildNumber: 79), at: second * 6))
+            XCTAssertEqual(heartbeat.failureSnapshot?.authorityFailureCode, 301)
+            XCTAssertEqual(heartbeat.failureSnapshot?.audioPolicyID, failedPolicy)
+            XCTAssertEqual(heartbeat.failureSnapshot?.recoveryAttempt, 1)
+            XCTAssertEqual(heartbeat.snapshot.authorityFailureCode, replacePolicy ? nil : 301)
+            let historical = try XCTUnwrap(heartbeat.events.first { $0.authorityFailureCode == 1073 })
+            XCTAssertNil(historical.audioPolicyID)
+            XCTAssertEqual(historical.recoveryAttempt, 0)
+            XCTAssertTrue(heartbeat.events.contains {
+                $0.authorityFailureCode == 301 && $0.audioPolicyID == failedPolicy && $0.recoveryAttempt == 1
+            })
+            let bytes = try AudioClientDiagnosticsEnvelope(version: 1, negotiationID: UUID(), heartbeat: heartbeat).encoded()
+            XCTAssertLessThanOrEqual(bytes.count, 4096)
+            let decoded = try AudioClientDiagnosticsEnvelope.decode(bytes).heartbeat
+            XCTAssertEqual(decoded.failureSnapshot?.authorityFailureCode, 301)
+            XCTAssertEqual(decoded.failureSnapshot?.audioPolicyID, failedPolicy)
+        }
+    }
+
+    func testCorrelatedCategoryFailureSurvivesSameNativeContextGainingTargetDetail() throws {
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: second)
+        journal.beginProof(recovery: true, at: second * 2)
+        journal.categoryObservationFailure(301, at: second * 3)
+        journal.authorityFailure(.failedClosed(nil), at: second * 3)
+
+        let detailedNative = try targetRejectionNative()
+        var nativeWithoutTargetDetail = detailedNative
+        var context = try XCTUnwrap(nativeWithoutTargetDetail.failureContext)
+        context.targetPolicyRejection = nil
+        nativeWithoutTargetDetail.failureContext = context
+        journal.observeNative(nativeWithoutTargetDetail, policyID: policy, at: second * 4)
+        XCTAssertEqual(journal.failureSnapshot?.authorityFailureCode, 301)
+        XCTAssertEqual(journal.failureSnapshot?.native?.failureContext, context,
+                       "The retained correlated failure has already acquired this exact native identity without target detail.")
+
+        journal.observeNative(detailedNative, policyID: policy, at: second * 5)
+        journal.authorityFailure(.failedClosed(nil), at: second * 5)
+        let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(buildNumber: 79), at: second * 6))
+        XCTAssertEqual(heartbeat.snapshot.authorityFailureCode, 301)
+        XCTAssertEqual(heartbeat.failureSnapshot?.authorityFailureCode, 301)
+        XCTAssertEqual(heartbeat.failureSnapshot?.audioPolicyID, policy)
+        XCTAssertEqual(heartbeat.failureSnapshot?.recoveryAttempt, 1)
+        XCTAssertEqual(heartbeat.failureSnapshot?.native?.failureContext?.eventSequence, context.eventSequence)
+        let historical = try XCTUnwrap(heartbeat.events.first { $0.authorityFailureCode == 1073 })
+        XCTAssertNil(historical.audioPolicyID)
+        XCTAssertEqual(historical.recoveryAttempt, 0)
+        XCTAssertEqual(heartbeat.events.filter { $0.authorityFailureCode == 1073 }.count, 1)
+    }
 
     private func targetRejectionNative(device: UInt64 = 7, event: UInt64 = 1,
                                        configuration: UInt64 = 3) throws -> WebRTCAudioClientNativeSnapshot {

@@ -115,10 +115,19 @@ manual IP addresses, router configuration, or public TCP ports.
   notify the delegate of input interruption before delivering on a different thread.
 - The iPhone must use one custom RemoteIO device. With microphone intent off, it is
   output-only and owns a `.playback` category / `.default` mode audio session with
-  `.longFormAudio` route-sharing policy and no category options. Microphone duplex
-  and authorized hosted-call playback retain `.default` route sharing. Match the
-  exact selected policy throughout native transactions and runtime proof; never
-  treat any non-default route as acceptable or redefine a diagnostic default bit.
+  `.longFormAudio` route-sharing policy and no category options. Ordinary raw
+  microphone duplex requests `.default` sharing. Its explicitly supported effective
+  sharing profile is only `.default` or `.longFormAudio`: real-device tests showed
+  that media-control registration changes the system getter while raw built-in
+  microphone capture remains functional. This narrow profile requires the exact
+  `.playAndRecord` / `.default` / DefaultToSpeaker|AllowBluetoothA2DP tuple and all
+  existing raw-RemoteIO, route, permission, authorization, and generation proof.
+  Authorized hosted-call playback still requires effective `.default`; output-only
+  playback still requires effective `.longFormAudio`. Preserve requested and observed
+  values separately throughout native/Swift/Rust transactions and diagnostics. Never
+  normalize observed long-form to default, accept independent/long-form-video/unknown
+  policies, infer notification origin from sharing alone, or redefine a diagnostic
+  default bit. The user explicitly approved this profile revision on 2026-09-19.
   For a production session handed off by authenticated pairing or reconnect,
   the first current-generation peer/ICE/control healthy boundary automatically
   establishes microphone intent and, while the app is active, requests permission

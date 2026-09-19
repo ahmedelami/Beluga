@@ -509,7 +509,11 @@ typedef NS_ENUM(NSInteger, ASIOSAudioCategoryTransactionState) {
 @property(nonatomic, copy, readonly) NSString *expectedCategory;
 @property(nonatomic, copy, readonly) NSString *expectedMode;
 @property(nonatomic, readonly) NSUInteger expectedCategoryOptions;
+/// Requested setter policy. Ordinary raw microphone requests default even when effective is 1.
 @property(nonatomic, readonly) NSInteger expectedRouteSharingPolicy;
+/// Exact named-profile match, not necessarily equality of requested/effective sharing policy.
+/// Ordinary raw microphone alone permits effective default or long-form audio; all other tuple
+/// members remain exact. This observation never grants microphone or realtime-gate authority.
 @property(nonatomic, readonly) BOOL policyTupleIsExact;
 @property(nonatomic, readonly) BOOL transactionEvidenceIsExact;
 
@@ -778,7 +782,12 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 - (NSDictionary<NSString *, NSNumber *> *)debugSystemAudioEventFenceForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetryAfterFailedInitialPlayoutForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugRetainedFailureContextForTesting;
+- (BOOL)debugRealSessionIsQuiescentForTesting
+    NS_SWIFT_NAME(debugRealSessionIsQuiescentForTesting());
 - (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterForTesting;
+- (NSDictionary<NSString *, NSNumber *> *)debugProbeRealSessionPolicySetterScenarioForTesting:
+    (NSUInteger)scenario
+    NS_SWIFT_NAME(debugProbeRealSessionPolicySetterScenarioForTesting(_:));
 - (NSDictionary<NSString *, NSNumber *> *)debugBoundedDiagnosticsReadForTesting;
 - (NSDictionary<NSString *, NSNumber *> *)debugPlayoutRetryFailureForTesting:
     (ASIOSPlayoutRetryFailureTestScenario)scenario

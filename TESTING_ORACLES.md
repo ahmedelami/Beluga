@@ -88,6 +88,62 @@ driver evidence and does not certify a later build from this source cleanup.
   prove restoration after `SIGKILL`, process crash, kernel failure, or power loss;
   release claims must state that limitation rather than inferring crash recovery.
 
+## Ordinary microphone effective-sharing profile
+
+The 2026-09-19 user-approved revision preserves the requested `.default` setter
+policy and the actual observed getter separately. Only ordinary raw microphone
+duplex with exact `.playAndRecord` / `.default` / options40 accepts effective
+`.default` or `.longFormAudio`. It does not identify the source of a notification,
+authorize capture, permit a different input route, or apply to hosted-call playback.
+Output-only playback remains effective long-form; hosted-call playback remains
+effective default. Native, Swift, and Rust must agree on this profile without
+normalizing observed values or changing the factual `isDefault` diagnostic bit.
+
+Require both effective values through current-operation observation, native
+configuration, sender admission/statistics, and physical PCM proof. A later 0/1
+observation is benign only with the same immutable transaction provenance and a
+newer sequence/time. A changed value under the same sequence remains conflicting.
+Reject independent, long-form-video, negative/unknown values, inconsistent diagnostic
+bits, wrong mode/options/category, stale operation/device/generation evidence, and
+missing native or capture authorization. Prove a strict-default mutation breaks the
+positive long-form case and a broad-acceptance mutation breaks the negative cases.
+
+The spare-phone AVAudioEngine test proved built-in raw RemoteIO capture under
+effective long-form in two fresh processes, with two advancing 500ms PCM windows
+per process and balanced teardown. That is platform evidence only: it does not
+replace sole-production-device capture, WebRTC sender, Mac consumer, reconnect,
+call-privacy, or physical media-button validation from the changed artifact.
+
+Pending route convergence must also handle a category observation that carries a
+real, chained route change. It may advance only the current Pending transaction's
+route cursor with exact profile, sequence/deadline/configuration/system provenance,
+unchanged pinned output and admissible ownership. It is not reason-8 evidence, a
+native-start settlement, a capture grant, or proof of notification origin. Require
+the production handler to update that cursor while preserving the category receipt;
+reject broken chains and wrong outputs, ownership, policies or generations, and
+keep Prepared/Starting/Consumed behavior unchanged. Removing the cursor update must
+fail the handler test. Physical proof must still exercise output-only to microphone
+and back, not merely cold microphone activation. Capture failure diagnostics before
+rollback, since deactivation removes input routes and can obscure the first cause.
+
+An SDK `stopRecording` callback is a synchronous capture-privacy boundary, not an
+application policy transaction. Require authorization revocation, drained capture,
+cleared recording generations and rejected bare restart, with no category, configuration
+or system-generation mutation. Preserve a pending exact output-only operation and the
+truthful configured input-bus flag until that operation disposes/rebuilds the unit.
+Exercise absent, output-only and microphone pending carriers; reject cross-carrier
+borrowing and competing enables. Restoring the untagged stop-time rebuild must fail
+the production-stop regression. Swift tests must prove privacy is already closed while
+the output-policy owner is suspended and before successful or failed native attempts.
+Physical repeated A/C cycles must show advancing native capture and sender energy,
+frozen capture after each disable, correlated category receipts, and real tag drains.
+The sole-viewer physical test keeps a real MediaPlayer command registered, negotiates
+normal local WebRTC with a no-hardware host, and runs three complete cycles on one
+production RemoteIO device. It consumes actual category/drain events through the Rust
+authority and stores scalar measurements only. Two fresh launches passed on the spare
+iPhone15 with effective long-form sharing. This does not exercise the production view
+model, a Mac consumer, worldwide traversal, actual remote-command delivery or TestFlight.
+
 ## Native media controls release boundary
 
 Thumbnail decoration must remain independent of command delivery. Cover legacy/malformed

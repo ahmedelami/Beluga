@@ -85,6 +85,30 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
     }
 }
 
+/// Ordinary raw microphone duplex requests default sharing. iOS may report default or
+/// long-form sharing for this exact profile; neither value implies why iOS selected it.
+/// This describes the session tuple only and never grants input or hosted-call authority.
+public enum WebRTCIOSOrdinaryRawMicrophonePolicy {
+    public nonisolated static func effectiveSharingPolicyIsSupported(rawValue: Int) -> Bool {
+        rawValue == 0 || rawValue == 1
+    }
+
+    public nonisolated static func matches(
+        categoryIsPlayAndRecord: Bool,
+        modeIsDefault: Bool,
+        categoryOptionsAreIPhoneMicrophoneRouting: Bool,
+        routeSharingPolicyIsDefault: Bool,
+        routeSharingPolicyIsLongFormAudio: Bool,
+        hostedCallMode: Bool
+    ) -> Bool {
+        categoryIsPlayAndRecord
+            && modeIsDefault
+            && categoryOptionsAreIPhoneMicrophoneRouting
+            && !hostedCallMode
+            && (routeSharingPolicyIsDefault != routeSharingPolicyIsLongFormAudio)
+    }
+}
+
 /// Release-safe ownership, processing, topology, and native-delivery state for the exact current
 /// iPhone microphone sender. Native sender/track identifiers and object identities remain private
 /// to `WebRTCPeer`; this projection carries only ephemeral generations and bounded state.
@@ -120,6 +144,7 @@ public struct WebRTCIPhoneMicrophoneSenderDiagnostics: Equatable, Sendable {
     public let categoryOptionsAreEmpty: Bool
     public let categoryOptionsAreIPhoneMicrophoneRouting: Bool
     public let routeSharingPolicyIsDefault: Bool
+    public var routeSharingPolicyIsLongFormAudio: Bool = false
     public let hasOutputRoute: Bool
     public let sampleRateIs48k: Bool
     public let ioBufferDurationIsBounded: Bool
@@ -134,6 +159,17 @@ public struct WebRTCIPhoneMicrophoneSenderDiagnostics: Equatable, Sendable {
     public let realtimeAdmissionCount: UInt64
     public let deliveryCallbackCount: UInt64
     public let deliveredFrameCount: UInt64
+
+    public var ordinaryRawMicrophonePolicyMatches: Bool {
+        WebRTCIOSOrdinaryRawMicrophonePolicy.matches(
+            categoryIsPlayAndRecord: categoryIsPlayAndRecord,
+            modeIsDefault: modeIsDefault,
+            categoryOptionsAreIPhoneMicrophoneRouting: categoryOptionsAreIPhoneMicrophoneRouting,
+            routeSharingPolicyIsDefault: routeSharingPolicyIsDefault,
+            routeSharingPolicyIsLongFormAudio: routeSharingPolicyIsLongFormAudio,
+            hostedCallMode: hostedCallMode
+        )
+    }
 }
 
 /// Exact sender-scoped outbound evidence for the current admitted iPhone microphone sender.

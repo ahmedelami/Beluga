@@ -356,7 +356,7 @@ enum WorldwideRawMicrophoneOracleEvaluator {
               sender.outputBusEnabled,
               !sender.categoryOptionsAreEmpty,
               sender.categoryOptionsAreIPhoneMicrophoneRouting,
-              sender.routeSharingPolicyIsDefault,
+              sender.ordinaryRawMicrophonePolicyMatches,
               sender.hasOutputRoute,
               sender.sampleRateIs48k,
               sender.ioBufferDurationIsBounded,
@@ -1141,8 +1141,7 @@ struct WorldwideAudioPlayoutOracleSnapshot: Equatable, Sendable {
         let routeSharingPolicyMatchesInputPolicy: Bool
         if diagnostics.inputBusEnabled {
             routeSharingPolicyMatchesInputPolicy =
-                diagnostics.routeSharingPolicyIsDefault
-                && !diagnostics.routeSharingPolicyIsLongFormAudio
+                diagnostics.ordinaryRawMicrophonePolicyMatches
             categoryMatchesInputPolicy =
                 !diagnostics.categoryIsMediaPlayback
                 && diagnostics.categoryIsMediaPlayAndRecord

@@ -27,6 +27,10 @@ typedef struct {
     uint32_t category;
     uint32_t mode;
     uint64_t options;
+    /* Expected targets retain the requested policy; observed targets retain the actual
+       getter. Canonical ordinary raw duplex (category 2, mode 1, options 40, input 1,
+       requested policy 0) accepts effective policy 0 or 1. Other profiles remain exact.
+       This policy membership never replaces operation, native, or capture proof. */
     int64_t route_sharing_policy;
     uint32_t input_required;
     uint32_t reserved;

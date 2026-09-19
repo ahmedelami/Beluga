@@ -44,6 +44,31 @@ impl Target {
     pub const CATEGORY_PLAYBACK: u32 = 1;
     pub const CATEGORY_PLAY_AND_RECORD: u32 = 2;
     pub const MODE_DEFAULT: u32 = 1;
+    /// DefaultToSpeaker (32) | AllowBluetoothA2DP (8), not a voice/chat profile.
+    pub const ORDINARY_RAW_MICROPHONE_OPTIONS: u64 = 40;
+
+    /// Expected targets preserve the requested policy; observations preserve the actual
+    /// getter. Only canonical ordinary raw duplex admits the two known effective policies.
+    /// Membership is evidence, never permission to capture or proof of MediaPlayer causality.
+    #[must_use]
+    pub const fn accepts_observed(self, observed: Self) -> bool {
+        let ordinary_raw_microphone = self.category == Self::CATEGORY_PLAY_AND_RECORD
+            && self.mode == Self::MODE_DEFAULT
+            && self.options == Self::ORDINARY_RAW_MICROPHONE_OPTIONS
+            && self.input_required == 1
+            && self.route_sharing_policy == 0;
+        self.is_valid()
+            && observed.is_valid()
+            && self.category == observed.category
+            && self.mode == observed.mode
+            && self.options == observed.options
+            && self.input_required == observed.input_required
+            && if ordinary_raw_microphone {
+                matches!(observed.route_sharing_policy, 0 | 1)
+            } else {
+                self.route_sharing_policy == observed.route_sharing_policy
+            }
+    }
 
     #[must_use]
     pub const fn is_valid(self) -> bool {
@@ -251,7 +276,7 @@ impl NativeObservationReceipt {
             && self.alignment_reserved == 0
             && self.expected_target.is_valid()
             && self.observed_target.is_valid()
-            && self.expected_target == self.observed_target
+            && self.expected_target.accepts_observed(self.observed_target)
             && self.expected_target.input_required == self.input_required
     }
 
@@ -287,7 +312,9 @@ impl NativeObservationReceipt {
             && self.reserved == earlier.reserved
             && self.alignment_reserved == earlier.alignment_reserved
             && self.expected_target == earlier.expected_target
-            && self.observed_target == earlier.observed_target
+            // Both observations must satisfy the same requested profile. A system-reported
+            // 0/1 sharing change within ordinary raw duplex does not change transaction
+            // provenance or grant new authority; all other tuple members remain exact.
     }
 }
 
