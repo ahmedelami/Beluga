@@ -10,7 +10,12 @@ readonly EXPECTED_FRAMEWORK_RPATH="@executable_path/../Frameworks"
 readonly EXPECTED_FRAMEWORK_INSTALL_NAME="@rpath/LiveKitWebRTC.framework/LiveKitWebRTC"
 readonly EXPECTED_ICON_SHA256="b2b23a101dc2de171d4a64eec31afc87858d8c31515048f958d82ed2e779f936"
 readonly MINIMUM_MACOS_VERSION="14.0"
-readonly INSTALLED_RUNTIME_APP_PATH="/Applications/Beluga Host.app"
+readonly INSTALLED_RUNTIME_APP_PATH="/Applications/opensteamer Host.app"
+readonly EXPECTED_MEDIA_BRIDGE_NAME="OpensteamerMediaBridge"
+readonly EXPECTED_MEDIA_BRIDGE_IDENTIFIER="org.example.opensteamer.MediaBridge"
+readonly EXPECTED_MEDIA_NATIVE_MANIFEST="org.example.opensteamer.media.json"
+readonly EXPECTED_MEDIA_ORIGIN="chrome-extension://dhmdpbpcldmnkjfibepklolofapiceab/"
+readonly EXPECTED_APPLE_EVENTS_USAGE="Beluga reads playback information and controls Chrome and Music when you enable media integration."
 
 fail() {
     print -u2 -- "verify-beluga-host-bundle: $*"
@@ -18,14 +23,19 @@ fail() {
 }
 
 XATTR_POLICY="strict"
-if (( $# > 0 )) && [[ "$1" == --installed-runtime ]]; then
-    XATTR_POLICY="installed-runtime"
+REQUIRED_MEDIA_CONTRACT=0
+while (( $# > 0 )); do
+    case "$1" in
+        --installed-runtime) XATTR_POLICY="installed-runtime" ;;
+        --media-integration-v1) REQUIRED_MEDIA_CONTRACT=1 ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 
 if (( $# < 1 || $# > 3 )); then
     print -u2 -- \
-        "usage: $0 [--installed-runtime] <Beluga Host.app> [expected-team-id] [designated-requirement-reference-code]"
+        "usage: $0 [--installed-runtime] [--media-integration-v1] <Beluga Host.app> [expected-team-id] [designated-requirement-reference-code]"
     exit 64
 fi
 
@@ -39,11 +49,12 @@ LEXICAL_APP_PATH="${APP_INPUT:a}"
 [[ ! -L "$LEXICAL_APP_PATH" && -d "$LEXICAL_APP_PATH" ]] || fail \
     "app bundle must be a real directory: $LEXICAL_APP_PATH"
 APP_PATH="${LEXICAL_APP_PATH:A}"
-[[ "${APP_PATH:t}" == "$EXPECTED_APP_BASENAME" ]] || fail \
-    "bundle basename: expected '$EXPECTED_APP_BASENAME', found '${APP_PATH:t}'"
 if [[ "$XATTR_POLICY" == installed-runtime ]]; then
     [[ "$APP_PATH" == "$INSTALLED_RUNTIME_APP_PATH" ]] || fail \
         "--installed-runtime is restricted to '$INSTALLED_RUNTIME_APP_PATH': $APP_PATH"
+else
+    [[ "${APP_PATH:t}" == "$EXPECTED_APP_BASENAME" ]] || fail \
+        "bundle basename: expected '$EXPECTED_APP_BASENAME', found '${APP_PATH:t}'"
 fi
 APP_ROOT_DEVICE_INODE="$(/usr/bin/stat -f '%d:%i' "$APP_PATH")" || fail \
     "could not capture app root identity"
@@ -58,6 +69,8 @@ FRAMEWORK="$FRAMEWORKS_DIR/LiveKitWebRTC.framework"
 FRAMEWORK_EXECUTABLE_LINK="$FRAMEWORK/LiveKitWebRTC"
 NOTICES="$RESOURCES_DIR/ThirdPartyNotices.md"
 APP_ICON="$RESOURCES_DIR/AppIcon.icns"
+MEDIA_BRIDGE="$MACOS_DIR/$EXPECTED_MEDIA_BRIDGE_NAME"
+MEDIA_NATIVE_MANIFEST="$RESOURCES_DIR/$EXPECTED_MEDIA_NATIVE_MANIFEST"
 
 assert_real_directory() {
     local target="$1" label="$2"
@@ -86,6 +99,20 @@ ICON_SHA256="$(/usr/bin/shasum -a 256 "$APP_ICON" | /usr/bin/awk '{ print $1 }')
     "could not hash Beluga app icon"
 [[ "$ICON_SHA256" == "$EXPECTED_ICON_SHA256" ]] || fail "Beluga app icon differs from the approved logo"
 [[ -x "$EXECUTABLE" ]] || fail "main executable is not executable"
+/usr/bin/plutil -lint "$INFO_PLIST" >/dev/null || fail "Info.plist is invalid"
+MEDIA_CONTRACT=0
+if /usr/bin/plutil -type OpensteamerMediaIntegrationVersion "$INFO_PLIST" >/dev/null 2>&1; then
+    MEDIA_CONTRACT="$(/usr/bin/plutil -extract OpensteamerMediaIntegrationVersion raw \
+        -expect integer -o - "$INFO_PLIST")" || fail "media integration version must be an integer"
+    [[ "$MEDIA_CONTRACT" == 1 ]] || fail "unsupported media integration contract version"
+fi
+[[ "$REQUIRED_MEDIA_CONTRACT" == 0 || "$MEDIA_CONTRACT" == 1 ]] || fail \
+    "media integration v1 contract is required"
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    assert_real_file "$MEDIA_BRIDGE" "media bridge executable" 755
+    assert_real_file "$MEDIA_NATIVE_MANIFEST" "native messaging manifest" 644
+    [[ -x "$MEDIA_BRIDGE" ]] || fail "media bridge is not executable"
+fi
 
 # The versioned framework has one exact reviewed alias set and one exact structural spine.
 # Every alias is required, must remain a symbolic link with the reviewed relative target, and no
@@ -205,10 +232,16 @@ CONTENTS_ENTRIES="$(/bin/ls -1A "$CONTENTS_DIR" | LC_ALL=C /usr/bin/sort)" || fa
     "could not enumerate Contents"
 [[ "$CONTENTS_ENTRIES" == $'Frameworks\nInfo.plist\nMacOS\nResources\n_CodeSignature' ]] || fail \
     "Contents entries differ from the reviewed bundle layout: $CONTENTS_ENTRIES"
-MACOS_ENTRIES="$(/bin/ls -1A "$MACOS_DIR")"
-[[ "$MACOS_ENTRIES" == "$EXPECTED_EXECUTABLE_NAME" ]] || fail "MacOS directory has unexpected entries"
-RESOURCES_ENTRIES="$(/bin/ls -1A "$RESOURCES_DIR")"
-[[ "$RESOURCES_ENTRIES" == $'AppIcon.icns\nThirdPartyNotices.md' ]] || fail "Resources directory has unexpected entries"
+MACOS_ENTRIES="$(/bin/ls -1A "$MACOS_DIR" | LC_ALL=C /usr/bin/sort)"
+RESOURCES_ENTRIES="$(/bin/ls -1A "$RESOURCES_DIR" | LC_ALL=C /usr/bin/sort)"
+EXPECTED_MACOS_ENTRIES="$EXPECTED_EXECUTABLE_NAME"
+EXPECTED_RESOURCES_ENTRIES=$'AppIcon.icns\nThirdPartyNotices.md'
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    EXPECTED_MACOS_ENTRIES+=$'\n'"$EXPECTED_MEDIA_BRIDGE_NAME"
+    EXPECTED_RESOURCES_ENTRIES+=$'\n'"$EXPECTED_MEDIA_NATIVE_MANIFEST"
+fi
+[[ "$MACOS_ENTRIES" == "$EXPECTED_MACOS_ENTRIES" ]] || fail "MacOS directory has unexpected entries"
+[[ "$RESOURCES_ENTRIES" == "$EXPECTED_RESOURCES_ENTRIES" ]] || fail "Resources directory has unexpected entries"
 FRAMEWORKS_ENTRIES="$(/bin/ls -1A "$FRAMEWORKS_DIR")"
 [[ "$FRAMEWORKS_ENTRIES" == LiveKitWebRTC.framework ]] || fail "Frameworks directory has unexpected entries"
 
@@ -277,6 +310,31 @@ assert_plist_value CFBundleName "Beluga Host"
 assert_plist_value CFBundleDisplayName "Beluga Host"
 assert_plist_value CFBundleIconFile "AppIcon.icns"
 assert_plist_value CFBundlePackageType APPL
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    APPLE_EVENTS_USAGE="$(/usr/bin/plutil -extract NSAppleEventsUsageDescription raw \
+        -expect string -o - "$INFO_PLIST")" || fail "missing Apple Events usage description"
+    [[ "$APPLE_EVENTS_USAGE" == "$EXPECTED_APPLE_EVENTS_USAGE" ]] || fail \
+        "Apple Events usage description differs from the reviewed media contract"
+    MANIFEST_KEYS="$(/usr/bin/plutil -convert xml1 -o - "$MEDIA_NATIVE_MANIFEST" \
+        | /usr/bin/sed -n 's/^[[:space:]]*<key>\([^<]*\)<\/key>$/\1/p' \
+        | LC_ALL=C /usr/bin/sort)" || fail "invalid native messaging manifest"
+    [[ "$MANIFEST_KEYS" == $'allowed_origins\ndescription\nname\npath\ntype' ]] || fail \
+        "native messaging manifest keys differ from the reviewed media contract"
+    assert_manifest_string() {
+        local key="$1" expected="$2" actual
+        actual="$(/usr/bin/plutil -extract "$key" raw -expect string -o - \
+            "$MEDIA_NATIVE_MANIFEST")" || fail "invalid native messaging manifest field: $key"
+        [[ "$actual" == "$expected" ]] || fail "native messaging manifest field differs: $key"
+    }
+    assert_manifest_string name org.example.opensteamer.media
+    assert_manifest_string description "opensteamer browser media bridge"
+    assert_manifest_string path "$INSTALLED_RUNTIME_APP_PATH/Contents/MacOS/$EXPECTED_MEDIA_BRIDGE_NAME"
+    assert_manifest_string type stdio
+    ORIGIN_COUNT="$(/usr/bin/plutil -extract allowed_origins raw -expect array -o - \
+        "$MEDIA_NATIVE_MANIFEST")" || fail "invalid native messaging allowed origins"
+    [[ "$ORIGIN_COUNT" == 1 ]] || fail "native messaging requires exactly one allowed origin"
+    assert_manifest_string allowed_origins.0 "$EXPECTED_MEDIA_ORIGIN"
+fi
 
 EXECUTABLE_FILE_TYPE="$(/usr/bin/file -b "$EXECUTABLE")"
 FRAMEWORK_FILE_TYPE="$(/usr/bin/file -b "$FRAMEWORK_EXECUTABLE")"
@@ -284,6 +342,11 @@ FRAMEWORK_FILE_TYPE="$(/usr/bin/file -b "$FRAMEWORK_EXECUTABLE")"
     "main executable is not a Mach-O executable: $EXECUTABLE_FILE_TYPE"
 [[ "$FRAMEWORK_FILE_TYPE" == *Mach-O* ]] || fail \
     "framework executable is not Mach-O: $FRAMEWORK_FILE_TYPE"
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    MEDIA_BRIDGE_FILE_TYPE="$(/usr/bin/file -b "$MEDIA_BRIDGE")"
+    [[ "$MEDIA_BRIDGE_FILE_TYPE" == *Mach-O* && "$MEDIA_BRIDGE_FILE_TYPE" == *executable* ]] || fail \
+        "media bridge is not a Mach-O executable"
+fi
 
 normalize_arches() {
     print -r -- "$1" | /usr/bin/tr ' ' '\n' | /usr/bin/sed '/^$/d' | LC_ALL=C /usr/bin/sort | \
@@ -307,6 +370,12 @@ done
 if [[ -n "$EXPECTED_ARCHITECTURES" ]]; then
     [[ "$HOST_ARCHES" == "$(normalize_arches "$EXPECTED_ARCHITECTURES")" ]] || fail \
         "host architectures '$HOST_ARCHES' differ from expected '$(normalize_arches "$EXPECTED_ARCHITECTURES")'"
+fi
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    MEDIA_BRIDGE_ARCHES="$(normalize_arches "$(/usr/bin/lipo -archs "$MEDIA_BRIDGE")")" || fail \
+        "could not read media bridge architectures"
+    [[ "$MEDIA_BRIDGE_ARCHES" == "$HOST_ARCHES" ]] || fail \
+        "media bridge architectures differ from the host"
 fi
 
 minimum_os_for() {
@@ -334,6 +403,12 @@ FRAMEWORK_MIN_OS="$(minimum_os_for "$FRAMEWORK_EXECUTABLE")" || fail \
     "host deployment target '$HOST_MIN_OS' is not exactly macOS $MINIMUM_MACOS_VERSION"
 version_at_most "$FRAMEWORK_MIN_OS" "$MINIMUM_MACOS_VERSION" || fail \
     "framework deployment target '$FRAMEWORK_MIN_OS' is newer than macOS $MINIMUM_MACOS_VERSION"
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    MEDIA_BRIDGE_MIN_OS="$(minimum_os_for "$MEDIA_BRIDGE")" || fail \
+        "could not read media bridge deployment target"
+    [[ "$MEDIA_BRIDGE_MIN_OS" == "$MINIMUM_MACOS_VERSION" ]] || fail \
+        "media bridge deployment target must be exactly macOS $MINIMUM_MACOS_VERSION"
+fi
 
 rpaths_for() {
     /usr/bin/otool -l "$1" | /usr/bin/awk '
@@ -344,6 +419,10 @@ rpaths_for() {
 HOST_RPATHS="$(rpaths_for "$EXECUTABLE")" || fail "could not read host rpaths"
 [[ "$HOST_RPATHS" == "$EXPECTED_FRAMEWORK_RPATH" ]] || fail \
     "main executable LC_RPATH set must be exactly '$EXPECTED_FRAMEWORK_RPATH', found '${HOST_RPATHS:-none}'"
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    MEDIA_BRIDGE_RPATHS="$(rpaths_for "$MEDIA_BRIDGE")" || fail "could not read media bridge rpaths"
+    [[ -z "$MEDIA_BRIDGE_RPATHS" ]] || fail "media bridge must not contain LC_RPATH entries"
+fi
 FRAMEWORK_RPATHS="$(rpaths_for "$FRAMEWORK_EXECUTABLE")" || fail "could not read framework rpaths"
 if print -r -- "$FRAMEWORK_RPATHS" | /usr/bin/grep -Eq \
     '(^|/)(\.build|build)(/|$)|/Users/|/private/|/tmp/|/var/tmp/|Xcode\.app|Toolchains|^@loader_path|^/usr/lib/swift'; then
@@ -496,23 +575,59 @@ validate_dependency_set host "$HOST_LIBRARIES" "$HOST_SLICE_COUNT"
 validate_dependency_set framework "$FRAMEWORK_LIBRARIES" "$FRAMEWORK_SLICE_COUNT"
 validate_framework_install_ids "$FRAMEWORK_INSTALL_IDS" "$FRAMEWORK_SLICE_COUNT"
 
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    MEDIA_BRIDGE_LIBRARIES="$(libraries_for "$MEDIA_BRIDGE")" || fail \
+        "could not read media bridge dependencies"
+    bridge_slice_count=0
+    bridge_current_slice=""
+    while IFS=$'\t' read -r slice dependency; do
+        if [[ "$slice" != "$bridge_current_slice" ]]; then
+            bridge_slice_count=$((bridge_slice_count + 1))
+            [[ "$slice" == "$bridge_slice_count" ]] || fail "media bridge dependency slice order is invalid"
+            bridge_current_slice="$slice"
+        fi
+        [[ "$dependency" != *'..'* && "$dependency" != *'//'* && "$dependency" != *' '* \
+            && "$dependency" != *$'\t'* ]] || fail "media bridge dependency path is malformed"
+        case "$dependency" in
+            /usr/lib/lib*.dylib|/usr/lib/system/*.dylib|/usr/lib/swift/*.dylib \
+            |/System/Library/Frameworks/Foundation.framework/Versions/*/Foundation \
+            |/System/Library/Frameworks/CoreFoundation.framework/Versions/*/CoreFoundation) ;;
+            *) fail "media bridge contains an unreviewed dependency: $dependency" ;;
+        esac
+    done <<< "$MEDIA_BRIDGE_LIBRARIES"
+    (( bridge_slice_count == HOST_SLICE_COUNT )) || fail "media bridge dependency slices are incomplete"
+fi
+
 verify_signature() {
     local target="$1" label="$2"
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$target" || fail \
         "strict code-signature verification failed for $label"
 }
 verify_signature "$FRAMEWORK" "LiveKitWebRTC.framework"
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    verify_signature "$MEDIA_BRIDGE" "the media bridge"
+fi
 verify_signature "$EXECUTABLE" "the main executable"
 verify_signature "$APP_PATH" "the app bundle"
 
-# The host and framework ship without custom entitlements. Reject any entitlement drift.
-for signed_target in "$APP_PATH" "$EXECUTABLE" "$FRAMEWORK"; do
+# v1 grants Apple Events only to the stable host code identity. Legacy bundles and nested
+# bridge/framework code retain the empty entitlement contract; historical verifier bytes stay valid.
+SIGNED_TARGETS=("$APP_PATH" "$EXECUTABLE" "$FRAMEWORK")
+[[ "$MEDIA_CONTRACT" == 0 ]] || SIGNED_TARGETS+=("$MEDIA_BRIDGE")
+for signed_target in "${SIGNED_TARGETS[@]}"; do
     entitlement_output="$(/usr/bin/codesign -d --entitlements :- "$signed_target" 2>/dev/null)" || fail \
         "could not inspect signed-code entitlements: $signed_target"
-    if [[ -n "$entitlement_output" && "$entitlement_output" != *'<dict/>'* \
-        && "$entitlement_output" != *'<dict></dict>'* ]]; then
-        fail "signed code contains unreviewed entitlements: $signed_target"
+    expected_entitlement_json='{}'
+    if [[ "$MEDIA_CONTRACT" == 1 && ( "$signed_target" == "$APP_PATH" || "$signed_target" == "$EXECUTABLE" ) ]]; then
+        expected_entitlement_json='{"com.apple.security.automation.apple-events":true}'
     fi
+    entitlement_json='{}'
+    if [[ -n "$entitlement_output" ]]; then
+        entitlement_json="$(print -r -- "$entitlement_output" | /usr/bin/plutil -convert json -o - -)" \
+            || fail "could not parse signed-code entitlements: $signed_target"
+    fi
+    [[ "$entitlement_json" == "$expected_entitlement_json" ]] || fail \
+        "signed code entitlements differ from the exact reviewed contract: $signed_target"
 done
 
 read_code_metadata() {
@@ -537,6 +652,18 @@ read_code_metadata "$EXECUTABLE" "the main executable"
 EXECUTABLE_CODE_IDENTIFIER="$CODE_IDENTIFIER"; EXECUTABLE_TEAM_ID="$CODE_TEAM_ID"; EXECUTABLE_DR="$CODE_DESIGNATED_REQUIREMENT"
 read_code_metadata "$FRAMEWORK" "LiveKitWebRTC.framework"
 FRAMEWORK_CODE_IDENTIFIER="$CODE_IDENTIFIER"; FRAMEWORK_TEAM_ID="$CODE_TEAM_ID"
+if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+    read_code_metadata "$MEDIA_BRIDGE" "the media bridge"
+    [[ "$CODE_IDENTIFIER" == "$EXPECTED_MEDIA_BRIDGE_IDENTIFIER" ]] || fail "wrong media bridge signature identifier"
+    [[ "$CODE_TEAM_ID" == "$APP_TEAM_ID" ]] || fail "media bridge TeamIdentifier differs from the host"
+    if [[ "$APP_TEAM_ID" == "not set" ]]; then
+        [[ "$CODE_DESIGNATED_REQUIREMENT" == "designated => cdhash "* ]] || fail \
+            "media bridge ad-hoc designated requirement is malformed"
+    else
+        [[ "$CODE_DESIGNATED_REQUIREMENT" == *"identifier \"$EXPECTED_MEDIA_BRIDGE_IDENTIFIER\""* ]] || fail \
+            "media bridge designated requirement lacks its distinct identifier"
+    fi
+fi
 
 [[ "$APP_CODE_IDENTIFIER" == "$EXPECTED_BUNDLE_IDENTIFIER" ]] || fail "wrong app signature identifier"
 [[ "$EXECUTABLE_CODE_IDENTIFIER" == "$EXPECTED_BUNDLE_IDENTIFIER" ]] || fail "wrong executable signature identifier"
@@ -566,6 +693,9 @@ if [[ -n "$EXPECTED_TEAM_ID" ]]; then
     verify_requirement "$APP_PATH" "$EXPECTED_BUNDLE_IDENTIFIER"
     verify_requirement "$EXECUTABLE" "$EXPECTED_BUNDLE_IDENTIFIER"
     verify_requirement "$FRAMEWORK" "$EXPECTED_FRAMEWORK_IDENTIFIER"
+    if [[ "$MEDIA_CONTRACT" == 1 ]]; then
+        verify_requirement "$MEDIA_BRIDGE" "$EXPECTED_MEDIA_BRIDGE_IDENTIFIER"
+    fi
 fi
 
 if [[ -n "$EXPECTED_DESIGNATED_REQUIREMENT_REFERENCE" ]]; then

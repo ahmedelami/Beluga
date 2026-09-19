@@ -404,6 +404,7 @@ print -r -- 'static let opensteamerPairingService =
 print -r -- 'let store = WorldwidePairingStore(
     dataStore: WorldwideKeychainDataStore()
 )
+fflush(stdout)
 fflush(stdout)' >"$BASELINE/macOS/Sources/CaptureServer/CaptureServerMain.swift"
 print -r -- 'static let legacyRuntimeDirectoryName =
     "com.elamin.AudioStreamer.CaptureServer.runtime"' \
@@ -1217,6 +1218,209 @@ replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflig
   'TESTFLIGHT_BUILD_WORKSPACE_KEY=$(string_vector_sha256 "${EXPECTED_BUILD_NUMBER}")'
 require_rejection "$CASE" 'side-by-side TestFlight checkout-specific DerivedData identity'
 
+CASE=$(new_case testflight-persistent-cache-workspace-pending-key)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'local pending_workspace_root="${workspaces_root}/.workspace-${TESTFLIGHT_BUILD_WORKSPACE_KEY}.pending"' \
+  'local pending_workspace_root="${workspaces_root}/.workspace-unreviewed.pending"'
+require_rejection "$CASE" \
+  'side-by-side TestFlight deterministic checkout-workspace staging path'
+
+CASE=$(new_case testflight-persistent-cache-workspace-staging-cardinality)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  '(( ${#children[@]} == 4 )) || return 1' \
+  '(( ${#children[@]} >= 3 )) || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exact staged workspace cardinality'
+
+CASE=$(new_case testflight-persistent-cache-workspace-staging-whitelist)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'function workspace_staging_directory_is_exact_and_empty() {\n  local workspace_root=$1\n  require_owned_private_directory "${workspace_root}" || return 1\n  local workspace_identity\n  workspace_identity=$(stat_identity "${workspace_root}") || return 1\n  local -a children=("${workspace_root}"/*(ND))\n  (( ${#children[@]} == 4 )) || return 1\n  local child\n  local child_name\n  local child_identity\n  local -a nested_children=()\n  for child in "${children[@]}"; do\n    child_name=${child:t}\n    case "${child_name}" in\n      run-tmp|DerivedData|Products|Intermediates)' \
+  $'function workspace_staging_directory_is_exact_and_empty() {\n  local workspace_root=$1\n  require_owned_private_directory "${workspace_root}" || return 1\n  local workspace_identity\n  workspace_identity=$(stat_identity "${workspace_root}") || return 1\n  local -a children=("${workspace_root}"/*(ND))\n  (( ${#children[@]} == 4 )) || return 1\n  local child\n  local child_name\n  local child_identity\n  local -a nested_children=()\n  for child in "${children[@]}"; do\n    child_name=${child:t}\n    case "${child_name}" in\n      run-tmp|DerivedData|Products|Intermediates|Unreviewed)'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exact staged workspace child whitelist'
+
+CASE=$(new_case testflight-persistent-cache-workspace-staging-same-device)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'    [[ "${child_identity%%:*}" == "${workspace_identity%%:*}" ]] \\\n      || return 1' \
+  $'    [[ "${child_identity%%:*}" != "${workspace_identity%%:*}" ]] \\\n      || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight staged workspace child same-device proof'
+
+CASE=$(new_case testflight-persistent-cache-workspace-pending-same-device)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'      *)\n        return 1\n        ;;\n    esac\n    require_owned_private_directory "${child}" || return 1\n    child_identity=$(stat_identity "${child}") || return 1\n    [[ "${child_identity%%:*}" \\\n        == "${pending_workspace_identity%%:*}" ]] || return 1' \
+  $'      *)\n        return 1\n        ;;\n    esac\n    require_owned_private_directory "${child}" || return 1\n    child_identity=$(stat_identity "${child}") || return 1\n    [[ "${child_identity%%:*}" \\\n        != "${pending_workspace_identity%%:*}" ]] || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight pending workspace child same-device proof'
+
+CASE=$(new_case testflight-persistent-cache-workspace-partial-resume-helper)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'function populate_or_verify_pending_workspace_directory() {' \
+  'function accept_partial_workspace_directory_without_verification() {'
+require_rejection "$CASE" \
+  'side-by-side TestFlight safe partial workspace-staging recovery'
+
+CASE=$(new_case testflight-persistent-cache-existing-workspace-verifier)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'function verify_existing_workspace_directory() {' \
+  'function accept_existing_workspace_directory() {'
+require_rejection "$CASE" \
+  'side-by-side TestFlight existing workspace fail-closed verifier'
+
+CASE=$(new_case testflight-persistent-cache-workspace-prepublish-lock)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  populate_or_verify_pending_workspace_directory \\\n    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1\n\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' \
+  $'  populate_or_verify_pending_workspace_directory \\\n    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1\n\n  /bin/sync\n  true # pre-publish cache-lock proof omitted'
+require_rejection "$CASE" \
+  'side-by-side TestFlight atomic checkout-workspace lock fencing'
+
+CASE=$(new_case testflight-persistent-cache-workspace-postpublish-lock)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1\n  /bin/sync\n  true # post-publish cache-lock proof omitted'
+require_rejection "$CASE" \
+  'side-by-side TestFlight atomic checkout-workspace lock fencing'
+
+CASE=$(new_case testflight-persistent-cache-workspace-prepublish-sync)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  populate_or_verify_pending_workspace_directory \\\n    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1\n\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' \
+  $'  populate_or_verify_pending_workspace_directory \\\n    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1\n\n  true # pre-publish sync omitted\n  verify_build_cache_lock_identity || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight durable checkout-workspace publication'
+
+CASE=$(new_case testflight-persistent-cache-workspace-postpublish-sync)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1\n  true # post-publish sync omitted\n  verify_build_cache_lock_identity || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight durable checkout-workspace publication'
+
+CASE=$(new_case testflight-persistent-cache-workspace-exclusive-publisher)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'function publish_workspace_directory_exclusively() {' \
+  'function publish_workspace_directory_with_clobbering() {'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exclusive workspace publisher'
+
+CASE=$(new_case testflight-persistent-cache-workspace-exclusive-rename-primitive)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'Fiddle.dlopen(nil)["renameatx_np"]' \
+  'Fiddle.dlopen(nil)["renameat_np"]'
+require_rejection "$CASE" \
+  'side-by-side TestFlight Darwin exclusive same-volume rename primitive'
+
+CASE=$(new_case testflight-persistent-cache-workspace-exclusive-rename-flags)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'rename_excl = 0x4; rename_nofollow_any = 0x10;' \
+  'rename_excl = 0x0; rename_nofollow_any = 0x0;'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exclusive no-follow workspace rename flags'
+
+CASE=$(new_case testflight-persistent-cache-workspace-exclusive-beneath-flag)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'rename_resolve_beneath = 0x20;' \
+  'rename_resolve_beneath = 0x0;'
+require_rejection "$CASE" \
+  'side-by-side TestFlight descriptor-beneath workspace rename flag'
+
+CASE=$(new_case testflight-persistent-cache-workspace-exclusive-rename-environment)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  '/usr/bin/ruby --disable=gems,rubyopt -e "${rename_program}" --' \
+  '/usr/bin/ruby -e "${rename_program}" --'
+require_rejection "$CASE" \
+  'side-by-side TestFlight environment-scrubbed system exclusive rename caller'
+
+CASE=$(new_case testflight-persistent-cache-workspace-parent-descriptor)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'parent_file = File.open(ARGV.fetch(0), File::RDONLY | File::NOFOLLOW);' \
+  'parent_file = File.open(ARGV.fetch(0), File::RDONLY);'
+require_rejection "$CASE" \
+  'side-by-side TestFlight no-follow workspace-parent descriptor'
+
+CASE=$(new_case testflight-persistent-cache-workspace-parent-descriptor-identity)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'parent_stat.dev == Integer(ARGV.fetch(1), 10) && parent_stat.ino == Integer(ARGV.fetch(2), 10)' \
+  'parent_stat.dev == Integer(ARGV.fetch(1), 10)'
+require_rejection "$CASE" \
+  'side-by-side TestFlight workspace-parent descriptor identity proof'
+
+CASE=$(new_case testflight-persistent-cache-workspace-exclusive-publish-call)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1' \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "unreviewed-parent-identity" \\\n    || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exclusive checkout-workspace publication'
+
+CASE=$(new_case testflight-persistent-cache-workspace-published-inode-proof)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'      && "$(stat_identity "${workspace_root}")" \\\n        == "${pending_workspace_identity}" ]] || return 1' \
+  $'      && "$(stat_identity "${workspace_root}")" \\\n        != "${pending_workspace_identity}" ]] || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight published workspace inode proof'
+
+CASE=$(new_case testflight-persistent-cache-workspace-published-identity-handoff)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'TESTFLIGHT_BUILD_SANDBOX_IDENTITY="${pending_workspace_identity}"' \
+  'TESTFLIGHT_BUILD_SANDBOX_IDENTITY="" # published inode handoff omitted'
+require_rejection "$CASE" \
+  'side-by-side TestFlight published workspace identity handoff'
+
+CASE=$(new_case testflight-persistent-cache-workspace-existing-identity-handoff)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'TESTFLIGHT_BUILD_SANDBOX_IDENTITY="${existing_workspace_identity}"' \
+  'TESTFLIGHT_BUILD_SANDBOX_IDENTITY="" # existing inode handoff omitted'
+require_rejection "$CASE" \
+  'side-by-side TestFlight existing workspace identity handoff'
+
+CASE=$(new_case testflight-persistent-cache-workspace-child-identity-handoff)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'function capture_verified_workspace_child_identities() {' \
+  'function capture_unverified_workspace_child_identities() {'
+require_rejection "$CASE" \
+  'side-by-side TestFlight workspace-child identity handoff'
+
+CASE=$(new_case testflight-persistent-cache-workspace-child-identity-constraint)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'local required_identity=${3:-}' \
+  'local required_identity="" # captured child identity ignored'
+require_rejection "$CASE" \
+  'side-by-side TestFlight verified cache-child identity constraint'
+
+CASE=$(new_case testflight-persistent-cache-workspace-child-identity-consumption)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY}" || return 1\n  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY}" || return 1\n  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY}" || return 1' \
+  $'  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}" "${workspace_root}" \\\n    "" || return 1\n  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}" "${workspace_root}" \\\n    "" || return 1\n  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}" "${workspace_root}" \\\n    "" || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight verified workspace-child identity consumption'
+
+CASE=$(new_case testflight-persistent-cache-workspace-run-tmp-identity-consumption)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  initialize_or_migrate_run_tmp_parent_directory \\\n    "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY}" || return 1' \
+  $'  initialize_or_migrate_run_tmp_parent_directory \\\n    "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \\\n    "" || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight verified run-TMP identity consumption'
+
+CASE=$(new_case testflight-persistent-cache-workspace-identity-consumption)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  [[ -n "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \\\n      && "$(stat_identity "${TESTFLIGHT_BUILD_SANDBOX_DIRECTORY}")" \\\n        == "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" ]] || return 1' \
+  $'  [[ -n "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \\\n      && "$(stat_identity "${TESTFLIGHT_BUILD_SANDBOX_DIRECTORY}")" \\\n        != "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" ]] || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight verified workspace identity consumption'
+
+CASE=$(new_case testflight-persistent-cache-workspace-parent-identity)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'workspaces_root_identity=$(stat_identity "${workspaces_root}") || return 1' \
+  'workspaces_root_identity=$(stat_identity "${workspace_root}") || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight checkout-workspace parent identity fencing'
+
+CASE=$(new_case testflight-persistent-cache-workspace-layout-call)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'  initialize_or_provision_workspace_directory \\\n    "${workspace_root}" "${workspaces_root}" || return 1' \
+  $'  initialize_or_require_cache_parent_directory \\\n    "${workspace_root}" "${workspaces_root}" || return 1'
+require_rejection "$CASE" \
+  'side-by-side TestFlight scoped atomic checkout-workspace provisioning call'
+
 CASE=$(new_case testflight-persistent-cache-shared-root)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
   'local shared_root="${cache_v1}/shared"' \
@@ -1609,7 +1813,8 @@ CASE=$(new_case testflight-empty-xcode-environment)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
   $'  local -a pinned_command=(\n    /usr/bin/env -i\n    "${TESTFLIGHT_XCODEBUILD_PINNED_ENVIRONMENT[@]}"' \
   $'  local -a pinned_command=(\n    /usr/bin/env\n    "${TESTFLIGHT_XCODEBUILD_PINNED_ENVIRONMENT[@]}"'
-require_rejection "$CASE" 'side-by-side TestFlight empty inherited Xcode environment'
+require_rejection "$CASE" \
+  'side-by-side TestFlight empty inherited Xcode and exclusive-rename environments'
 
 CASE=$(new_case testflight-xcode-sandbox)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
@@ -1764,15 +1969,61 @@ require_rejection "$CASE" 'side-by-side TestFlight package update suppression'
 
 CASE=$(new_case testflight-package-manifest-pin)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
-  'EXPECTED_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"' \
+  'EXPECTED_PACKAGE_MANIFEST_SHA256="443fe7a76bfbe8cda2d193c047cc04122c01479f8763ccd9e2d5871b7e504f82"' \
   'EXPECTED_PACKAGE_MANIFEST_SHA256="0000000000000000000000000000000000000000000000000000000000000000"'
 require_rejection "$CASE" 'side-by-side TestFlight exact package manifest pin'
 
-CASE=$(new_case testflight-package-resolved-pin)
+CASE=$(new_case testflight-package-resolved-state)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
-  'EXPECTED_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"' \
-  'EXPECTED_PACKAGE_RESOLVED_SHA256="0000000000000000000000000000000000000000000000000000000000000000"'
-require_rejection "$CASE" 'side-by-side TestFlight exact resolved package pin'
+  'EXPECTED_PACKAGE_RESOLVED_STATE="absent"' \
+  'EXPECTED_PACKAGE_RESOLVED_STATE="allow-stale-remote-lock"'
+require_rejection "$CASE" 'side-by-side TestFlight exact absent-lock state'
+
+CASE=$(new_case testflight-vendor-missing-contract)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'&& verify_pinned_vendor_archive \\\n      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"' \
+  '&& true # unverified vendor archive'
+require_rejection "$CASE" 'side-by-side TestFlight package contract requires exact vendor bytes'
+
+CASE=$(new_case testflight-vendor-digest)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  '"$(sha256_file "${archive_path}")" == "${expected_sha256}"' \
+  '-n "${expected_sha256}"'
+require_rejection "$CASE" 'side-by-side TestFlight one exact vendor digest verification'
+
+CASE=$(new_case testflight-vendor-mutation-fence)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  '"$(vendor_archive_identity "${archive_path}")" == "${identity}"' \
+  '-n "${identity}"'
+require_rejection "$CASE" 'side-by-side TestFlight vendor hash identity fence'
+
+CASE=$(new_case testflight-cache-enrollment-package-manifest-pin)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"' \
+  'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="0000000000000000000000000000000000000000000000000000000000000000"'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exact enrolled package-manifest pin'
+
+CASE=$(new_case testflight-cache-enrollment-package-resolved-pin)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"' \
+  'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="0000000000000000000000000000000000000000000000000000000000000000"'
+require_rejection "$CASE" \
+  'side-by-side TestFlight exact enrolled resolved-package pin'
+
+CASE=$(new_case testflight-cache-enrollment-current-package-verification)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'function run_initialize_build_cache() {\n  verify_package_dependency_contract \\\n    || fail "current package inputs changed before build-cache enrollment"' \
+  $'function run_initialize_build_cache() {\n  true # current package inputs not verified before enrollment'
+require_rejection "$CASE" \
+  'side-by-side TestFlight fresh enrollment current-package verification'
+
+CASE=$(new_case testflight-entrypoint-current-package-verification)
+replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
+  $'verify_static_contract\nverify_package_dependency_contract \\\n  || fail "current package inputs do not match the reviewed release pins"\npin_export_options_identity' \
+  $'verify_static_contract\ntrue # current package inputs not verified at entrypoint\npin_export_options_identity'
+require_rejection "$CASE" \
+  'side-by-side TestFlight entrypoint current-package verification'
 
 CASE=$(new_case testflight-xcode-sandbox-profile-consumption)
 replace_once "$CASE/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh" \
@@ -2569,8 +2820,9 @@ require_rejection "$CASE" 'explicit opensteamer pairing-store composition'
 
 CASE=$(new_case mac-pairing-code-flush)
 replace_once "$CASE/macOS/Sources/CaptureServer/CaptureServerMain.swift" \
-  'fflush(stdout)' '/* missing pairing-code flush */'
-require_rejection "$CASE" 'immediate one-time pairing-code flush'
+  $'fflush(stdout)\nfflush(stdout)' \
+  $'/* missing primary pairing-code flush */\nfflush(stdout)'
+require_rejection "$CASE" 'immediate primary and secondary one-time pairing-code flushes'
 
 CASE=$(new_case mac-runtime-lock-namespace)
 replace_once "$CASE/macOS/Sources/CaptureServer/WorldwideHostProcessLock.swift" \
@@ -2639,7 +2891,91 @@ BEHAVIOR_CONTROL="$BEHAVIOR_ROOT/control"
 BEHAVIOR_TARGET_IMAGE='/Volumes/t7/opensteamer-behavior-target.sparseimage'
 BEHAVIOR_MOUNT_POINT='/private/tmp/opensteamer-behavior-mount'
 BEHAVIOR_WRAPPER="$ROOT_DIR/iOS/opensteamer/scripts/archive-upload-side-by-side-testflight.sh"
+typeset BEHAVIOR_EXPECTED_BUILD_NUMBER
+BEHAVIOR_EXPECTED_BUILD_NUMBER=$(/usr/bin/awk '
+  /^[[:space:]]*(readonly[[:space:]]+)?EXPECTED_BUILD_NUMBER[[:space:]]*=/ {
+    count += 1
+    if ($0 !~ /^readonly EXPECTED_BUILD_NUMBER="[1-9][0-9]*"$/) invalid = 1
+    value = $0
+    sub(/^readonly EXPECTED_BUILD_NUMBER="/, "", value)
+    sub(/"$/, "", value)
+  }
+  END { if (count != 1 || invalid) exit 1; print value }
+' "$BEHAVIOR_WRAPPER") || {
+  print -u2 -r -- 'identity behavior setup failed: expected one strict numeric build pin'
+  exit 1
+}
+readonly BEHAVIOR_EXPECTED_BUILD_NUMBER
 mkdir -p "$BEHAVIOR_CONTROL"
+
+VENDOR_FIXTURE_ROOT="$BEHAVIOR_ROOT/vendor-archive"
+mkdir -p "$VENDOR_FIXTURE_ROOT"
+WRAPPER_PATH="$BEHAVIOR_WRAPPER" VENDOR_FIXTURE_ROOT="$VENDOR_FIXTURE_ROOT" \
+/bin/zsh <<'VENDORARCHIVETEST'
+source <(/usr/bin/sed '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
+trap - EXIT HUP INT QUIT TERM
+
+typeset archive="$VENDOR_FIXTURE_ROOT/fixture.zip"
+typeset original="$VENDOR_FIXTURE_ROOT/original.zip"
+typeset hash_log="$VENDOR_FIXTURE_ROOT/hash-calls"
+print -rn -- 'reviewed fixture' >"$archive"
+cp -p "$archive" "$original"
+typeset checksum
+checksum=$(sha256_file "$archive")
+function reset_vendor_identity_for_test() {
+  TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY=''
+  TESTFLIGHT_VENDOR_ARCHIVE_SHA256=''
+}
+function require_vendor_rejection() {
+  if verify_pinned_vendor_archive "$@"; then
+    print -u2 -r -- 'unreviewed or changed vendor artifact was accepted'
+    exit 1
+  fi
+}
+function sha256_file() {
+  print -r -- hashed >>"$hash_log"
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+# Missing bytes, a placeholder, malformed digest, wrong bytes and symlinks all fail before
+# any archive/signing action. Tiny text fixtures exercise the real digest guard, not WebRTC.
+require_vendor_rejection "$VENDOR_FIXTURE_ROOT/missing.zip" "$checksum"
+require_vendor_rejection "$archive" 'UNPREPARED_PATCHED_LIVEKIT_ARTIFACT'
+require_vendor_rejection "$archive" "${checksum:u}"
+require_vendor_rejection "$archive" '0000000000000000000000000000000000000000000000000000000000000000'
+ln -s "$archive" "$VENDOR_FIXTURE_ROOT/symlink.zip"
+require_vendor_rejection "$VENDOR_FIXTURE_ROOT/symlink.zip" "$checksum"
+
+reset_vendor_identity_for_test
+: >"$hash_log"
+verify_pinned_vendor_archive "$archive" "$checksum"
+verify_pinned_vendor_archive "$archive" "$checksum"
+[[ "$(/usr/bin/wc -l <"$hash_log" | /usr/bin/tr -d ' ')" == 1 ]]
+
+# Same-length in-place tamper remains rejected even after restoring mtime; ctime is fenced.
+print -rn -- 'tampered fixture' >"$archive"
+touch -r "$original" "$archive"
+require_vendor_rejection "$archive" "$checksum"
+
+# Once cached, replacement by byte-identical content must not silently renew source identity.
+cp -p "$original" "$archive"
+reset_vendor_identity_for_test
+verify_pinned_vendor_archive "$archive" "$checksum"
+mv "$archive" "$VENDOR_FIXTURE_ROOT/retired.zip"
+cp -p "$original" "$archive"
+require_vendor_rejection "$archive" "$checksum"
+
+# Mutating during the initial hash must fail its post-hash identity check.
+reset_vendor_identity_for_test
+function sha256_file() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+  print -rn -- 'tampered fixture' >"$1"
+  touch -r "$original" "$1"
+}
+require_vendor_rejection "$archive" "$checksum"
+[[ -z "$TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY" \
+    && -z "$TESTFLIGHT_VENDOR_ARCHIVE_SHA256" ]]
+VENDORARCHIVETEST
 
 DOTTED_KEY_FIXTURE="$BEHAVIOR_ROOT/dotted-entitlement-keys.plist"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
@@ -3141,7 +3477,7 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <key>Architectures</key><array><string>arm64</string></array>
 <key>CFBundleIdentifier</key><string>com.elamin.opensteamer</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>57</string>
+<key>CFBundleVersion</key><string>'"$BEHAVIOR_EXPECTED_BUILD_NUMBER"'</string>
 <key>SigningIdentity</key><string>Apple Development: Ahmed Elamin (92LVX32M8K)</string>
 <key>Team</key><string>MSMG8CJLB3</string>
 </dict>
@@ -3157,7 +3493,7 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <key>Architectures</key><array><string>arm64</string></array>
 <key>CFBundleIdentifier</key><string>com.elamin.opensteamer</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>57</string>
+<key>CFBundleVersion</key><string>'"$BEHAVIOR_EXPECTED_BUILD_NUMBER"'</string>
 <key>SigningIdentity</key><string>Apple Development: Ahmed Elamin (92LVX32M8K)</string>
 <key>Team</key><string>MSMG8CJLB3</string>
 </dict>
@@ -3172,7 +3508,7 @@ print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <key>task</key><string>distribute</string>
 <key>teamID</key><string>MSMG8CJLB3</string>
 <key>uploadDestination</key><string>App Store</string>
-<key>uploadedBuildNumber</key><string>57</string>
+<key>uploadedBuildNumber</key><string>'"$BEHAVIOR_EXPECTED_BUILD_NUMBER"'</string>
 <key>uploadEvent</key><dict><key>errors</key><array/><key>state</key><string>success</string></dict>
 </dict></array>
 <key>Name</key><string>opensteamerTestFlight</string>
@@ -3235,7 +3571,7 @@ expect_distribution_rejection identifier
 /usr/bin/plutil -replace Distributions.0.uploadedBuildNumber -string 40 \
   "$POSTUPLOAD_ARCHIVE_INFO"
 expect_distribution_rejection build
-/usr/bin/plutil -replace Distributions.0.uploadedBuildNumber -string 57 \
+/usr/bin/plutil -replace Distributions.0.uploadedBuildNumber -string "$EXPECTED_BUILD_NUMBER" \
   "$POSTUPLOAD_ARCHIVE_INFO"
 /usr/bin/plutil -replace Distributions.0.certificateSHA1 \
   -string 0000000000000000000000000000000000000000 "$POSTUPLOAD_ARCHIVE_INFO"
@@ -3891,6 +4227,266 @@ recover_stale_persistent_build_cache_state >/dev/null
     && "$(/usr/bin/wc -l <"$STALE_RECOVERY_MARKER" | /usr/bin/tr -d ' ')" == 2 ]]
 STALERECOVERYTEST
 
+WORKSPACE_ATOMIC_PARENT="$BEHAVIOR_ROOT/workspace-atomic-parent"
+/bin/mkdir -m 700 "$WORKSPACE_ATOMIC_PARENT"
+WRAPPER_PATH="$BEHAVIOR_WRAPPER" \
+WORKSPACE_ATOMIC_PARENT="$WORKSPACE_ATOMIC_PARENT" \
+/bin/zsh <<'WORKSPACEATOMICTEST'
+source <(/usr/bin/sed '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
+trap - EXIT HUP INT QUIT TERM
+
+TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE=0
+typeset -i WORKSPACE_LOCK_CHECKS=0
+function verify_build_cache_lock_identity() {
+  (( WORKSPACE_LOCK_CHECKS += 1 ))
+  return 0
+}
+function verify_persistent_build_cache_contract() { return 0 }
+function select_workspace_key() {
+  local key=$1
+  local workspace="$WORKSPACE_ATOMIC_PARENT/$key"
+  TESTFLIGHT_BUILD_WORKSPACE_KEY=$key
+  TESTFLIGHT_BUILD_SANDBOX_DIRECTORY=$workspace
+  TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY="$workspace/run-tmp"
+  TESTFLIGHT_DERIVED_DATA_DIRECTORY="$workspace/DerivedData"
+  TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY="$workspace/Products"
+  TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY="$workspace/Intermediates"
+}
+function expect_workspace_rejection() {
+  local label=$1
+  local key=$2
+  select_workspace_key "$key"
+  if initialize_or_provision_workspace_directory \
+      "$WORKSPACE_ATOMIC_PARENT/$key" "$WORKSPACE_ATOMIC_PARENT" \
+      >/dev/null 2>&1; then
+    print -u2 -r -- \
+      "malformed checkout workspace unexpectedly passed: ${label}"
+    exit 1
+  fi
+}
+
+typeset first_key=1111111111111111111111111111111111111111111111111111111111111111
+typeset second_key=2222222222222222222222222222222222222222222222222222222222222222
+typeset first_workspace="$WORKSPACE_ATOMIC_PARENT/$first_key"
+typeset second_workspace="$WORKSPACE_ATOMIC_PARENT/$second_key"
+typeset second_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${second_key}.pending"
+typeset parent_identity
+parent_identity=$(stat_identity "$WORKSPACE_ATOMIC_PARENT")
+
+# A previously unseen second checkout is published with only the exact four
+# empty private children; the first checkout remains untouched.
+select_workspace_key "$first_key"
+initialize_or_provision_workspace_directory \
+  "$first_workspace" "$WORKSPACE_ATOMIC_PARENT"
+typeset first_identity
+first_identity=$(stat_identity "$first_workspace")
+typeset -i lock_checks_before=$WORKSPACE_LOCK_CHECKS
+select_workspace_key "$second_key"
+initialize_or_provision_workspace_directory \
+  "$second_workspace" "$WORKSPACE_ATOMIC_PARENT"
+(( WORKSPACE_LOCK_CHECKS - lock_checks_before == 4 ))
+typeset second_identity
+second_identity=$(stat_identity "$second_workspace")
+[[ "$TESTFLIGHT_BUILD_SANDBOX_IDENTITY" == "$second_identity" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY" \
+      == "$(stat_identity "$second_workspace/run-tmp")" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY" \
+      == "$(stat_identity "$second_workspace/DerivedData")" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY" \
+      == "$(stat_identity "$second_workspace/Products")" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY" \
+      == "$(stat_identity "$second_workspace/Intermediates")" \
+    && "$(stat_identity "$first_workspace")" == "$first_identity" \
+    && ! -e "$second_pending" \
+    && ! -L "$second_pending" ]]
+workspace_staging_directory_is_exact_and_empty "$second_workspace"
+typeset -a published_workspaces=("$WORKSPACE_ATOMIC_PARENT"/*(ND))
+(( ${#published_workspaces[@]} == 2 ))
+
+# Revalidating the same checkout preserves the workspace and every child inode.
+typeset -a rerun_nodes=(
+  "$second_workspace"
+  "$second_workspace/run-tmp"
+  "$second_workspace/DerivedData"
+  "$second_workspace/Products"
+  "$second_workspace/Intermediates"
+)
+typeset -a rerun_identities=()
+typeset node
+for node in "${rerun_nodes[@]}"; do
+  rerun_identities+=("$(stat_identity "$node")")
+done
+lock_checks_before=$WORKSPACE_LOCK_CHECKS
+initialize_or_provision_workspace_directory \
+  "$second_workspace" "$WORKSPACE_ATOMIC_PARENT"
+(( WORKSPACE_LOCK_CHECKS - lock_checks_before == 2 ))
+[[ "$TESTFLIGHT_BUILD_SANDBOX_IDENTITY" == "$second_identity" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY" \
+      == "$rerun_identities[2]" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY" \
+      == "$rerun_identities[3]" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY" \
+      == "$rerun_identities[4]" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY" \
+      == "$rerun_identities[5]" ]]
+typeset -i node_index=1
+for node in "${rerun_nodes[@]}"; do
+  [[ "$(stat_identity "$node")" == "$rerun_identities[$node_index]" ]]
+  (( node_index += 1 ))
+done
+
+# Replacing any captured child before its downstream consumer runs is rejected.
+typeset child_record
+typeset child_path
+typeset child_identity
+typeset child_label
+typeset child_remainder
+typeset held_child
+for child_record in \
+    "$second_workspace/DerivedData|$TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY|derived-data" \
+    "$second_workspace/Products|$TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY|products" \
+    "$second_workspace/Intermediates|$TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY|intermediates"; do
+  child_path=${child_record%%|*}
+  child_remainder=${child_record#*|}
+  child_identity=${child_remainder%%|*}
+  child_label=${child_remainder#*|}
+  held_child="${WORKSPACE_ATOMIC_PARENT:h}/held-${child_label}"
+  /bin/mv -- "$child_path" "$held_child"
+  /bin/mkdir -m 700 "$child_path"
+  TESTFLIGHT_PINNED_BUILD_DIRECTORIES=()
+  if initialize_or_pin_cache_directory \
+      "$child_path" "$second_workspace" "$child_identity" \
+      >/dev/null 2>&1; then
+    print -u2 -r -- \
+      "replacement workspace child unexpectedly pinned: ${child_label}"
+    exit 1
+  fi
+  /bin/rmdir -- "$child_path"
+  /bin/mv -- "$held_child" "$child_path"
+  [[ "$(stat_identity "$child_path")" == "$child_identity" ]]
+done
+
+typeset held_run_tmp="${WORKSPACE_ATOMIC_PARENT:h}/held-run-tmp"
+/bin/mv -- "$second_workspace/run-tmp" "$held_run_tmp"
+/bin/mkdir -m 700 "$second_workspace/run-tmp"
+if initialize_or_migrate_run_tmp_parent_directory \
+    "$second_workspace/run-tmp" "$second_workspace" "$second_identity" \
+    "$TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY" \
+    >/dev/null 2>&1; then
+  print -u2 -r -- 'replacement workspace run-TMP parent unexpectedly passed'
+  exit 1
+fi
+/bin/rmdir -- "$second_workspace/run-tmp"
+/bin/mv -- "$held_run_tmp" "$second_workspace/run-tmp"
+[[ "$(stat_identity "$second_workspace/run-tmp")" \
+    == "$TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY" ]]
+
+# An interrupted pending directory may contain a safe subset of the exact
+# children. Completion preserves those inodes and publishes the pending inode.
+typeset partial_key=3333333333333333333333333333333333333333333333333333333333333333
+typeset partial_workspace="$WORKSPACE_ATOMIC_PARENT/$partial_key"
+typeset partial_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${partial_key}.pending"
+/bin/mkdir -m 700 "$partial_pending"
+/bin/mkdir -m 700 "$partial_pending/DerivedData"
+/bin/mkdir -m 700 "$partial_pending/run-tmp"
+typeset partial_pending_identity
+typeset partial_derived_data_identity
+typeset partial_run_tmp_identity
+partial_pending_identity=$(stat_identity "$partial_pending")
+partial_derived_data_identity=$(stat_identity "$partial_pending/DerivedData")
+partial_run_tmp_identity=$(stat_identity "$partial_pending/run-tmp")
+lock_checks_before=$WORKSPACE_LOCK_CHECKS
+select_workspace_key "$partial_key"
+initialize_or_provision_workspace_directory \
+  "$partial_workspace" "$WORKSPACE_ATOMIC_PARENT"
+(( WORKSPACE_LOCK_CHECKS - lock_checks_before == 3 ))
+[[ ! -e "$partial_pending" \
+    && ! -L "$partial_pending" \
+    && "$TESTFLIGHT_BUILD_SANDBOX_IDENTITY" \
+      == "$partial_pending_identity" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY" \
+      == "$partial_run_tmp_identity" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY" \
+      == "$partial_derived_data_identity" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY" \
+      == "$(stat_identity "$partial_workspace/Products")" \
+    && "$TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY" \
+      == "$(stat_identity "$partial_workspace/Intermediates")" \
+    && "$(stat_identity "$partial_workspace")" \
+      == "$partial_pending_identity" \
+    && "$(stat_identity "$partial_workspace/DerivedData")" \
+      == "$partial_derived_data_identity" \
+    && "$(stat_identity "$partial_workspace/run-tmp")" \
+      == "$partial_run_tmp_identity" ]]
+workspace_staging_directory_is_exact_and_empty "$partial_workspace"
+
+# Linked, public, nonempty, unexpected, and incomplete states all fail closed.
+typeset symlink_key=4444444444444444444444444444444444444444444444444444444444444444
+typeset symlink_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${symlink_key}.pending"
+/bin/mkdir -m 700 "$symlink_pending"
+/bin/ln -s "$first_workspace/DerivedData" "$symlink_pending/DerivedData"
+expect_workspace_rejection symlink-child "$symlink_key"
+
+typeset wrong_mode_key=5555555555555555555555555555555555555555555555555555555555555555
+typeset wrong_mode_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${wrong_mode_key}.pending"
+/bin/mkdir -m 700 "$wrong_mode_pending"
+/bin/mkdir -m 755 "$wrong_mode_pending/DerivedData"
+expect_workspace_rejection wrong-mode-child "$wrong_mode_key"
+
+typeset nonempty_key=6666666666666666666666666666666666666666666666666666666666666666
+typeset nonempty_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${nonempty_key}.pending"
+/bin/mkdir -m 700 "$nonempty_pending"
+/bin/mkdir -m 700 "$nonempty_pending/DerivedData"
+print -r -- occupied >"$nonempty_pending/DerivedData/unreviewed"
+expect_workspace_rejection nonempty-child "$nonempty_key"
+
+typeset unexpected_key=7777777777777777777777777777777777777777777777777777777777777777
+typeset unexpected_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${unexpected_key}.pending"
+/bin/mkdir -m 700 "$unexpected_pending"
+/bin/mkdir -m 700 "$unexpected_pending/Unreviewed"
+expect_workspace_rejection unexpected-child "$unexpected_key"
+
+typeset missing_key=8888888888888888888888888888888888888888888888888888888888888888
+typeset missing_workspace="$WORKSPACE_ATOMIC_PARENT/$missing_key"
+/bin/mkdir -m 700 "$missing_workspace"
+/bin/mkdir -m 700 "$missing_workspace/DerivedData"
+/bin/mkdir -m 700 "$missing_workspace/Products"
+/bin/mkdir -m 700 "$missing_workspace/run-tmp"
+expect_workspace_rejection missing-existing-child "$missing_key"
+
+# Inject a target after the provisioner's final absence check but at the
+# exclusive-publisher boundary. The appeared target and pending source remain
+# distinct, with neither object replaced or nested beneath the other.
+typeset appearance_key=9999999999999999999999999999999999999999999999999999999999999999
+typeset appearance_workspace="$WORKSPACE_ATOMIC_PARENT/$appearance_key"
+typeset appearance_pending="$WORKSPACE_ATOMIC_PARENT/.workspace-${appearance_key}.pending"
+typeset appearance_target_identity=''
+typeset appearance_pending_identity=''
+function publish_workspace_directory_exclusively() {
+  [[ "$2" == "$appearance_workspace" ]] || return 1
+  appearance_pending_identity=$(stat_identity "$1") || return 1
+  print -r -- appeared >"$2" || return 1
+  /bin/chmod 600 "$2" || return 1
+  appearance_target_identity=$(stat_identity "$2") || return 1
+  return 1
+}
+lock_checks_before=$WORKSPACE_LOCK_CHECKS
+expect_workspace_rejection target-appearance "$appearance_key"
+(( WORKSPACE_LOCK_CHECKS - lock_checks_before == 3 ))
+[[ -z "$TESTFLIGHT_BUILD_SANDBOX_IDENTITY" \
+    && -f "$appearance_workspace" \
+    && ! -L "$appearance_workspace" \
+    && "$(stat_identity "$appearance_workspace")" \
+      == "$appearance_target_identity" \
+    && -d "$appearance_pending" \
+    && ! -L "$appearance_pending" \
+    && "$(stat_identity "$appearance_pending")" \
+      == "$appearance_pending_identity" \
+    && ! "$appearance_workspace" -ef "$appearance_pending" ]]
+workspace_staging_directory_is_exact_and_empty "$appearance_pending"
+[[ "$(stat_identity "$WORKSPACE_ATOMIC_PARENT")" == "$parent_identity" ]]
+WORKSPACEATOMICTEST
+
 RUN_TMP_MIGRATION_PARENT="$BEHAVIOR_ROOT/run-tmp-migration-workspace"
 RUN_TMP_MIGRATION_TARGET="$RUN_TMP_MIGRATION_PARENT/run-tmp"
 /bin/mkdir -m 700 "$RUN_TMP_MIGRATION_PARENT"
@@ -3902,14 +4498,20 @@ source <(/usr/bin/sed '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
 trap - EXIT HUP INT QUIT TERM
 
 TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE=0
+function verify_build_cache_lock_identity() { return 0 }
+function verify_persistent_build_cache_contract() { return 0 }
+typeset RUN_TMP_MIGRATION_PARENT_IDENTITY
+RUN_TMP_MIGRATION_PARENT_IDENTITY=$(stat_identity "$RUN_TMP_MIGRATION_PARENT")
 initialize_or_migrate_run_tmp_parent_directory \
-  "$RUN_TMP_MIGRATION_TARGET" "$RUN_TMP_MIGRATION_PARENT"
+  "$RUN_TMP_MIGRATION_TARGET" "$RUN_TMP_MIGRATION_PARENT" \
+  "$RUN_TMP_MIGRATION_PARENT_IDENTITY" ''
 require_owned_private_directory "$RUN_TMP_MIGRATION_TARGET"
 /bin/rmdir -- "$RUN_TMP_MIGRATION_TARGET"
 
 /bin/ln -s "$RUN_TMP_MIGRATION_PARENT" "$RUN_TMP_MIGRATION_TARGET"
 if initialize_or_migrate_run_tmp_parent_directory \
     "$RUN_TMP_MIGRATION_TARGET" "$RUN_TMP_MIGRATION_PARENT" \
+    "$RUN_TMP_MIGRATION_PARENT_IDENTITY" '' \
     >/dev/null 2>&1; then
   print -u2 -r -- 'symlink run-TMP migration target unexpectedly passed'
   exit 1
@@ -3919,6 +4521,7 @@ fi
 /bin/mkdir -m 755 "$RUN_TMP_MIGRATION_TARGET"
 if initialize_or_migrate_run_tmp_parent_directory \
     "$RUN_TMP_MIGRATION_TARGET" "$RUN_TMP_MIGRATION_PARENT" \
+    "$RUN_TMP_MIGRATION_PARENT_IDENTITY" '' \
     >/dev/null 2>&1; then
   print -u2 -r -- 'public run-TMP migration target unexpectedly passed'
   exit 1
@@ -4049,6 +4652,31 @@ if ! [[ "$observed_processing_tmp" \
 fi
 PROCESSINGQUERYTEST
 
+ENROLLMENT_DIVERGENCE_MARKER="$BEHAVIOR_ROOT/enrollment-divergence-initialized"
+WRAPPER_PATH="$BEHAVIOR_WRAPPER" \
+ENROLLMENT_DIVERGENCE_MARKER="$ENROLLMENT_DIVERGENCE_MARKER" \
+/bin/zsh <<'ENROLLMENTDIVERGENCETEST'
+source <(/usr/bin/sed \
+  -e 's|^readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256=.*$|readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="0000000000000000000000000000000000000000000000000000000000000000"|' \
+  -e '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
+trap - EXIT HUP INT QUIT TERM
+
+function verify_package_dependency_contract() { return 0 }
+function initialize_private_testflight_build_volume() {
+  print -r -- initialized >"$ENROLLMENT_DIVERGENCE_MARKER"
+}
+
+if ( run_initialize_build_cache ) >/dev/null 2>&1; then
+  print -u2 -r -- 'fresh enrollment accepted divergent package provenance'
+  exit 1
+fi
+if [[ -e "$ENROLLMENT_DIVERGENCE_MARKER" \
+    || -L "$ENROLLMENT_DIVERGENCE_MARKER" ]]; then
+  print -u2 -r -- 'divergent enrollment reached cache initialization'
+  exit 1
+fi
+ENROLLMENTDIVERGENCETEST
+
 ENROLLMENT_RECOVERY_CREDENTIALS="$BEHAVIOR_ROOT/enrollment-recovery-credentials"
 ENROLLMENT_RECOVERY_BUILD_ROOT="$BEHAVIOR_ROOT/enrollment-recovery-build-root"
 ENROLLMENT_RECOVERY_MOUNT_ROOT="$BEHAVIOR_ROOT/enrollment-recovery-mount-root"
@@ -4065,9 +4693,12 @@ source <(/usr/bin/sed \
   -e 's|^readonly EXPECTED_ASC_API_KEY_DIRECTORY=.*$|readonly EXPECTED_ASC_API_KEY_DIRECTORY="${ENROLLMENT_RECOVERY_CREDENTIALS}"|' \
   -e 's|^readonly TESTFLIGHT_BUILD_ROOT=.*$|readonly TESTFLIGHT_BUILD_ROOT="${ENROLLMENT_RECOVERY_BUILD_ROOT}"|' \
   -e 's|^readonly TESTFLIGHT_BUILD_MOUNT_ROOT=.*$|readonly TESTFLIGHT_BUILD_MOUNT_ROOT="${ENROLLMENT_RECOVERY_MOUNT_ROOT}"|' \
+  -e 's|^readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256=.*$|readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="${EXPECTED_PACKAGE_MANIFEST_SHA256}"|' \
+  -e 's|^readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256=.*$|readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="${EXPECTED_PACKAGE_RESOLVED_STATE}"|' \
   -e '/^verify_static_contract$/,$d' "$WRAPPER_PATH")
 trap - EXIT HUP INT QUIT TERM
 
+function verify_package_dependency_contract() { return 0 }
 function find_current_attachment_record() { return 1 }
 function reset_enrollment_recovery_state() {
   if (( TESTFLIGHT_BUILD_ENROLLMENT_MARKER_FD >= 0 )); then
@@ -4447,7 +5078,7 @@ print -r -- '{
   "app-store-attributes": {
     "buildAudienceType": "INTERNAL_ONLY",
     "processingState": "VALID",
-    "version": "57",
+    "version": "'"$BEHAVIOR_EXPECTED_BUILD_NUMBER"'",
     "expired": false
   }
 }' >"$PROCESSING_STATUS"
@@ -4491,7 +5122,7 @@ expect_processing_status_rejection audience
   -string 52 "$PROCESSING_STATUS"
 expect_processing_status_rejection build
 /usr/bin/plutil -replace app-store-attributes.version \
-  -string 57 "$PROCESSING_STATUS"
+  -string "$EXPECTED_BUILD_NUMBER" "$PROCESSING_STATUS"
 /usr/bin/plutil -replace delivery-uuid \
   -string 11111111-2222-3333-4444-555555555555 "$PROCESSING_STATUS"
 expect_processing_status_rejection delivery

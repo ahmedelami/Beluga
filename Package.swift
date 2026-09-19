@@ -18,15 +18,11 @@ let package = Package(
         .library(name: "WebRTCTransport", targets: ["WebRTCTransport"]),
         .executable(name: "CaptureCLI", targets: ["CaptureCLI"]),
         .executable(name: "CaptureServer", targets: ["CaptureServer"]),
+        .executable(name: "OpensteamerMediaBridge", targets: ["OpensteamerMediaBridge"]),
         .executable(name: "PCMClient", targets: ["PCMClient"]),
         .executable(name: "PCMPlayer", targets: ["PCMPlayer"])
     ],
-    dependencies: [
-        .package(
-            url: "https://github.com/livekit/webrtc-xcframework.git",
-            exact: "144.7559.11"
-        )
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "CaptureCLI",
@@ -37,6 +33,7 @@ let package = Package(
             name: "CaptureServer",
             dependencies: [
                 "CaptureCore",
+                "MediaBridgeCore",
                 .target(
                     name: "MacWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.macOS])
@@ -63,6 +60,17 @@ let package = Package(
             name: "PCMClient",
             dependencies: ["Streaming", "Utilities"],
             path: "macOS/Sources/PCMClient"
+        ),
+        .target(name: "MediaBridgeCore", path: "macOS/Sources/MediaBridgeCore"),
+        .executableTarget(
+            name: "OpensteamerMediaBridge",
+            dependencies: ["MediaBridgeCore"],
+            path: "macOS/Sources/OpensteamerMediaBridge"
+        ),
+        .testTarget(
+            name: "MediaBridgeCoreTests",
+            dependencies: ["MediaBridgeCore"],
+            path: "macOS/Tests/MediaBridgeCoreTests"
         ),
         .executableTarget(
             name: "PCMPlayer",
@@ -121,6 +129,10 @@ let package = Package(
             dependencies: [
                 "RemoteSessionCore",
                 .target(
+                    name: "OpensteamerAudioTransactionAuthority",
+                    condition: .when(platforms: [.iOS])
+                ),
+                .target(
                     name: "IOSWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.iOS])
                 ),
@@ -128,20 +140,22 @@ let package = Package(
                     name: "MacWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.macOS])
                 ),
-                .product(
-                    name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework"
-                )
+                .target(name: "LiveKitWebRTC")
             ],
             path: "shared/Sources/WebRTCTransport"
+        ),
+        .binaryTarget(
+            name: "LiveKitWebRTC",
+            path: "shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"
+        ),
+        .binaryTarget(
+            name: "OpensteamerAudioTransactionAuthority",
+            path: "iOS/opensteamer/Frameworks/OpensteamerAudioTransactionAuthority.xcframework"
         ),
         .target(
             name: "MacWebRTCAudioDeviceShim",
             dependencies: [
-                .product(
-                    name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework"
-                )
+                .target(name: "LiveKitWebRTC")
             ],
             path: "shared/Sources/MacWebRTCAudioDeviceShim",
             publicHeadersPath: "include",
@@ -152,10 +166,7 @@ let package = Package(
         .target(
             name: "IOSWebRTCAudioDeviceShim",
             dependencies: [
-                .product(
-                    name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework"
-                )
+                .target(name: "LiveKitWebRTC")
             ],
             path: "shared/Sources/IOSWebRTCAudioDeviceShim",
             publicHeadersPath: "include",
@@ -171,9 +182,8 @@ let package = Package(
                     name: "MacWebRTCAudioDeviceShim",
                     condition: .when(platforms: [.macOS])
                 ),
-                .product(
+                .target(
                     name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework",
                     condition: .when(platforms: [.macOS])
                 )
             ],
@@ -195,7 +205,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CaptureServerTests",
-            dependencies: ["CaptureServer"],
+            dependencies: ["CaptureServer", "WebRTCTransport", "MediaBridgeCore"],
             path: "macOS/Tests/CaptureServerTests"
         ),
         .testTarget(
@@ -242,9 +252,8 @@ let package = Package(
                     name: "MacWebRTCAudioDeviceShimTestSupport",
                     condition: .when(platforms: [.macOS])
                 ),
-                .product(
+                .target(
                     name: "LiveKitWebRTC",
-                    package: "webrtc-xcframework",
                     condition: .when(platforms: [.macOS])
                 )
             ],

@@ -711,6 +711,112 @@ final class WorldwideRemoteInputLifecycleTests: XCTestCase {
     }
 
     @MainActor
+    func testFormatTransitionKeepsKeyboardFocusedWhilePointerGeometryIsRevoked() {
+        let settled = WorldwideScreenViewerView.remoteInputPresentationAvailability(
+            remoteInputAvailable: true,
+            renderedVideoSize: CGSize(width: 540, height: 1_170),
+            allowsPresentation: true,
+            screenMediaIsCovered: false,
+            scenePhase: .active
+        )
+        XCTAssertTrue(settled.keyboard)
+        XCTAssertTrue(settled.pointer)
+
+        let transitioning = WorldwideScreenViewerView.remoteInputPresentationAvailability(
+            remoteInputAvailable: true,
+            renderedVideoSize: nil,
+            allowsPresentation: true,
+            screenMediaIsCovered: false,
+            scenePhase: .active
+        )
+        XCTAssertTrue(transitioning.keyboard)
+        XCTAssertFalse(transitioning.pointer)
+    }
+
+    @MainActor
+    func testResumeCoverZeroSizeRevokesPointerGeometryUntilNextPresentedFrame() {
+        XCTAssertTrue(
+            WorldwideScreenViewerView.videoSizeCallbackRevokesPresentedGeometry(.zero)
+        )
+        XCTAssertFalse(
+            WorldwideScreenViewerView.videoSizeCallbackRevokesPresentedGeometry(
+                CGSize(width: 540, height: 1_170)
+            )
+        )
+        let coveredReset = WorldwideScreenViewerView.remoteInputPresentationAvailability(
+            remoteInputAvailable: true,
+            renderedVideoSize: nil,
+            allowsPresentation: true,
+            screenMediaIsCovered: true,
+            scenePhase: .active
+        )
+        XCTAssertFalse(coveredReset.keyboard)
+        XCTAssertFalse(coveredReset.pointer)
+    }
+
+    @MainActor
+    func testKeyboardContinuityDoesNotCrossPrivacyOrAuthorizationBoundaries() {
+        for availability in [
+            WorldwideScreenViewerView.remoteInputPresentationAvailability(
+                remoteInputAvailable: false,
+                renderedVideoSize: CGSize(width: 540, height: 1_170),
+                allowsPresentation: true,
+                screenMediaIsCovered: false,
+                scenePhase: .active
+            ),
+            WorldwideScreenViewerView.remoteInputPresentationAvailability(
+                remoteInputAvailable: true,
+                renderedVideoSize: CGSize(width: 540, height: 1_170),
+                allowsPresentation: false,
+                screenMediaIsCovered: false,
+                scenePhase: .active
+            ),
+            WorldwideScreenViewerView.remoteInputPresentationAvailability(
+                remoteInputAvailable: true,
+                renderedVideoSize: CGSize(width: 540, height: 1_170),
+                allowsPresentation: true,
+                screenMediaIsCovered: true,
+                scenePhase: .active
+            ),
+            WorldwideScreenViewerView.remoteInputPresentationAvailability(
+                remoteInputAvailable: true,
+                renderedVideoSize: CGSize(width: 540, height: 1_170),
+                allowsPresentation: true,
+                screenMediaIsCovered: false,
+                scenePhase: .inactive
+            )
+        ] {
+            XCTAssertFalse(availability.keyboard)
+            XCTAssertFalse(availability.pointer)
+        }
+    }
+
+    @MainActor
+    func testTerminalOrReplacementStateDismissesRetainedFullScreenViewer() {
+        XCTAssertFalse(
+            PlayerView.shouldDismissWorldwideScreen(
+                canViewScreen: false,
+                presentationIsCurrent: true,
+                shouldRemainMounted: true
+            )
+        )
+        XCTAssertTrue(
+            PlayerView.shouldDismissWorldwideScreen(
+                canViewScreen: false,
+                presentationIsCurrent: true,
+                shouldRemainMounted: false
+            )
+        )
+        XCTAssertTrue(
+            PlayerView.shouldDismissWorldwideScreen(
+                canViewScreen: true,
+                presentationIsCurrent: false,
+                shouldRemainMounted: false
+            )
+        )
+    }
+
+    @MainActor
     func testTransientInactiveKeepsRendererMountedBehindPrivacyCover() {
         XCTAssertTrue(
             WorldwideScreenViewerView.keepsScreenRendererMounted(
@@ -755,6 +861,439 @@ final class WorldwideRemoteInputLifecycleTests: XCTestCase {
         )
         XCTAssertFalse(videoView.debugPresentationCoverIsVisible)
         XCTAssertTrue(videoView.debugHasCurrentPresentedFrame)
+    }
+
+    @MainActor
+    func testAdaptiveFormatTransitionKeepsLastFrameVisibleWhileRevokingTouch() {
+        let videoView = WebRTCRemoteVideoView(frame: .zero)
+        var publishedSizes: [CGSize] = []
+        var invalidations: [WebRTCVideoPresentationInvalidation] = []
+        videoView.onVideoSizeChanged = { publishedSizes.append($0) }
+        videoView.onVideoPresentationInvalidated = { _, invalidation in
+            invalidations.append(invalidation)
+        }
+        videoView.debugInstallPresentedFrameForPrivacyCoverTests()
+
+        videoView.debugBeginFormatTransitionForContinuityTests()
+
+        XCTAssertFalse(videoView.debugPresentationCoverIsVisible)
+        XCTAssertTrue(videoView.debugHasCurrentPresentedFrame)
+        XCTAssertEqual(publishedSizes, [.zero])
+        XCTAssertEqual(invalidations, [.formatTransition])
+
+        videoView.debugInvalidateGeometryForContinuityTests()
+
+        XCTAssertTrue(videoView.debugPresentationCoverIsVisible)
+        XCTAssertFalse(videoView.debugHasCurrentPresentedFrame)
+        XCTAssertEqual(publishedSizes, [.zero, .zero])
+        XCTAssertEqual(invalidations, [.formatTransition, .invalidGeometry])
+    }
+
+    @MainActor
+    func testTransportUncertaintyRetainsConfirmedPresentationAndRevokesInput() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+
+        XCTAssertFalse(viewModel.canViewScreen)
+        XCTAssertFalse(viewModel.screenPresentationIsVisible(fixture.lease))
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        XCTAssertFalse(viewModel.remoteInputIsAvailable(for: fixture.lease))
+        XCTAssertFalse(fixture.authorization.isValid)
+        XCTAssertEqual(
+            viewModel.debugScreenPresentationState.currentLease,
+            fixture.lease
+        )
+        XCTAssertNil(viewModel.debugScreenPresentationState.activeLease)
+        XCTAssertEqual(
+            viewModel.debugScreenPresentationState.recoveringLease,
+            fixture.lease
+        )
+
+        viewModel.retireScreenPresentationLease(fixture.lease)
+        XCTAssertFalse(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testTransportRecoveryPreservesCompletedResumeFreshnessFence() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let floor: UInt32 = 9_100
+        viewModel.debugInstallCompletedScreenMediaFenceForTests(
+            lease: fixture.lease,
+            minimumAcceptedRTPTimestamp: floor
+        )
+
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+
+        let retainedFence = try XCTUnwrap(
+            viewModel.screenMediaViewerFence(for: fixture.lease)
+        )
+        XCTAssertFalse(retainedFence.forceCover)
+        XCTAssertEqual(retainedFence.minimumAcceptedRTPTimestamp, floor)
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testTransportRecoveryRevealsForcedFenceOnlyAfterFreshCurrentFrame() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let floor: UInt32 = 9_200
+        viewModel.debugInstallForcedScreenMediaFenceForTests(
+            lease: fixture.lease,
+            minimumAcceptedRTPTimestamp: floor
+        )
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        await transport.waitForRequestCount(1)
+
+        let showKey = WorldwideScreenVisibilityRequestKey(
+            sessionGeneration: fixture.lease.sessionGeneration,
+            requestID: 1_201
+        )
+        await transport.resolveRequest(at: 0, with: .success(showKey.requestID))
+        await viewModel.debugWaitForPendingScreenVisibilityRequest(showKey)
+        _ = await viewModel.debugDeliverControlAcknowledgement(
+            key: showKey,
+            state: .active,
+            sourcePeer: peer
+        )
+
+        let coveredAfterAcknowledgement = try XCTUnwrap(
+            viewModel.screenMediaViewerFence(for: fixture.lease)
+        )
+        XCTAssertTrue(coveredAfterAcknowledgement.forceCover)
+        XCTAssertEqual(
+            coveredAfterAcknowledgement.minimumAcceptedRTPTimestamp,
+            floor
+        )
+
+        viewModel.screenVideoFrameDidRender(
+            WebRTCVideoRenderObservation(
+                frameCount: 1,
+                timestampNanoseconds: 42,
+                width: 1_080,
+                height: 2_340,
+                contentDigest: 7,
+                contentSampleCount: 1,
+                contentChangeCount: 0
+            ),
+            for: fixture.lease
+        )
+
+        let revealedFence = try XCTUnwrap(
+            viewModel.screenMediaViewerFence(for: fixture.lease)
+        )
+        XCTAssertFalse(revealedFence.forceCover)
+        XCTAssertEqual(revealedFence.minimumAcceptedRTPTimestamp, floor)
+        XCTAssertNil(revealedFence.statusText)
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testFreshSuspensionCannotBeRevealedByPriorRecoveryFrame() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        viewModel.debugInstallForcedScreenMediaFenceForTests(
+            lease: fixture.lease,
+            minimumAcceptedRTPTimestamp: 9_200
+        )
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        await transport.waitForRequestCount(1)
+
+        let showKey = WorldwideScreenVisibilityRequestKey(
+            sessionGeneration: fixture.lease.sessionGeneration,
+            requestID: 1_201
+        )
+        await transport.resolveRequest(at: 0, with: .success(showKey.requestID))
+        await viewModel.debugWaitForPendingScreenVisibilityRequest(showKey)
+        _ = await viewModel.debugDeliverControlAcknowledgement(
+            key: showKey,
+            state: .active,
+            sourcePeer: peer
+        )
+        let recoveredFence = try XCTUnwrap(
+            viewModel.screenMediaViewerFence(for: fixture.lease)
+        )
+
+        viewModel.debugInstallForcedScreenMediaFenceForTests(
+            lease: fixture.lease,
+            minimumAcceptedRTPTimestamp: 9_300
+        )
+        let replacementFence = try XCTUnwrap(
+            viewModel.screenMediaViewerFence(for: fixture.lease)
+        )
+        XCTAssertNotEqual(replacementFence.coverID, recoveredFence.coverID)
+
+        viewModel.screenVideoFrameDidRender(
+            WebRTCVideoRenderObservation(
+                frameCount: 2,
+                timestampNanoseconds: 84,
+                width: 1_080,
+                height: 2_340,
+                contentDigest: 8,
+                contentSampleCount: 1,
+                contentChangeCount: 1
+            ),
+            for: fixture.lease
+        )
+
+        let retainedReplacementFence = try XCTUnwrap(
+            viewModel.screenMediaViewerFence(for: fixture.lease)
+        )
+        XCTAssertEqual(retainedReplacementFence.coverID, replacementFence.coverID)
+        XCTAssertTrue(retainedReplacementFence.forceCover)
+        XCTAssertEqual(
+            retainedReplacementFence.minimumAcceptedRTPTimestamp,
+            9_300
+        )
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testHealthyRecoveryAutomaticallyReissuesShowForRetainedLease() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        await transport.waitForRequestCount(1)
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        for _ in 0..<4 { await Task.yield() }
+
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertTrue(transport.requests[0].isVisible)
+        XCTAssertEqual(transport.requests[0].lease, fixture.lease)
+        let showKey = WorldwideScreenVisibilityRequestKey(
+            sessionGeneration: fixture.lease.sessionGeneration,
+            requestID: 1_201
+        )
+        await transport.resolveRequest(at: 0, with: .success(showKey.requestID))
+        await viewModel.debugWaitForPendingScreenVisibilityRequest(showKey)
+        let authorization = await viewModel.debugDeliverControlAcknowledgement(
+            key: showKey,
+            state: .active,
+            inputCapability: WebRTCInputCapability(
+                inputSessionID: UUID(),
+                screenRequestID: showKey.requestID
+            ),
+            sourcePeer: peer
+        )
+        await Task.yield()
+
+        XCTAssertTrue(viewModel.screenPresentationIsVisible(fixture.lease))
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        XCTAssertNil(viewModel.debugScreenPresentationState.recoveringLease)
+        XCTAssertEqual(viewModel.debugScreenPresentationState.activeLease, fixture.lease)
+        XCTAssertTrue(authorization?.isValid ?? false)
+        XCTAssertTrue(viewModel.remoteInputIsAvailable(for: fixture.lease))
+        XCTAssertEqual(transport.requests.count, 1)
+
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testRecoveryShowTimeoutHidesExactlyThenRetriesShow() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        await transport.waitForRequestCount(1)
+
+        let showKey = WorldwideScreenVisibilityRequestKey(
+            sessionGeneration: fixture.lease.sessionGeneration,
+            requestID: 1_201
+        )
+        await transport.resolveRequest(at: 0, with: .success(showKey.requestID))
+        await viewModel.debugWaitForPendingScreenVisibilityRequest(showKey)
+        viewModel.debugTriggerScreenVisibilityTimeout(key: showKey)
+        await transport.waitForRequestCount(2)
+
+        XCTAssertEqual(transport.requests.map(\.isVisible), [true, false])
+        XCTAssertEqual(transport.requests.map(\.lease), [fixture.lease, fixture.lease])
+        let hideKey = WorldwideScreenVisibilityRequestKey(
+            sessionGeneration: fixture.lease.sessionGeneration,
+            requestID: 1_202
+        )
+        await transport.resolveRequest(at: 1, with: .success(hideKey.requestID))
+        await viewModel.debugWaitForPendingScreenVisibilityRequest(hideKey)
+        await viewModel.debugDeliverControlAcknowledgement(
+            key: hideKey,
+            state: .inactive,
+            sourcePeer: peer
+        )
+        await transport.waitForRequestCount(3)
+
+        XCTAssertEqual(transport.requests.map(\.isVisible), [true, false, true])
+        let retryShowKey = WorldwideScreenVisibilityRequestKey(
+            sessionGeneration: fixture.lease.sessionGeneration,
+            requestID: 1_203
+        )
+        await transport.resolveRequest(at: 2, with: .success(retryShowKey.requestID))
+        await viewModel.debugWaitForPendingScreenVisibilityRequest(retryShowKey)
+        _ = await viewModel.debugDeliverControlAcknowledgement(
+            key: retryShowKey,
+            state: .active,
+            sourcePeer: peer
+        )
+
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        XCTAssertTrue(viewModel.screenPresentationIsVisible(fixture.lease))
+        XCTAssertNil(viewModel.debugScreenPresentationState.recoveringLease)
+        XCTAssertTrue(viewModel.debugScreenPresentationState.remoteHideRequired)
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testRecoveryShowRetryExhaustionHidesExactlyThenRetiresViewer() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+
+        for requestIndex in [0, 2] {
+            await transport.waitForRequestCount(requestIndex + 1)
+            let showKey = WorldwideScreenVisibilityRequestKey(
+                sessionGeneration: fixture.lease.sessionGeneration,
+                requestID: UInt64(1_201 + requestIndex)
+            )
+            await transport.resolveRequest(
+                at: requestIndex,
+                with: .success(showKey.requestID)
+            )
+            await viewModel.debugWaitForPendingScreenVisibilityRequest(showKey)
+            viewModel.debugTriggerScreenVisibilityTimeout(key: showKey)
+
+            await transport.waitForRequestCount(requestIndex + 2)
+            let hideKey = WorldwideScreenVisibilityRequestKey(
+                sessionGeneration: fixture.lease.sessionGeneration,
+                requestID: UInt64(1_202 + requestIndex)
+            )
+            await transport.resolveRequest(
+                at: requestIndex + 1,
+                with: .success(hideKey.requestID)
+            )
+            await viewModel.debugWaitForPendingScreenVisibilityRequest(hideKey)
+            await viewModel.debugDeliverControlAcknowledgement(
+                key: hideKey,
+                state: .inactive,
+                sourcePeer: peer
+            )
+        }
+        for _ in 0..<4 { await Task.yield() }
+
+        XCTAssertEqual(
+            transport.requests.map(\.isVisible),
+            [true, false, true, false]
+        )
+        XCTAssertFalse(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        XCTAssertNil(viewModel.debugScreenPresentationState.currentLease)
+        XCTAssertNil(viewModel.debugScreenPresentationState.recoveringLease)
+        XCTAssertTrue(
+            PlayerView.shouldDismissWorldwideScreen(
+                canViewScreen: viewModel.canViewScreen,
+                presentationIsCurrent:
+                    viewModel.screenPresentationIsCurrent(fixture.lease),
+                shouldRemainMounted:
+                    viewModel.screenPresentationShouldRemainMounted(fixture.lease)
+            )
+        )
+        viewModel.disconnect()
+        await peer.close()
+    }
+
+    @MainActor
+    func testReplacementSessionCannotRestoreStaleRetainedLease() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let oldPeer = try makeScreenPeer()
+        let oldFixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: oldPeer)
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(oldFixture.lease))
+
+        let replacementPeer = try makeScreenPeer()
+        viewModel.debugInstallScreenSessionForTests(
+            peer: replacementPeer,
+            generation: UUID()
+        )
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        for _ in 0..<4 { await Task.yield() }
+
+        XCTAssertFalse(viewModel.screenPresentationShouldRemainMounted(oldFixture.lease))
+        XCTAssertNil(viewModel.debugScreenPresentationState.recoveringLease)
+        XCTAssertTrue(transport.requests.isEmpty)
+        viewModel.disconnect()
+        await oldPeer.close()
+        await replacementPeer.close()
+    }
+
+    @MainActor
+    func testTerminalFailureClearsRecoveringPresentation() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+
+        viewModel.debugFailSessionForTests("terminal")
+
+        XCTAssertFalse(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        XCTAssertNil(viewModel.debugScreenPresentationState.currentLease)
+        XCTAssertNil(viewModel.debugScreenPresentationState.recoveringLease)
+        await peer.close()
+    }
+
+    @MainActor
+    func testBackgroundDuringRecoveryClearsRetentionAndPreventsAutomaticShow() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeScreenPeer()
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let transport = ScreenVisibilityTransportProbe()
+        viewModel.debugInstallScreenVisibilityRequestSender(transport.send)
+        viewModel.handleAppBecameActive()
+        viewModel.debugMarkViewerTransportUncertainForAutomaticMicrophoneTests()
+        XCTAssertTrue(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+
+        viewModel.handleAppEnteredBackground()
+        await viewModel.debugMarkViewerTransportHealthyForAutomaticMicrophoneTests()
+        for _ in 0..<4 { await Task.yield() }
+
+        XCTAssertFalse(viewModel.screenPresentationShouldRemainMounted(fixture.lease))
+        XCTAssertNil(viewModel.debugScreenPresentationState.currentLease)
+        XCTAssertNil(viewModel.debugScreenPresentationState.recoveringLease)
+        XCTAssertTrue(transport.requests.isEmpty)
+        viewModel.disconnect()
+        await peer.close()
     }
 
     @MainActor
@@ -1555,6 +2094,9 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         XCTAssertTrue(viewModel.debugSignalingIs(replacementClient))
         XCTAssertTrue(viewModel.hasActiveSession)
         viewModel.disconnect()
+        // The next fixture must not race the exact asynchronous peer/signaling teardown.
+        let retired = await viewModel.admitFreshConnectionPreparation()
+        XCTAssertTrue(retired)
     }
 
     func testStaleInputUnavailableCannotRevokeReplacementInputSession() async throws {
@@ -1701,6 +2243,56 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         XCTAssertNotEqual(binding, replacementBinding)
     }
 
+    func testPresentationEventLedgerSynthesizesFormatAndKeepsInvalidGeometrySticky() {
+        let ledger = WebRTCVideoPresentationEventLedger(bindingGeneration: 44)
+        ledger.record(
+            dimensionGeneration: 2,
+            invalidation: .invalidGeometry
+        )
+        ledger.recordFormatTransitionIfAbsent(dimensionGeneration: 3)
+
+        let events = ledger.takeInvalidations(through: 3)
+        XCTAssertEqual(events.map { $0.0 }, [
+            .init(bindingGeneration: 44, dimensionGeneration: 2),
+            .init(bindingGeneration: 44, dimensionGeneration: 3),
+        ])
+        XCTAssertEqual(events.map { $0.1 }, [
+            .invalidGeometry,
+            .formatTransition,
+        ])
+        XCTAssertTrue(ledger.takeInvalidations(through: 3).isEmpty)
+
+        // Publication can win its MainActor race; it synthesizes the same-token boundary once.
+        ledger.recordFormatTransitionIfAbsent(dimensionGeneration: 4)
+        let synthesized = ledger.takeInvalidations(through: 4)
+        XCTAssertEqual(synthesized.map { $0.0 }, [
+            .init(bindingGeneration: 44, dimensionGeneration: 4),
+        ])
+        XCTAssertEqual(synthesized.map { $0.1 }, [.formatTransition])
+
+        // Even if a newer valid format drains first, a late lower-generation malformed geometry
+        // remains fatal and is delivered once rather than disappearing behind the high-water.
+        ledger.recordFormatTransitionIfAbsent(dimensionGeneration: 6)
+        XCTAssertEqual(
+            ledger.takeInvalidations(through: 6).map { $0.1 },
+            [.formatTransition]
+        )
+        ledger.record(
+            dimensionGeneration: 5,
+            invalidation: .invalidGeometry
+        )
+        let lateFatal = ledger.takeInvalidations(through: 6)
+        XCTAssertEqual(lateFatal.map { $0.0 }, [
+            .init(bindingGeneration: 44, dimensionGeneration: 5),
+        ])
+        XCTAssertEqual(lateFatal.map { $0.1 }, [.invalidGeometry])
+        ledger.record(
+            dimensionGeneration: 5,
+            invalidation: .invalidGeometry
+        )
+        XCTAssertTrue(ledger.takeInvalidations(through: 6).isEmpty)
+    }
+
     func testDelayedNativeSizeCallbackCannotRevokePresentedGeneration() throws {
         let oldSize = CGSize(width: 1_080, height: 2_340)
         let newSize = CGSize(width: 720, height: 1_560)
@@ -1724,7 +2316,7 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         )
         let renderer = ObservedVideoRenderer(
             downstream: SilentVideoRenderer(),
-            invalidatePresentation: { _ in },
+            invalidatePresentation: { _, _ in },
             publish: { _, _ in }
         )
         var fence = WebRTCVideoPresentationGenerationFence()
@@ -1791,6 +2383,19 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         XCTAssertEqual(cachedObservation, newObservation)
     }
 
+    func testNilNativeFrameDoesNotClearRetainedDrawable() {
+        let downstream = SilentVideoRenderer()
+        let renderer = ObservedVideoRenderer(
+            downstream: downstream,
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in }
+        )
+
+        renderer.renderFrame(nil)
+
+        XCTAssertEqual(downstream.renderedFrameCount, 0)
+    }
+
     func testNonzeroRotationFrameRevokesCachedTouchObservation() throws {
         let cachedObservation = WebRTCVideoRenderObservation(
             frameCount: 12,
@@ -1806,8 +2411,8 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         let downstream = OrderedVideoRenderer(orderingProbe: orderingProbe)
         let renderer = ObservedVideoRenderer(
             downstream: downstream,
-            invalidatePresentation: { generation in
-                orderingProbe.record(.invalidation(generation))
+            invalidatePresentation: { generation, invalidation in
+                orderingProbe.record(.invalidation(generation, invalidation))
                 observationCache.invalidate(generation: generation)
             },
             publish: { _, _ in
@@ -1844,7 +2449,10 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         renderer.renderFrame(frame)
 
         XCTAssertEqual(downstream.renderedFrameCount, 1)
-        XCTAssertEqual(orderingProbe.events, [.invalidation(2), .downstreamRender])
+        XCTAssertEqual(
+            orderingProbe.events,
+            [.invalidation(2, .invalidGeometry), .downstreamRender]
+        )
         XCTAssertEqual(observationCache.invalidatedGenerations, [2])
         XCTAssertEqual(observationCache.publicationCount, 0)
         XCTAssertNil(
@@ -1877,6 +2485,211 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
 
         XCTAssertEqual(sentAction, .tap(.init(x: 0.25, y: 0.75)))
         XCTAssertEqual(sentSize, expectedSize)
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testSecureFocusFeedbackPresentsSecureKeyboardAndUsesExactGeneration() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let tapSent = expectation(description: "tap sent")
+        let secureTextSent = expectation(description: "secure text sent")
+        let secureGeneration: UInt64 = 808
+        var sentActions: [WebRTCInputAction] = []
+        viewModel.debugInstallRemoteInputSender { _, action, _, _, _, _ in
+            sentActions.append(action)
+            if sentActions.count == 1 {
+                tapSent.fulfill()
+            } else if sentActions.count == 2 {
+                secureTextSent.fulfill()
+            }
+            return UInt64(sentActions.count)
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(peer: peer)
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        viewModel.sendRemoteTap(
+            normalizedPoint: CGPoint(x: 0.25, y: 0.75),
+            viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+        )
+        await fulfillment(of: [tapSent], timeout: 2)
+        for _ in 0 ..< 20 where viewModel.debugRemoteInputState.pendingActionCount == 0 {
+            await Task.yield()
+        }
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 1)
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: secureGeneration, secure: true)
+            )
+        )
+
+        XCTAssertEqual(viewModel.focusedInputGeneration, secureGeneration)
+        XCTAssertTrue(viewModel.focusedInputIsSecure)
+        XCTAssertTrue(fixture.authorization.isValid)
+
+        viewModel.sendRemoteText("credential", focusGeneration: secureGeneration)
+        await fulfillment(of: [secureTextSent], timeout: 2)
+        XCTAssertEqual(
+            sentActions,
+            [
+                .tap(.init(x: 0.25, y: 0.75)),
+                .insertText("credential", focusGeneration: secureGeneration),
+            ]
+        )
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testFormatTransitionRejectionKeepsKeyboardFocusForNextCommittedText() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let focusGeneration: UInt64 = 404
+        let nextTextSent = expectation(description: "next committed text sent")
+        var sentActions: [WebRTCInputAction] = []
+        viewModel.debugInstallRemoteInputSender { _, action, _, _, _, _ in
+            sentActions.append(action)
+            if sentActions.count == 2 {
+                nextTextSent.fulfill()
+            }
+            return UInt64(sentActions.count)
+        }
+        let authorization =
+            viewModel.debugInstallQueuedRemoteInputSessionForRaceTests(
+                peer: peer,
+                focusGeneration: focusGeneration,
+                diagnostic: "format transition fixture",
+                queuedAction: .insertText(
+                    "a",
+                    focusGeneration: focusGeneration
+                )
+            )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        await viewModel.debugDrainRemoteInputQueueForRaceTests()
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 1)
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .rateLimited,
+                screenFormatChanging: true
+            )
+        )
+
+        let transitioningState = viewModel.debugRemoteInputState
+        XCTAssertEqual(transitioningState.focusGeneration, focusGeneration)
+        XCTAssertEqual(transitioningState.pendingActionCount, 0)
+        XCTAssertTrue(transitioningState.inputAvailable)
+        XCTAssertTrue(authorization.isValid)
+        XCTAssertEqual(
+            viewModel.lastDiagnostic,
+            "Mac screen format changed during remote input."
+        )
+
+        viewModel.sendRemoteText("b", focusGeneration: focusGeneration)
+        await fulfillment(of: [nextTextSent], timeout: 2)
+        XCTAssertEqual(
+            sentActions,
+            [
+                .insertText("a", focusGeneration: focusGeneration),
+                .insertText("b", focusGeneration: focusGeneration)
+            ]
+        )
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 2,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: focusGeneration, secure: false)
+            )
+        )
+        XCTAssertEqual(
+            viewModel.debugRemoteInputState.focusGeneration,
+            focusGeneration
+        )
+        XCTAssertTrue(authorization.isValid)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testFormatTransitionRejectionForPointerStillClosesKeyboardFocus() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let focusGeneration: UInt64 = 406
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        _ = viewModel.debugInstallQueuedRemoteInputSessionForRaceTests(
+            peer: peer,
+            focusGeneration: focusGeneration,
+            diagnostic: "format-transition pointer fixture",
+            queuedAction: .tap(.init(x: 0.25, y: 0.75)),
+            viewerVideoSize: .init(width: 1_080, height: 2_340)
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        await viewModel.debugDrainRemoteInputQueueForRaceTests()
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .rateLimited,
+                screenFormatChanging: true
+            )
+        )
+
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertEqual(
+            viewModel.lastDiagnostic,
+            "Mac screen format changed during remote input."
+        )
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testUnqualifiedKeyboardRateLimitClosesFocusImmediately() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let focusGeneration: UInt64 = 405
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        _ = viewModel.debugInstallQueuedRemoteInputSessionForRaceTests(
+            peer: peer,
+            focusGeneration: focusGeneration,
+            diagnostic: "rate-limited keyboard fixture",
+            queuedAction: .insertText(
+                "x",
+                focusGeneration: focusGeneration
+            )
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        await viewModel.debugDrainRemoteInputQueueForRaceTests()
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .rateLimited
+            )
+        )
+
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
         viewModel.disconnect()
         await peer.close(reason: .viewerDisconnected)
     }
@@ -2283,6 +3096,1257 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         await peer.close(reason: .viewerDisconnected)
     }
 
+    @MainActor
+    func testFocusedWindowResizeRequestsSelectsAndCommitsWithExactFocusAndGeometry() async throws {
+        try await assertResizePreservesExactFocusAndGeometry(secure: false)
+    }
+
+    @MainActor
+    func testSecureFocusedWindowResizeRequestsSelectsAndCommitsPreservePrivacy() async throws {
+        try await assertResizePreservesExactFocusAndGeometry(secure: true)
+    }
+
+    @MainActor
+    private func assertResizePreservesExactFocusAndGeometry(secure: Bool) async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let focusGeneration: UInt64 = 501
+        let containerSize = CGSize(width: 390, height: 844)
+        let videoSize = CGSize(width: 1_080, height: 2_340)
+        var sentActions: [WebRTCInputAction] = []
+        var sentSizes: [WebRTCInputVideoSize?] = []
+        viewModel.debugInstallRemoteInputSender { _, action, size, _, _, _ in
+            sentActions.append(action)
+            sentSizes.append(size)
+            return UInt64(sentActions.count)
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: focusGeneration,
+            supportsFocusedWindowResize: true
+        )
+        viewModel.debugSetRemoteKeyboardFocusForTests(focusGeneration, secure: secure)
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: containerSize,
+                viewerVideoSize: videoSize
+            )
+        )
+        for _ in 0 ..< 40 where sentActions.count < 1 { await Task.yield() }
+        XCTAssertEqual(sentActions, [.requestFocusedWindowResizeTarget])
+        XCTAssertEqual(sentSizes, [.init(width: 1_080, height: 2_340)])
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, focusGeneration)
+        XCTAssertEqual(viewModel.focusedInputIsSecure, secure)
+
+        let targetA = WebRTCWindowResizeTarget(
+            generation: UUID(),
+            normalizedFrame: .init(x: 0.1, y: 0.2, width: 0.5, height: 0.4)
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: focusGeneration, secure: secure),
+                windowResize: .init(kind: .targetAcquired, target: targetA)
+            )
+        )
+        XCTAssertEqual(
+            viewModel.focusedWindowResizeState.interaction?.target,
+            .init(resize: targetA)
+        )
+
+        viewModel.selectWindowForFocusedResize(
+            at: CGPoint(x: 0.75, y: 0.25),
+            for: fixture.lease,
+            containerSize: containerSize,
+            viewerVideoSize: videoSize
+        )
+        for _ in 0 ..< 40 where sentActions.count < 2 { await Task.yield() }
+        XCTAssertEqual(
+            sentActions.last,
+            .selectWindowForResize(at: .init(x: 0.75, y: 0.25))
+        )
+        let targetB = WebRTCWindowResizeTarget(
+            generation: UUID(),
+            normalizedFrame: .init(x: 0.2, y: 0.1, width: 0.6, height: 0.7)
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 2,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: focusGeneration, secure: secure),
+                windowResize: .init(kind: .windowSelected, target: targetB)
+            )
+        )
+
+        viewModel.commitFocusedWindowResize(
+            targetGeneration: targetB.generation,
+            startNormalizedPoint: CGPoint(x: 0.21, y: 0.11),
+            endNormalizedPoint: CGPoint(x: 0.1, y: 0.05),
+            for: fixture.lease,
+            containerSize: containerSize,
+            viewerVideoSize: videoSize
+        )
+        XCTAssertNil(viewModel.focusedWindowResizeState.interaction?.target)
+        for _ in 0 ..< 40 where sentActions.count < 3 { await Task.yield() }
+        XCTAssertEqual(
+            sentActions.last,
+            .commitFocusedWindowResize(
+                targetGeneration: targetB.generation,
+                start: .init(x: 0.21, y: 0.11),
+                end: .init(x: 0.1, y: 0.05)
+            )
+        )
+        let successor = WebRTCWindowResizeTarget(
+            generation: UUID(),
+            normalizedFrame: .init(x: 0.09, y: 0.04, width: 0.71, height: 0.76)
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 3,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: focusGeneration, secure: secure),
+                windowResize: .init(
+                    kind: .resizeCommitted,
+                    committedTargetGeneration: targetB.generation,
+                    target: successor
+                )
+            )
+        )
+
+        XCTAssertEqual(
+            viewModel.focusedWindowResizeState.interaction?.target,
+            .init(resize: successor)
+        )
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, focusGeneration)
+        XCTAssertEqual(viewModel.focusedInputIsSecure, secure)
+        viewModel.cancelFocusedWindowResize()
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, focusGeneration)
+        XCTAssertEqual(viewModel.focusedInputIsSecure, secure)
+        XCTAssertTrue(fixture.authorization.isValid)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testSecureResizeFeedbackPreservesPrivacyAcrossRejectionAndRetirement() async throws {
+        for (accepted, retired) in [(false, false), (false, true), (true, true)] {
+            try await assertResizeFeedbackPrivacy(
+                initiallySecure: true, feedbackSecure: true,
+                accepted: accepted, retired: retired, retainsFocus: true
+            )
+        }
+    }
+
+    @MainActor
+    func testResizeFeedbackRejectsSameGenerationSecureClassificationChanges() async throws {
+        for initiallySecure in [false, true] {
+            for accepted in [false, true] {
+                for retired in [false, true] {
+                    try await assertResizeFeedbackPrivacy(
+                        initiallySecure: initiallySecure, feedbackSecure: !initiallySecure,
+                        accepted: accepted, retired: retired, retainsFocus: false
+                    )
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func assertResizeFeedbackPrivacy(
+        initiallySecure: Bool,
+        feedbackSecure: Bool,
+        accepted: Bool,
+        retired: Bool,
+        retainsFocus: Bool
+    ) async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let generation: UInt64 = 811
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer, screenRequestID: generation, supportsFocusedWindowResize: true
+        )
+        viewModel.debugSetRemoteKeyboardFocusForTests(generation, secure: initiallySecure)
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        XCTAssertTrue(viewModel.beginFocusedWindowResize(
+            for: fixture.lease,
+            containerSize: CGSize(width: 390, height: 844),
+            viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+        ))
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 1)
+        if retired { viewModel.cancelFocusedWindowResize() }
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: accepted ? .accepted : .rejected,
+                rejectionReason: accepted ? nil : .invalidRequest,
+                focus: .editable(generation: generation, secure: feedbackSecure),
+                windowResize: accepted ? .init(
+                    kind: .targetAcquired,
+                    target: .init(
+                        generation: UUID(),
+                        normalizedFrame: .init(x: 0.1, y: 0.2, width: 0.5, height: 0.4)
+                    )
+                ) : nil
+            )
+        )
+
+        XCTAssertEqual(viewModel.focusedInputGeneration, retainsFocus ? generation : nil)
+        XCTAssertEqual(viewModel.focusedInputIsSecure, retainsFocus && initiallySecure)
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(viewModel.focusedWindowResizeState.interaction?.target)
+        XCTAssertTrue(fixture.authorization.isValid)
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testResizeOnlyRejectionAppliesCorrelatedFocusThenCancelsOnlyResize() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let focusGeneration: UInt64 = 502
+        var requestID: UInt64 = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            requestID += 1
+            return requestID
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: focusGeneration,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .invalidRequest,
+                focus: .editable(generation: focusGeneration, secure: false)
+            )
+        )
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, focusGeneration)
+        XCTAssertTrue(fixture.authorization.isValid)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 2,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .invalidRequest,
+                focus: .none
+            )
+        )
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testEnteringResizeRetiresDelayedOrdinaryPointerFeedbackWithoutClearingFocus() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        var sentCount = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            sentCount += 1
+            return UInt64(sentCount)
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 503,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        viewModel.sendRemoteTap(
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        viewModel.debugSetRemoteKeyboardFocusForTests(900)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+            )
+        )
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, 900)
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .none
+            )
+        )
+
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, 900)
+        XCTAssertTrue(viewModel.focusedWindowResizeState.isActive)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testEnteringResizeStillAppliesDelayedPointerTerminalRejection() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        var sentCount = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            sentCount += 1
+            return UInt64(sentCount)
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 511,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        viewModel.sendRemoteTap(
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        viewModel.debugSetRemoteKeyboardFocusForTests(901)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .staleSession,
+                focus: .editable(generation: 901, secure: false)
+            )
+        )
+
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(fixture.authorization.isValid)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testRepeatedResizeCancellationIgnoresLateFeedbackWithoutPendingOrEarlyGrowth() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        var nextRequestID: UInt64 = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            nextRequestID += 1
+            return nextRequestID
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 504,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        for expectedRequestID in 1 ... 20 {
+            XCTAssertTrue(
+                viewModel.beginFocusedWindowResize(
+                    for: fixture.lease,
+                    containerSize: CGSize(width: 390, height: 844),
+                    viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+                )
+            )
+            for _ in 0 ..< 40
+                where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+                await Task.yield()
+            }
+            XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 1)
+            viewModel.cancelFocusedWindowResize()
+            viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+                WebRTCInputFeedback(
+                    id: UInt64(expectedRequestID),
+                    screenRequestID: capability.screenRequestID,
+                    inputSessionID: capability.inputSessionID,
+                    result: .rejected,
+                    rejectionReason: .invalidRequest,
+                    focus: .editable(generation: 504, secure: false)
+                )
+            )
+            XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+            XCTAssertEqual(viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+        }
+        XCTAssertEqual(viewModel.debugRemoteInputState.retiredRequestIDCount, 20)
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, 504)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testCancelledSentSelectionAppliesAcceptedNoneWithoutRestoringResizeTarget() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        var nextRequestID: UInt64 = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            nextRequestID += 1
+            return nextRequestID
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 507,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        let containerSize = CGSize(width: 390, height: 844)
+        let videoSize = CGSize(width: 1_920, height: 1_080)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: containerSize,
+                viewerVideoSize: videoSize
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        let target = WebRTCWindowResizeTarget(
+            generation: UUID(),
+            normalizedFrame: .init(x: 0.1, y: 0.2, width: 0.6, height: 0.5)
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: 507, secure: false),
+                windowResize: .init(kind: .targetAcquired, target: target)
+            )
+        )
+
+        viewModel.selectWindowForFocusedResize(
+            at: CGPoint(x: 0.7, y: 0.3),
+            for: fixture.lease,
+            containerSize: containerSize,
+            viewerVideoSize: videoSize
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        viewModel.cancelFocusedWindowResize()
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 2,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .none,
+                windowResize: .init(
+                    kind: .windowSelected,
+                    target: .init(
+                        generation: UUID(),
+                        normalizedFrame: .init(
+                            x: 0.2,
+                            y: 0.1,
+                            width: 0.5,
+                            height: 0.6
+                        )
+                    )
+                )
+            )
+        )
+
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(viewModel.focusedWindowResizeState.interaction?.target)
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertTrue(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertTrue(fixture.authorization.isValid)
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+        XCTAssertEqual(viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testCancelledSentCommitStillAppliesLateTerminalRejection() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        var nextRequestID: UInt64 = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            nextRequestID += 1
+            return nextRequestID
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 508,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        let containerSize = CGSize(width: 390, height: 844)
+        let videoSize = CGSize(width: 1_920, height: 1_080)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: containerSize,
+                viewerVideoSize: videoSize
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        let target = WebRTCWindowResizeTarget(
+            generation: UUID(),
+            normalizedFrame: .init(x: 0.1, y: 0.2, width: 0.6, height: 0.5)
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: 508, secure: false),
+                windowResize: .init(kind: .targetAcquired, target: target)
+            )
+        )
+        viewModel.commitFocusedWindowResize(
+            targetGeneration: target.generation,
+            startNormalizedPoint: CGPoint(x: 0.12, y: 0.22),
+            endNormalizedPoint: CGPoint(x: 0.05, y: 0.1),
+            for: fixture.lease,
+            containerSize: containerSize,
+            viewerVideoSize: videoSize
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        viewModel.cancelFocusedWindowResize()
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 2,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .inputDisabled,
+                focus: .editable(generation: 508, secure: false)
+            )
+        )
+
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(fixture.authorization.isValid)
+        XCTAssertEqual(
+            viewModel.lastError,
+            "Remote control is disabled on the Mac."
+        )
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testRenderedGeometryChangeCancelsResizeButPreservesKeyboardFocus() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 509,
+            supportsFocusedWindowResize: true
+        )
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+
+        viewModel.screenVideoPresentationGeometryDidChange(
+            to: CGSize(width: 2_560, height: 1_440),
+            for: fixture.lease
+        )
+
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, 509)
+        XCTAssertTrue(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertTrue(fixture.authorization.isValid)
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+        XCTAssertEqual(viewModel.debugRemoteInputState.retiredRequestIDCount, 1)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testPresentationRetirementCancelsResizeAndRevokesKeyboardInput() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 510,
+            supportsFocusedWindowResize: true
+        )
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+
+        viewModel.retireScreenPresentationLease(fixture.lease)
+
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(fixture.authorization.isValid)
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testResizeToggleOffPreservesFocusButViewerHideRevokesIt() async throws {
+        let lifecycle = try await makeActiveResizeLifecycleFixture(
+            screenRequestID: 512
+        )
+
+        lifecycle.viewModel.cancelFocusedWindowResize()
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertEqual(
+            lifecycle.viewModel.debugRemoteInputState.focusGeneration,
+            512
+        )
+        XCTAssertTrue(lifecycle.presentation.authorization.isValid)
+
+        XCTAssertTrue(
+            lifecycle.viewModel.beginFocusedWindowResize(
+                for: lifecycle.presentation.lease,
+                containerSize: lifecycle.containerSize,
+                viewerVideoSize: lifecycle.videoSize
+            )
+        )
+        lifecycle.viewModel.debugInstallScreenVisibilityRequestSender {
+            (_: Bool) async throws -> UInt64 in 900
+        }
+        XCTAssertTrue(
+            lifecycle.viewModel.beginPassiveScreenTeardown(
+                for: lifecycle.presentation.lease
+            )
+        )
+
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(lifecycle.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(lifecycle.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(lifecycle.presentation.authorization.isValid)
+
+        lifecycle.viewModel.disconnect()
+        await lifecycle.peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testDisconnectRevokesResizeAndKeyboardFocus() async throws {
+        let lifecycle = try await makeActiveResizeLifecycleFixture(
+            screenRequestID: 513
+        )
+
+        lifecycle.viewModel.disconnect()
+
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(lifecycle.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(lifecycle.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(lifecycle.presentation.authorization.isValid)
+
+        await lifecycle.peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testRecoveryCoverRevokesResizeAndKeyboardFocus() async throws {
+        let lifecycle = try await makeActiveResizeLifecycleFixture(
+            screenRequestID: 514
+        )
+        lifecycle.viewModel.debugInstallScreenMediaCancellationObserver { _, _ in }
+
+        lifecycle.viewModel.debugDeliverScreenMediaSuspensionForTests(
+            WebRTCScreenMediaSuspensionNotice(
+                screenRequestID: 514,
+                suspensionGeneration: 1
+            ),
+            sourcePeer: lifecycle.peer
+        )
+
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(lifecycle.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(lifecycle.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(lifecycle.presentation.authorization.isValid)
+        XCTAssertTrue(
+            try XCTUnwrap(
+                lifecycle.viewModel.screenMediaViewerFence(
+                    for: lifecycle.presentation.lease
+                )
+            ).forceCover
+        )
+
+        lifecycle.viewModel.disconnect()
+        await lifecycle.peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testAccessibilityPermissionLossRevokesResizeAndKeyboardFocus() async throws {
+        let lifecycle = try await makeActiveResizeLifecycleFixture(
+            screenRequestID: 515
+        )
+
+        lifecycle.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: lifecycle.capability.screenRequestID,
+                inputSessionID: lifecycle.capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .accessibilityPermissionRequired,
+                focus: .editable(generation: 515, secure: false)
+            )
+        )
+
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(lifecycle.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(lifecycle.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(lifecycle.presentation.authorization.isValid)
+        XCTAssertEqual(
+            lifecycle.viewModel.lastError,
+            "Remote control needs Accessibility permission on the Mac."
+        )
+
+        lifecycle.viewModel.disconnect()
+        await lifecycle.peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testInputCapabilitySessionReplacementRevokesResizeAndKeyboardFocus() async throws {
+        let lifecycle = try await makeActiveResizeLifecycleFixture(
+            screenRequestID: 516
+        )
+        let replacementInputSessionID = UUID()
+
+        let replacementAuthorization = try XCTUnwrap(
+            lifecycle.viewModel.debugReplaceRemoteInputCapabilityForTests(
+                inputSessionID: replacementInputSessionID,
+                supportsFocusedWindowResize: false
+            )
+        )
+
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(lifecycle.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(lifecycle.presentation.authorization.isValid)
+        XCTAssertTrue(replacementAuthorization.isValid)
+        XCTAssertEqual(
+            lifecycle.viewModel.debugRemoteInputState.capability?.inputSessionID,
+            replacementInputSessionID
+        )
+        XCTAssertFalse(lifecycle.viewModel.isFocusedWindowResizeAvailable)
+
+        lifecycle.viewModel.disconnect()
+        await lifecycle.peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testTrackAndContainerGeometryChangesCancelResizeButPreserveKeyboardFocus() async throws {
+        let lifecycle = try await makeActiveResizeLifecycleFixture(
+            screenRequestID: 517
+        )
+
+        lifecycle.viewModel.debugReplaceFocusedWindowResizeTrackForTests()
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertEqual(
+            lifecycle.viewModel.debugRemoteInputState.focusGeneration,
+            517
+        )
+        XCTAssertTrue(lifecycle.presentation.authorization.isValid)
+
+        XCTAssertTrue(
+            lifecycle.viewModel.beginFocusedWindowResize(
+                for: lifecycle.presentation.lease,
+                containerSize: lifecycle.containerSize,
+                viewerVideoSize: lifecycle.videoSize
+            )
+        )
+        lifecycle.viewModel.focusedWindowResizeContainerGeometryDidChange(
+            to: CGSize(width: 844, height: 390),
+            for: lifecycle.presentation.lease
+        )
+
+        XCTAssertFalse(lifecycle.viewModel.focusedWindowResizeState.isActive)
+        XCTAssertEqual(
+            lifecycle.viewModel.debugRemoteInputState.focusGeneration,
+            517
+        )
+        XCTAssertTrue(lifecycle.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertTrue(lifecycle.presentation.authorization.isValid)
+
+        lifecycle.viewModel.disconnect()
+        await lifecycle.peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testMismatchedResizeFeedbackKindFailsClosedWithoutInstallingTarget() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 505,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: 505, secure: false),
+                windowResize: .init(
+                    kind: .windowSelected,
+                    target: .init(
+                        generation: UUID(),
+                        normalizedFrame: .init(
+                            x: 0.1,
+                            y: 0.1,
+                            width: 0.5,
+                            height: 0.5
+                        )
+                    )
+                )
+            )
+        )
+
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertEqual(
+            viewModel.lastDiagnostic,
+            "The Mac returned mismatched focused-window resize feedback."
+        )
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testResizeCancelledDuringSuspendedSendAppliesLateTerminalFeedback() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        let sendReachedBoundary = expectation(description: "resize send reached actor boundary")
+        let sendGate = NonCooperativeAsyncGate()
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            sendReachedBoundary.fulfill()
+            await sendGate.wait()
+            return 1
+        }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 506,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_080, height: 2_340)
+            )
+        )
+        await fulfillment(of: [sendReachedBoundary], timeout: 2)
+        viewModel.cancelFocusedWindowResize()
+        await sendGate.open()
+        for _ in 0 ..< 80 where viewModel.debugRemoteInputState.retiredRequestIDCount < 1 {
+            await Task.yield()
+        }
+        XCTAssertEqual(viewModel.debugRemoteInputState.retiredRequestIDCount, 1)
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .inputDisabled,
+                focus: .none
+            )
+        )
+
+        XCTAssertEqual(viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertFalse(fixture.authorization.isValid)
+        XCTAssertEqual(
+            viewModel.lastError,
+            "Remote control is disabled on the Mac."
+        )
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testInactiveLateRetiredResizeFeedbackCannotRestoreKeyboardFocus() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 519,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        viewModel.handleAppBecameActive()
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+
+        viewModel.handleAppBecameInactive()
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertEqual(viewModel.debugRemoteInputState.retiredRequestIDCount, 1)
+
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: 519, secure: false),
+                windowResize: .init(
+                    kind: .targetAcquired,
+                    target: .init(
+                        generation: UUID(),
+                        normalizedFrame: .init(
+                            x: 0.1,
+                            y: 0.2,
+                            width: 0.6,
+                            height: 0.5
+                        )
+                    )
+                )
+            )
+        )
+
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertTrue(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertTrue(fixture.authorization.isValid)
+
+        viewModel.handleAppBecameActive()
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertTrue(viewModel.remoteInputIsAvailable(for: fixture.lease))
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testInactiveLateRetiredResizeRejectionCannotRestoreKeyboardFocus() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in 1 }
+        let fixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: 521,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        viewModel.handleAppBecameActive()
+
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: fixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+
+        viewModel.handleAppBecameInactive()
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: capability.screenRequestID,
+                inputSessionID: capability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .invalidRequest,
+                focus: .editable(generation: 521, secure: false)
+            )
+        )
+        viewModel.handleAppBecameActive()
+
+        XCTAssertNil(viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(viewModel.focusedWindowResizeState.isActive)
+        XCTAssertTrue(viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertTrue(fixture.authorization.isValid)
+        XCTAssertEqual(
+            viewModel.lastDiagnostic,
+            "The Mac rejected an invalid remote input action."
+        )
+
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
+    }
+
+    @MainActor
+    func testOldSuspendedResizeSendCannotTombstoneReusedReplacementRequestID() async throws {
+        let viewModel = WorldwideSessionViewModel()
+        let oldPeer = try makeViewerPeer()
+        let replacementPeer = try makeViewerPeer()
+        let oldSendReachedBoundary = expectation(
+            description: "old resize send reached actor boundary"
+        )
+        let oldSendReturned = expectation(description: "old resize send returned")
+        let replacementSendReturned = expectation(
+            description: "replacement resize send returned"
+        )
+        let oldSendGate = NonCooperativeAsyncGate()
+        let replacementSendReachedBoundary = expectation(
+            description: "replacement resize send reached actor boundary"
+        )
+        let replacementSendGate = NonCooperativeAsyncGate()
+        viewModel.debugInstallRemoteInputSender { sourcePeer, _, _, _, _, _ in
+            if sourcePeer === oldPeer {
+                oldSendReachedBoundary.fulfill()
+                await oldSendGate.wait()
+                oldSendReturned.fulfill()
+                return 1
+            }
+            XCTAssertTrue(sourcePeer === replacementPeer)
+            replacementSendReachedBoundary.fulfill()
+            await replacementSendGate.wait()
+            replacementSendReturned.fulfill()
+            return 1
+        }
+
+        let oldFixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: oldPeer,
+            generation: UUID(),
+            screenRequestID: 520,
+            supportsFocusedWindowResize: true
+        )
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: oldFixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        await fulfillment(of: [oldSendReachedBoundary], timeout: 2)
+
+        let replacementFixture = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: replacementPeer,
+            generation: UUID(),
+            screenRequestID: 520,
+            supportsFocusedWindowResize: true
+        )
+        let replacementCapability = try XCTUnwrap(
+            viewModel.debugRemoteInputState.capability
+        )
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: replacementFixture.lease,
+                containerSize: CGSize(width: 390, height: 844),
+                viewerVideoSize: CGSize(width: 1_920, height: 1_080)
+            )
+        )
+        await fulfillment(of: [replacementSendReachedBoundary], timeout: 2)
+
+        let target = WebRTCWindowResizeTarget(
+            generation: UUID(),
+            normalizedFrame: .init(x: 0.2, y: 0.1, width: 0.5, height: 0.6)
+        )
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(
+            WebRTCInputFeedback(
+                id: 1,
+                screenRequestID: replacementCapability.screenRequestID,
+                inputSessionID: replacementCapability.inputSessionID,
+                result: .accepted,
+                focus: .editable(generation: 520, secure: false),
+                windowResize: .init(kind: .targetAcquired, target: target)
+            )
+        )
+        XCTAssertEqual(viewModel.debugRemoteInputState.earlyFeedbackCount, 1)
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+
+        await oldSendGate.open()
+        await fulfillment(of: [oldSendReturned], timeout: 2)
+        for _ in 0 ..< 80
+            where viewModel.debugRemoteInputState.retiredRequestIDCount < 1 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(viewModel.debugRemoteInputState.earlyFeedbackCount, 1)
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+        XCTAssertEqual(viewModel.debugRemoteInputState.retiredRequestIDCount, 1)
+        XCTAssertTrue(replacementFixture.authorization.isValid)
+
+        await replacementSendGate.open()
+        await fulfillment(of: [replacementSendReturned], timeout: 2)
+        let interactionTarget = FocusedWindowInteractionTarget(resize: target)
+        for _ in 0 ..< 80
+            where viewModel.focusedWindowResizeState.interaction?.target != interactionTarget {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 0)
+        XCTAssertEqual(viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+        XCTAssertEqual(
+            viewModel.focusedWindowResizeState.interaction?.target,
+            interactionTarget
+        )
+        XCTAssertEqual(viewModel.debugRemoteInputState.focusGeneration, 520)
+        XCTAssertFalse(oldFixture.authorization.isValid)
+
+        viewModel.disconnect()
+        await oldPeer.close(reason: .viewerDisconnected)
+        await replacementPeer.close(reason: .viewerDisconnected)
+    }
+
+    private typealias ActiveResizeLifecycleFixture = (
+        viewModel: WorldwideSessionViewModel,
+        peer: WebRTCPeer,
+        presentation: WorldwideScreenPresentationDebugFixture,
+        capability: WebRTCInputCapability,
+        containerSize: CGSize,
+        videoSize: CGSize
+    )
+
+    @MainActor
+    private func makeActiveResizeLifecycleFixture(
+        screenRequestID: UInt64
+    ) async throws -> ActiveResizeLifecycleFixture {
+        let viewModel = WorldwideSessionViewModel()
+        let peer = try makeViewerPeer()
+        var nextRequestID: UInt64 = 0
+        viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            nextRequestID += 1
+            return nextRequestID
+        }
+        let presentation = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer,
+            screenRequestID: screenRequestID,
+            supportsFocusedWindowResize: true
+        )
+        let capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        let containerSize = CGSize(width: 390, height: 844)
+        let videoSize = CGSize(width: 1_920, height: 1_080)
+        XCTAssertTrue(
+            viewModel.beginFocusedWindowResize(
+                for: presentation.lease,
+                containerSize: containerSize,
+                viewerVideoSize: videoSize
+            )
+        )
+        for _ in 0 ..< 40 where viewModel.debugRemoteInputState.pendingActionCount < 1 {
+            await Task.yield()
+        }
+        XCTAssertEqual(viewModel.debugRemoteInputState.pendingActionCount, 1)
+        XCTAssertEqual(
+            viewModel.debugRemoteInputState.focusGeneration,
+            screenRequestID
+        )
+        return (
+            viewModel,
+            peer,
+            presentation,
+            capability,
+            containerSize,
+            videoSize
+        )
+    }
+
     private func assertStaleInputFailureCannotMutateReplacement(
         _ error: WebRTCTransportError,
         file: StaticString = #filePath,
@@ -2393,7 +4457,7 @@ private final class OrderedVideoRenderer: NSObject, LKRTCVideoRenderer {
 
 private final class VideoPresentationOrderingProbe: @unchecked Sendable {
     enum Event: Equatable {
-        case invalidation(UInt64)
+        case invalidation(UInt64, WebRTCVideoPresentationInvalidation)
         case downstreamRender
     }
 
@@ -2575,5 +4639,1312 @@ private final class MainActorCountGate {
         await withCheckedContinuation { continuation in
             waiters.append((count, continuation))
         }
+    }
+}
+
+final class WorldwideFocusedWindowMoveLifecycleTests: XCTestCase {
+    @MainActor
+    func testMoveCancelledDuringSuspendedSendAppliesLateTerminalFeedback() async throws {
+        let fixture = try MoveLifecycleFixture()
+        let started = expectation(description: "move selection send suspended")
+        let gate = NonCooperativeAsyncGate()
+        fixture.viewModel.debugInstallRemoteInputSender { _, _, _, _, _, _ in
+            started.fulfill()
+            await gate.wait()
+            return 1
+        }
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fulfillment(of: [started], timeout: 2)
+        fixture.viewModel.cancelFocusedWindowInteraction()
+        fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 1, screenRequestID: fixture.capability.screenRequestID,
+            inputSessionID: fixture.capability.inputSessionID, result: .rejected,
+            rejectionReason: .accessibilityPermissionRequired,
+            focus: .editable(generation: fixture.focusGeneration, secure: true)
+        ))
+        XCTAssertTrue(fixture.presentation.authorization.isValid)
+        await gate.open()
+        await fixture.drain()
+        XCTAssertFalse(fixture.presentation.authorization.isValid)
+        XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveRequiresItsOwnCapabilityAndExplicitSelection() async throws {
+        let legacy = try MoveLifecycleFixture(supportsMove: false)
+        XCTAssertTrue(legacy.viewModel.isFocusedWindowResizeAvailable)
+        XCTAssertFalse(legacy.viewModel.isFocusedWindowMoveAvailable)
+        XCTAssertFalse(legacy.beginMove())
+        legacy.select()
+        await legacy.drain()
+        XCTAssertTrue(legacy.actions.isEmpty)
+        await legacy.close()
+
+        let fixture = try MoveLifecycleFixture(supportsResize: false)
+        XCTAssertFalse(fixture.viewModel.isFocusedWindowResizeAvailable)
+        XCTAssertTrue(fixture.beginMove())
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.mode, .move)
+        XCTAssertNil(fixture.viewModel.focusedWindowInteractionState.interaction?.target)
+        fixture.commit(fixture.target.generation)
+        fixture.viewModel.sendRemoteTap(
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5), viewerVideoSize: fixture.videoSize
+        )
+        fixture.viewModel.sendRemotePrimaryDrag(
+            startNormalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            endNormalizedPoint: CGPoint(x: 0.6, y: 0.6), viewerVideoSize: fixture.videoSize
+        )
+        await fixture.drain()
+        XCTAssertTrue(fixture.actions.isEmpty)
+
+        fixture.select()
+        fixture.select()
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [.selectWindowForMove(at: .init(x: 0.75, y: 0.25))])
+        XCTAssertEqual(fixture.videoSizes, [.init(width: 1_920, height: 1_080)])
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveConsumesTargetOnceAndKeepsExactSecureKeyboardFocus() async throws {
+        let fixture = try MoveLifecycleFixture()
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.target, fixture.interactionTarget)
+
+        // A drag can begin anywhere in the remote image, including outside the selected window.
+        fixture.commit(fixture.target.generation)
+        fixture.commit(fixture.target.generation)
+        XCTAssertNil(fixture.viewModel.focusedWindowInteractionState.interaction?.target)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [
+            .selectWindowForMove(at: .init(x: 0.75, y: 0.25)),
+            .commitFocusedWindowMove(
+                targetGeneration: fixture.target.generation,
+                start: .init(x: 0.95, y: 0.95), end: .init(x: 0.8, y: 0.8)
+            )
+        ])
+        let successor = WebRTCWindowMoveTarget(
+            generation: UUID(), normalizedFrame: .init(x: 0.1, y: 0.1, width: 0.5, height: 0.4)
+        )
+        fixture.deliver(
+            id: 2,
+            move: .init(
+                kind: .moveCommitted, committedTargetGeneration: fixture.target.generation,
+                target: successor
+            )
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?.target,
+            .init(move: successor)
+        )
+        fixture.commit(fixture.target.generation)
+        fixture.viewModel.sendRemoteText("A", focusGeneration: fixture.focusGeneration)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.count, 3)
+        XCTAssertEqual(fixture.actions.last, .insertText("A", focusGeneration: fixture.focusGeneration))
+        fixture.viewModel.cancelFocusedWindowInteraction()
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        XCTAssertTrue(fixture.presentation.authorization.isValid)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveOffscreenCapabilityOptsInAndRetainsFullFrameAcrossScaleFence() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsScaleRebinding: true,
+            supportsRecoverableOffscreen: true
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?.target,
+            fixture.interactionTarget
+        )
+        XCTAssertNotNil(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .target?.unclippedNormalizedFrame
+        )
+
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 21,
+            dimensionGeneration: 2
+        )
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?.target,
+            fixture.interactionTarget
+        )
+
+        fixture.commit(fixture.target.generation, videoSize: scaledSize)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.last, .commitFocusedWindowMove(
+            targetGeneration: fixture.target.generation,
+            start: .init(x: 0.95, y: 0.95),
+            end: .init(x: 0.8, y: 0.8),
+            allowsRecoverableOffscreen: true
+        ))
+        await fixture.close()
+
+        let legacy = try MoveLifecycleFixture(supportsRecoverableOffscreen: false)
+        XCTAssertTrue(legacy.beginMove())
+        legacy.select()
+        await legacy.drain()
+        legacy.acceptSelection()
+        legacy.commit(legacy.target.generation)
+        await legacy.drain()
+        XCTAssertEqual(legacy.actions.last, .commitFocusedWindowMove(
+            targetGeneration: legacy.target.generation,
+            start: .init(x: 0.95, y: 0.95),
+            end: .init(x: 0.8, y: 0.8)
+        ))
+        await legacy.close()
+    }
+
+    @MainActor
+    func testNegotiatedMoveRejectsFeedbackMissingTheRequiredFullFrame() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsRecoverableOffscreen: true,
+            includesUnclippedFrame: false
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+
+        fixture.acceptSelection()
+
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertEqual(
+            fixture.viewModel.lastDiagnostic,
+            "The Mac returned mismatched focused-window move feedback."
+        )
+        await fixture.close()
+    }
+
+    @MainActor
+    func testModeSwitchRetiresPendingSelectionAndRejectsCrossModeCommit() async throws {
+        let fixture = try MoveLifecycleFixture()
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+        let resizeID = try XCTUnwrap(fixture.viewModel.focusedWindowInteractionState.interaction?.id)
+        fixture.acceptSelection()
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.id, resizeID)
+        XCTAssertEqual(fixture.viewModel.focusedWindowInteractionState.interaction?.mode, .resize)
+        XCTAssertNil(fixture.viewModel.focusedWindowInteractionState.interaction?.target)
+        fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 2, screenRequestID: fixture.capability.screenRequestID,
+            inputSessionID: fixture.capability.inputSessionID, result: .accepted,
+            focus: .editable(generation: fixture.focusGeneration, secure: true),
+            windowResize: .init(
+                kind: .targetAcquired,
+                target: .init(
+                    generation: fixture.target.generation,
+                    normalizedFrame: fixture.target.normalizedFrame
+                )
+            )
+        ))
+        fixture.commit(fixture.target.generation)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.count, 2)
+        XCTAssertTrue(fixture.beginMove())
+        fixture.viewModel.commitFocusedWindowResize(
+            targetGeneration: fixture.target.generation,
+            startNormalizedPoint: .init(x: 0.1, y: 0.1),
+            endNormalizedPoint: .init(x: 0.2, y: 0.2),
+            for: fixture.presentation.lease,
+            containerSize: fixture.containerSize, viewerVideoSize: fixture.videoSize
+        )
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.count, 2)
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveFeedbackRejectsResizePayloadWrongKindAndSecureDowngrade() async throws {
+        for invalidPayload in 0 ..< 3 {
+            let fixture = try MoveLifecycleFixture()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            if invalidPayload == 0 {
+                fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+                    id: 1, screenRequestID: fixture.capability.screenRequestID,
+                    inputSessionID: fixture.capability.inputSessionID, result: .accepted,
+                    focus: .editable(generation: fixture.focusGeneration, secure: true),
+                    windowResize: .init(
+                        kind: .windowSelected,
+                        target: .init(
+                            generation: fixture.target.generation,
+                            normalizedFrame: fixture.target.normalizedFrame
+                        )
+                    )
+                ))
+            } else {
+                fixture.deliver(
+                    id: 1,
+                    move: .init(
+                        kind: invalidPayload == 1 ? .targetAcquired : .windowSelected,
+                        target: fixture.target
+                    ),
+                    secure: invalidPayload != 2
+                )
+            }
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+            XCTAssertEqual(fixture.viewModel.lastDiagnostic, "The Mac returned mismatched focused-window move feedback.")
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRetiredMoveFeedbackCannotResurrectTargetOrDowngradeSecureFocus() async throws {
+        for secure in [true, false] {
+            let fixture = try MoveLifecycleFixture()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            fixture.viewModel.cancelFocusedWindowInteraction()
+            fixture.deliver(id: 1, move: .init(kind: .windowSelected, target: fixture.target), secure: secure)
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                secure ? fixture.focusGeneration : nil
+            )
+            XCTAssertEqual(fixture.viewModel.focusedInputIsSecure, secure)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.pendingActionCount, 0)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.earlyFeedbackCount, 0)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testAcceptedMoveTargetRebindsOnlyAfterExactPresentedScaledFrame() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let staleToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 7, dimensionGeneration: 1
+        )
+        let scaledToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 7, dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: scaledToken,
+            for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentedVideoSize,
+            .zero
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?.target,
+            fixture.interactionTarget
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        let suspended = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(suspended.mode, .move)
+        XCTAssertEqual(suspended.target, fixture.interactionTarget)
+        XCTAssertEqual(suspended.awaitingPresentedVideoSize, scaledSize)
+        XCTAssertEqual(suspended.binding.viewerVideoSize, fixture.videoSize)
+
+        // Neither stale callbacks nor direct attempts can commit during the presentation fence.
+        fixture.commit(fixture.target.generation)
+        fixture.commit(fixture.target.generation, videoSize: scaledSize)
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: fixture.videoSize,
+            token: staleToken,
+            for: fixture.presentation.lease
+        )
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [
+            .selectWindowForMove(at: .init(x: 0.75, y: 0.25))
+        ])
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentedVideoSize,
+            scaledSize
+        )
+
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: scaledToken,
+            for: fixture.presentation.lease
+        )
+        let rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(rebound.awaitingPresentedVideoSize)
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertEqual(rebound.target, fixture.interactionTarget)
+        XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+
+        fixture.commit(fixture.target.generation, videoSize: scaledSize)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions.last, .commitFocusedWindowMove(
+            targetGeneration: fixture.target.generation,
+            start: .init(x: 0.95, y: 0.95),
+            end: .init(x: 0.8, y: 0.8)
+        ))
+        XCTAssertEqual(fixture.videoSizes.last, .init(width: 1_536, height: 864))
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveScaleRebindNeedsNoNativeSizeCallbackAndIgnoresDelayedOne() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 11, dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: token, for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize, token: token, for: fixture.presentation.lease
+        )
+
+        var rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertEqual(rebound.target, fixture.interactionTarget)
+        XCTAssertNil(rebound.awaitingPresentationToken)
+
+        // A delayed LiveKit size callback cannot fence or hide the already-proven presentation.
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize, for: fixture.presentation.lease
+        )
+        rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertNil(rebound.awaitingPresentationToken)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testAcceptedResizeTargetRebindsOnlyAfterExactPresentedScaledFrame() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsResizeScaleRebinding: true
+        )
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 21,
+            dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        fixture.acceptResizeTarget()
+
+        let fenced = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(fenced.mode, .resize)
+        XCTAssertEqual(fenced.target, fixture.resizeInteractionTarget)
+        XCTAssertEqual(fenced.awaitingPresentedVideoSize, scaledSize)
+        XCTAssertEqual(fenced.binding.viewerVideoSize, fixture.videoSize)
+
+        fixture.commitResize(fixture.resizeTarget.generation)
+        fixture.commitResize(
+            fixture.resizeTarget.generation,
+            videoSize: scaledSize
+        )
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [.requestFocusedWindowResizeTarget])
+
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        let rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(rebound.awaitingPresentedVideoSize)
+        XCTAssertEqual(rebound.binding.viewerVideoSize, scaledSize)
+        XCTAssertEqual(rebound.target, fixture.resizeInteractionTarget)
+        XCTAssertEqual(
+            fixture.viewModel.debugRemoteInputState.focusGeneration,
+            fixture.focusGeneration
+        )
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+
+        fixture.commitResize(
+            fixture.resizeTarget.generation,
+            videoSize: scaledSize
+        )
+        await fixture.drain()
+        XCTAssertEqual(
+            fixture.actions.last,
+            .commitFocusedWindowResize(
+                targetGeneration: fixture.resizeTarget.generation,
+                start: .init(x: 0.95, y: 0.95),
+                end: .init(x: 0.8, y: 0.8)
+            )
+        )
+        XCTAssertEqual(
+            fixture.videoSizes.last,
+            .init(width: 1_536, height: 864)
+        )
+        await fixture.close()
+    }
+
+    @MainActor
+    func testSelectedResizeTargetSurvivesFormatTransitionUntilExactFrameRebind() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsResizeScaleRebinding: true
+        )
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 24,
+            dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+        fixture.acceptResizeTarget()
+
+        var interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(interaction.target, fixture.resizeInteractionTarget)
+        XCTAssertNil(interaction.pending)
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+
+        interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(interaction.target, fixture.resizeInteractionTarget)
+        XCTAssertEqual(interaction.awaitingPresentedVideoSize, scaledSize)
+        XCTAssertEqual(interaction.binding.viewerVideoSize, fixture.videoSize)
+
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: .init(
+                bindingGeneration: token.bindingGeneration,
+                dimensionGeneration: token.dimensionGeneration - 1
+            ),
+            for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .binding.viewerVideoSize,
+            fixture.videoSize
+        )
+
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(interaction.awaitingPresentedVideoSize)
+        XCTAssertEqual(interaction.binding.viewerVideoSize, scaledSize)
+        XCTAssertEqual(interaction.target, fixture.resizeInteractionTarget)
+
+        fixture.commitResize(
+            fixture.resizeTarget.generation,
+            videoSize: scaledSize
+        )
+        await fixture.drain()
+        XCTAssertEqual(
+            fixture.actions.last,
+            .commitFocusedWindowResize(
+                targetGeneration: fixture.resizeTarget.generation,
+                start: .init(x: 0.95, y: 0.95),
+                end: .init(x: 0.8, y: 0.8)
+            )
+        )
+        XCTAssertEqual(
+            fixture.videoSizes.last,
+            .init(width: 1_536, height: 864)
+        )
+        await fixture.close()
+    }
+
+    @MainActor
+    func testResizeSizeCallbackBeforeTypedTransitionFencesUntilExactFrame() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsResizeScaleRebinding: true
+        )
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 25,
+            dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+        fixture.acceptResizeTarget()
+
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        var interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(interaction.target, fixture.resizeInteractionTarget)
+        XCTAssertEqual(interaction.awaitingPresentedVideoSize, .zero)
+        XCTAssertNil(interaction.awaitingPresentationToken)
+
+        fixture.commitResize(
+            fixture.resizeTarget.generation,
+            videoSize: fixture.videoSize
+        )
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [.requestFocusedWindowResizeTarget])
+
+        // A presented frame cannot authorize rebinding until its typed format event is correlated.
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(interaction.binding.viewerVideoSize, fixture.videoSize)
+        XCTAssertNil(interaction.awaitingPresentationToken)
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(interaction.awaitingPresentedVideoSize, .zero)
+        XCTAssertEqual(interaction.awaitingPresentationToken, token)
+
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        interaction = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(interaction.binding.viewerVideoSize, scaledSize)
+        XCTAssertNil(interaction.awaitingPresentedVideoSize)
+        XCTAssertNil(interaction.awaitingPresentationToken)
+        XCTAssertEqual(interaction.target, fixture.resizeInteractionTarget)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testResizeTargetRequestCanFinishAfterExactFrameRebind() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsResizeScaleRebinding: true
+        )
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 22,
+            dimensionGeneration: 2
+        )
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: token,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: token,
+            for: fixture.presentation.lease
+        )
+
+        let reboundPending = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(reboundPending.binding.viewerVideoSize, scaledSize)
+        XCTAssertNil(reboundPending.target)
+        XCTAssertNotNil(reboundPending.pending)
+
+        fixture.acceptResizeTarget()
+        let selected = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(selected.pending)
+        XCTAssertEqual(selected.target, fixture.resizeInteractionTarget)
+        XCTAssertEqual(selected.binding.viewerVideoSize, scaledSize)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testResizeScaleRebindRejectsLegacyOrDifferentAspectGeometry() async throws {
+        for (index, supportsScaleRebinding) in [false, true].enumerated() {
+            let fixture = try MoveLifecycleFixture(
+                supportsResizeScaleRebinding: supportsScaleRebinding
+            )
+            let token = WebRTCVideoPresentationToken(
+                bindingGeneration: 23,
+                dimensionGeneration: UInt64(index + 1)
+            )
+            XCTAssertTrue(fixture.beginResize())
+            await fixture.drain()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition,
+                token: token,
+                for: fixture.presentation.lease
+            )
+            if supportsScaleRebinding {
+                XCTAssertTrue(
+                    fixture.viewModel.focusedWindowInteractionState.isActive
+                )
+                fixture.viewModel.screenVideoPresentationGeometryDidChange(
+                    to: .init(width: 1_600, height: 1_000),
+                    for: fixture.presentation.lease
+                )
+            }
+            XCTAssertFalse(
+                fixture.viewModel.focusedWindowInteractionState.isActive
+            )
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                fixture.focusGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testResizeFormatTransitionRejectsPendingSelectionOrCommit() async throws {
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 26,
+            dimensionGeneration: 2
+        )
+        for pendingOperation in 0 ..< 2 {
+            let fixture = try MoveLifecycleFixture(
+                supportsResizeScaleRebinding: true
+            )
+            XCTAssertTrue(fixture.beginResize())
+            await fixture.drain()
+            fixture.acceptResizeTarget()
+            if pendingOperation == 0 {
+                fixture.selectResize()
+            } else {
+                fixture.commitResize(fixture.resizeTarget.generation)
+            }
+            await fixture.drain()
+            XCTAssertNotNil(
+                fixture.viewModel.focusedWindowInteractionState.interaction?.pending
+            )
+
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition,
+                token: token,
+                for: fixture.presentation.lease
+            )
+            XCTAssertFalse(
+                fixture.viewModel.focusedWindowInteractionState.isActive
+            )
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                fixture.focusGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRapidResizeScaleChangesWaitForNewestPresentedGeneration() async throws {
+        let fixture = try MoveLifecycleFixture(
+            supportsResizeScaleRebinding: true
+        )
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let firstToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 27,
+            dimensionGeneration: 2
+        )
+        let newestToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 27,
+            dimensionGeneration: 3
+        )
+        XCTAssertTrue(fixture.beginResize())
+        await fixture.drain()
+        fixture.acceptResizeTarget()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: firstToken,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition,
+            token: newestToken,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: fixture.videoSize,
+            for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize,
+            token: firstToken,
+            for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentationToken,
+            newestToken
+        )
+
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: fixture.videoSize,
+            token: newestToken,
+            for: fixture.presentation.lease
+        )
+        let rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(rebound.awaitingPresentedVideoSize)
+        XCTAssertNil(rebound.awaitingPresentationToken)
+        XCTAssertEqual(rebound.binding.viewerVideoSize, fixture.videoSize)
+        XCTAssertEqual(rebound.target, fixture.resizeInteractionTarget)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMovePresentationFenceRejectsModeSwitchUsingStaleVideoSize() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 11, dimensionGeneration: 3
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: token, for: fixture.presentation.lease
+        )
+
+        XCTAssertFalse(fixture.beginResize())
+        let preserved = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertEqual(preserved.mode, .move)
+        XCTAssertEqual(preserved.target, fixture.interactionTarget)
+        XCTAssertEqual(preserved.awaitingPresentationToken, token)
+        await fixture.drain()
+        XCTAssertEqual(fixture.actions, [
+            .selectWindowForMove(at: .init(x: 0.75, y: 0.25))
+        ])
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveFormatTransitionRequiresSelectedIdleTargetAndValidGeometry() async throws {
+        let token = WebRTCVideoPresentationToken(
+            bindingGeneration: 12, dimensionGeneration: 2
+        )
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginMove())
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition, token: token, for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            await fixture.close()
+        }
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition, token: token, for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            await fixture.close()
+        }
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginResize())
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition, token: token, for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            await fixture.close()
+        }
+
+        do {
+            let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            fixture.acceptSelection()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .invalidGeometry, token: token, for: fixture.presentation.lease
+            )
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition,
+                token: .init(bindingGeneration: 12, dimensionGeneration: 3),
+                for: fixture.presentation.lease
+            )
+            fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+                size: .init(width: 1_536, height: 864),
+                token: .init(bindingGeneration: 12, dimensionGeneration: 3),
+                for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                fixture.focusGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testMovePresentationTimeoutIsBoundToExactTransitionGeneration() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+        let oldToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 13, dimensionGeneration: 2
+        )
+        let newToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 13, dimensionGeneration: 3
+        )
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: oldToken, for: fixture.presentation.lease
+        )
+        let oldFence = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        let oldRebindingID = try XCTUnwrap(oldFence.presentationRebindingID)
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: newToken, for: fixture.presentation.lease
+        )
+        let newFence = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        let newRebindingID = try XCTUnwrap(newFence.presentationRebindingID)
+
+        fixture.viewModel.focusedWindowInteractionPresentationTimeoutDidFire(
+            interactionID: oldFence.id,
+            lease: oldFence.binding.lease,
+            awaitedSize: .zero,
+            token: oldToken,
+            rebindingID: oldRebindingID
+        )
+        XCTAssertTrue(fixture.viewModel.focusedWindowInteractionState.isActive)
+
+        fixture.viewModel.focusedWindowInteractionPresentationTimeoutDidFire(
+            interactionID: newFence.id,
+            lease: newFence.binding.lease,
+            awaitedSize: .zero,
+            token: newToken,
+            rebindingID: newRebindingID
+        )
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        XCTAssertEqual(
+            fixture.viewModel.debugRemoteInputState.focusGeneration,
+            fixture.focusGeneration
+        )
+        XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testMoveScaleRebindRejectsLegacyOrDifferentAspectGeometry() async throws {
+        for (index, supportsScaleRebinding) in [false, true].enumerated() {
+            let fixture = try MoveLifecycleFixture(
+                supportsScaleRebinding: supportsScaleRebinding
+            )
+            let token = WebRTCVideoPresentationToken(
+                bindingGeneration: 8,
+                dimensionGeneration: UInt64(index + 1)
+            )
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            fixture.acceptSelection()
+            fixture.viewModel.screenVideoPresentationDidInvalidate(
+                .formatTransition,
+                token: token,
+                for: fixture.presentation.lease
+            )
+            if supportsScaleRebinding {
+                XCTAssertTrue(fixture.viewModel.focusedWindowInteractionState.isActive)
+            }
+            fixture.viewModel.screenVideoPresentationGeometryDidChange(
+                to: supportsScaleRebinding
+                    ? .init(width: 1_600, height: 1_000)
+                    : .init(width: 1_536, height: 864),
+                for: fixture.presentation.lease
+            )
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(
+                fixture.viewModel.debugRemoteInputState.focusGeneration,
+                fixture.focusGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRapidMoveScaleChangesWaitForNewestPresentedSize() async throws {
+        let fixture = try MoveLifecycleFixture(supportsScaleRebinding: true)
+        let scaledSize = CGSize(width: 1_536, height: 864)
+        let firstToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 9, dimensionGeneration: 2
+        )
+        let newestToken = WebRTCVideoPresentationToken(
+            bindingGeneration: 9, dimensionGeneration: 3
+        )
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.acceptSelection()
+
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: firstToken, for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: scaledSize, for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationDidInvalidate(
+            .formatTransition, token: newestToken, for: fixture.presentation.lease
+        )
+        fixture.viewModel.screenVideoPresentationGeometryDidChange(
+            to: fixture.videoSize, for: fixture.presentation.lease
+        )
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: scaledSize, token: firstToken, for: fixture.presentation.lease
+        )
+        XCTAssertEqual(
+            fixture.viewModel.focusedWindowInteractionState.interaction?
+                .awaitingPresentedVideoSize,
+            .zero
+        )
+        fixture.viewModel.focusedWindowInteractionVideoFrameDidPresent(
+            size: fixture.videoSize, token: newestToken, for: fixture.presentation.lease
+        )
+        let rebound = try XCTUnwrap(
+            fixture.viewModel.focusedWindowInteractionState.interaction
+        )
+        XCTAssertNil(rebound.awaitingPresentedVideoSize)
+        XCTAssertEqual(rebound.binding.viewerVideoSize, fixture.videoSize)
+        XCTAssertEqual(rebound.target, fixture.interactionTarget)
+        await fixture.close()
+    }
+
+    @MainActor
+    func testFrameTrackAndContainerChangesRetireMoveWithoutLosingSecureTyping() async throws {
+        for boundary in 0 ..< 3 {
+            let fixture = try MoveLifecycleFixture()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            switch boundary {
+            case 0:
+                fixture.viewModel.screenVideoPresentationDidInvalidate(
+                    .formatTransition,
+                    token: .init(bindingGeneration: 10, dimensionGeneration: 2),
+                    for: fixture.presentation.lease
+                )
+            case 1:
+                fixture.viewModel.debugReplaceFocusedWindowResizeTrackForTests()
+            default:
+                fixture.viewModel.focusedWindowInteractionContainerGeometryDidChange(
+                    to: .init(width: 844, height: 390), for: fixture.presentation.lease
+                )
+            }
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+            XCTAssertTrue(fixture.viewModel.focusedInputIsSecure)
+            fixture.acceptSelection()
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertEqual(fixture.viewModel.debugRemoteInputState.focusGeneration, fixture.focusGeneration)
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testSceneHideDisconnectCapabilityAndRecoveryRevokeMoveAndFocus() async throws {
+        for boundary in 0 ..< 6 {
+            let fixture = try MoveLifecycleFixture()
+            fixture.viewModel.handleAppBecameActive()
+            XCTAssertTrue(fixture.beginMove())
+            fixture.select()
+            await fixture.drain()
+            switch boundary {
+            case 0:
+                fixture.viewModel.handleAppBecameInactive()
+            case 1:
+                fixture.viewModel.retireScreenPresentationLease(fixture.presentation.lease)
+            case 2:
+                fixture.viewModel.disconnect()
+            case 3:
+                fixture.viewModel.debugReplaceRemoteInputCapabilityForTests(
+                    supportsFocusedWindowResize: true, supportsFocusedWindowMove: false
+                )
+            case 4:
+                fixture.viewModel.debugInstallScreenMediaCancellationObserver { _, _ in }
+                fixture.viewModel.debugDeliverScreenMediaSuspensionForTests(
+                    .init(screenRequestID: fixture.focusGeneration, suspensionGeneration: 1),
+                    sourcePeer: fixture.peer
+                )
+            default:
+                fixture.viewModel.handleAppEnteredBackground()
+            }
+            XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+            XCTAssertFalse(fixture.viewModel.focusedInputIsSecure)
+            if boundary == 0 {
+                fixture.acceptSelection()
+                XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+                XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+            }
+            await fixture.close()
+        }
+    }
+
+    @MainActor
+    func testRetiredMovePermissionRejectionStillRevokesInput() async throws {
+        let fixture = try MoveLifecycleFixture()
+        XCTAssertTrue(fixture.beginMove())
+        fixture.select()
+        await fixture.drain()
+        fixture.viewModel.cancelFocusedWindowInteraction()
+        fixture.viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 1, screenRequestID: fixture.capability.screenRequestID,
+            inputSessionID: fixture.capability.inputSessionID, result: .rejected,
+            rejectionReason: .accessibilityPermissionRequired,
+            focus: .editable(generation: fixture.focusGeneration, secure: true)
+        ))
+        XCTAssertFalse(fixture.presentation.authorization.isValid)
+        XCTAssertFalse(fixture.viewModel.debugRemoteInputState.capabilityInstalled)
+        XCTAssertNil(fixture.viewModel.debugRemoteInputState.focusGeneration)
+        XCTAssertFalse(fixture.viewModel.focusedWindowInteractionState.isActive)
+        await fixture.close()
+    }
+}
+
+@MainActor
+private final class MoveLifecycleFixture {
+    let viewModel = WorldwideSessionViewModel()
+    let peer: WebRTCPeer
+    let presentation: WorldwideScreenPresentationDebugFixture
+    let capability: WebRTCInputCapability
+    let focusGeneration: UInt64 = 701
+    let containerSize = CGSize(width: 390, height: 844)
+    let videoSize = CGSize(width: 1_920, height: 1_080)
+    let target: WebRTCWindowMoveTarget
+    let resizeTarget: WebRTCWindowResizeTarget
+    var interactionTarget: FocusedWindowInteractionTarget { .init(move: target) }
+    var resizeInteractionTarget: FocusedWindowInteractionTarget {
+        .init(resize: resizeTarget)
+    }
+    var actions: [WebRTCInputAction] = []
+    var videoSizes: [WebRTCInputVideoSize?] = []
+
+    init(
+        supportsMove: Bool = true,
+        supportsResize: Bool = true,
+        supportsResizeScaleRebinding: Bool = false,
+        supportsScaleRebinding: Bool = false,
+        supportsRecoverableOffscreen: Bool = false,
+        includesUnclippedFrame: Bool? = nil
+    ) throws {
+        let carriesUnclippedFrame = includesUnclippedFrame
+            ?? supportsRecoverableOffscreen
+        target = WebRTCWindowMoveTarget(
+            generation: UUID(),
+            normalizedFrame: supportsRecoverableOffscreen
+                ? .init(x: 0, y: 0.2, width: 0.2, height: 0.4)
+                : .init(x: 0.2, y: 0.2, width: 0.5, height: 0.4),
+            unclippedNormalizedFrame: carriesUnclippedFrame
+                ? .init(x: -0.3, y: 0.2, width: 0.5, height: 0.4)
+                : nil
+        )
+        resizeTarget = WebRTCWindowResizeTarget(
+            generation: target.generation,
+            normalizedFrame: target.normalizedFrame
+        )
+        peer = try WebRTCPeer(configuration: .init(role: .viewer, iceServers: []))
+        presentation = viewModel.debugInstallActiveScreenPresentationForTests(
+            peer: peer, screenRequestID: focusGeneration,
+            supportsFocusedWindowResize: supportsResize,
+            supportsFocusedWindowResizeScaleRebinding:
+                supportsResizeScaleRebinding,
+            supportsFocusedWindowMove: supportsMove,
+            supportsFocusedWindowMoveScaleRebinding: supportsScaleRebinding,
+            supportsFocusedWindowMoveRecoverableOffscreen: supportsRecoverableOffscreen
+        )
+        capability = try XCTUnwrap(viewModel.debugRemoteInputState.capability)
+        viewModel.debugSetRemoteKeyboardFocusForTests(focusGeneration, secure: true)
+        viewModel.debugInstallRemoteInputSender { [weak self] _, action, size, _, _, _ in
+            guard let self else { return 0 }
+            actions.append(action)
+            videoSizes.append(size)
+            return UInt64(actions.count)
+        }
+    }
+
+    func beginMove() -> Bool {
+        viewModel.beginFocusedWindowMove(
+            for: presentation.lease, containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func beginResize() -> Bool {
+        viewModel.beginFocusedWindowResize(
+            for: presentation.lease, containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func select() {
+        viewModel.selectWindowForFocusedMove(
+            at: .init(x: 0.75, y: 0.25), for: presentation.lease,
+            containerSize: containerSize, viewerVideoSize: videoSize
+        )
+    }
+
+    func selectResize() {
+        viewModel.selectWindowForFocusedResize(
+            at: .init(x: 0.75, y: 0.25),
+            for: presentation.lease,
+            containerSize: containerSize,
+            viewerVideoSize: videoSize
+        )
+    }
+
+    func commit(_ generation: UUID, videoSize: CGSize? = nil) {
+        viewModel.commitFocusedWindowMove(
+            targetGeneration: generation, startNormalizedPoint: .init(x: 0.95, y: 0.95),
+            endNormalizedPoint: .init(x: 0.8, y: 0.8), for: presentation.lease,
+            containerSize: containerSize, viewerVideoSize: videoSize ?? self.videoSize
+        )
+    }
+
+    func commitResize(_ generation: UUID, videoSize: CGSize? = nil) {
+        viewModel.commitFocusedWindowResize(
+            targetGeneration: generation,
+            startNormalizedPoint: .init(x: 0.95, y: 0.95),
+            endNormalizedPoint: .init(x: 0.8, y: 0.8),
+            for: presentation.lease,
+            containerSize: containerSize,
+            viewerVideoSize: videoSize ?? self.videoSize
+        )
+    }
+
+    func acceptSelection() {
+        deliver(id: 1, move: .init(kind: .windowSelected, target: target))
+    }
+
+    func acceptResizeTarget() {
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: 1,
+            screenRequestID: capability.screenRequestID,
+            inputSessionID: capability.inputSessionID,
+            result: .accepted,
+            focus: .editable(generation: focusGeneration, secure: true),
+            windowResize: .init(kind: .targetAcquired, target: resizeTarget)
+        ))
+    }
+
+    func deliver(id: UInt64, move: WebRTCWindowMoveFeedback, secure: Bool = true) {
+        viewModel.debugDeliverRemoteInputFeedbackForRaceTests(.init(
+            id: id, screenRequestID: capability.screenRequestID,
+            inputSessionID: capability.inputSessionID, result: .accepted,
+            focus: .editable(generation: focusGeneration, secure: secure), windowMove: move
+        ))
+    }
+
+    func drain() async {
+        for _ in 0 ..< 40 { await Task.yield() }
+    }
+
+    func close() async {
+        viewModel.disconnect()
+        await peer.close(reason: .viewerDisconnected)
     }
 }

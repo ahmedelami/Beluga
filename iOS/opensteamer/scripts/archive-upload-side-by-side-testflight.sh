@@ -16,7 +16,7 @@ readonly EXPECTED_BUNDLE_IDENTIFIER="com.elamin.opensteamer"
 readonly PROTECTED_BUNDLE_IDENTIFIER="com.elamin.AudioStreamer"
 readonly EXPECTED_SCHEME="opensteamerTestFlight"
 readonly EXPECTED_CONFIGURATION="TestFlight"
-readonly EXPECTED_BUILD_NUMBER="57"
+readonly EXPECTED_BUILD_NUMBER="80"
 readonly EXPECTED_SHORT_VERSION="0.1.0"
 readonly EXPECTED_TEAM_ID="MSMG8CJLB3"
 readonly EXPECTED_ARCHIVE_SIGNING_IDENTITY="Apple Development: Ahmed Elamin (92LVX32M8K)"
@@ -107,8 +107,16 @@ readonly -i APP_STORE_PROCESSING_WAIT_POLL_SECONDS=5
 readonly -i APP_STORE_PROCESSING_TERMINATION_GRACE_SECONDS=5
 readonly PACKAGE_MANIFEST_PATH="${REPOSITORY_ROOT}/Package.swift"
 readonly PACKAGE_RESOLVED_PATH="${REPOSITORY_ROOT}/Package.resolved"
-readonly EXPECTED_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"
-readonly EXPECTED_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"
+readonly EXPECTED_PACKAGE_MANIFEST_SHA256="443fe7a76bfbe8cda2d193c047cc04122c01479f8763ccd9e2d5871b7e504f82"
+readonly EXPECTED_PACKAGE_RESOLVED_STATE="absent"
+readonly VENDOR_ARCHIVE_PATH="${REPOSITORY_ROOT}/shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"
+# Replaced only after the actual patched slices and complete ZIP pass artifact verification.
+# A non-checksum placeholder deliberately prevents archive/export from consuming unreviewed code.
+readonly EXPECTED_VENDOR_ARCHIVE_SHA256="1399ee6f9a34a6926d2abe9196c1361a40a7fbc9551becd5d13b15a73f510cf7"
+# These are immutable enrollment provenance, not the current release inputs.
+# SwiftPM validates current inputs separately before it consumes the cache.
+readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"
+readonly EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"
 readonly EXPECTED_APPLICATION_IDENTIFIER="${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_IDENTIFIER}"
 readonly PROTECTED_APPLICATION_IDENTIFIER="${EXPECTED_TEAM_ID}.${PROTECTED_BUNDLE_IDENTIFIER}"
 readonly -a REJECTED_BUILD_ENVIRONMENT_VARIABLES=(
@@ -235,6 +243,10 @@ typeset TESTFLIGHT_BUILD_TMP_DIRECTORY=""
 typeset TESTFLIGHT_BUILD_TMP_IDENTITY=""
 typeset TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY=""
 typeset TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY=""
+typeset TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY=""
+typeset TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY=""
+typeset TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY=""
+typeset TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY=""
 typeset TESTFLIGHT_BUILD_DSTROOT_DIRECTORY=""
 typeset TESTFLIGHT_BUILD_PRECOMPILED_DIRECTORY=""
 typeset TESTFLIGHT_BUILD_CACHE_DIRECTORY=""
@@ -287,6 +299,8 @@ typeset TESTFLIGHT_ARCHIVE_TREE_SHA256=""
 typeset TESTFLIGHT_ARCHIVE_TREE_WITHOUT_ROOT_INFO_SHA256=""
 typeset EXPORT_OPTIONS_IDENTITY=""
 typeset EXPORT_OPTIONS_SHA256=""
+typeset TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY=""
+typeset TESTFLIGHT_VENDOR_ARCHIVE_SHA256=""
 typeset -i EXPORT_OPTIONS_FD=-1
 typeset TESTFLIGHT_XCODEBUILD_AUTHENTICATION_MODE="xcode-account"
 typeset TESTFLIGHT_XCODEBUILD_AUTHENTICATION_ARGUMENTS_SHA256=""
@@ -525,15 +539,45 @@ function pin_app_store_connect_api_key_identity() {
   TESTFLIGHT_ASC_API_KEY_PIN_FAILURE='none'
 }
 
+function vendor_archive_identity() {
+  /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%HT:%z:%Fm:%Fc' "$1" 2>/dev/null
+}
+
+function verify_pinned_vendor_archive() {
+  local archive_path=$1
+  local expected_sha256=$2
+  local identity
+  [[ "${#expected_sha256}" == 64 \
+      && "${expected_sha256}" != *[^0-9a-f]* \
+      && "${archive_path:A}" == "${archive_path}" \
+      && -f "${archive_path}" && ! -L "${archive_path}" ]] || return 1
+  identity=$(vendor_archive_identity "${archive_path}") || return 1
+  [[ -n "${identity}" ]] || return 1
+  if [[ -n "${TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY}" ]]; then
+    [[ "${identity}" == "${TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY}" \
+        && "${expected_sha256}" == "${TESTFLIGHT_VENDOR_ARCHIVE_SHA256}" ]]
+    return $?
+  fi
+  # Hash once per unchanged release invocation, fenced by inode, size, ownership, mode and
+  # nanosecond mtime/ctime. Later stages reject mutation instead of accepting a renewed artifact.
+  [[ "$(sha256_file "${archive_path}")" == "${expected_sha256}" \
+      && "${archive_path:A}" == "${archive_path}" \
+      && -f "${archive_path}" && ! -L "${archive_path}" \
+      && "$(vendor_archive_identity "${archive_path}")" == "${identity}" ]] || return 1
+  TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY=${identity}
+  TESTFLIGHT_VENDOR_ARCHIVE_SHA256=${expected_sha256}
+}
+
 function verify_package_dependency_contract() {
   [[ "${PACKAGE_MANIFEST_PATH:A}" == "${PACKAGE_MANIFEST_PATH}" \
       && "${PACKAGE_RESOLVED_PATH:A}" == "${PACKAGE_RESOLVED_PATH}" \
       && -f "${PACKAGE_MANIFEST_PATH}" && ! -L "${PACKAGE_MANIFEST_PATH}" \
-      && -f "${PACKAGE_RESOLVED_PATH}" && ! -L "${PACKAGE_RESOLVED_PATH}" \
+      && "${EXPECTED_PACKAGE_RESOLVED_STATE}" == 'absent' \
+      && ! -e "${PACKAGE_RESOLVED_PATH}" && ! -L "${PACKAGE_RESOLVED_PATH}" \
       && "$(sha256_file "${PACKAGE_MANIFEST_PATH}")" \
-        == "${EXPECTED_PACKAGE_MANIFEST_SHA256}" \
-      && "$(sha256_file "${PACKAGE_RESOLVED_PATH}")" \
-        == "${EXPECTED_PACKAGE_RESOLVED_SHA256}" ]]
+        == "${EXPECTED_PACKAGE_MANIFEST_SHA256}" ]] \
+    && verify_pinned_vendor_archive \
+      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"
 }
 
 function archive_info_without_distributions_sha256() {
@@ -1778,6 +1822,7 @@ function write_mounted_volume_info() {
 function initialize_or_pin_cache_directory() {
   local directory=$1
   local required_parent=$2
+  local required_identity=${3:-}
   require_canonical_safe_path "${directory}" "${required_parent}" || return 1
   if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 1 )); then
     [[ ! -e "${directory}" && ! -L "${directory}" ]] || return 1
@@ -1788,7 +1833,12 @@ function initialize_or_pin_cache_directory() {
   fi
   local identity
   identity=$(stat_identity "${directory}") || return 1
-  [[ -n "${identity}" ]] || return 1
+  local parent_identity
+  parent_identity=$(stat_identity "${required_parent}") || return 1
+  [[ -n "${identity}" \
+      && "${identity%%:*}" == "${parent_identity%%:*}" \
+      && ( -z "${required_identity}" \
+        || "${identity}" == "${required_identity}" ) ]] || return 1
   verify_reviewed_cache_directory_metadata "${directory}" || return 1
   TESTFLIGHT_PINNED_BUILD_DIRECTORIES+=("${directory}|${identity}")
 }
@@ -1891,10 +1941,10 @@ function verify_persistent_build_cache_contract() {
         == "${EXPECTED_XCODEBUILD_SHA256}" \
       && "$(plist_typed_raw_value \
         "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" packageManifestSHA256 string)" \
-        == "${EXPECTED_PACKAGE_MANIFEST_SHA256}" \
+        == "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256}" \
       && "$(plist_typed_raw_value \
         "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" packageResolvedSHA256 string)" \
-        == "${EXPECTED_PACKAGE_RESOLVED_SHA256}" \
+        == "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256}" \
       && "$(plist_typed_raw_value \
         "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" scheme string)" \
         == "${EXPECTED_SCHEME}" \
@@ -1917,25 +1967,396 @@ function initialize_or_require_cache_parent_directory() {
     /bin/mkdir -m 700 "${directory}" || return 1
     /bin/chmod 700 "${directory}" || return 1
   fi
-  require_owned_private_directory "${directory}"
+  require_owned_private_directory "${directory}" || return 1
+  local directory_identity
+  local parent_identity
+  directory_identity=$(stat_identity "${directory}") || return 1
+  parent_identity=$(stat_identity "${required_parent}") || return 1
+  [[ "${directory_identity%%:*}" == "${parent_identity%%:*}" ]]
+}
+
+function workspace_staging_directory_is_exact_and_empty() {
+  local workspace_root=$1
+  require_owned_private_directory "${workspace_root}" || return 1
+  local workspace_identity
+  workspace_identity=$(stat_identity "${workspace_root}") || return 1
+  local -a children=("${workspace_root}"/*(ND))
+  (( ${#children[@]} == 4 )) || return 1
+  local child
+  local child_name
+  local child_identity
+  local -a nested_children=()
+  for child in "${children[@]}"; do
+    child_name=${child:t}
+    case "${child_name}" in
+      run-tmp|DerivedData|Products|Intermediates)
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    require_owned_private_directory "${child}" || return 1
+    child_identity=$(stat_identity "${child}") || return 1
+    [[ "${child_identity%%:*}" == "${workspace_identity%%:*}" ]] \
+      || return 1
+    nested_children=("${child}"/*(ND))
+    (( ${#nested_children[@]} == 0 )) || return 1
+  done
+  for child_name in run-tmp DerivedData Products Intermediates; do
+    require_owned_private_directory \
+      "${workspace_root}/${child_name}" || return 1
+  done
+  [[ "$(stat_identity "${workspace_root}")" == "${workspace_identity}" ]]
+}
+
+function populate_or_verify_pending_workspace_directory() {
+  local pending_workspace_root=$1
+  local pending_workspace_identity=$2
+  require_owned_private_directory "${pending_workspace_root}" || return 1
+  [[ "$(stat_identity "${pending_workspace_root}")" \
+      == "${pending_workspace_identity}" ]] || return 1
+  local -a children=("${pending_workspace_root}"/*(ND))
+  local child
+  local child_name
+  local child_identity
+  local -a nested_children=()
+  for child in "${children[@]}"; do
+    child_name=${child:t}
+    case "${child_name}" in
+      run-tmp|DerivedData|Products|Intermediates)
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    require_owned_private_directory "${child}" || return 1
+    child_identity=$(stat_identity "${child}") || return 1
+    [[ "${child_identity%%:*}" \
+        == "${pending_workspace_identity%%:*}" ]] || return 1
+    nested_children=("${child}"/*(ND))
+    (( ${#nested_children[@]} == 0 )) || return 1
+  done
+  for child_name in run-tmp DerivedData Products Intermediates; do
+    child="${pending_workspace_root}/${child_name}"
+    if [[ ! -e "${child}" && ! -L "${child}" ]]; then
+      [[ "$(stat_identity "${pending_workspace_root}")" \
+          == "${pending_workspace_identity}" ]] || return 1
+      /bin/mkdir -m 700 "${child}" || return 1
+      /bin/chmod 700 "${child}" || return 1
+    fi
+    require_owned_private_directory "${child}" || return 1
+    child_identity=$(stat_identity "${child}") || return 1
+    [[ "${child_identity%%:*}" \
+        == "${pending_workspace_identity%%:*}" ]] || return 1
+    nested_children=("${child}"/*(ND))
+    (( ${#nested_children[@]} == 0 )) || return 1
+  done
+  [[ "$(stat_identity "${pending_workspace_root}")" \
+      == "${pending_workspace_identity}" ]] \
+    && workspace_staging_directory_is_exact_and_empty \
+      "${pending_workspace_root}"
+}
+
+function verify_existing_workspace_directory() {
+  local workspace_root=$1
+  require_owned_private_directory "${workspace_root}" || return 1
+  local -a children=("${workspace_root}"/*(ND))
+  (( ${#children[@]} >= 3 && ${#children[@]} <= 4 )) || return 1
+  local child
+  local child_name
+  for child in "${children[@]}"; do
+    child_name=${child:t}
+    case "${child_name}" in
+      DerivedData)
+        verify_reviewed_cache_directory_metadata "${child}" || return 1
+        ;;
+      Products|Intermediates|run-tmp)
+        require_owned_private_directory "${child}" || return 1
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+  verify_reviewed_cache_directory_metadata \
+    "${workspace_root}/DerivedData" || return 1
+  require_owned_private_directory \
+    "${workspace_root}/Products" || return 1
+  require_owned_private_directory \
+    "${workspace_root}/Intermediates" || return 1
+  if [[ -e "${workspace_root}/run-tmp" \
+      || -L "${workspace_root}/run-tmp" ]]; then
+    require_owned_private_directory \
+      "${workspace_root}/run-tmp" || return 1
+  fi
+}
+
+function capture_verified_workspace_child_identities() {
+  local workspace_root=$1
+  local workspace_identity=$2
+  local require_run_tmp=$3
+  [[ "${require_run_tmp}" == 0 || "${require_run_tmp}" == 1 ]] || return 1
+  [[ "${workspace_root}" == "${TESTFLIGHT_BUILD_SANDBOX_DIRECTORY}" \
+      && "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" \
+        == "${workspace_root}/run-tmp" \
+      && "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}" \
+        == "${workspace_root}/DerivedData" \
+      && "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}" \
+        == "${workspace_root}/Products" \
+      && "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}" \
+        == "${workspace_root}/Intermediates" \
+      && "$(stat_identity "${workspace_root}")" \
+        == "${workspace_identity}" ]] || return 1
+
+  local derived_data_identity
+  local products_identity
+  local intermediates_identity
+  local run_tmp_identity=""
+  verify_reviewed_cache_directory_metadata \
+    "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}" || return 1
+  derived_data_identity=$(stat_identity \
+    "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}") || return 1
+  require_owned_private_directory \
+    "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}" || return 1
+  products_identity=$(stat_identity \
+    "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}") || return 1
+  require_owned_private_directory \
+    "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}" || return 1
+  intermediates_identity=$(stat_identity \
+    "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}") || return 1
+  if [[ -e "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" \
+      || -L "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" ]]; then
+    require_owned_private_directory \
+      "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" || return 1
+    run_tmp_identity=$(stat_identity \
+      "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}") || return 1
+  else
+    (( require_run_tmp == 0 )) || return 1
+  fi
+
+  [[ "$(stat_identity "${workspace_root}")" \
+        == "${workspace_identity}" \
+      && "${derived_data_identity%%:*}" \
+        == "${workspace_identity%%:*}" \
+      && "${products_identity%%:*}" \
+        == "${workspace_identity%%:*}" \
+      && "${intermediates_identity%%:*}" \
+        == "${workspace_identity%%:*}" \
+      && "$(stat_identity "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}")" \
+        == "${derived_data_identity}" \
+      && "$(stat_identity "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}")" \
+        == "${products_identity}" \
+      && "$(stat_identity "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}")" \
+        == "${intermediates_identity}" ]] || return 1
+  if [[ -n "${run_tmp_identity}" ]]; then
+    [[ "${run_tmp_identity%%:*}" == "${workspace_identity%%:*}" \
+        && "$(stat_identity "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}")" \
+        == "${run_tmp_identity}" ]] || return 1
+  else
+    [[ ! -e "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" \
+        && ! -L "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" ]] || return 1
+  fi
+  TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY="${run_tmp_identity}"
+  TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY="${derived_data_identity}"
+  TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY="${products_identity}"
+  TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY="${intermediates_identity}"
+}
+
+function publish_workspace_directory_exclusively() {
+  local pending_workspace_root=$1
+  local workspace_root=$2
+  local workspaces_root=$3
+  local workspaces_root_identity=$4
+  require_canonical_safe_path \
+    "${pending_workspace_root}" "${workspaces_root}" || return 1
+  require_canonical_safe_path "${workspace_root}" "${workspaces_root}" \
+    || return 1
+  [[ -n "${workspaces_root_identity}" \
+      && "$(stat_identity "${workspaces_root}")" \
+        == "${workspaces_root_identity}" ]] || return 1
+  require_owned_private_directory "${pending_workspace_root}" || return 1
+  [[ ! -e "${workspace_root}" && ! -L "${workspace_root}" ]] || return 1
+  local pending_workspace_identity
+  pending_workspace_identity=$(stat_identity \
+    "${pending_workspace_root}") || return 1
+  local workspaces_root_device=${workspaces_root_identity%%:*}
+  local workspaces_root_identity_tail=${workspaces_root_identity#*:}
+  local workspaces_root_inode=${workspaces_root_identity_tail%%:*}
+  local pending_workspace_name=${pending_workspace_root:t}
+  local workspace_name=${workspace_root:t}
+  [[ "${pending_workspace_name}" \
+        == ".workspace-${TESTFLIGHT_BUILD_WORKSPACE_KEY}.pending" \
+      && "${workspace_name}" == "${TESTFLIGHT_BUILD_WORKSPACE_KEY}" ]] \
+    || return 1
+  local rename_program='ruby_library_root = "/System/Library/Frameworks/Ruby.framework/Versions/2.6/usr/lib/ruby/2.6.0"; $LOAD_PATH.replace([ruby_library_root, "#{ruby_library_root}/universal-darwin25"]); require "fiddle"; exit(74) unless $LOADED_FEATURES.grep(/fiddle/).all? { |feature| feature.start_with?(ruby_library_root) }; parent_file = File.open(ARGV.fetch(0), File::RDONLY | File::NOFOLLOW); parent_stat = parent_file.stat; exit(75) unless parent_stat.directory? && parent_stat.dev == Integer(ARGV.fetch(1), 10) && parent_stat.ino == Integer(ARGV.fetch(2), 10) && parent_stat.uid == Process.euid && (parent_stat.mode & 0o777) == 0o700; rename_excl = 0x4; rename_nofollow_any = 0x10; rename_resolve_beneath = 0x20; rename_exclusive = Fiddle::Function.new(Fiddle.dlopen(nil)["renameatx_np"], [Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT], Fiddle::TYPE_INT); exit(rename_exclusive.call(parent_file.fileno, ARGV.fetch(3), parent_file.fileno, ARGV.fetch(4), rename_excl | rename_nofollow_any | rename_resolve_beneath) == 0 ? 0 : 73)'
+  /usr/bin/env -i PATH=/usr/bin:/bin \
+    /usr/bin/ruby --disable=gems,rubyopt -e "${rename_program}" -- \
+      "${workspaces_root}" "${workspaces_root_device}" \
+      "${workspaces_root_inode}" "${pending_workspace_name}" \
+      "${workspace_name}" || return 1
+  [[ ! -e "${pending_workspace_root}" \
+      && ! -L "${pending_workspace_root}" \
+      && "$(stat_identity "${workspaces_root}")" \
+        == "${workspaces_root_identity}" \
+      && "$(stat_identity "${workspace_root}")" \
+        == "${pending_workspace_identity}" ]]
+}
+
+function initialize_or_provision_workspace_directory() {
+  local workspace_root=$1
+  local workspaces_root=$2
+  TESTFLIGHT_BUILD_SANDBOX_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY=""
+  require_canonical_safe_path "${workspace_root}" "${workspaces_root}" \
+    || return 1
+  [[ "${workspace_root}" \
+      == "${workspaces_root}/${TESTFLIGHT_BUILD_WORKSPACE_KEY}" ]] || return 1
+  string_is_lowercase_sha256 "${TESTFLIGHT_BUILD_WORKSPACE_KEY}" || return 1
+  if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 1 )); then
+    initialize_or_require_cache_parent_directory \
+      "${workspace_root}" "${workspaces_root}" || return 1
+    TESTFLIGHT_BUILD_SANDBOX_IDENTITY=$(stat_identity \
+      "${workspace_root}") || return 1
+    require_owned_private_directory "${workspace_root}"
+    return
+  fi
+
+  verify_build_cache_lock_identity || return 1
+  verify_persistent_build_cache_contract || return 1
+  require_owned_private_directory "${workspaces_root}" || return 1
+  local workspaces_root_identity
+  workspaces_root_identity=$(stat_identity "${workspaces_root}") || return 1
+  local pending_workspace_root="${workspaces_root}/.workspace-${TESTFLIGHT_BUILD_WORKSPACE_KEY}.pending"
+  require_canonical_safe_path \
+    "${pending_workspace_root}" "${workspaces_root}" || return 1
+
+  if [[ -e "${workspace_root}" || -L "${workspace_root}" ]]; then
+    [[ ! -e "${pending_workspace_root}" \
+        && ! -L "${pending_workspace_root}" ]] || return 1
+    local existing_workspace_identity
+    existing_workspace_identity=$(stat_identity "${workspace_root}") || return 1
+    [[ "${existing_workspace_identity%%:*}" \
+        == "${workspaces_root_identity%%:*}" ]] || return 1
+    verify_existing_workspace_directory "${workspace_root}" || return 1
+    verify_build_cache_lock_identity || return 1
+    [[ "$(stat_identity "${workspaces_root}")" \
+        == "${workspaces_root_identity}" \
+        && "$(stat_identity "${workspace_root}")" \
+          == "${existing_workspace_identity}" ]] || return 1
+    verify_persistent_build_cache_contract || return 1
+    [[ "$(stat_identity "${workspace_root}")" \
+        == "${existing_workspace_identity}" ]] || return 1
+    capture_verified_workspace_child_identities \
+      "${workspace_root}" "${existing_workspace_identity}" 0 || return 1
+    [[ "$(stat_identity "${workspace_root}")" \
+        == "${existing_workspace_identity}" ]] || return 1
+    TESTFLIGHT_BUILD_SANDBOX_IDENTITY="${existing_workspace_identity}"
+    return
+  fi
+
+  if [[ ! -e "${pending_workspace_root}" \
+      && ! -L "${pending_workspace_root}" ]]; then
+    [[ "$(stat_identity "${workspaces_root}")" \
+        == "${workspaces_root_identity}" ]] || return 1
+    verify_build_cache_lock_identity || return 1
+    /bin/mkdir -m 700 "${pending_workspace_root}" || return 1
+    /bin/chmod 700 "${pending_workspace_root}" || return 1
+  fi
+  require_owned_private_directory "${pending_workspace_root}" || return 1
+  local pending_workspace_identity
+  pending_workspace_identity=$(stat_identity \
+    "${pending_workspace_root}") || return 1
+  [[ "${pending_workspace_identity%%:*}" \
+      == "${workspaces_root_identity%%:*}" ]] || return 1
+  populate_or_verify_pending_workspace_directory \
+    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1
+
+  /bin/sync
+  verify_build_cache_lock_identity || return 1
+  [[ "$(stat_identity "${workspaces_root}")" \
+      == "${workspaces_root_identity}" \
+      && ! -e "${workspace_root}" \
+      && ! -L "${workspace_root}" \
+      && "$(stat_identity "${pending_workspace_root}")" \
+        == "${pending_workspace_identity}" ]] || return 1
+  workspace_staging_directory_is_exact_and_empty \
+    "${pending_workspace_root}" || return 1
+  # renameatx_np(RENAME_EXCL | RENAME_NOFOLLOW_ANY) keeps a target that appears
+  # after the final absence check from being replaced, followed, or treated as
+  # a destination directory.
+  publish_workspace_directory_exclusively \
+    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \
+    "${workspaces_root_identity}" \
+    || return 1
+  /bin/sync
+  verify_build_cache_lock_identity || return 1
+  [[ "$(stat_identity "${workspaces_root}")" \
+      == "${workspaces_root_identity}" \
+      && ! -e "${pending_workspace_root}" \
+      && ! -L "${pending_workspace_root}" \
+      && "$(stat_identity "${workspace_root}")" \
+        == "${pending_workspace_identity}" ]] || return 1
+  workspace_staging_directory_is_exact_and_empty "${workspace_root}" \
+    || return 1
+  verify_persistent_build_cache_contract || return 1
+  [[ "$(stat_identity "${workspace_root}")" \
+      == "${pending_workspace_identity}" ]] || return 1
+  capture_verified_workspace_child_identities \
+    "${workspace_root}" "${pending_workspace_identity}" 1 || return 1
+  [[ "$(stat_identity "${workspace_root}")" \
+      == "${pending_workspace_identity}" ]] || return 1
+  TESTFLIGHT_BUILD_SANDBOX_IDENTITY="${pending_workspace_identity}"
 }
 
 function initialize_or_migrate_run_tmp_parent_directory() {
   local directory=$1
   local required_parent=$2
+  local required_parent_identity=$3
+  local expected_identity=${4:-}
   require_canonical_safe_path "${directory}" "${required_parent}" || return 1
+  [[ -n "${required_parent_identity}" \
+      && "$(stat_identity "${required_parent}")" \
+        == "${required_parent_identity}" ]] || return 1
   if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 1 )); then
+    [[ -z "${expected_identity}" ]] || return 1
     [[ ! -e "${directory}" && ! -L "${directory}" ]] || return 1
     /bin/mkdir -m 700 "${directory}" || return 1
     /bin/chmod 700 "${directory}" || return 1
-  elif [[ ! -e "${directory}" && ! -L "${directory}" ]]; then
+  elif [[ -n "${expected_identity}" ]]; then
+    [[ "$(stat_identity "${directory}")" == "${expected_identity}" ]] \
+      || return 1
+  else
     # Cache schema v1 predates the per-run TMPDIR parent. This exact empty
     # directory is safe to add under the already identity-pinned workspace;
     # every other missing or mismatched persistent-cache node still fails.
+    verify_build_cache_lock_identity || return 1
+    verify_persistent_build_cache_contract || return 1
+    [[ "$(stat_identity "${required_parent}")" \
+          == "${required_parent_identity}" \
+        && ! -e "${directory}" \
+        && ! -L "${directory}" ]] || return 1
     /bin/mkdir -m 700 "${directory}" || return 1
     /bin/chmod 700 "${directory}" || return 1
   fi
-  require_owned_private_directory "${directory}"
+  require_owned_private_directory "${directory}" || return 1
+  local directory_identity
+  directory_identity=$(stat_identity "${directory}") || return 1
+  [[ "${directory_identity%%:*}" \
+        == "${required_parent_identity%%:*}" \
+      && ( -z "${expected_identity}" \
+        || "${directory_identity}" == "${expected_identity}" ) \
+      && "$(stat_identity "${required_parent}")" \
+        == "${required_parent_identity}" ]] || return 1
+  if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 0 )); then
+    verify_build_cache_lock_identity || return 1
+    verify_persistent_build_cache_contract || return 1
+    [[ "$(stat_identity "${directory}")" \
+        == "${directory_identity}" ]] || return 1
+  fi
+  TESTFLIGHT_BUILD_RUN_TMP_PARENT_IDENTITY="${directory_identity}"
 }
 
 function create_persistent_build_cache_contract() {
@@ -1960,10 +2381,10 @@ function create_persistent_build_cache_contract() {
   /usr/bin/plutil -insert xcodebuildSHA256 -string "${EXPECTED_XCODEBUILD_SHA256}" \
     "${pending_contract}" || return 1
   /usr/bin/plutil -insert packageManifestSHA256 -string \
-    "${EXPECTED_PACKAGE_MANIFEST_SHA256}" \
+    "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256}" \
     "${pending_contract}" || return 1
   /usr/bin/plutil -insert packageResolvedSHA256 -string \
-    "${EXPECTED_PACKAGE_RESOLVED_SHA256}" \
+    "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256}" \
     "${pending_contract}" || return 1
   /usr/bin/plutil -insert scheme -string "${EXPECTED_SCHEME}" \
     "${pending_contract}" || return 1
@@ -1995,6 +2416,11 @@ function initialize_or_pin_persistent_build_cache_layout() {
     || return 1
   string_is_lowercase_sha256 "${TESTFLIGHT_BUILD_WORKSPACE_KEY}" || return 1
   local workspace_root="${workspaces_root}/${TESTFLIGHT_BUILD_WORKSPACE_KEY}"
+  TESTFLIGHT_BUILD_SANDBOX_DIRECTORY="${workspace_root}"
+  TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY="${workspace_root}/run-tmp"
+  TESTFLIGHT_DERIVED_DATA_DIRECTORY="${workspace_root}/DerivedData"
+  TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY="${workspace_root}/Products"
+  TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY="${workspace_root}/Intermediates"
   initialize_or_require_cache_parent_directory \
     "${cache_base}" "${TESTFLIGHT_BUILD_MOUNT_POINT}" || return 1
   initialize_or_require_cache_parent_directory \
@@ -2003,33 +2429,51 @@ function initialize_or_pin_persistent_build_cache_layout() {
     "${shared_root}" "${cache_v1}" || return 1
   initialize_or_require_cache_parent_directory \
     "${workspaces_root}" "${cache_v1}" || return 1
-  initialize_or_require_cache_parent_directory \
+  TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH="${cache_v1}/cache-contract.plist"
+  if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 0 )); then
+    [[ -f "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" \
+        && ! -L "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" ]] || return 1
+    TESTFLIGHT_BUILD_CACHE_CONTRACT_IDENTITY=$(stat_identity \
+      "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}") || return 1
+    TESTFLIGHT_BUILD_CACHE_CONTRACT_SHA256=$(sha256_file \
+      "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}") || return 1
+    verify_persistent_build_cache_contract || return 1
+  fi
+  initialize_or_provision_workspace_directory \
     "${workspace_root}" "${workspaces_root}" || return 1
 
-  TESTFLIGHT_BUILD_SANDBOX_DIRECTORY="${workspace_root}"
-  TESTFLIGHT_BUILD_SANDBOX_IDENTITY=$(stat_identity \
-    "${TESTFLIGHT_BUILD_SANDBOX_DIRECTORY}") || return 1
-  TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY="${workspace_root}/run-tmp"
+  [[ -n "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \
+      && "$(stat_identity "${TESTFLIGHT_BUILD_SANDBOX_DIRECTORY}")" \
+        == "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" ]] || return 1
   initialize_or_migrate_run_tmp_parent_directory \
-    "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" "${workspace_root}" || return 1
-  TESTFLIGHT_BUILD_RUN_TMP_PARENT_IDENTITY=$(stat_identity \
-    "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}") || return 1
-  TESTFLIGHT_DERIVED_DATA_DIRECTORY="${workspace_root}/DerivedData"
-  TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY="${workspace_root}/Products"
-  TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY="${workspace_root}/Intermediates"
+    "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" "${workspace_root}" \
+    "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \
+    "${TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY}" || return 1
   TESTFLIGHT_BUILD_PRECOMPILED_DIRECTORY="${shared_root}/SharedPrecompiledHeaders"
   TESTFLIGHT_BUILD_CACHE_DIRECTORY="${shared_root}/Caches"
   TESTFLIGHT_BUILD_MODULE_CACHE_DIRECTORY="${shared_root}/ModuleCache.noindex"
   TESTFLIGHT_BUILD_PACKAGE_CACHE_DIRECTORY="${shared_root}/PackageCache"
   TESTFLIGHT_BUILD_SOURCE_PACKAGES_DIRECTORY="${shared_root}/SourcePackages"
   TESTFLIGHT_PINNED_BUILD_DIRECTORIES=()
+  if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 0 )); then
+    [[ -n "${TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY}" \
+        && -n "${TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY}" \
+        && -n "${TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY}" ]] \
+      || return 1
+  fi
+  initialize_or_pin_cache_directory \
+    "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}" "${workspace_root}" \
+    "${TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY}" || return 1
+  initialize_or_pin_cache_directory \
+    "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}" "${workspace_root}" \
+    "${TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY}" || return 1
+  initialize_or_pin_cache_directory \
+    "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}" "${workspace_root}" \
+    "${TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY}" || return 1
   local build_record
   local build_directory
   local build_parent
   for build_record in \
-      "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}|${workspace_root}" \
-      "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}|${workspace_root}" \
-      "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}|${workspace_root}" \
       "${TESTFLIGHT_BUILD_PRECOMPILED_DIRECTORY}|${shared_root}" \
       "${TESTFLIGHT_BUILD_CACHE_DIRECTORY}|${shared_root}" \
       "${TESTFLIGHT_BUILD_MODULE_CACHE_DIRECTORY}|${shared_root}" \
@@ -2052,16 +2496,15 @@ function initialize_or_pin_persistent_build_cache_layout() {
     "${TESTFLIGHT_PINNED_BUILD_DIRECTORIES[@]}"
   )
 
-  TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH="${cache_v1}/cache-contract.plist"
   if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 1 )); then
     create_persistent_build_cache_contract || return 1
+    [[ -f "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" \
+        && ! -L "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" ]] || return 1
+    TESTFLIGHT_BUILD_CACHE_CONTRACT_IDENTITY=$(stat_identity \
+      "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}") || return 1
+    TESTFLIGHT_BUILD_CACHE_CONTRACT_SHA256=$(sha256_file \
+      "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}") || return 1
   fi
-  [[ -f "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" \
-      && ! -L "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}" ]] || return 1
-  TESTFLIGHT_BUILD_CACHE_CONTRACT_IDENTITY=$(stat_identity \
-    "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}") || return 1
-  TESTFLIGHT_BUILD_CACHE_CONTRACT_SHA256=$(sha256_file \
-    "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}") || return 1
   TESTFLIGHT_DERIVED_DATA_IDENTITY=$(stat_identity \
     "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}") || return 1
   verify_persistent_build_cache_contract \
@@ -2565,6 +3008,10 @@ function cleanup_private_build_volume() {
   TESTFLIGHT_BUILD_TMP_IDENTITY=""
   TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY=""
   TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY=""
+  TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY=""
+  TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY=""
   TESTFLIGHT_BUILD_DSTROOT_DIRECTORY=""
   TESTFLIGHT_BUILD_PRECOMPILED_DIRECTORY=""
   TESTFLIGHT_BUILD_CACHE_DIRECTORY=""
@@ -4808,6 +5255,13 @@ function run_archive_only() {
 }
 
 function run_initialize_build_cache() {
+  verify_package_dependency_contract \
+    || fail "current package inputs changed before build-cache enrollment"
+  [[ "${EXPECTED_PACKAGE_MANIFEST_SHA256}" \
+        == "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256}" \
+      && "${EXPECTED_PACKAGE_RESOLVED_STATE}" \
+        == "${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256}" ]] \
+    || fail "build-cache enrollment provenance pins do not match the current package inputs"
   TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE=1
   initialize_private_testflight_build_volume
   verify_private_build_volume_identity \
@@ -4892,6 +5346,8 @@ function run_authorized_api_key_upload() {
 }
 
 verify_static_contract
+verify_package_dependency_contract \
+  || fail "current package inputs do not match the reviewed release pins"
 pin_export_options_identity \
   || fail "could not pin the reviewed export-options identity"
 reject_unsafe_build_environment

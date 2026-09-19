@@ -114,8 +114,21 @@ manual IP addresses, router configuration, or public TCP ports.
   `frameCount * 2` elements. A serial dispatch queue may change pthreads, so synchronously
   notify the delegate of input interruption before delivering on a different thread.
 - The iPhone must use one custom RemoteIO device. With microphone intent off, it is
-  output-only and owns a `.playback` / `.default` audio session with no category
-  options. For a production session handed off by authenticated pairing or reconnect,
+  output-only and owns a `.playback` category / `.default` mode audio session with
+  `.longFormAudio` route-sharing policy and no category options. Ordinary raw
+  microphone duplex requests `.default` sharing. Its explicitly supported effective
+  sharing profile is only `.default` or `.longFormAudio`: real-device tests showed
+  that media-control registration changes the system getter while raw built-in
+  microphone capture remains functional. This narrow profile requires the exact
+  `.playAndRecord` / `.default` / DefaultToSpeaker|AllowBluetoothA2DP tuple and all
+  existing raw-RemoteIO, route, permission, authorization, and generation proof.
+  Authorized hosted-call playback still requires effective `.default`; output-only
+  playback still requires effective `.longFormAudio`. Preserve requested and observed
+  values separately throughout native/Swift/Rust transactions and diagnostics. Never
+  normalize observed long-form to default, accept independent/long-form-video/unknown
+  policies, infer notification origin from sharing alone, or redefine a diagnostic
+  default bit. The user explicitly approved this profile revision on 2026-09-19.
+  For a production session handed off by authenticated pairing or reconnect,
   the first current-generation peer/ICE/control healthy boundary automatically
   establishes microphone intent and, while the app is active, requests permission
   once for that media session. The manual toggle remains an override; denial or a
@@ -358,8 +371,11 @@ manual IP addresses, router configuration, or public TCP ports.
   or Active-for-Hide acknowledgement closes the peer fail closed. Do not expose even
   retained remote frames unless the scene is active and the current Show is confirmed.
 - Only atomic primary taps, atomic primary drags, bounded incremental scroll deltas,
-  bounded committed text, Backspace, and Return belong in the input protocol. Primary
-  drag and scroll are explicitly advertised optional capabilities. For primary drag,
+  focused-window target/selection/resize/move commits, bounded committed text, Backspace,
+  and Return belong in the input protocol. Primary drag, scroll, and focused-window
+  resize/move are independently advertised optional capabilities. Focused-window resize uses
+  a separate one-shot, session-bound target generation and mandatory viewer-frame
+  geometry; it never reuses primary drag or editable-focus authorization. For primary drag,
   the iPhone sends one bounded start/end action only
   after a long-press drag finishes, and the Mac constructs down/dragged/up before
   posting any of them inside one authorization window. No mouse-down state may persist
@@ -372,14 +388,41 @@ manual IP addresses, router configuration, or public TCP ports.
   one pixel-unit scroll-wheel event without persisting a remote gesture or mouse-button
   state. Scroll needs its own rate limit, and any input-session, presentation, scene,
   track, or rendered-size transition discards pending deltas. The Mac must revalidate
-  Accessibility focus identity and
-  a host-issued focus generation before every keyboard event. Secure AX text fields
-  stay local and must never receive a remote focus generation; AppKit private-use
-  function-key scalars are commands rather than text and must be rejected. Never transmit or log
-  field contents, arbitrary key codes, modifiers, shortcuts, clipboard data, or AX
-  values, including typed text. Keep committed text only in the bounded pre-send and
-  native-delivery window; feedback correlation and duplicate histories must retain
-  binding metadata, never the action payload. Synthesizing input needs Accessibility
+  focused standard-window AX identity, settable position/size, original frame, permissions,
+  stable capture geometry, and target generation immediately before a direct resize. Keep
+  the opposite corner anchored across application-constrained size readback, roll back a
+  partial transaction when possible, and revoke the target/session when restoration is
+  uncertain. Resize-mode selection may focus only a safe top-level window without clicking
+  its controls. Its iPhone preview and host commit must share the same midpoint and drag-delta
+  geometry, and resize-only transitions must not dismiss an exactly preserved editable focus.
+  Move mode requires an explicit safe window-selection tap, then hold-and-drag may start
+  anywhere in the visible remote image. Bind its target and feedback to Move independently
+  of Resize, preserve window size, and mutate only AX position with fenced readback.
+  A host may separately advertise Move and Resize scale rebinding. Only then may an idle selected
+  target survive a same-session decoded-size transition; Resize may additionally preserve its
+  initial non-mutating target request. Fence either native-size/typed-event callback ordering,
+  block gestures until the new frame is presented, require exact integer aspect equality and an
+  unchanged host capture transform, and retain the exact
+  target generation, AX element, focus, frame, display, and session fences. Pending selection or
+  commit work, host capture/framebuffer transitions, and peers missing the mode's additive
+  capability remain exact-size fail-closed.
+  Never implement Move using a primary drag or a resize commit. Revoke its one-shot target
+  on stale focus/frame/geometry, mode change, or session/scene/permission loss without
+  dismissing an exactly preserved editable or secure keyboard focus.
+  The Mac must revalidate Accessibility focus identity, secure classification, and
+  a host-issued focus generation before every keyboard event. An exact enabled secure
+  AX text field may receive a fresh generation-bound remote keyboard capability without
+  reading or writing its AX value; malformed or disabled secure elements remain a hard
+  ancestry boundary, and any secure-classification change revokes the old generation.
+  The iPhone must present secure focus with secure-entry traits and must never mirror the
+  field value. Resize feedback must preserve both the exact focus generation and secure
+  classification; it must not downgrade secure entry or revive retired focus.
+  AppKit private-use function-key scalars are commands rather than text and
+  must be rejected. Never retrieve or transmit AX field values; never persist, mirror, or
+  log field contents or typed text. Never send arbitrary key codes, modifiers, shortcuts,
+  or clipboard data. Keep committed text only in the bounded pre-send and native-delivery
+  window; feedback correlation and duplicate histories must retain binding metadata,
+  never the action payload. Synthesizing input needs Accessibility
   and Post Event permission, not Input Monitoring; do not request permissions the
   feature does not use.
 - Treat ICE recovery and signaling recovery as separate protocols. The current
@@ -438,8 +481,16 @@ worker.
   directory, mount it at the fixed reviewed path, and detach it without deleting or
   resetting it. Enrollment is an explicit one-time action; missing, partial, mismatched,
   or contended cache state fails closed instead of silently falling back to a cold build.
-  The sole legacy-layout migration is creation of the exact empty mode-700 `run-tmp`
-  parent beneath an already identity-pinned workspace; no other cache node is repaired.
+  Provision an absent hash-keyed checkout workspace only as a lock-owned transaction:
+  recover only an exact safe subset of empty private children in its deterministic sibling
+  staging directory, fill the fixed `run-tmp`, `DerivedData`, `Products`, and
+  `Intermediates` layout, sync, and publish it by a same-volume exclusive rename. Pin and
+  verify the immutable cache contract and image before the transaction and prove the same
+  contract, parent, lock, and staged inode afterward. This is normal workspace creation,
+  not cache enrollment. The sole legacy-layout migration is creation of the exact empty
+  mode-700 `run-tmp` parent beneath an already identity-pinned workspace. Existing
+  malformed, replaced, linked, public, missing-required-child, or unexpected cache nodes
+  are never repaired.
 - Treat cache enrollment as a transaction. Publish its exact contract atomically and
   last, and publish a durable private pending-enrollment marker before creating its key
   or cache root. If enrollment fails or the process/host dies, the next initialization
@@ -453,6 +504,10 @@ worker.
   checkout path. Do not bind the cache to a Git commit or build number. Every release
   still creates a fresh archive destination and independently verifies its signature,
   entitlements, profile, nested code, metadata, and complete filesystem manifest.
+- Treat package hashes stored in the immutable cache contract as enrollment provenance,
+  independently pinned from the current release package hashes. A source-manifest change
+  must not invalidate the enrolled cache; validate the current manifest and resolved graph
+  before every release, and require both pin sets to agree before a fresh enrollment.
 - Give each release a fresh mode-700 TMPDIR inside the encrypted cache and remove only
   that identity-pinned run directory during cleanup; never reuse a killed run's scratch
   directory or delete the shared package/module cache.
@@ -479,6 +534,12 @@ worker.
   still requires the complete guarded recovery path.
 
 ## Commits
+
+Before microphone-affecting changes, read [MICROPHONE_REGRESSION_GUARDRAILS.md](MICROPHONE_REGRESSION_GUARDRAILS.md).
+Preserve its cross-layer policy, immediate privacy-stop, exact operation ownership and
+fresh-reconnect invariants. Run the required suites and applicable physical oracles;
+do not treat archive success, comments, mocked reconnects or on/off cycles as physical
+paired-reconnect proof. The upload script does not run these tests for you.
 
 Release validation must follow [TESTING_ORACLES.md](TESTING_ORACLES.md). A source string, mocked
 state transition, UI label, or stale artifact is not sufficient proof of a production behavior;

@@ -145,6 +145,56 @@ private final class BoundedCallbackProbe<Value: Sendable>:
     }
 }
 
+private final class FixedStatisticsSingleFlightProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = WebRTCStatisticsSingleFlightGate()
+    private var samples = 0
+    private var nativeRequests = 0
+
+    func sample() async -> Bool {
+        let sample = lock.withLock {
+            samples += 1
+            return samples
+        }
+        if gate.begin() != nil {
+            lock.withLock { nativeRequests += 1 }
+            let _: Int? = await WebRTCBoundedCallback.value(
+                timeout: .milliseconds(40),
+                register: { _ in
+                    // Models a native getStats callback that never returns. The gate deliberately
+                    // remains held until this peer is retired, so later ticks cannot accumulate
+                    // uncancellable native requests.
+                }
+            )
+        }
+        return sample < 4
+    }
+
+    func snapshot() -> (samples: Int, nativeRequests: Int) {
+        lock.withLock { (samples, nativeRequests) }
+    }
+}
+
+private actor FixedStatisticsOverrunProbe {
+    private var starts: [ContinuousClock.Instant] = []
+
+    func sample() async -> Bool {
+        starts.append(ContinuousClock.now)
+        guard starts.count == 1 else { return false }
+        do {
+            try await Task.sleep(for: .milliseconds(250))
+        } catch {
+            return false
+        }
+        return true
+    }
+
+    func startGap() -> Duration? {
+        guard starts.count == 2 else { return nil }
+        return starts[0].duration(to: starts[1])
+    }
+}
+
 private final class SemanticNativeWrapper: NSObject {
     let stableIdentity: String
 
@@ -339,6 +389,254 @@ private func makeScreenClientDiagnosticsHeartbeat(
 }
 
 final class WebRTCPeerLoopbackTests: XCTestCase {
+    func testVideoControlOnlyHostBuildsNoAudioTopologyOrSDPSection() async throws {
+        let host = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .host,
+                iceServers: [],
+                mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false
+            )
+        )
+        let viewer = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .viewer,
+                iceServers: [],
+                mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false
+            )
+        )
+        defer {
+            Task {
+                await host.close(reason: .normal)
+                await viewer.close(reason: .normal)
+            }
+        }
+
+        XCTAssertNil(host.externalAudioCapturer)
+        let usesCustomAudioDevice = await host
+            .usesCustomMacStereoAudioDeviceForTesting
+        let microphoneReceiverID = await host
+            .iPhoneMicrophoneReceiverIDForTesting
+        XCTAssertFalse(usesCustomAudioDevice)
+        XCTAssertNil(microphoneReceiverID)
+
+        let offerTask = Task<String?, Never> {
+            for await event in host.events {
+                if case .outboundSignal(.offer(let sdp)) = event {
+                    return sdp
+                }
+            }
+            return nil
+        }
+        try await host.start()
+        let offeredValue = await offerTask.value
+        let offer = try XCTUnwrap(offeredValue)
+
+        XCTAssertTrue(mediaSections(kind: "audio", in: offer).isEmpty)
+        XCTAssertEqual(mediaSections(kind: "video", in: offer).count, 1)
+        XCTAssertFalse(MacHostedCallEvidenceSDP.peerSupportsEvidence(in: offer))
+
+        let answerTask = Task<String?, Never> {
+            for await event in viewer.events {
+                if case .outboundSignal(.answer(let sdp)) = event {
+                    return sdp
+                }
+            }
+            return nil
+        }
+        try await viewer.receive(.offer(sdp: offer))
+        let answerValue = await answerTask.value
+        let answer = try XCTUnwrap(answerValue)
+
+        XCTAssertTrue(mediaSections(kind: "audio", in: answer).isEmpty)
+        XCTAssertEqual(mediaSections(kind: "video", in: answer).count, 1)
+        XCTAssertFalse(MacHostedCallEvidenceSDP.peerSupportsEvidence(in: answer))
+    }
+
+    func testHeadlessViewerTaskLocalCannotAddAudioToRestrictedHost() async throws {
+        let host = try WebRTCPeer.makeHeadlessViewerForTesting(
+            configuration: WebRTCTransportConfiguration(
+                role: .host,
+                iceServers: [],
+                mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false
+            )
+        )
+        defer {
+            Task { await host.close(reason: .normal) }
+        }
+
+        let usesCustomAudioDevice = await host
+            .usesCustomMacStereoAudioDeviceForTesting
+        let microphoneReceiverID = await host
+            .iPhoneMicrophoneReceiverIDForTesting
+        XCTAssertFalse(usesCustomAudioDevice)
+        XCTAssertNil(host.externalAudioCapturer)
+        XCTAssertNil(microphoneReceiverID)
+    }
+
+    func testVideoControlOnlyViewerRejectsEveryAudioLineEndingBeforeNativeSDP()
+        async throws {
+        let viewer = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .viewer,
+                iceServers: [],
+                mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false
+            )
+        )
+        defer {
+            Task { await viewer.close(reason: .normal) }
+        }
+
+        for offer in [
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "v=0\nm=audio 9 UDP/TLS/RTP/SAVPF 111\n",
+            "v=0\rm=audio 9 UDP/TLS/RTP/SAVPF 111\r",
+            "v=0\r\nM=AUDIO 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        ] {
+            do {
+                try await viewer.receive(.offer(sdp: offer))
+                XCTFail("A restricted viewer must reject every audio media section")
+            } catch let error as WebRTCTransportError {
+                guard case .invalidSessionDescription = error else {
+                    return XCTFail("Unexpected restricted-viewer error: \(error)")
+                }
+            }
+            let remoteDescriptionIsSet = await viewer
+                .remoteDescriptionIsSetForTesting
+            XCTAssertFalse(
+                remoteDescriptionIsSet,
+                "Audio SDP must be rejected before native remote-description application."
+            )
+        }
+    }
+
+    func testSupersededInputDecisionSendsViewOnlyActiveWithoutDisablingVideo()
+        async throws {
+        let host = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .host,
+                iceServers: [],
+                mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false
+            )
+        )
+        let viewer = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .viewer,
+                iceServers: [],
+                mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false
+            )
+        )
+        let recorder = LoopbackRecorder()
+        let expectations = LoopbackExpectations()
+        let hostForwarder = Task {
+            do {
+                for await event in host.events {
+                    for milestone in await recorder.observe(event, from: .host) {
+                        expectations.fulfill(milestone)
+                    }
+                    if case .outboundSignal(let payload) = event {
+                        for milestone in await recorder.recordEmitted(payload, from: .host) {
+                            expectations.fulfill(milestone)
+                        }
+                        try await viewer.handle(payload)
+                        for milestone in await recorder.recordDelivered(payload, from: .host) {
+                            expectations.fulfill(milestone)
+                        }
+                    }
+                }
+            } catch {
+                await recorder.recordForwardingError(error)
+            }
+        }
+        let viewerForwarder = Task {
+            do {
+                for await event in viewer.events {
+                    for milestone in await recorder.observe(event, from: .viewer) {
+                        expectations.fulfill(milestone)
+                    }
+                    if case .outboundSignal(let payload) = event {
+                        for milestone in await recorder.recordEmitted(payload, from: .viewer) {
+                            expectations.fulfill(milestone)
+                        }
+                        try await host.handle(payload)
+                        for milestone in await recorder.recordDelivered(payload, from: .viewer) {
+                            expectations.fulfill(milestone)
+                        }
+                    }
+                }
+            } catch {
+                await recorder.recordForwardingError(error)
+            }
+        }
+        defer {
+            hostForwarder.cancel()
+            viewerForwarder.cancel()
+            Task {
+                await host.close(reason: .normal)
+                await viewer.close(reason: .normal)
+            }
+        }
+
+        try await host.start()
+        await fulfillment(
+            of: [
+                expectations.hostConnected,
+                expectations.viewerConnected,
+                expectations.hostDataChannelOpen,
+                expectations.viewerDataChannelOpen,
+                expectations.remoteVideoTrack
+            ],
+            timeout: 8
+        )
+        let showID = try await viewer.setScreenVisible(true)
+        await fulfillment(of: [expectations.showRequestReceived], timeout: 3)
+
+        let candidateAuthorization = WebRTCInputAuthorization()
+        let candidateCapability = WebRTCInputCapability(
+            inputSessionID: UUID(),
+            screenRequestID: showID,
+            supportsPrimaryDrag: true,
+            supportsScroll: true
+        )
+        try await host.acknowledgeActiveControlRequestIfTransportHealthy(
+            id: showID,
+            authorization: WebRTCControlAuthorization(),
+            inputCapability: candidateCapability,
+            inputAuthorization: candidateAuthorization,
+            withFinalInputOwnershipCommit: { operation in
+                try operation(false)
+                candidateAuthorization.revoke()
+                return false
+            }
+        )
+        await fulfillment(of: [expectations.showAcknowledged], timeout: 3)
+
+        let snapshot = await recorder.snapshot()
+        XCTAssertEqual(
+            snapshot.controlAcknowledgements,
+            [WebRTCControlAcknowledgement(id: showID, state: .active)]
+        )
+        XCTAssertTrue(snapshot.viewerInputAuthorizations.isEmpty)
+        XCTAssertFalse(candidateAuthorization.isValid)
+        let encodingActivityValue = await host
+            .screenVideoEncodingActivityForTesting()
+        let encodingActivity = try XCTUnwrap(encodingActivityValue)
+        XCTAssertFalse(encodingActivity.isEmpty)
+        XCTAssertTrue(
+            encodingActivity.allSatisfy { $0 },
+            "A superseded controller must remain an active screen viewer."
+        )
+        XCTAssertTrue(
+            snapshot.forwardingErrors.isEmpty,
+            snapshot.forwardingErrors.joined(separator: "\n")
+        )
+    }
+
     func testScreenVideoEncodingLimitsApplyAtomicallyAndFailClosed() async throws {
         let host = try WebRTCPeer(
             configuration: WebRTCTransportConfiguration(
@@ -410,6 +708,9 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
                 .screenVideoPriorityForTesting()
             XCTAssertEqual(preservedPriority, expectedVideoPriority)
         }
+        let initialTotalRTPCeiling =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(initialTotalRTPCeiling, 12_000_000)
 
         let staleUpdate = try XCTUnwrap(firstUpdate)
         let staleRollback = try await host
@@ -419,9 +720,18 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         XCTAssertFalse(staleRollback)
 
         let priorLimits = try XCTUnwrap(profiles.last)
-        let reversibleUpdate = try await host.applyScreenVideoEncodingLimits(
-            profiles[5]
+        let reversibleProfile = WebRTCScreenVideoEncodingLimits(
+            maximumBitrateBps: profiles[5].maximumBitrateBps,
+            maximumFramesPerSecond: profiles[5].maximumFramesPerSecond,
+            scaleResolutionDownBy: profiles[5].scaleResolutionDownBy,
+            maximumTotalRTPBitrateBps: 2_000_000
         )
+        let reversibleUpdate = try await host.applyScreenVideoEncodingLimits(
+            reversibleProfile
+        )
+        let loweredTotalRTPCeiling =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(loweredTotalRTPCeiling, 2_000_000)
         let currentRollback = try await host
             .rollbackScreenVideoEncodingUpdateIfCurrent(
                 reversibleUpdate
@@ -430,6 +740,9 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         let limitsAfterRollback =
             await host.screenVideoEncodingLimitsForTesting()
         XCTAssertEqual(limitsAfterRollback, priorLimits)
+        let restoredTotalRTPCeiling =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(restoredTotalRTPCeiling, 12_000_000)
         let priorityAfterRollback = await host
             .screenVideoPriorityForTesting()
         XCTAssertEqual(priorityAfterRollback, expectedVideoPriority)
@@ -456,6 +769,29 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
             priorLimits,
             "Rejected limits must not mutate the last native sender profile."
         )
+        let totalRTPCeilingAfterSenderRejection =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(totalRTPCeilingAfterSenderRejection, 12_000_000)
+
+        do {
+            _ = try await host.applyScreenVideoEncodingLimits(
+                WebRTCScreenVideoEncodingLimits(
+                    maximumBitrateBps: 280_320,
+                    maximumFramesPerSecond: 5,
+                    scaleResolutionDownBy: 4,
+                    maximumTotalRTPBitrateBps: 12_000_001
+                )
+            )
+            XCTFail("A total RTP ceiling above the configured cap must fail closed.")
+        } catch let error as WebRTCTransportError {
+            guard case .nativeFailure = error else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+        }
+        let totalRTPCeilingAfterCapRejection =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(totalRTPCeilingAfterCapRejection, 12_000_000)
 
         _ = try await host.setScreenVideoEncodingActive(true)
         let activeBeforeTransportUncertainty = await host
@@ -499,6 +835,153 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(10))
     }
 
+    func testFastStatisticsDeadlineRejectsAFourHundredFiftyMillisecondCallback()
+        async throws {
+        let lateCallback = BoundedCallbackProbe<Int>()
+        Task.detached {
+            try? await Task.sleep(for: .milliseconds(450))
+            lateCallback.resolve(43)
+        }
+        let result: Int? = await WebRTCBoundedCallback.value(
+            timeout: .milliseconds(400),
+            register: { resolve in lateCallback.install(resolve) }
+        )
+        XCTAssertNil(result)
+        try await Task.sleep(for: .milliseconds(75))
+    }
+
+    func testStatisticsSingleFlightGateWaitsForTheExactLateCallback() throws {
+        let gate = WebRTCStatisticsSingleFlightGate()
+        let first = try XCTUnwrap(gate.begin())
+        XCTAssertNil(gate.begin())
+
+        gate.complete(UUID())
+        XCTAssertNil(gate.begin())
+
+        gate.complete(first)
+        XCTAssertNotNil(gate.begin())
+    }
+
+    func testStatisticsCollectionSequenceRejectsALatePreBoundaryCallback()
+        throws {
+        let sequencer = WebRTCStatisticsCollectionSequencer()
+        let preBoundarySequence = sequencer.reserveNextSequence()
+        let minimumPostBoundarySequence = sequencer.minimumNextSequence()
+
+        // Models the already-started native callback returning only after resume completed.
+        let callbackReturnedLate = WebRTCStatisticsSnapshot(
+            collectedAt: Date(timeIntervalSince1970: 200),
+            collectionSequence: preBoundarySequence
+        )
+
+        XCTAssertLessThan(
+            try XCTUnwrap(callbackReturnedLate.collectionSequence),
+            minimumPostBoundarySequence
+        )
+        XCTAssertEqual(
+            callbackReturnedLate.collectedAt,
+            Date(timeIntervalSince1970: 200)
+        )
+    }
+
+    func testStatisticsCollectionSequenceAdmitsARequestStartedAfterBoundary()
+        throws {
+        let sequencer = WebRTCStatisticsCollectionSequencer()
+        _ = sequencer.reserveNextSequence()
+        let minimumPostBoundarySequence = sequencer.minimumNextSequence()
+        let postBoundarySequence = sequencer.reserveNextSequence()
+
+        let postBoundarySnapshot = WebRTCStatisticsSnapshot(
+            collectedAt: Date(timeIntervalSince1970: 100),
+            collectionSequence: postBoundarySequence
+        )
+
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(postBoundarySnapshot.collectionSequence),
+            minimumPostBoundarySequence
+        )
+        XCTAssertEqual(postBoundarySequence, minimumPostBoundarySequence)
+    }
+
+    func testPeerSharesOneCollectionSequenceAcrossWholePeerAndScreenSenderStats()
+        async throws {
+        let host = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .host,
+                iceServers: []
+            )
+        )
+        defer {
+            Task { await host.close(reason: .normal) }
+        }
+
+        let wholePeerBoundary =
+            host.minimumNextStatisticsCollectionSequence()
+        let wholePeerSnapshot = await host.statisticsSnapshot()
+        XCTAssertEqual(
+            wholePeerSnapshot.collectionSequence,
+            wholePeerBoundary
+        )
+
+        let screenSenderBoundary =
+            host.minimumNextStatisticsCollectionSequence()
+        let optionalScreenSenderReport =
+            await host.screenVideoStatisticsSnapshot(timeout: .seconds(1))
+        let screenSenderReport = try XCTUnwrap(
+            optionalScreenSenderReport
+        )
+        XCTAssertEqual(
+            screenSenderReport.snapshot.collectionSequence,
+            screenSenderBoundary
+        )
+        XCTAssertTrue(
+            screenSenderReport.nativeReportTimestampMicroseconds.isFinite
+        )
+        XCTAssertGreaterThan(
+            screenSenderReport.nativeReportTimestampMicroseconds, 0
+        )
+        XCTAssertGreaterThan(screenSenderBoundary, wholePeerBoundary)
+        XCTAssertEqual(
+            host.minimumNextStatisticsCollectionSequence(),
+            screenSenderBoundary + 1
+        )
+    }
+
+    func testFixedStatisticsSamplerCannotAccumulateANeverReturningRequest()
+        async {
+        let probe = FixedStatisticsSingleFlightProbe()
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+
+        await WebRTCFixedIntervalStatisticsSampler.run(
+            interval: .milliseconds(50)
+        ) {
+            await probe.sample()
+        }
+
+        let elapsed = startedAt.duration(to: clock.now)
+        let snapshot = probe.snapshot()
+        XCTAssertEqual(snapshot.samples, 4)
+        XCTAssertEqual(snapshot.nativeRequests, 1)
+        XCTAssertLessThan(elapsed, Duration.milliseconds(250))
+    }
+
+    func testFixedStatisticsSamplerKeepsAnOverrunOnTheAnchoredDeadline()
+        async throws {
+        let probe = FixedStatisticsOverrunProbe()
+
+        await WebRTCFixedIntervalStatisticsSampler.run(
+            interval: .milliseconds(200)
+        ) {
+            await probe.sample()
+        }
+
+        let observedGap = await probe.startGap()
+        let gap = try XCTUnwrap(observedGap)
+        XCTAssertGreaterThanOrEqual(gap, Duration.milliseconds(240))
+        XCTAssertLessThan(gap, Duration.milliseconds(400))
+    }
+
     func testIPhoneMicrophoneStageRecoveryClassificationIsFailClosed() {
         let retryable: [WebRTCIOSMicrophoneStageFailureReason] = [
             .delegateUnavailable,
@@ -507,6 +990,8 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
             .nativeRecoveryRequired,
             .topologyRebuildFailed,
             .topologyStillNotStaged,
+            .captureDeliveryDidNotStart,
+            .outboundRTPDidNotStart,
         ]
         let lifecycleControlled: [WebRTCIOSMicrophoneStageFailureReason] = [
             .hostedCall,
@@ -537,6 +1022,164 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
                 !$0.permitsAutomaticAudioRecovery
                     && !$0.isLifecycleControlled
             }
+        )
+    }
+
+    func testMicrophoneAdmissionRequiresTwoFreshNativeDeliverySamplesAfterAStaleGeneration() {
+        let staleGenerationFloor =
+            WebRTCIPhoneMicrophoneNativeDeliveryProgress(
+                realtimeAdmissionCount: 8_000,
+                deliveryCallbackCount: 8_000,
+                deliveredFrameCount: 3_840_000
+            )
+        var tracker =
+            WebRTCIPhoneMicrophoneNativeDeliveryProgressTracker(
+                baseline: staleGenerationFloor
+            )
+
+        XCTAssertEqual(
+            tracker.observe(staleGenerationFloor),
+            .waiting
+        )
+        XCTAssertEqual(
+            tracker.observe(
+                WebRTCIPhoneMicrophoneNativeDeliveryProgress(
+                    realtimeAdmissionCount: 8_001,
+                    deliveryCallbackCount: 8_001,
+                    deliveredFrameCount: 3_840_480
+                )
+            ),
+            .waiting,
+            "One callback can be the tail of the retired generation and must not commit startup."
+        )
+        XCTAssertEqual(
+            tracker.observe(
+                WebRTCIPhoneMicrophoneNativeDeliveryProgress(
+                    realtimeAdmissionCount: 8_001,
+                    deliveryCallbackCount: 8_001,
+                    deliveredFrameCount: 3_840_480
+                )
+            ),
+            .waiting,
+            "A works-once-then-stalled callback floor must remain unproven."
+        )
+        XCTAssertEqual(
+            tracker.observe(
+                WebRTCIPhoneMicrophoneNativeDeliveryProgress(
+                    realtimeAdmissionCount: 8_002,
+                    deliveryCallbackCount: 8_002,
+                    deliveredFrameCount: 3_840_960
+                )
+            ),
+            .satisfied,
+            "Two distinct post-baseline callback advances prove continuing capture publication."
+        )
+
+        var regressed =
+            WebRTCIPhoneMicrophoneNativeDeliveryProgressTracker(
+                baseline: staleGenerationFloor
+            )
+        XCTAssertEqual(
+            regressed.observe(
+                WebRTCIPhoneMicrophoneNativeDeliveryProgress(
+                    realtimeAdmissionCount: 0,
+                    deliveryCallbackCount: 0,
+                    deliveredFrameCount: 0
+                )
+            ),
+            .regressed,
+            "A retired or wrapped counter generation cannot prove the current admission."
+        )
+    }
+
+    func testMicrophoneAdmissionRequiresExactSenderPacketAndByteAdvancement() {
+        let oldIdentity = WebRTCIPhoneMicrophoneOutboundRTPIdentity(
+            peerEpoch: UUID(),
+            bindingGeneration: 1,
+            negotiationEpoch: 1,
+            trackGeneration: 1,
+            senderID: "retired-sender",
+            localTrackID: "iphone-microphone",
+            mid: "mic-mid"
+        )
+        let currentIdentity = WebRTCIPhoneMicrophoneOutboundRTPIdentity(
+            peerEpoch: UUID(),
+            bindingGeneration: 1,
+            negotiationEpoch: 1,
+            trackGeneration: 1,
+            senderID: "current-sender",
+            localTrackID: "iphone-microphone",
+            mid: "mic-mid"
+        )
+        let currentBaseline =
+            WebRTCIPhoneMicrophoneOutboundRTPProgress(
+                identity: currentIdentity,
+                outboundRTPRecordIDs: ["current-outbound"],
+                packetsSent: 20,
+                bytesSent: 2_000
+            )
+        var tracker =
+            WebRTCIPhoneMicrophoneOutboundRTPProgressTracker()
+
+        XCTAssertEqual(tracker.observe(currentBaseline), .waiting)
+        XCTAssertEqual(
+            tracker.observe(
+                WebRTCIPhoneMicrophoneOutboundRTPProgress(
+                    identity: currentIdentity,
+                    outboundRTPRecordIDs: ["current-outbound"],
+                    packetsSent: 21,
+                    bytesSent: 2_000
+                )
+            ),
+            .waiting,
+            "A packet-only observation cannot prove payload-byte publication."
+        )
+        XCTAssertEqual(
+            tracker.observe(
+                WebRTCIPhoneMicrophoneOutboundRTPProgress(
+                    identity: currentIdentity,
+                    outboundRTPRecordIDs: ["current-outbound"],
+                    packetsSent: 20,
+                    bytesSent: 2_100
+                )
+            ),
+            .waiting,
+            "A byte-only observation cannot prove a fresh RTP packet."
+        )
+        let advanced =
+            WebRTCIPhoneMicrophoneOutboundRTPProgress(
+                identity: currentIdentity,
+                outboundRTPRecordIDs: ["current-outbound"],
+                packetsSent: 21,
+                bytesSent: 2_100
+            )
+        XCTAssertEqual(
+            tracker.observe(advanced),
+            .satisfied(
+                WebRTCIPhoneMicrophoneOutboundRTPAdvancement(
+                    baseline: currentBaseline,
+                    current: advanced
+                )
+            )
+        )
+
+        var replacementTracker =
+            WebRTCIPhoneMicrophoneOutboundRTPProgressTracker()
+        XCTAssertEqual(
+            replacementTracker.observe(currentBaseline),
+            .waiting
+        )
+        XCTAssertEqual(
+            replacementTracker.observe(
+                WebRTCIPhoneMicrophoneOutboundRTPProgress(
+                    identity: oldIdentity,
+                    outboundRTPRecordIDs: ["retired-outbound"],
+                    packetsSent: 50_000,
+                    bytesSent: 5_000_000
+                )
+            ),
+            .invalidated,
+            "Large counters from a retired peer/sender must not satisfy the current attempt."
         )
     }
 
@@ -1799,6 +2442,246 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         )
     }
 
+    func testReplacementPeerRecoversFreshMicrophoneOutboundRTPAfterOneStall()
+        async throws {
+        let frameCount = 480
+        let tone: [Int16] = (0..<(frameCount * 2)).map { index in
+            ((index / 2) % 48) < 24 ? 6_000 : -6_000
+        }
+        var successfulIdentities:
+            [WebRTCIPhoneMicrophoneOutboundRTPIdentity] = []
+
+        for attempt in 0..<2 {
+            let host = try WebRTCPeer(
+                configuration:
+                    WebRTCTransportConfiguration(
+                        role: .host,
+                        iceServers: []
+                    )
+            )
+            let viewer = try WebRTCPeer.makeHeadlessViewerForTesting(
+                configuration:
+                    WebRTCTransportConfiguration(
+                        role: .viewer,
+                        iceServers: []
+                    )
+            )
+            let hostForwarder = Task<(any Error)?, Never> {
+                do {
+                    for await event in host.events {
+                        if case .outboundSignal(let payload) = event {
+                            try await viewer.handle(payload)
+                        }
+                    }
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            let viewerForwarder = Task<(any Error)?, Never> {
+                do {
+                    for await event in viewer.events {
+                        if case .outboundSignal(let payload) = event {
+                            try await host.handle(payload)
+                        }
+                    }
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+
+            do {
+                try await host.start()
+                var senderReady = false
+                for _ in 0..<1_000 where !senderReady {
+                    let state =
+                        await viewer
+                            .iPhoneMicrophoneSenderStateForTesting()
+                    let transportHealthy =
+                        await viewer
+                            .isTransportHealthyForMediaForTesting
+                    senderReady =
+                        state.senderOwnsLocalTrack
+                            && state.bindingNegotiationEpoch
+                                == state.currentNegotiationEpoch
+                            && transportHealthy
+                    if !senderReady {
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                }
+                XCTAssertTrue(
+                    senderReady,
+                    "Reconnect attempt \(attempt) never acquired its exact negotiated sender."
+                )
+                _ = try await viewer
+                    .debugEnableIPhoneMicrophoneTrackAfterRawProcessingForTesting(
+                        maximumAttempts: 100,
+                        rawProcessingMaximumAttempts: 100
+                    )
+
+                if attempt == 1 {
+                    let admittedReplacementState =
+                        await viewer
+                            .iPhoneMicrophoneSenderStateForTesting()
+                    let clock = ContinuousClock()
+                    let startedAt = clock.now
+                    do {
+                        _ = try await viewer
+                            .awaitHeadlessMacIPhoneMicrophoneOutboundRTPForTesting(
+                                timeout: .milliseconds(300),
+                                callbackTimeout: .milliseconds(75)
+                            )
+                        XCTFail(
+                            "The replacement sender must not report outbound RTP before source PCM exists."
+                        )
+                    } catch let error as WebRTCTransportError {
+                        guard case .iPhoneMicrophoneStageFailed(
+                            .outboundRTPDidNotStart,
+                            _
+                        ) = error else {
+                            XCTFail(
+                                "Unexpected replacement-stall error: \(error)"
+                            )
+                            throw error
+                        }
+                    }
+                    XCTAssertLessThan(
+                        startedAt.duration(to: clock.now),
+                        .seconds(1),
+                        "The replacement stall must fail within its bounded deadline."
+                    )
+                    let stalledReplacementState =
+                        await viewer
+                            .iPhoneMicrophoneSenderStateForTesting()
+                    XCTAssertFalse(stalledReplacementState.trackIsEnabled)
+                    XCTAssertEqual(
+                        stalledReplacementState
+                            .nativeApprovedRecordingGeneration,
+                        0,
+                        "Typed RTP startup failure must revoke native source admission."
+                    )
+                    XCTAssertEqual(
+                        stalledReplacementState.bindingNegotiationEpoch,
+                        stalledReplacementState.currentNegotiationEpoch
+                    )
+                    XCTAssertTrue(
+                        stalledReplacementState.senderOwnsLocalTrack,
+                        "The stalled replacement must retain its exact sender for same-peer recovery."
+                    )
+                    XCTAssertEqual(
+                        stalledReplacementState.currentNegotiationEpoch,
+                        admittedReplacementState.currentNegotiationEpoch,
+                        "Recovery must not silently replace or renegotiate the second peer."
+                    )
+
+                    _ = try await viewer
+                        .debugEnableIPhoneMicrophoneTrackAfterRawProcessingForTesting(
+                            maximumAttempts: 100,
+                            rawProcessingMaximumAttempts: 100
+                        )
+                    let readmittedReplacementState =
+                        await viewer
+                            .iPhoneMicrophoneSenderStateForTesting()
+                    XCTAssertTrue(readmittedReplacementState.trackIsEnabled)
+                    XCTAssertTrue(
+                        readmittedReplacementState.senderOwnsLocalTrack
+                    )
+                    XCTAssertEqual(
+                        readmittedReplacementState.bindingNegotiationEpoch,
+                        admittedReplacementState.bindingNegotiationEpoch,
+                        "Readmission must reuse the stalled replacement's exact sender."
+                    )
+                    XCTAssertEqual(
+                        readmittedReplacementState.currentNegotiationEpoch,
+                        admittedReplacementState.currentNegotiationEpoch
+                    )
+                    let readmittedRecordingGeneration = try XCTUnwrap(
+                        readmittedReplacementState.nativeRecordingGeneration
+                    )
+                    XCTAssertGreaterThan(readmittedRecordingGeneration, 0)
+                    XCTAssertEqual(
+                        readmittedReplacementState
+                            .nativeApprovedRecordingGeneration,
+                        readmittedRecordingGeneration
+                    )
+                }
+
+                let producer = Task<Int, Never> {
+                    var delivered = 0
+                    for _ in 0..<300 where !Task.isCancelled {
+                        if await viewer
+                            .deliverHeadlessMacIPhoneMicrophoneFramesForTesting(
+                                tone,
+                                frameCount: frameCount
+                            ) {
+                            delivered += 1
+                        }
+                        try? await Task.sleep(
+                            for: .milliseconds(10)
+                        )
+                    }
+                    return delivered
+                }
+                let advancement: WebRTCIPhoneMicrophoneOutboundRTPAdvancement
+                do {
+                    advancement = try await viewer
+                        .awaitHeadlessMacIPhoneMicrophoneOutboundRTPForTesting(
+                            timeout: .seconds(3),
+                            callbackTimeout: .milliseconds(250)
+                        )
+                } catch {
+                    producer.cancel()
+                    _ = await producer.value
+                    throw error
+                }
+                producer.cancel()
+                let delivered = await producer.value
+                XCTAssertGreaterThan(delivered, 1)
+                XCTAssertEqual(
+                    advancement.baseline.identity,
+                    advancement.current.identity
+                )
+                XCTAssertGreaterThan(
+                    advancement.current.packetsSent,
+                    advancement.baseline.packetsSent
+                )
+                XCTAssertGreaterThan(
+                    advancement.current.bytesSent,
+                    advancement.baseline.bytesSent
+                )
+                successfulIdentities.append(
+                    advancement.current.identity
+                )
+            } catch {
+                await host.close(reason: .protocolError)
+                await viewer.close(reason: .protocolError)
+                hostForwarder.cancel()
+                viewerForwarder.cancel()
+                throw error
+            }
+
+            let hostRetired = await host.close(reason: .normal)
+            let viewerRetired = await viewer.close(reason: .normal)
+            XCTAssertTrue(hostRetired)
+            XCTAssertTrue(
+                viewerRetired,
+                "Peer attempt \(attempt) must retire before replacement admission."
+            )
+            hostForwarder.cancel()
+            viewerForwarder.cancel()
+            _ = await hostForwarder.value
+            _ = await viewerForwarder.value
+        }
+
+        XCTAssertEqual(successfulIdentities.count, 2)
+        XCTAssertEqual(
+            Set(successfulIdentities.map(\.peerEpoch)).count,
+            2,
+            "Each replacement peer must prove RTP from its own fresh identity."
+        )
+    }
+
     func testScreenMediaSuspensionNeedsExactAnswerEchoAndOlderPeerKeepsLegacyPath()
         async throws {
         let host = try WebRTCPeer(
@@ -2882,6 +3765,29 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
                 focus: .editable(generation: 1, secure: false)
             )
         ])
+
+        try await host.sendInputFeedback(
+            for: dragInputID,
+            result: .rejected,
+            rejectionReason: .rateLimited,
+            screenFormatChanging: true
+        )
+        var transitionFeedbackSnapshot = await recorder.snapshot()
+        for _ in 0..<300 where transitionFeedbackSnapshot.inputFeedback.count < 2 {
+            try await Task.sleep(for: .milliseconds(10))
+            transitionFeedbackSnapshot = await recorder.snapshot()
+        }
+        XCTAssertEqual(
+            transitionFeedbackSnapshot.inputFeedback.last,
+            WebRTCInputFeedback(
+                id: dragInputID,
+                screenRequestID: showID,
+                inputSessionID: inputCapability.inputSessionID,
+                result: .rejected,
+                rejectionReason: .rateLimited,
+                screenFormatChanging: true
+            )
+        )
 
         guard let capturer = host.externalVideoCapturer else {
             XCTFail("The host did not expose its external screen capturer.")

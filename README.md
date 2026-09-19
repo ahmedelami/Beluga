@@ -25,6 +25,8 @@ for compatibility; see [BRANDING.md](BRANDING.md).
 
 - Mac system-audio capture with ScreenCaptureKit and 48 kHz stereo Opus transport.
 - H.264 screen video with Show/Hide independent from audio playback.
+- Native iPhone Lock Screen and Control Center Play/Pause/Next/Previous controls for
+  a supported Mac media source, when both peers negotiate support.
 - An opt-in adjustable portrait display for a headless Mac. It replaces the sole Apple headless
   placeholder with the same desktop plus verified iPhone-resolution choices; screen video uses
   the active framebuffer while system-audio selection remains independent.
@@ -92,6 +94,42 @@ During an active iPhone call, Beluga keeps authenticated streamed playback alive
 output-only mode, temporarily mutes the iPhone microphone uplink, and automatically restores
 the microphone after the call ends and the exact built-in-microphone route is healthy again.
 
+## Native media controls
+
+The iPhone mirrors a supported Mac media source, including bounded title,
+artist, elapsed-time, and duration metadata. Only commands supported by that source are
+enabled. Changing the active player or media item replaces the old context; queued controls
+must not operate on a replacement item or survive a connection recovery boundary.
+
+When no current item is available, the generic `opensteamer` card does not label the
+connection as a live broadcast or invent a media duration, elapsed time, or commands.
+It remains separate from source-backed controls; missing Mac metadata does not prove
+the content is live or that a player supports Next/Previous.
+
+These commands control playback on the Mac, not the iPhone's local audio-route policy.
+An iPhone interruption or headphone-loss privacy mute is not cleared by pressing Play.
+The displayed playback state describes the Mac source and can therefore remain Playing
+while local audio is muted. Force-quitting the iPhone app still ends its session; the
+controls do not create background execution through synthetic audio. Artwork and seeking
+are not included in the bounded control-channel protocol.
+
+The directly distributed Mac host supports YouTube in Chrome through the local
+[media extension](browser/opensteamer-media/README.md), and Apple Music through
+permissioned Apple Events. The signed native helper communicates over a private,
+same-user Unix socket; it opens no network port and cannot start the host. Music is
+never automatically launched or prompted during discovery. Use the extension popup's
+Enable Music controls button to request the normal macOS Automation permission.
+
+A newly playing supported source wins; a paused source stays selected until another
+source starts. This is explicit supported-player arbitration, not a claim to mirror
+the private global owner in macOS Control Center. Missing/stale metadata disables
+source-backed controls without disabling streamed audio. Music Next/Previous require
+a proven playlist neighbor, and YouTube requires an available control on the exact
+current player. Unsupported apps retain the generic card. No iOS private API or
+additional iPhone permission is involved. Source tests do not certify Lock Screen
+behavior on a physical iPhone; see the media-controls release boundary in
+[TESTING_ORACLES.md](TESTING_ORACLES.md).
+
 ## Configure before building
 
 1. For a fork or self-hosted deployment, deploy the backend from `services/RendezvousWorker` and
@@ -127,7 +165,7 @@ The authoritative values for the maintainer build are:
 | Configuration field | Checked-in value |
 | --- | --- |
 | Protected legacy Release bundle | <code>com.elamin.AudioStreamer</code>, build `36` |
-| Side-by-side TestFlight bundle | <code>com.elamin.opensteamer</code>, build `57` |
+| Side-by-side TestFlight bundle | <code>com.elamin.opensteamer</code>, build `80` |
 | Development team | `MSMG8CJLB3` |
 | Marketing version | `0.1.0` |
 | Release rendezvous | `OPENSTEAMER_RENDEZVOUS_URL` uses the production WSS Worker origin declared in [`project.yml`](iOS/opensteamer/project.yml) |

@@ -88,6 +88,302 @@ driver evidence and does not certify a later build from this source cleanup.
   prove restoration after `SIGKILL`, process crash, kernel failure, or power loss;
   release claims must state that limitation rather than inferring crash recovery.
 
+## Ordinary microphone effective-sharing profile
+
+The 2026-09-19 user-approved revision preserves the requested `.default` setter
+policy and the actual observed getter separately. Only ordinary raw microphone
+duplex with exact `.playAndRecord` / `.default` / options40 accepts effective
+`.default` or `.longFormAudio`. It does not identify the source of a notification,
+authorize capture, permit a different input route, or apply to hosted-call playback.
+Output-only playback remains effective long-form; hosted-call playback remains
+effective default. Native, Swift, and Rust must agree on this profile without
+normalizing observed values or changing the factual `isDefault` diagnostic bit.
+
+Require both effective values through current-operation observation, native
+configuration, sender admission/statistics, and physical PCM proof. A later 0/1
+observation is benign only with the same immutable transaction provenance and a
+newer sequence/time. A changed value under the same sequence remains conflicting.
+Reject independent, long-form-video, negative/unknown values, inconsistent diagnostic
+bits, wrong mode/options/category, stale operation/device/generation evidence, and
+missing native or capture authorization. Prove a strict-default mutation breaks the
+positive long-form case and a broad-acceptance mutation breaks the negative cases.
+
+The spare-phone AVAudioEngine test proved built-in raw RemoteIO capture under
+effective long-form in two fresh processes, with two advancing 500ms PCM windows
+per process and balanced teardown. That is platform evidence only: it does not
+replace sole-production-device capture, WebRTC sender, Mac consumer, reconnect,
+call-privacy, or physical media-button validation from the changed artifact.
+
+Pending route convergence must also handle a category observation that carries a
+real, chained route change. It may advance only the current Pending transaction's
+route cursor with exact profile, sequence/deadline/configuration/system provenance,
+unchanged pinned output and admissible ownership. It is not reason-8 evidence, a
+native-start settlement, a capture grant, or proof of notification origin. Require
+the production handler to update that cursor while preserving the category receipt;
+reject broken chains and wrong outputs, ownership, policies or generations, and
+keep Prepared/Starting/Consumed behavior unchanged. Removing the cursor update must
+fail the handler test. Physical proof must still exercise output-only to microphone
+and back, not merely cold microphone activation. Capture failure diagnostics before
+rollback, since deactivation removes input routes and can obscure the first cause.
+
+An SDK `stopRecording` callback is a synchronous capture-privacy boundary, not an
+application policy transaction. Require authorization revocation, drained capture,
+cleared recording generations and rejected bare restart, with no category, configuration
+or system-generation mutation. Preserve a pending exact output-only operation and the
+truthful configured input-bus flag until that operation disposes/rebuilds the unit.
+Exercise absent, output-only and microphone pending carriers; reject cross-carrier
+borrowing and competing enables. Restoring the untagged stop-time rebuild must fail
+the production-stop regression. Swift tests must prove privacy is already closed while
+the output-policy owner is suspended and before successful or failed native attempts.
+Physical repeated A/C cycles must show advancing native capture and sender energy,
+frozen capture after each disable, correlated category receipts, and real tag drains.
+The sole-viewer physical test keeps a real MediaPlayer command registered, negotiates
+normal local WebRTC with a no-hardware host, and runs three complete cycles on one
+production RemoteIO device. It consumes actual category/drain events through the Rust
+authority and stores scalar measurements only. Two fresh launches passed on the spare
+iPhone15 with effective long-form sharing. This does not exercise the production view
+model, a Mac consumer, worldwide traversal, actual remote-command delivery or TestFlight.
+
+## Native media controls release boundary
+
+Thumbnail decoration must remain independent of command delivery. Cover legacy/malformed
+optional artwork decoding, current-source reference binding, immediate metadata/controls while
+loading stalls, and owner/context/negotiation replacement rejecting late results. The actual
+network loader must reject a streamed oversized body before EOF and cancel superseded requests;
+a post-download size assertion alone is insufficient. Reject untrusted redirects and oversized
+decoded dimensions. A matching iPhone build must separately prove native artwork presentation;
+unit dictionaries and a successful image fetch are not Lock Screen evidence.
+
+Native artwork must also be requested from a non-main executor through the actual
+published MPMediaItemArtwork, without a prior main-thread image request. Require
+returned dimensions and pixels plus unchanged metadata/controls. Artwork and native
+command handlers must remain explicitly Sendable: Objective-C may invoke them outside
+the main actor. Restoring the inferred MainActor artwork callback must fail this
+background test with the executor assertion, not merely a missing-image assertion.
+Run `ruby scripts/test-native-media-callback-isolation.rb EMPTY_PRIVATE_OUTPUT_DIRECTORY
+DEVELOPER_DIRECTORY` with the selected canonical Xcode developer directory. This bounded
+compiler oracle extracts both production callbacks and checks their isolation in SILGen
+and optimized Swift 6, with independent annotation-removal mutants. It complements the
+signed artwork runtime test; it does not execute a native remote command or prove a
+physical iPhone crash has the same cause.
+
+Before shipping a change to Now Playing controls, require deterministic coverage of
+negotiation with legacy peers, the 4 KiB wire bound, exact current-source command
+admission, at-most-once Next/Previous execution, and fresh state after startup and
+same-peer ICE recovery. Queue-delay mutations must demonstrate that a command or
+acknowledgement admitted before recovery cannot acquire a new generation's authority.
+Backpressure must not replay a relative command or permanently disable controls for an
+unchanged paused item. Native metadata tests must cover owner replacement, source clear,
+unsupported controls, and preservation of local interruption/headphone privacy policy.
+
+Native Chrome integration additionally requires exact-production-script behavior
+tests for document/item identity in Chrome's page execution context, video replacement, navigation
+unavailability, same-URL ABA/reload/BFCache, bounded metadata and command ledgers,
+renderer-side deadlines, duplicate relative commands, and late promise completion.
+Native Apple Event tests must bind PID/launch identity and stable window/tab IDs,
+reject changed targets, enforce final host authorization/deadlines, verify actual
+command readback, and fail closed on ambiguous or indeterminate player discovery.
+Mutation oracles must reject removal of final renderer/native admission and expiry
+checks and relative-command duplicate interception. Permission-only helper IPC must
+work without an extension or connected peer, reject media-state injection, tolerate
+ordinary consent latency, recover from a transient listener failure, and retire on
+stop/disconnect. Ordinary polling must never prompt or activate Chrome.
+
+The retained optional extension path additionally requires the production browser worker,
+isolated bridge, and MAIN adapter behavior tests; native framed-socket tests; Music
+Apple Event identity/readback tests; and composite source/item ABA revocation tests.
+Exercise expired queued commands, wrong peers, malformed/replayed revisions,
+disconnect during permission requests, source replacement, and indeterminate reads.
+Mutation oracles must reject removal of final command authorization and deadline
+checks, not merely match source text. Verify the signed helper, exact native origin,
+host Automation entitlement and old-bundle rollback compatibility independently.
+Normal signed-host Automation consent and real native Chrome/Music operations remain
+live integration gates; fake descriptors and VM DOM tests do not prove them. A real
+installed extension is required only for claims about the optional extension path,
+not for the native Apple Events path. Preserve the old signed bundle's rollback
+verifier separately when changing the reviewed Automation usage description.
+
+A physical release claim additionally requires the deployed host and intended iPhone
+build: observe the system Lock Screen/Control Center metadata, change between two real
+Mac media sources, and verify Play/Pause/Next/Previous affect only the active source.
+Repeat while paused, through a connection recovery, and with local audio muted by its
+privacy policy. A successful command acknowledgement or metadata dictionary alone does
+not prove native iOS presentation or the Mac player's observable response. Keep this
+physical evidence separate from compile, simulator, upload, and deployment results.
+
+## Focused-window resize boundary
+
+Exercise the actual controller against position-dependent size clamping and rejection,
+including right-flush left expansion, partial room, negative display origins, all four
+corners, mixed-axis directions, and application minimum/maximum constraints. Observe
+actual intermediate and final mock window frames, bounded writes, opposite-corner
+anchoring, and successor authority; accepting an unchanged frame is not resize success.
+Independently remove prepositioning and the no-op rejection to prove those regressions
+fail. Preserve exact editable/secure focus and existing stale-target/session tests.
+
+Each forward and rollback write must recheck authorization, window eligibility, focus,
+geometry, and the previously observed owned frame. Test failures between phases and
+external frame drift after readback. Unknown readback or lost authority must not cause
+blind rollback or replay. These deterministic fixtures model synchronous AX behavior;
+they do not establish how a real application settles delayed Accessibility changes.
+A physical resize claim still requires the matching installed host and a disposable
+real window, with before/after AX bounds and pixels plus uninterrupted keyboard focus.
+
+## Focused-window move boundary
+
+Move requires a distinct advertised capability, mode-bound target generation and feedback.
+Exercise an explicit safe selection, hold-and-drag originating outside the selected window,
+exactly one commit, no normal click/scroll/primary-drag leakage, and pending/cancelled gestures.
+Exercise the separately advertised Move and Resize scale-rebinding capabilities. A decoded-size
+change must block input until the exact typed generation reaches Metal, then preserve the same
+target generation only for exact integer aspect equality while the host capture transform is
+unchanged. Move may preserve an idle selected target; Resize may also preserve its initial
+non-mutating target request. Prove exact-aspect decoded rebinding succeeds without a host-geometry
+update, while rounded aspect, any host capture/framebuffer transition, pending selection or commit,
+and peers missing the matching mode capability remain fail-closed. Mutants that remove either
+capability gate, use tolerant floating-point aspect matching, accept a changed host transform, or
+retire safe state during the bounded client presentation gap must fail.
+The production controller must write only position, preserve size and exact secure/editable
+focus, observe actual readback, and issue a fresh successor. Legacy Move remains fully display
+contained. Recoverable offscreen Move requires a separate advertised capability and an explicit
+viewer commit opt-in; retain a visible top/title-bar band and horizontal grip, and return both a
+legacy unit-contained visible intersection and the bounded full frame. Prove an already-recoverable
+partial target can move inward, while Resize, an old viewer, and an old host keep strict containment.
+Both Move feedback rectangles are normalized to the encoded frame. A capture-content inset beyond
+the half-pixel framework-rounding allowance must suppress both until format renegotiation completes;
+the wire does not carry enough transform metadata to interpret meaningful letterboxing safely.
+Cover wrong-mode/stale target, changed frame/focus/geometry/permission, constrained or failed
+position writes, and lost authorization. Accept same-size application-constrained readback only
+when it progresses monotonically toward the requested origin without overshoot, opposite motion,
+or untouched-axis drift and remains recoverable. Unknown state must not authorize blind rollback.
+An outward drag already clamped at its negotiated edge is a no-op: perform no AX writes,
+revalidate ownership and issue a fresh target so the next inward drag remains usable. Do not
+confuse that with a setter ignoring a genuinely changed proposal, which must fail. Mutants that
+remove the opt-in gate, reuse the clipped frame as the next preview origin, accept a lost grip/top
+band, or relax generic normalized rectangles and Resize must fail.
+Behavioral mutations must reject a forbidden size write and acceptance of stale authority.
+Signed iOS lifecycle tests must retire selection/commit feedback across mode, scene, track,
+frame, Show and input-session replacement without dismissing preserved keyboard focus.
+These deterministic proofs are not a physical move claim: that still requires the matching
+deployed host and iPhone build, a disposable real window, before/after bounds and pixels,
+and uninterrupted typing.
+
+## Screen startup quality boundary
+
+Replay promotion-cap contraction and the recorded adverse queue, RTT, and bandwidth
+samples independently. A temporary promotion ceiling must use fresh measured capacity,
+never exceed the active probe/configured ceiling, expire without statistics, and be
+revoked by stale ownership or genuine congestion. Mutants must reject removing this
+continuity or substituting the doubled probe budget for measured capacity.
+
+Parse native probe diagnostics from the actual pinned SDK, not only synthetic log
+fixtures; retain only bounded numeric/enum events. Native callbacks are process-scoped
+and must not acquire a current peer's identity merely because that peer drains them.
+A cluster-created event or accepted sender parameter is not probe-feedback or frame
+presentation evidence. Bind live timing to the installed host and one acknowledged
+Show request, distinguish host-receipt timing from actual display timing, and retain
+intermediate reversals. Full-resolution reports do not alone prove perceived clarity.
+
+Retain native estimator send/receive intervals as checked signed microseconds or
+explicit positive/negative infinity, never coerced zero or unbounded native text.
+Exercise unit conversion, zero/negative values, the one-second boundary, overflow,
+malformed inputs, and both collector-copy fields. An actual pinned-SDK callback
+must preserve successful finite intervals in a fresh native process. Keep legacy
+observer compatibility while accepting the complete new field pair; partial,
+duplicate or unknown fields must fail closed. A missing-field-copy mutation must
+fail the behavioral collector/native oracle. These process-scoped intervals explain
+native feedback rejection; they do not identify a peer or prove receiver display time.
+
+Mac native probing must not wait indefinitely for a large media packet when a
+low-detail screencast produces only small RTP packets. Exercise the actual
+production peer initializer in a fresh process, with continuous tiny frames,
+unchanged encoded geometry and a bounded total-cap increase. Require native
+feedback, advancing sender-scoped measured BWE, and receiver frame progress
+before the original deadline; a created cluster or accepted cap is insufficient.
+Removing the startup configuration must make the recovery oracle fail. A
+factory field trial is process-wide configuration, not a per-Show permission;
+never toggle it during capture or reconnect. Preserve PCM/device policy and
+verify same-peer Show/Hide/Show with decoded-frame cessation after drain and
+continued independent audio. Padding packets while hidden are not new screen
+frames, and a configured probe target is not a hard instantaneous wire-rate cap.
+Synthetic local recovery remains separate from installed-host and real-iPhone
+clarity timing.
+
+During active startup discovery, successively improving ordinary reports must expose
+the best tier qualified by both reports, without treating the latest higher tier as
+confirmed or ending discovery merely to show the intermediate picture. Native
+qualification requires advancing report identity, measured low packet delay, healthy
+RTT evidence, and 500–1500 ms separation. A fresh no-packet report may hold the original
+witness only while its tier remains supported and its original lease is valid; it
+must not increment the count or renew any timestamp. Missing/reset queue, invalid
+identity, unsupported capacity, or unhealthy RTT breaks pending qualification.
+Geometry changes reset queue permission, so fast growth waits for a new ordinary
+low-queue measurement. Preserve the original probe origin, deadline, accepted budget
+and bandwidth high-water mark across intermediate geometry. Silence or expiry removes
+speculative capacity without erasing previously applied quality; fresh adverse
+capacity must protect that quality's sustainable requirement in both statistics lanes.
+Hide/Show and route boundaries retire pending and confirmed discovery state. Rejected
+native application must never copy positive geometry confirmation. Exercise rising
+capacity, plateau completion, no-packet cadence, expiry, adverse capacity, ownership
+and failed-apply outcomes; mutations must reject disabled intermediate presentation,
+selection of the better single-witness tier, and removal of freshness/lease guards.
+This policy improvement does not establish recovery from invalid native feedback;
+installed-host and real-iPhone startup timing remain separate requirements.
+
+Selected ICE-pair RTT is cached between native ping responses. A new statistics request
+or collection sequence is not a new RTT measurement. Consume a privacy-reduced pair
+identity plus advancing cumulative total RTT/response counters once for RTT-only
+pressure and baseline learning; piggyback acknowledgements may advance only the total.
+Reject missing/malformed native metadata and reordered reports. Keep retained unhealthy
+or expired evidence from authorizing upgrades, while preserving independent fresh
+queue/bandwidth protection and clock-bounded probe expiry. Cover pair ABA/reset,
+Hide/route/lane changes, legacy snapshot decoding, and both native snapshot-copy paths.
+Mutants must fail when duplicate watermarks regain pressure, unknown RTT becomes healthy,
+the sequence fence disappears, or either copy drops the observation. A provisional
+initial reference must not add two native ping intervals to cold startup; document
+that it has less initial outlier filtering than a three-distinct-measurement baseline.
+
+Intermediate startup-capacity observations must use the same single-flight collector,
+retain 500 ms quality/pressure windows, and leave the original probe deadline intact.
+Require advancing native report identity and increasing measured BWE before raising
+the bounded ceiling. A native UTC timestamp is identity, not an elapsed-time clock.
+Cached requests cannot compound capacity or renew primary RTT/queue leases. Preserve
+negative RTT identity across fast/ordinary lanes, including pair ABA and malformed
+metadata followed by a repaired cached tuple. Neutral queue bursts and small bandwidth
+declines withhold growth rather than becoming extra congestion samples. Keep a
+cap-dependent feedback oracle for first-full timing, plus disabled-growth, cached-report,
+deadline, cadence, and negative-invalidation mutants. Fence requests to their original
+Show/capture before interpreting callbacks. Full host compilation and new installed-host
+and iPhone evidence remain required; synthetic feedback timing is not a network prediction.
+
+Probe-collapse thresholds must use calibrated codec demand, not the configured sender
+ceiling. Exercise high and balanced origins at 50 Mbps in both ordinary and capacity-only
+lanes, stable/rising estimates below the full probe ceiling, calibrated collapse boundaries,
+and genuine 200 ms queue pressure. Independently restore the configured-ceiling comparison
+in each lane and require its recovery tests to fail. Fast decision diagnostics must report
+their own packet/delay delta, not the ordinary queue window; keep proposed budgets separate
+from native apply results. Numeric/enum diagnostics must reject malformed values without
+logging media, peer addresses, or raw connection identities, and must not change policy state.
+
+Below-reserve floor recovery must require two advancing native ordinary reports with
+measured low packet delay, healthy RTT, capacity at least the first witness's value,
+and at least 500 ms separation
+within a 1.5 s evidence lease. Fast/no-packet/cached reports must not supply admission
+witnesses. Keep the visible floor unchanged while testing bounded capacity, use the
+trial's seed-relative collapse threshold, preserve real congestion and the original
+hard deadline, and consume at most one attempt per acknowledged Show. Reserve ownership
+before asynchronous Show work and activate only for its exact successful capture/ACK;
+failed or superseded native application cannot refund the allowance or transfer positive
+health to another Show. Cover expiry, disproof, cooldown, stale identities, and seed
+retirement. Independently disable admission, restore the ordinary collapse threshold,
+and remove failed-apply attempt consumption; their behavioral regressions must fail.
+Cold-first-Show fixtures must also admit a constant below-reserve estimate without
+fabricated prior congestion or per-poll RTT advancement. An intervening estimate below
+the first witness invalidates that pending window, including early/no-packet reports.
+Equality permits initial bounded discovery only, never repeated capacity growth or
+visible promotion. Retain exact-value trend and admission-reason diagnostics as
+proposal evidence separate from native acceptance and client presentation.
+
 ## Execution and Claim Boundary
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac

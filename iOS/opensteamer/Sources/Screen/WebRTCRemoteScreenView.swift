@@ -13,7 +13,10 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
     var markerProof: ScreenVideoInBandMarkerNonce?
     var presentationCoverID: UUID?
     var onVideoSizeChanged: (CGSize) -> Void = { _ in }
-    var onVideoFrameRendered: (WebRTCVideoRenderObservation) -> Void = { _ in }
+    var onVideoPresentationInvalidated:
+        (WebRTCVideoPresentationToken, WebRTCVideoPresentationInvalidation) -> Void = { _, _ in }
+    var onVideoFrameRendered:
+        (WebRTCVideoRenderObservation, WebRTCVideoPresentationToken) -> Void = { _, _ in }
     var onVideoFramePresentedForProof:
         (WebRTCVideoPresentationProofObservation) -> Void = { _ in }
     var onVideoMarkerFramePresentedForProof:
@@ -43,6 +46,7 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
     func makeUIView(context: Context) -> WebRTCRemoteVideoView {
         let view = WebRTCRemoteVideoView(frame: .zero)
         view.onVideoSizeChanged = onVideoSizeChanged
+        view.onVideoPresentationInvalidated = onVideoPresentationInvalidated
         view.onVideoFrameRendered = onVideoFrameRendered
         view.onVideoFramePresentedForProof = onVideoFramePresentedForProof
         view.onVideoMarkerFramePresentedForProof =
@@ -63,6 +67,7 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
 
     func updateUIView(_ view: WebRTCRemoteVideoView, context: Context) {
         view.onVideoSizeChanged = onVideoSizeChanged
+        view.onVideoPresentationInvalidated = onVideoPresentationInvalidated
         view.onVideoFrameRendered = onVideoFrameRendered
         view.onVideoFramePresentedForProof = onVideoFramePresentedForProof
         view.onVideoMarkerFramePresentedForProof =
@@ -87,6 +92,7 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
     ) {
         // Clear callbacks before detaching so a late native render cannot retain SwiftUI state.
         view.onVideoSizeChanged = nil
+        view.onVideoPresentationInvalidated = nil
         view.onVideoFrameRendered = nil
         view.onVideoFramePresentedForProof = nil
         view.onVideoMarkerFramePresentedForProof = nil

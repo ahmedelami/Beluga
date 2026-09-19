@@ -1469,9 +1469,9 @@ public final class WebRTCAudioPlaybackSession {
     #if os(iOS)
     private func configureAndActivate() throws {
         session.prepareForManualAudio()
-        // `isAudioEnabled == false` halts both incoming and outgoing native audio, including
-        // custom RTCAudioDevice callbacks. Keep the gate open while the custom output device is
-        // active; that device, not LKRTCAudioSession, owns category, mode, activation, and I/O.
+        // This enables RTCAudioSession's stock-device delegate policy. The injected custom
+        // RTCAudioDevice does not subscribe to that switch: its own native gates and ordered
+        // transactions exclusively own category, mode, activation, and I/O.
         session.isAudioEnabled = true
     }
 

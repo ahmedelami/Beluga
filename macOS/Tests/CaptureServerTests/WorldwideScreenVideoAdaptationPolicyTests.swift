@@ -9,35 +9,59 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
 
         XCTAssertEqual(
             policy.recommendation(for: .full),
-            recommendation(.full, bitrate: 9_344_000, fps: 60, scale: 1)
+            recommendation(
+                .full, bitrate: 9_344_000, totalBitrate: 12_000_000,
+                fps: 60, scale: 1
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .high),
-            recommendation(.high, bitrate: 6_260_480, fps: 45, scale: 1.25)
+            recommendation(
+                .high, bitrate: 6_260_480, totalBitrate: 10_996_560,
+                fps: 45, scale: 1.25
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .balanced),
-            recommendation(.balanced, bitrate: 3_924_480, fps: 30, scale: 1.5)
+            recommendation(
+                .balanced, bitrate: 3_924_480, totalBitrate: 7_054_560,
+                fps: 30, scale: 1.5
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .constrained),
-            recommendation(.constrained, bitrate: 1_962_240, fps: 20, scale: 2)
+            recommendation(
+                .constrained, bitrate: 1_962_240, totalBitrate: 3_743_281,
+                fps: 20, scale: 2
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .critical),
-            recommendation(.critical, bitrate: 747_520, fps: 10, scale: 3)
+            recommendation(
+                .critical, bitrate: 747_520, totalBitrate: 1_693_440,
+                fps: 10, scale: 3
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .survival),
-            recommendation(.survival, bitrate: 280_320, fps: 5, scale: 4)
+            recommendation(
+                .survival, bitrate: 280_320, totalBitrate: 905_041,
+                fps: 5, scale: 4
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .emergency),
-            recommendation(.emergency, bitrate: 93_440, fps: 2, scale: 8)
+            recommendation(
+                .emergency, bitrate: 93_440, totalBitrate: 589_680,
+                fps: 2, scale: 8
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .audioPriority),
-            recommendation(.audioPriority, bitrate: 32_000, fps: 1, scale: 12)
+            recommendation(
+                .audioPriority, bitrate: 32_000, totalBitrate: 486_001,
+                fps: 1, scale: 12
+            )
         )
 
         let thirtyFPSPolicy = WorldwideScreenVideoAdaptationPolicy(
@@ -64,27 +88,45 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         XCTAssertEqual(policy.maximumTierVideoBitrateBps, 39_744_000)
         XCTAssertEqual(
             policy.recommendation(for: .full),
-            recommendation(.full, bitrate: 39_744_000, fps: 60, scale: 1)
+            recommendation(
+                .full, bitrate: 39_744_000, totalBitrate: 16_200_001,
+                fps: 60, scale: 1
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .high),
-            recommendation(.high, bitrate: 26_628_480, fps: 45, scale: 1.25)
+            recommendation(
+                .high, bitrate: 26_628_480, totalBitrate: 10_996_560,
+                fps: 45, scale: 1.25
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .balanced),
-            recommendation(.balanced, bitrate: 16_692_480, fps: 30, scale: 1.5)
+            recommendation(
+                .balanced, bitrate: 16_692_480, totalBitrate: 7_054_560,
+                fps: 30, scale: 1.5
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .constrained),
-            recommendation(.constrained, bitrate: 8_346_240, fps: 20, scale: 2)
+            recommendation(
+                .constrained, bitrate: 8_346_240, totalBitrate: 3_743_281,
+                fps: 20, scale: 2
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .critical),
-            recommendation(.critical, bitrate: 3_179_520, fps: 10, scale: 3)
+            recommendation(
+                .critical, bitrate: 3_179_520, totalBitrate: 1_693_440,
+                fps: 10, scale: 3
+            )
         )
         XCTAssertEqual(
             policy.recommendation(for: .survival),
-            recommendation(.survival, bitrate: 1_192_320, fps: 5, scale: 4)
+            recommendation(
+                .survival, bitrate: 1_192_320, totalBitrate: 905_041,
+                fps: 5, scale: 4
+            )
         )
     }
 
@@ -95,7 +137,10 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
 
-        for sample in 1...9 {
+        let coldStrongCapacitySampleCount =
+            WorldwideScreenVideoAdaptationPolicy.roundTripTimeBootstrapSampleCount - 1
+            + WorldwideScreenVideoAdaptationPolicy.requiredHealthyUpgradeSampleCount
+        for sample in 1..<coldStrongCapacitySampleCount {
             XCTAssertNil(
                 policy.update(
                     peerGeneration: 1,
@@ -115,13 +160,51 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             isCaptureActive: true,
             availableOutgoingBitrateBps: 47_500_000,
             currentRoundTripTimeSeconds: 0.020,
-            outboundVideoPacketsSent: 1_000,
-            outboundVideoTotalPacketSendDelaySeconds: 5
+            outboundVideoPacketsSent: UInt64(coldStrongCapacitySampleCount * 100),
+            outboundVideoTotalPacketSendDelaySeconds:
+                Double(coldStrongCapacitySampleCount) * 0.5
         )
         XCTAssertEqual(full?.tier, .full)
         XCTAssertEqual(full?.maximumBitrateBps, 39_744_000)
         XCTAssertEqual(full?.maximumFramesPerSecond, 60)
         XCTAssertEqual(full?.scaleResolutionDownBy, 1)
+    }
+
+    func testFiftyMegabitTransportCapDoesNotInflateTierDecisionThresholds() {
+        var policy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(policy.bind(toPeerGeneration: 1))
+
+        var update: WorldwideScreenVideoEncodingRecommendation?
+        for sample in 1...4 {
+            update = policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_262_000,
+                currentRoundTripTimeSeconds: 0.012,
+                outboundVideoPacketsSent: UInt64(sample * 100),
+                outboundVideoTotalPacketSendDelaySeconds:
+                    Double(sample) * 0.5
+            ) ?? update
+        }
+
+        XCTAssertEqual(update?.tier, .critical)
+        XCTAssertEqual(policy.currentTier, .critical)
+        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumBitrateBps,
+            3_179_520
+        )
+        XCTAssertEqual(
+            policy.currentTierMinimumSustainableBitrateBps,
+            1_254_400
+        )
+        XCTAssertEqual(
+            policy.nextHigherTierMinimumDirectUpgradeBitrateBps,
+            3_743_281
+        )
     }
 
     func testSenderLimitedFullTierHoldsUntilCapacityLeavesItsHealthyBand() {
@@ -191,57 +274,169 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             XCTAssertEqual(policy.currentTier, .full)
         }
 
+        let reducedEstimate = 9_344_000.0 * 0.848
+        XCTAssertNil(update(availableOutgoingBitrateBps: reducedEstimate))
+        XCTAssertEqual(policy.currentTier, .full)
         XCTAssertEqual(
-            update(
-                availableOutgoingBitrateBps: Double(
-                    policy.currentRecommendation.maximumBitrateBps
-                ) * 0.848
-            )?.tier,
-            .high
+            update(availableOutgoingBitrateBps: reducedEstimate)?.tier,
+            .balanced
         )
     }
 
-    func testApplicationLimitedEstimateEarnsOnlyOneTierProbe() {
+    func testApplicationLimitedEstimateRaisesOnlyTheBitrateCeiling() {
         var policy = WorldwideScreenVideoAdaptationPolicy(
             configuredTotalRTPBitrateBps: 50_000_000,
             baseFramesPerSecond: 60
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        let senderLimitedEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 100,
+                outboundVideoTotalPacketSendDelaySeconds: 0.1
+            )?.tier,
+            .audioPriority
+        )
+        let originRecommendation = policy.currentRecommendation
 
-        for sample in 1...6 {
-            XCTAssertNil(
-                policy.update(
-                    peerGeneration: 1,
-                    isCaptureActive: true,
-                    availableOutgoingBitrateBps: senderLimitedEstimate,
-                    currentRoundTripTimeSeconds: 0.020,
-                    outboundVideoPacketsSent: UInt64(sample * 100),
-                    outboundVideoTotalPacketSendDelaySeconds:
-                        Double(sample) * 0.5
-                )
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 140,
+                outboundVideoTotalPacketSendDelaySeconds: 0.104
             )
-            XCTAssertEqual(policy.currentTier, .survival)
-        }
-
+        )
         let probe = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
-            availableOutgoingBitrateBps: senderLimitedEstimate,
+            availableOutgoingBitrateBps: 400_000,
             currentRoundTripTimeSeconds: 0.020,
-            outboundVideoPacketsSent: 700,
-            outboundVideoTotalPacketSendDelaySeconds: 3.5
+            outboundVideoPacketsSent: 180,
+            outboundVideoTotalPacketSendDelaySeconds: 0.108
         )
-        XCTAssertEqual(probe?.tier, .critical)
-        XCTAssertEqual(policy.currentTier, .critical)
+        XCTAssertEqual(probe?.tier, .audioPriority)
+        XCTAssertEqual(probe?.maximumBitrateBps, policy.maximumTierVideoBitrateBps)
+        XCTAssertGreaterThan(
+            probe?.maximumTotalRTPBitrateBps ?? 0,
+            originRecommendation.maximumTotalRTPBitrateBps
+        )
+        XCTAssertEqual(
+            probe?.maximumTotalRTPBitrateBps,
+            800_000
+        )
+        XCTAssertLessThanOrEqual(
+            probe?.maximumTotalRTPBitrateBps ?? Int.max,
+            2 * 400_000
+        )
+        XCTAssertEqual(
+            probe?.maximumFramesPerSecond,
+            originRecommendation.maximumFramesPerSecond
+        )
+        XCTAssertEqual(
+            probe?.scaleResolutionDownBy,
+            originRecommendation.scaleResolutionDownBy
+        )
+        XCTAssertEqual(policy.currentTier, .audioPriority)
         XCTAssertEqual(
             policy.applicationLimitedProbeGraceSamplesRemaining,
             WorldwideScreenVideoAdaptationPolicy
                 .applicationLimitedProbeGraceSampleCount
         )
-        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .survival)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+    }
+
+    func testMissingReportsExpireOnlyTheRaisedProbeAtItsMonotonicDeadline() {
+        var policy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(policy.bind(toPeerGeneration: 1))
+        let startedAt = ContinuousClock.now
+        _ = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 100_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 100,
+            outboundVideoTotalPacketSendDelaySeconds: 0.1,
+            observedAt: startedAt
+        )
+        _ = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 400_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 140,
+            outboundVideoTotalPacketSendDelaySeconds: 0.104,
+            observedAt: startedAt.advanced(by: .milliseconds(500))
+        )
+        let probeStartedAt = startedAt.advanced(by: .milliseconds(1_000))
+        _ = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 400_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 180,
+            outboundVideoTotalPacketSendDelaySeconds: 0.108,
+            observedAt: probeStartedAt
+        )
+
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+        let baselineRTT = policy.roundTripTimeBaselineSeconds
+        let baselineQueueDelay = policy.lastAveragePacketSendDelaySeconds
+
+        for elapsed in [500, 1_000, 1_999] {
+            XCTAssertNil(
+                policy.expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: 1,
+                    isCaptureActive: true,
+                    observedAt: probeStartedAt.advanced(
+                        by: .milliseconds(elapsed)
+                    )
+                )
+            )
+            XCTAssertEqual(policy.currentTier, .audioPriority)
+            XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+            XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 0)
+            XCTAssertEqual(policy.roundTripTimeBaselineSeconds, baselineRTT)
+            XCTAssertEqual(
+                policy.lastAveragePacketSendDelaySeconds,
+                baselineQueueDelay
+            )
+        }
+
+        XCTAssertEqual(
+            policy.expireApplicationLimitedProbeWithoutReport(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                observedAt: probeStartedAt.advanced(
+                    by: WorldwideScreenVideoAdaptationPolicy
+                        .applicationLimitedProbeGraceDuration
+                )
+            )?.tier,
+            .audioPriority
+        )
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
+        XCTAssertNil(policy.applicationLimitedProbeDeadline)
+        XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 1)
+        XCTAssertEqual(
+            policy.applicationLimitedProbeCooldownSamplesRemaining,
+            WorldwideScreenVideoAdaptationPolicy
+                .initialApplicationLimitedProbeCooldownSampleCount
+        )
+        XCTAssertEqual(policy.roundTripTimeBaselineSeconds, baselineRTT)
+        XCTAssertEqual(
+            policy.lastAveragePacketSendDelaySeconds,
+            baselineQueueDelay
+        )
     }
 
     func testVeryLowPositiveEstimateBypassesBootstrapAndDowngradesImmediately() {
@@ -267,38 +462,30 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
     }
 
-    func testMissingBandwidthCannotRearmLowPositiveBootstrap() {
+    func testSenderLimitedEstimateCannotProbeWithoutRTTOrSendQueueEvidence() {
         var policy = WorldwideScreenVideoAdaptationPolicy(
             configuredTotalRTPBitrateBps: 50_000_000,
             baseFramesPerSecond: 60
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
 
-        XCTAssertNil(
-            policy.update(
-                peerGeneration: 1,
-                isCaptureActive: true,
-                availableOutgoingBitrateBps: nil,
-                currentRoundTripTimeSeconds: 0.020
-            )
-        )
         XCTAssertEqual(
             policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
                 availableOutgoingBitrateBps: 100_000,
-                currentRoundTripTimeSeconds: 0.020
+                currentRoundTripTimeSeconds: nil
             )?.tier,
             .audioPriority
         )
 
-        for _ in 0..<4 {
+        for _ in 0..<16 {
             XCTAssertNil(
                 policy.update(
                     peerGeneration: 1,
                     isCaptureActive: true,
                     availableOutgoingBitrateBps: nil,
-                    currentRoundTripTimeSeconds: 0.020
+                    currentRoundTripTimeSeconds: nil
                 )
             )
             XCTAssertNil(
@@ -306,30 +493,40 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     peerGeneration: 1,
                     isCaptureActive: true,
                     availableOutgoingBitrateBps: 100_000,
-                    currentRoundTripTimeSeconds: 0.020
+                    currentRoundTripTimeSeconds: nil
                 )
             )
             XCTAssertEqual(policy.currentTier, .audioPriority)
         }
     }
 
-    func testFailedApplicationLimitedProbeRevertsAndUsesExponentialCooldown() {
+    func testFailedApplicationLimitedProbeBoundsVisibleReevaluationAndRetainsBackoff() {
         var policy = WorldwideScreenVideoAdaptationPolicy(
             configuredTotalRTPBitrateBps: 50_000_000,
             baseFramesPerSecond: 60
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        let fixedEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
-        var packetsSent: UInt64 = 0
-        var totalPacketSendDelay = 0.0
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.1
+
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay
+            )?.tier,
+            .audioPriority
+        )
 
         func update(
-            _ availableOutgoingBitrateBps: Double?
+            _ availableOutgoingBitrateBps: Double? = 400_000
         ) -> WorldwideScreenVideoEncodingRecommendation? {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
+            packetsSent += 40
+            totalPacketSendDelay += 0.004
             return policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
@@ -341,17 +538,20 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             )
         }
 
-        for _ in 0..<96 where policy.applicationLimitedProbeOriginTier == nil {
-            _ = update(fixedEstimate)
+        for _ in 0..<16 where policy.applicationLimitedProbeOriginTier == nil {
+            _ = update()
         }
-        XCTAssertNotNil(policy.applicationLimitedProbeOriginTier)
-        XCTAssertEqual(policy.currentTier, .critical)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumBitrateBps,
+            policy.maximumTierVideoBitrateBps
+        )
 
-        for _ in 0..<WorldwideScreenVideoAdaptationPolicy
-            .applicationLimitedProbeGraceSampleCount {
-            _ = update(fixedEstimate)
+        for _ in 0..<16 where policy.applicationLimitedProbeFailureCount == 0 {
+            _ = update()
         }
-        XCTAssertEqual(policy.currentTier, .survival)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
         XCTAssertNil(policy.applicationLimitedProbeOriginTier)
         XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 1)
         XCTAssertEqual(
@@ -360,29 +560,32 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 .initialApplicationLimitedProbeCooldownSampleCount
         )
 
-        for _ in 0..<(WorldwideScreenVideoAdaptationPolicy
-            .initialApplicationLimitedProbeCooldownSampleCount / 2) {
-            _ = update(nil)
+        let boundedCooldown = WorldwideScreenVideoAdaptationPolicy
+            .maximumActiveApplicationLimitedProbeCooldownSampleCount
+        for _ in 0..<boundedCooldown {
+            XCTAssertNil(update())
             XCTAssertNil(policy.applicationLimitedProbeOriginTier)
-            XCTAssertEqual(policy.currentTier, .survival)
-        }
-        for _ in 0..<(WorldwideScreenVideoAdaptationPolicy
-            .initialApplicationLimitedProbeCooldownSampleCount / 2) {
-            _ = update(fixedEstimate)
-            XCTAssertNil(policy.applicationLimitedProbeOriginTier)
-            XCTAssertEqual(policy.currentTier, .survival)
+            XCTAssertEqual(policy.currentTier, .audioPriority)
         }
         for _ in 1..<WorldwideScreenVideoAdaptationPolicy
             .requiredApplicationLimitedUpgradeSampleCount {
-            _ = update(fixedEstimate)
+            XCTAssertNil(update())
         }
-        XCTAssertEqual(update(fixedEstimate)?.tier, .critical)
+        XCTAssertEqual(update()?.tier, .audioPriority)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+        XCTAssertLessThan(
+            (boundedCooldown
+                + WorldwideScreenVideoAdaptationPolicy
+                    .requiredApplicationLimitedUpgradeSampleCount)
+                * WorldwideScreenVideoAdaptationPolicy
+                    .sampleIntervalMilliseconds,
+            5_000
+        )
 
-        for _ in 0..<WorldwideScreenVideoAdaptationPolicy
-            .applicationLimitedProbeGraceSampleCount {
-            _ = update(fixedEstimate)
+        for _ in 0..<16 where policy.applicationLimitedProbeFailureCount < 2 {
+            _ = update()
         }
-        XCTAssertEqual(policy.currentTier, .survival)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
         XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 2)
         XCTAssertEqual(
             policy.applicationLimitedProbeCooldownSamplesRemaining,
@@ -391,227 +594,592 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
     }
 
-    func testApplicationLimitedProbeNeedsFreshStrictEvidenceToSucceed() {
-        var policy = WorldwideScreenVideoAdaptationPolicy(
+    func testApplicationLimitedProbeRequiresRTTAndSendQueueEvidence() {
+        var roundTripTimeOnlyPolicy = WorldwideScreenVideoAdaptationPolicy(
             configuredTotalRTPBitrateBps: 50_000_000,
             baseFramesPerSecond: 60
         )
-        XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        var packetsSent: UInt64 = 0
-        var totalPacketSendDelay = 0.0
-        let survivalEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
-
-        for _ in 0..<96 where policy.applicationLimitedProbeOriginTier == nil {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
-            _ = policy.update(
+        XCTAssertTrue(roundTripTimeOnlyPolicy.bind(toPeerGeneration: 1))
+        XCTAssertEqual(
+            roundTripTimeOnlyPolicy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: survivalEstimate,
-                currentRoundTripTimeSeconds: 0.020,
-                outboundVideoPacketsSent: packetsSent,
-                outboundVideoTotalPacketSendDelaySeconds:
-                    totalPacketSendDelay
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020
+            )?.tier,
+            .audioPriority
+        )
+
+        for _ in 0..<16 {
+            _ = roundTripTimeOnlyPolicy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020
             )
         }
-        XCTAssertEqual(policy.currentTier, .critical)
-        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .survival)
-        let criticalEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
+        XCTAssertEqual(roundTripTimeOnlyPolicy.currentTier, .audioPriority)
+        XCTAssertNil(roundTripTimeOnlyPolicy.applicationLimitedProbeOriginTier)
 
-        XCTAssertNil(
-            policy.update(
+        var sendQueueOnlyPolicy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(sendQueueOnlyPolicy.bind(toPeerGeneration: 1))
+        XCTAssertEqual(
+            sendQueueOnlyPolicy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: criticalEstimate,
-                currentRoundTripTimeSeconds: 0.020,
-                outboundVideoPacketsSent: packetsSent,
-                outboundVideoTotalPacketSendDelaySeconds:
-                    totalPacketSendDelay
-            )
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: nil,
+                outboundVideoPacketsSent: 100,
+                outboundVideoTotalPacketSendDelaySeconds: 0.1
+            )?.tier,
+            .audioPriority
         )
-        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .survival)
-
-        packetsSent += 100
-        totalPacketSendDelay += 0.5
-        XCTAssertNil(
-            policy.update(
+        for sample in 1...16 {
+            _ = sendQueueOnlyPolicy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: criticalEstimate,
-                currentRoundTripTimeSeconds: 0.020,
-                outboundVideoPacketsSent: packetsSent,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: nil,
+                outboundVideoPacketsSent: UInt64(100 + sample * 40),
                 outboundVideoTotalPacketSendDelaySeconds:
-                    totalPacketSendDelay
+                    0.1 + Double(sample) * 0.004
             )
-        )
-        XCTAssertEqual(policy.currentTier, .critical)
-        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
-        XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 0)
-        XCTAssertEqual(policy.applicationLimitedProbeCooldownSamplesRemaining, 0)
+        }
+        XCTAssertEqual(sendQueueOnlyPolicy.currentTier, .audioPriority)
+        XCTAssertNil(sendQueueOnlyPolicy.applicationLimitedProbeOriginTier)
     }
 
-    func testCapacityCollapseAbortsApplicationLimitedProbeImmediately() {
-        var policy = WorldwideScreenVideoAdaptationPolicy(
-            configuredTotalRTPBitrateBps: 50_000_000,
-            baseFramesPerSecond: 60
-        )
-        XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        let senderLimitedEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
-        var packetsSent: UInt64 = 0
-        var totalPacketSendDelay = 0.0
+    func testSevereBandwidthCollapseWinsOverSoftQueueDuringProbe() {
+        var fixture = makeLiveCeilingProbeFromAudioPriority()
 
-        for _ in 0..<96 where policy.applicationLimitedProbeOriginTier == nil {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
-            _ = policy.update(
-                peerGeneration: 1,
-                isCaptureActive: true,
-                availableOutgoingBitrateBps: senderLimitedEstimate,
-                currentRoundTripTimeSeconds: 0.020,
-                outboundVideoPacketsSent: packetsSent,
-                outboundVideoTotalPacketSendDelaySeconds:
-                    totalPacketSendDelay
-            )
-        }
-        XCTAssertEqual(policy.currentTier, .critical)
-        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .survival)
-
-        packetsSent += 100
-        totalPacketSendDelay += 0.5
-        let collapsed = policy.update(
+        fixture.packetsSent += 100
+        fixture.totalPacketSendDelay += 10.5
+        let collapsed = fixture.policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
             availableOutgoingBitrateBps: 100_000,
             currentRoundTripTimeSeconds: 0.020,
-            outboundVideoPacketsSent: packetsSent,
+            outboundVideoPacketsSent: fixture.packetsSent,
             outboundVideoTotalPacketSendDelaySeconds:
-                totalPacketSendDelay
+                fixture.totalPacketSendDelay
         )
 
         XCTAssertEqual(collapsed?.tier, .audioPriority)
-        XCTAssertEqual(policy.currentTier, .audioPriority)
-        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
-        XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 1)
-        XCTAssertTrue(policy.lastSampleHasPositiveSuspensionPressure)
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeFailureCount, 1)
+        XCTAssertTrue(fixture.policy.lastSampleHasPositiveSuspensionPressure)
     }
 
     func testLatencyFailedProbeKeepsBackoffDespiteHighBandwidth() {
-        var policy = WorldwideScreenVideoAdaptationPolicy(
-            configuredTotalRTPBitrateBps: 50_000_000,
-            baseFramesPerSecond: 60
-        )
-        XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        let senderLimitedEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
-        var packetsSent: UInt64 = 0
-        var totalPacketSendDelay = 0.0
+        var fixture = makeLiveCeilingProbeFromAudioPriority()
 
-        for _ in 0..<96 where policy.applicationLimitedProbeOriginTier == nil {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
-            _ = policy.update(
-                peerGeneration: 1,
-                isCaptureActive: true,
-                availableOutgoingBitrateBps: senderLimitedEstimate,
-                currentRoundTripTimeSeconds: 0.020,
-                outboundVideoPacketsSent: packetsSent,
-                outboundVideoTotalPacketSendDelaySeconds:
-                    totalPacketSendDelay
-            )
-        }
-        XCTAssertEqual(policy.currentTier, .critical)
-        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .survival)
-
-        packetsSent += 100
-        totalPacketSendDelay += 20
-        let pressured = policy.update(
+        fixture.packetsSent += 100
+        fixture.totalPacketSendDelay += 20
+        let pressured = fixture.policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
             availableOutgoingBitrateBps: 50_000_000,
             currentRoundTripTimeSeconds: 0.020,
-            outboundVideoPacketsSent: packetsSent,
+            outboundVideoPacketsSent: fixture.packetsSent,
             outboundVideoTotalPacketSendDelaySeconds:
-                totalPacketSendDelay
+                fixture.totalPacketSendDelay
         )
 
-        XCTAssertEqual(pressured?.tier, .emergency)
-        XCTAssertEqual(policy.currentTier, .emergency)
-        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
-        XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 1)
+        XCTAssertEqual(pressured?.tier, .audioPriority)
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeFailureCount, 1)
         XCTAssertEqual(
-            policy.applicationLimitedProbeCooldownSamplesRemaining,
+            fixture.policy.applicationLimitedProbeCooldownSamplesRemaining,
             WorldwideScreenVideoAdaptationPolicy
                 .initialApplicationLimitedProbeCooldownSampleCount
         )
-        XCTAssertTrue(policy.lastSampleHasLatencyPressure)
+        XCTAssertTrue(fixture.policy.lastSampleHasLatencyPressure)
     }
 
-    func testFreshSenderLimitedEvidenceConvergesAcrossEveryTierAndHoldsFull() {
+    func testCeilingOnlyProbeRecoversFullyWithOneFinalGeometryTransition() {
         var policy = WorldwideScreenVideoAdaptationPolicy(
             configuredTotalRTPBitrateBps: 50_000_000,
             baseFramesPerSecond: 60
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        var packetsSent: UInt64 = 0
-        var totalPacketSendDelay = 0.0
-        var visitedTiers: Set<WorldwideScreenVideoAdaptationTier> = [
-            policy.currentTier
-        ]
-
-        for _ in 0..<200 where policy.currentTier != .full {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
-            _ = policy.update(
+        let startedAt = ContinuousClock.now
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.1
+        XCTAssertEqual(
+            policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: Double(
-                    policy.currentRecommendation.maximumBitrateBps
-                ) * 0.90,
+                availableOutgoingBitrateBps: 100_000,
                 currentRoundTripTimeSeconds: 0.020,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
-                    totalPacketSendDelay
+                    totalPacketSendDelay,
+                observedAt: startedAt
+            )?.tier,
+            .audioPriority
+        )
+        let originRecommendation = policy.currentRecommendation
+        var recoveryRecommendations:
+            [WorldwideScreenVideoEncodingRecommendation] = []
+        var appliedProbeCaps: [(
+            availableOutgoingBitrateBps: Double,
+            maximumTotalRTPBitrateBps: Int
+        )] = []
+        var recoverySampleCount = 0
+
+        packetsSent += 40
+        totalPacketSendDelay += 0.004
+        recoverySampleCount += 1
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(500))
             )
-            visitedTiers.insert(policy.currentTier)
+        )
+
+        packetsSent += 40
+        totalPacketSendDelay += 0.004
+        recoverySampleCount += 1
+        let bitrateOnlyProbe = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 400_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: packetsSent,
+            outboundVideoTotalPacketSendDelaySeconds:
+                totalPacketSendDelay,
+            observedAt: startedAt.advanced(by: .milliseconds(1_000))
+        )
+        if let bitrateOnlyProbe {
+            recoveryRecommendations.append(bitrateOnlyProbe)
+            appliedProbeCaps.append(
+                (400_000, bitrateOnlyProbe.maximumTotalRTPBitrateBps)
+            )
+        }
+        XCTAssertEqual(bitrateOnlyProbe?.tier, .audioPriority)
+        XCTAssertEqual(
+            bitrateOnlyProbe?.maximumBitrateBps,
+            policy.maximumTierVideoBitrateBps
+        )
+        XCTAssertGreaterThan(
+            bitrateOnlyProbe?.maximumTotalRTPBitrateBps ?? 0,
+            originRecommendation.maximumTotalRTPBitrateBps
+        )
+        XCTAssertEqual(
+            bitrateOnlyProbe?.maximumTotalRTPBitrateBps,
+            800_000
+        )
+        XCTAssertEqual(
+            bitrateOnlyProbe?.maximumFramesPerSecond,
+            originRecommendation.maximumFramesPerSecond
+        )
+        XCTAssertEqual(
+            bitrateOnlyProbe?.scaleResolutionDownBy,
+            originRecommendation.scaleResolutionDownBy
+        )
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+        let graceBeforeSpike = policy.applicationLimitedProbeGraceSamplesRemaining
+
+        packetsSent += 100
+        totalPacketSendDelay += 10.5
+        recoverySampleCount += 1
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(1_500))
+            )
+        )
+        XCTAssertEqual(policy.queuePressureSampleCount, 1)
+        XCTAssertEqual(
+            policy.applicationLimitedProbeGraceSamplesRemaining,
+            graceBeforeSpike
+        )
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumTotalRTPBitrateBps,
+            bitrateOnlyProbe?.maximumTotalRTPBitrateBps
+        )
+
+        let chainedProbeSamples: [(
+            availableOutgoingBitrateBps: Double,
+            elapsedMilliseconds: Int
+        )] = [
+            (1_600_000, 2_000),
+            (4_100_000, 2_500),
+            (8_200_000, 3_000),
+            (50_000_000, 3_500),
+            (50_000_000, 4_000),
+        ]
+        for sample in chainedProbeSamples {
+            packetsSent += 100
+            totalPacketSendDelay += 0.5
+            recoverySampleCount += 1
+            if let recommendation = policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps:
+                    sample.availableOutgoingBitrateBps,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(
+                    by: .milliseconds(sample.elapsedMilliseconds)
+                )
+            ) {
+                recoveryRecommendations.append(recommendation)
+                if recommendation.tier == .audioPriority {
+                    appliedProbeCaps.append(
+                        (
+                            sample.availableOutgoingBitrateBps,
+                            recommendation.maximumTotalRTPBitrateBps
+                        )
+                    )
+                    XCTAssertEqual(
+                        recommendation.maximumFramesPerSecond,
+                        originRecommendation.maximumFramesPerSecond
+                    )
+                    XCTAssertEqual(
+                        recommendation.scaleResolutionDownBy,
+                        originRecommendation.scaleResolutionDownBy
+                    )
+                    XCTAssertEqual(policy.currentTier, .audioPriority)
+                    XCTAssertEqual(
+                        policy.applicationLimitedProbeOriginTier,
+                        .audioPriority
+                    )
+                }
+            }
         }
 
         XCTAssertEqual(
-            visitedTiers,
-            Set([
-                .survival,
-                .critical,
-                .constrained,
-                .balanced,
-                .high,
+            recoveryRecommendations.map(\.tier),
+            [
+                .audioPriority,
+                .audioPriority,
+                .audioPriority,
+                .audioPriority,
                 .full,
-            ])
+            ]
+        )
+        XCTAssertEqual(
+            appliedProbeCaps.map(\.maximumTotalRTPBitrateBps),
+            [800_000, 3_200_000, 8_200_000, 16_200_001]
+        )
+        XCTAssertTrue(
+            appliedProbeCaps.allSatisfy { appliedProbe in
+                Double(appliedProbe.maximumTotalRTPBitrateBps)
+                    <= appliedProbe.availableOutgoingBitrateBps * 2
+            }
+        )
+        XCTAssertEqual(
+            recoveryRecommendations.filter {
+                $0.maximumFramesPerSecond
+                    != originRecommendation.maximumFramesPerSecond
+                    || $0.scaleResolutionDownBy
+                        != originRecommendation.scaleResolutionDownBy
+            }.count,
+            1
         )
         XCTAssertEqual(policy.currentTier, .full)
-        for _ in 0..<32 {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
-            XCTAssertNil(
-                policy.update(
-                    peerGeneration: 1,
-                    isCaptureActive: true,
-                    availableOutgoingBitrateBps: Double(
-                        policy.currentRecommendation.maximumBitrateBps
-                    ) * 0.90,
-                    currentRoundTripTimeSeconds: 0.020,
-                    outboundVideoPacketsSent: packetsSent,
-                    outboundVideoTotalPacketSendDelaySeconds:
-                        totalPacketSendDelay
-                )
+        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(policy.currentRecommendation.maximumFramesPerSecond, 60)
+        XCTAssertEqual(policy.currentRecommendation.scaleResolutionDownBy, 1)
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumTotalRTPBitrateBps,
+            appliedProbeCaps.last?.maximumTotalRTPBitrateBps
+        )
+        XCTAssertLessThan(
+            recoverySampleCount
+                * WorldwideScreenVideoAdaptationPolicy
+                    .sampleIntervalMilliseconds,
+            5_000
+        )
+    }
+
+    func testSoftQueuePressureSurvivesOneNoPacketPoll() {
+        var policy = makeFiftyMegabitPolicyAtFull()
+        let startedAt = ContinuousClock.now
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.5
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt
             )
-            XCTAssertEqual(policy.currentTier, .full)
+        )
+
+        packetsSent += 100
+        totalPacketSendDelay += 10.5
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(500))
+            )
+        )
+        XCTAssertEqual(policy.queuePressureSampleCount, 1)
+
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(1_000))
+            )
+        )
+        XCTAssertEqual(policy.queuePressureSampleCount, 1)
+        XCTAssertEqual(policy.currentTier, .full)
+
+        packetsSent += 100
+        totalPacketSendDelay += 10.5
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(1_500))
+            )?.tier,
+            .high
+        )
+        XCTAssertEqual(policy.currentTier, .high)
+    }
+
+    func testSevereBandwidthCollapseReachesAudioFloorWithSoftOrConfirmedQueue() {
+        let startedAt = ContinuousClock.now
+
+        var softPolicy = makeFiftyMegabitPolicyAtFull()
+        _ = softPolicy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 50_000_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 100,
+            outboundVideoTotalPacketSendDelaySeconds: 0.5,
+            observedAt: startedAt
+        )
+        XCTAssertEqual(
+            softPolicy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 200,
+                outboundVideoTotalPacketSendDelaySeconds: 11,
+                observedAt: startedAt.advanced(by: .milliseconds(500))
+            )?.tier,
+            .audioPriority
+        )
+        XCTAssertEqual(softPolicy.currentTier, .audioPriority)
+
+        var confirmedPolicy = makeFiftyMegabitPolicyAtFull()
+        _ = confirmedPolicy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 50_000_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 100,
+            outboundVideoTotalPacketSendDelaySeconds: 0.5,
+            observedAt: startedAt
+        )
+        XCTAssertNil(
+            confirmedPolicy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 200,
+                outboundVideoTotalPacketSendDelaySeconds: 11,
+                observedAt: startedAt.advanced(by: .milliseconds(500))
+            )
+        )
+        XCTAssertEqual(confirmedPolicy.queuePressureSampleCount, 1)
+        XCTAssertEqual(
+            confirmedPolicy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 300,
+                outboundVideoTotalPacketSendDelaySeconds: 21.5,
+                observedAt: startedAt.advanced(by: .milliseconds(1_000))
+            )?.tier,
+            .audioPriority
+        )
+        XCTAssertEqual(confirmedPolicy.currentTier, .audioPriority)
+    }
+
+    func testSubCeilingEstimatesAreNotHeldAsApplicationLimited() {
+        var survivalPolicy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(survivalPolicy.bind(toPeerGeneration: 1))
+        XCTAssertEqual(
+            survivalPolicy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 100,
+                outboundVideoTotalPacketSendDelaySeconds: 0.5
+            )?.tier,
+            .audioPriority
+        )
+        XCTAssertNil(survivalPolicy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(survivalPolicy.currentTier, .audioPriority)
+
+        var fullPolicy = makeFiftyMegabitPolicyAtFull()
+        _ = fullPolicy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 50_000_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 100,
+            outboundVideoTotalPacketSendDelaySeconds: 0.5
+        )
+        var fullUpdate: WorldwideScreenVideoEncodingRecommendation?
+        for sample in 2...4 where fullPolicy.currentTier == .full {
+            fullUpdate = fullPolicy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 8_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: UInt64(sample * 100),
+                outboundVideoTotalPacketSendDelaySeconds:
+                    Double(sample) * 0.5
+            ) ?? fullUpdate
+            XCTAssertNil(fullPolicy.applicationLimitedProbeOriginTier)
         }
+        XCTAssertEqual(fullUpdate?.tier, .balanced)
+        XCTAssertEqual(fullPolicy.currentTier, .balanced)
+    }
+
+    func testCommittedIntermediateProbeQualitySurvivesTelemetryEnding() {
+        var missingBandwidthFixture = makeLiveCeilingProbeFromAudioPriority()
+        let originalDeadline = try! XCTUnwrap(
+            missingBandwidthFixture.policy.applicationLimitedProbeDeadline
+        )
+        for sample in 1...2 {
+            missingBandwidthFixture.packetsSent += 40
+            missingBandwidthFixture.totalPacketSendDelay += 0.004
+            let update = missingBandwidthFixture.policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_500_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent:
+                    missingBandwidthFixture.packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    missingBandwidthFixture.totalPacketSendDelay
+            )
+            if sample == 1 {
+                XCTAssertEqual(update?.tier, .audioPriority)
+                XCTAssertEqual(update?.maximumTotalRTPBitrateBps, 5_000_000)
+                XCTAssertLessThanOrEqual(
+                    update?.maximumTotalRTPBitrateBps ?? Int.max,
+                    2 * 2_500_000
+                )
+                XCTAssertEqual(update?.maximumFramesPerSecond, 1)
+                XCTAssertEqual(update?.scaleResolutionDownBy, 12)
+            } else {
+                XCTAssertEqual(update?.tier, .critical)
+                XCTAssertEqual(update?.maximumFramesPerSecond, 10)
+                XCTAssertEqual(update?.scaleResolutionDownBy, 3)
+            }
+        }
+        XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
+        XCTAssertNil(
+            missingBandwidthFixture.policy.applicationLimitedProbeOriginTier
+        )
+        for sample in 1...8 {
+            let update = missingBandwidthFixture.policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: nil,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: missingBandwidthFixture.packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    missingBandwidthFixture.totalPacketSendDelay,
+                observedAt: originalDeadline.advanced(by: .seconds(sample))
+            )
+            if sample == 1 {
+                XCTAssertEqual(
+                    update,
+                    missingBandwidthFixture.policy.recommendation(for: .critical)
+                )
+            } else {
+                XCTAssertNil(update)
+            }
+            XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
+        }
+        XCTAssertEqual(missingBandwidthFixture.policy.currentTier, .critical)
+        XCTAssertNil(
+            missingBandwidthFixture.policy.applicationLimitedProbeOriginTier
+        )
+
+        var noReportFixture = makeLiveCeilingProbeFromAudioPriority()
+        let deadline = try! XCTUnwrap(
+            noReportFixture.policy.applicationLimitedProbeDeadline
+        )
+        for _ in 0..<2 {
+            noReportFixture.packetsSent += 40
+            noReportFixture.totalPacketSendDelay += 0.004
+            _ = noReportFixture.policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_500_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: noReportFixture.packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    noReportFixture.totalPacketSendDelay
+            )
+        }
+        let expired = noReportFixture.policy.expireApplicationLimitedProbeWithoutReport(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            observedAt: deadline
+        )
+        XCTAssertEqual(expired, noReportFixture.policy.recommendation(for: .critical))
+        XCTAssertEqual(noReportFixture.policy.currentTier, .critical)
+        XCTAssertNil(noReportFixture.policy.applicationLimitedProbeOriginTier)
     }
 
     func testQueueGrayZoneHoldsAndInflationDowngradesAtFiftyMegabits() {
@@ -645,7 +1213,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
         XCTAssertEqual(policy.currentTier, .full)
 
-        XCTAssertEqual(
+        XCTAssertNil(
             policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
@@ -653,15 +1221,277 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 currentRoundTripTimeSeconds: 0.020,
                 outboundVideoPacketsSent: 1_200,
                 outboundVideoTotalPacketSendDelaySeconds: 21.1
+            )
+        )
+        XCTAssertEqual(policy.currentTier, .full)
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 1_300,
+                outboundVideoTotalPacketSendDelaySeconds: 32.2
             )?.tier,
             .high
         )
     }
 
-    func testBadSamplesDowngradeDirectlyThroughLowestBandwidthTiers() {
+    func testLiveSoftQueueSpikeDoesNotUndoCeilingProbe() {
+        var fixture = makeLiveCeilingProbeFromAudioPriority()
+        let probeGrace = fixture.policy
+            .applicationLimitedProbeGraceSamplesRemaining
+
+        fixture.packetsSent += 100
+        fixture.totalPacketSendDelay += 10.5
+        XCTAssertNil(
+            fixture.policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_262_000,
+                currentRoundTripTimeSeconds: 0.012,
+                outboundVideoPacketsSent: fixture.packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    fixture.totalPacketSendDelay
+            )
+        )
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertEqual(
+            fixture.policy.applicationLimitedProbeOriginTier,
+            .audioPriority
+        )
+        XCTAssertEqual(
+            fixture.policy.applicationLimitedProbeGraceSamplesRemaining,
+            probeGrace
+        )
+        XCTAssertEqual(fixture.policy.queuePressureSampleCount, 1)
+        XCTAssertFalse(fixture.policy.lastSampleHasLatencyPressure)
+
+        fixture.packetsSent += 100
+        fixture.totalPacketSendDelay += 0.5
+        let chainedProbe = fixture.policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 2_262_000,
+            currentRoundTripTimeSeconds: 0.012,
+            outboundVideoPacketsSent: fixture.packetsSent,
+            outboundVideoTotalPacketSendDelaySeconds:
+                fixture.totalPacketSendDelay
+        )
+        XCTAssertEqual(chainedProbe?.tier, .audioPriority)
+        XCTAssertEqual(
+            chainedProbe?.maximumTotalRTPBitrateBps,
+            4_524_000
+        )
+        XCTAssertLessThanOrEqual(
+            chainedProbe?.maximumTotalRTPBitrateBps ?? Int.max,
+            2 * 2_262_000
+        )
+        XCTAssertEqual(chainedProbe?.maximumFramesPerSecond, 1)
+        XCTAssertEqual(chainedProbe?.scaleResolutionDownBy, 12)
+        XCTAssertEqual(
+            fixture.policy.applicationLimitedProbeGraceSamplesRemaining,
+            probeGrace - 1
+        )
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertEqual(
+            fixture.policy.applicationLimitedProbeOriginTier,
+            .audioPriority
+        )
+        XCTAssertEqual(
+            fixture.policy.applicationLimitedProbeBestQualifiedTier,
+            .critical
+        )
+        XCTAssertEqual(
+            fixture.policy.applicationLimitedProbeHealthySampleCount,
+            1
+        )
+    }
+
+    func testTwoSoftQueueSamplesFailOnlyTheCeilingProbe() {
+        var fixture = makeLiveCeilingProbeFromAudioPriority()
+
+        for sample in 1...2 {
+            fixture.packetsSent += 100
+            fixture.totalPacketSendDelay += 10.5
+            let update = fixture.policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_262_000,
+                currentRoundTripTimeSeconds: 0.012,
+                outboundVideoPacketsSent: fixture.packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    fixture.totalPacketSendDelay
+            )
+            XCTAssertEqual(
+                update?.tier,
+                sample == 2 ? .audioPriority : nil
+            )
+        }
+
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeFailureCount, 1)
+        XCTAssertEqual(fixture.policy.queuePressureSampleCount, 0)
+        XCTAssertTrue(fixture.policy.lastSampleHasLatencyPressure)
+    }
+
+    func testMissingBandwidthProbeFailureIsTerminalForItsReport() {
+        var fixture = makeLiveCeilingProbeFromAudioPriority()
+        fixture.packetsSent += 100
+        fixture.totalPacketSendDelay += 20
+
+        XCTAssertEqual(
+            fixture.policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: nil,
+                currentRoundTripTimeSeconds: 0.012,
+                outboundVideoPacketsSent: fixture.packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    fixture.totalPacketSendDelay
+            )?.tier,
+            .audioPriority
+        )
+        XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertEqual(fixture.policy.applicationLimitedProbeFailureCount, 1)
+        XCTAssertTrue(fixture.policy.lastSampleHasLatencyPressure)
+    }
+
+    func testLowFPSNoPacketPollReusesFreshHealthyQueueEvidence() {
+        var policy = makePolicy()
+        move(&policy, to: .audioPriority, roundTripTime: 0.020)
+        let startedAt = ContinuousClock.now
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.1
+
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt
+            )
+        )
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(500))
+            )
+        )
+        packetsSent += 40
+        totalPacketSendDelay += 0.004
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay,
+                observedAt: startedAt.advanced(by: .milliseconds(1_000))
+            )?.tier,
+            .audioPriority
+        )
+        XCTAssertEqual(policy.applicationLimitedUpgradeSampleCount, 0)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
+
+        let chainedProbe = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 600_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: packetsSent,
+            outboundVideoTotalPacketSendDelaySeconds:
+                totalPacketSendDelay,
+            observedAt: startedAt.advanced(by: .milliseconds(1_500))
+        )
+        XCTAssertEqual(chainedProbe?.tier, .audioPriority)
+        XCTAssertEqual(chainedProbe?.maximumTotalRTPBitrateBps, 1_200_000)
+        XCTAssertEqual(chainedProbe?.maximumFramesPerSecond, 1)
+        XCTAssertEqual(chainedProbe?.scaleResolutionDownBy, 12)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(
+            policy.applicationLimitedProbeOriginTier,
+            .audioPriority
+        )
+        XCTAssertEqual(
+            policy.applicationLimitedProbeBestQualifiedTier,
+            .emergency
+        )
+        XCTAssertEqual(
+            policy.applicationLimitedProbeHealthySampleCount,
+            1
+        )
+    }
+
+    func testLowFPSHealthyQueueEvidenceCannotCrossCadenceReset() {
+        var policy = makePolicy()
+        move(&policy, to: .audioPriority, roundTripTime: 0.020)
+        let startedAt = ContinuousClock.now
+
+        _ = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 300_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 100,
+            outboundVideoTotalPacketSendDelaySeconds: 0.1,
+            observedAt: startedAt
+        )
+        _ = policy.update(
+            peerGeneration: 1,
+            isCaptureActive: true,
+            availableOutgoingBitrateBps: 300_000,
+            currentRoundTripTimeSeconds: 0.020,
+            outboundVideoPacketsSent: 140,
+            outboundVideoTotalPacketSendDelaySeconds: 0.104,
+            observedAt: startedAt.advanced(by: .milliseconds(500))
+        )
+        XCTAssertEqual(policy.applicationLimitedUpgradeSampleCount, 0)
+        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
+
+        policy.resetIncompleteEvidenceWindow()
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 140,
+                outboundVideoTotalPacketSendDelaySeconds: 0.104,
+                observedAt: startedAt.advanced(by: .milliseconds(1_000))
+            )
+        )
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(policy.applicationLimitedUpgradeSampleCount, 0)
+    }
+
+    func testPersistentBandwidthOnlyPressureDowngradesAfterTwoHealthyLatencySamples() {
         var policy = makePolicy()
         move(&policy, to: .full)
 
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_000_000,
+                currentRoundTripTimeSeconds: 0.050
+            )
+        )
+        XCTAssertEqual(policy.currentTier, .full)
         let critical = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
@@ -671,6 +1501,15 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         XCTAssertEqual(critical?.tier, .critical)
         XCTAssertEqual(policy.currentTier, .critical)
 
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 600_000,
+                currentRoundTripTimeSeconds: 0.050
+            )
+        )
+        XCTAssertEqual(policy.currentTier, .critical)
         let emergency = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
@@ -680,6 +1519,15 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         XCTAssertEqual(emergency?.tier, .emergency)
         XCTAssertEqual(policy.currentTier, .emergency)
 
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 300_000,
+                currentRoundTripTimeSeconds: 0.050
+            )
+        )
+        XCTAssertEqual(policy.currentTier, .emergency)
         let audioPriority = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
@@ -688,6 +1536,31 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
         XCTAssertEqual(audioPriority?.tier, .audioPriority)
         XCTAssertEqual(policy.currentTier, .audioPriority)
+    }
+
+    func testBandwidthOnlyDowngradeDebounceResetsAfterOneHealthySample() {
+        var policy = makePolicy()
+        move(&policy, to: .full)
+
+        func lowCapacityUpdate()
+            -> WorldwideScreenVideoEncodingRecommendation? {
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 2_000_000,
+                currentRoundTripTimeSeconds: 0.050
+            )
+        }
+
+        XCTAssertNil(lowCapacityUpdate())
+        XCTAssertEqual(policy.bandwidthOnlyDowngradeSampleCount, 1)
+        XCTAssertNil(healthyUpdate(&policy))
+        XCTAssertEqual(policy.currentTier, .full)
+        XCTAssertEqual(policy.bandwidthOnlyDowngradeSampleCount, 0)
+
+        XCTAssertNil(lowCapacityUpdate())
+        XCTAssertEqual(policy.currentTier, .full)
+        XCTAssertEqual(lowCapacityUpdate()?.tier, .critical)
     }
 
     func testHigherTierProbeCollapseBelowReserveLatchesAndKeepsVisibleFloor() {
@@ -699,18 +1572,18 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         _ = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
-            availableOutgoingBitrateBps: 400_000,
+            availableOutgoingBitrateBps: 853_000,
             currentRoundTripTimeSeconds: 0.050,
             outboundVideoPacketsSent: packetsSent,
             outboundVideoTotalPacketSendDelaySeconds: totalPacketSendDelay
         )
-        for _ in 0..<8 where policy.applicationLimitedProbeOriginTier == nil {
+        for _ in 0..<32 where policy.applicationLimitedProbeOriginTier == nil {
             packetsSent += 40
             totalPacketSendDelay += 0.004
             _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 400_000,
+                availableOutgoingBitrateBps: 853_000,
                 currentRoundTripTimeSeconds: 0.050,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
@@ -718,7 +1591,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             )
         }
         XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .emergency)
-        XCTAssertEqual(policy.currentTier, .survival)
+        XCTAssertEqual(policy.currentTier, .emergency)
 
         packetsSent += 40
         totalPacketSendDelay += 0.004
@@ -734,6 +1607,8 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             )?.tier,
             .audioPriority
         )
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertNil(policy.applicationLimitedProbeOriginTier)
         XCTAssertTrue(policy.belowReserveProbeDisprovedSenderLimitation)
         XCTAssertTrue(policy.lastSampleHasPositiveSuspensionPressure)
         XCTAssertNil(
@@ -759,14 +1634,19 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         }
     }
 
-    func testEightHealthySamplesRecoverDirectlyToSustainableTier() {
+    func testFourHealthySamplesRecoverDirectlyToSustainableTier() {
         var policy = makePolicy()
         move(&policy, to: .constrained)
 
-        for _ in 0..<7 {
+        for _ in 1..<WorldwideScreenVideoAdaptationPolicy
+            .requiredHealthyUpgradeSampleCount {
             XCTAssertNil(healthyUpdate(&policy))
         }
-        XCTAssertEqual(policy.healthyUpgradeSampleCount, 7)
+        XCTAssertEqual(
+            policy.healthyUpgradeSampleCount,
+            WorldwideScreenVideoAdaptationPolicy
+                .requiredHealthyUpgradeSampleCount - 1
+        )
         XCTAssertEqual(healthyUpdate(&policy)?.tier, .full)
         XCTAssertEqual(policy.currentTier, .full)
     }
@@ -1047,11 +1927,132 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         XCTAssertTrue(policy.bandwidthEstimateIsUnavailable)
     }
 
+    func testAlternatingMissingBandwidthPressureCannotPingPongUpward() {
+        var policy = makePolicy()
+        move(&policy, to: .balanced)
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.1
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: nil,
+                currentRoundTripTimeSeconds: 0.050,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay
+            )
+        )
+
+        for expectedPressureTier in [
+            WorldwideScreenVideoAdaptationTier.constrained,
+            .critical,
+            .survival,
+        ] {
+            let tierBeforeHealthySample = policy.currentTier
+            packetsSent += 100
+            totalPacketSendDelay += 0.1
+            XCTAssertNil(
+                policy.update(
+                    peerGeneration: 1,
+                    isCaptureActive: true,
+                    availableOutgoingBitrateBps: nil,
+                    currentRoundTripTimeSeconds: 0.050,
+                    outboundVideoPacketsSent: packetsSent,
+                    outboundVideoTotalPacketSendDelaySeconds:
+                        totalPacketSendDelay
+                )
+            )
+            XCTAssertEqual(policy.currentTier, tierBeforeHealthySample)
+
+            packetsSent += 100
+            totalPacketSendDelay += 20
+            XCTAssertEqual(
+                policy.update(
+                    peerGeneration: 1,
+                    isCaptureActive: true,
+                    availableOutgoingBitrateBps: nil,
+                    currentRoundTripTimeSeconds: 0.200,
+                    outboundVideoPacketsSent: packetsSent,
+                    outboundVideoTotalPacketSendDelaySeconds:
+                        totalPacketSendDelay
+                )?.tier,
+                expectedPressureTier
+            )
+        }
+    }
+
+    func testColdMissingBandwidthFirstReactionIsFastAndEveryTierNeedsFreshEvidence() {
+        var policy = makePolicy()
+        move(&policy, to: .audioPriority)
+        policy.invalidateSelectedRoute()
+        var tierTransitions: [WorldwideScreenVideoAdaptationTier] = []
+        var transitionSamples: [Int] = []
+        let sampleLimit = WorldwideScreenVideoAdaptationPolicy
+            .roundTripTimeBootstrapSampleCount - 1
+            + (WorldwideScreenVideoAdaptationTier.allCases.count - 1)
+                * WorldwideScreenVideoAdaptationPolicy
+                    .requiredUnavailableBandwidthUpgradeSampleCount
+
+        for sample in 1...sampleLimit {
+            let recommendation = policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: nil,
+                currentRoundTripTimeSeconds: 0.050,
+                outboundVideoPacketsSent: UInt64(sample * 10),
+                outboundVideoTotalPacketSendDelaySeconds:
+                    Double(sample) * 0.050
+            )
+            if let recommendation {
+                tierTransitions.append(recommendation.tier)
+                transitionSamples.append(sample)
+            }
+        }
+
+        XCTAssertEqual(
+            tierTransitions,
+            [
+                .emergency,
+                .survival,
+                .critical,
+                .constrained,
+                .balanced,
+                .high,
+                .full,
+            ]
+        )
+        XCTAssertEqual(policy.currentTier, .full)
+        XCTAssertEqual(
+            transitionSamples.first,
+            WorldwideScreenVideoAdaptationPolicy
+                .roundTripTimeBootstrapSampleCount - 1
+                + WorldwideScreenVideoAdaptationPolicy
+                    .requiredUnavailableBandwidthUpgradeSampleCount
+        )
+        XCTAssertLessThan(
+            (transitionSamples.first ?? Int.max)
+                * WorldwideScreenVideoAdaptationPolicy
+                    .sampleIntervalMilliseconds,
+            5_000
+        )
+        XCTAssertTrue(
+            zip(transitionSamples, transitionSamples.dropFirst())
+                .allSatisfy { earlier, later in
+                    later - earlier
+                        == WorldwideScreenVideoAdaptationPolicy
+                            .requiredUnavailableBandwidthUpgradeSampleCount
+                }
+        )
+    }
+
     func testPositiveBandwidthCanRecoverWhenRTTIsMissingButSendQueueIsHealthy() {
         var policy = makePolicy()
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
+        let requiredSamples = WorldwideScreenVideoAdaptationPolicy
+            .requiredHealthyUpgradeSampleCount
 
-        for sample in 1...8 {
+        for sample in 1...requiredSamples {
             let recommendation = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
@@ -1071,8 +2072,9 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 isCaptureActive: true,
                 availableOutgoingBitrateBps: 12_000_000,
                 currentRoundTripTimeSeconds: nil,
-                outboundVideoPacketsSent: 90,
-                outboundVideoTotalPacketSendDelaySeconds: 0.450
+                outboundVideoPacketsSent: UInt64((requiredSamples + 1) * 10),
+                outboundVideoTotalPacketSendDelaySeconds:
+                    Double(requiredSamples + 1) * 0.050
             )?.tier,
             .full
         )
@@ -1083,20 +2085,26 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         var policy = makePolicy()
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
 
-        for sample in 1...5 {
-            XCTAssertNil(
-                policy.update(
-                    peerGeneration: 1,
-                    isCaptureActive: true,
-                    availableOutgoingBitrateBps: nil,
-                    currentRoundTripTimeSeconds: 0.050,
-                    outboundVideoPacketsSent: UInt64(sample * 10),
-                    outboundVideoTotalPacketSendDelaySeconds:
-                        Double(sample) * 0.050
-                )
+        var missingBandwidthRecommendation:
+            WorldwideScreenVideoEncodingRecommendation?
+        let samplesBeforeFirstMissingBandwidthUpgrade =
+            WorldwideScreenVideoAdaptationPolicy
+                .roundTripTimeBootstrapSampleCount - 1
+                + WorldwideScreenVideoAdaptationPolicy
+                    .requiredUnavailableBandwidthUpgradeSampleCount
+        for sample in 1...samplesBeforeFirstMissingBandwidthUpgrade {
+            missingBandwidthRecommendation = policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: nil,
+                currentRoundTripTimeSeconds: 0.050,
+                outboundVideoPacketsSent: UInt64(sample * 10),
+                outboundVideoTotalPacketSendDelaySeconds:
+                    Double(sample) * 0.050
             )
         }
-        XCTAssertEqual(policy.healthyUpgradeSampleCount, 3)
+        XCTAssertEqual(missingBandwidthRecommendation?.tier, .critical)
+        XCTAssertEqual(policy.currentTier, .critical)
 
         for _ in 0..<(
             WorldwideScreenVideoAdaptationPolicy.requiredHealthyUpgradeSampleCount
@@ -1104,7 +2112,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         ) {
             XCTAssertNil(healthyUpdate(&policy))
         }
-        XCTAssertEqual(policy.currentTier, .survival)
+        XCTAssertEqual(policy.currentTier, .critical)
         XCTAssertEqual(healthyUpdate(&policy)?.tier, .full)
     }
 
@@ -1112,7 +2120,12 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         var policy = makePolicy()
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
 
-        for _ in 0..<9 {
+        let positiveSamplesBeforeUpgrade =
+            WorldwideScreenVideoAdaptationPolicy
+                .roundTripTimeBootstrapSampleCount
+                + WorldwideScreenVideoAdaptationPolicy
+                .requiredHealthyUpgradeSampleCount - 2
+        for _ in 0..<positiveSamplesBeforeUpgrade {
             XCTAssertNil(healthyUpdate(&policy))
         }
         XCTAssertEqual(
@@ -1121,7 +2134,10 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 - 1
         )
 
-        for sample in 1...4 {
+        let unavailableSamplesBeforeUpgrade =
+            WorldwideScreenVideoAdaptationPolicy
+                .requiredUnavailableBandwidthUpgradeSampleCount
+        for sample in 1...unavailableSamplesBeforeUpgrade {
             XCTAssertNil(
                 policy.update(
                     peerGeneration: 1,
@@ -1141,7 +2157,8 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 isCaptureActive: true,
                 availableOutgoingBitrateBps: nil,
                 currentRoundTripTimeSeconds: 0.050,
-                outboundVideoPacketsSent: 50,
+                outboundVideoPacketsSent:
+                    UInt64((unavailableSamplesBeforeUpgrade + 1) * 10),
                 outboundVideoTotalPacketSendDelaySeconds: 0.250
             )?.tier,
             .critical
@@ -1191,19 +2208,29 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             baseFramesPerSecond: 60
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
-        let senderLimitedEstimate = Double(
-            policy.currentRecommendation.maximumBitrateBps
-        ) * 0.90
-        var packetsSent: UInt64 = 0
-        var totalPacketSendDelay = 0.0
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.1
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020,
+                selectedRoute: direct,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay
+            )?.tier,
+            .audioPriority
+        )
 
-        for _ in 0..<96 where policy.applicationLimitedProbeOriginTier == nil {
-            packetsSent += 100
-            totalPacketSendDelay += 0.5
+        for _ in 0..<16 where policy.applicationLimitedProbeOriginTier == nil {
+            packetsSent += 40
+            totalPacketSendDelay += 0.004
             _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: senderLimitedEstimate,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.020,
                 selectedRoute: direct,
                 outboundVideoPacketsSent: packetsSent,
@@ -1212,16 +2239,16 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             )
         }
         XCTAssertNotNil(policy.applicationLimitedProbeOriginTier)
-        XCTAssertEqual(policy.currentTier, .critical)
-        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .survival)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
 
-        packetsSent += 100
-        totalPacketSendDelay += 0.5
+        packetsSent += 40
+        totalPacketSendDelay += 0.004
         XCTAssertNil(
             policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: senderLimitedEstimate,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.020,
                 selectedRoute: relayed,
                 outboundVideoPacketsSent: packetsSent,
@@ -1229,7 +2256,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     totalPacketSendDelay
             )
         )
-        XCTAssertEqual(policy.currentTier, .survival)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
         XCTAssertNil(policy.applicationLimitedProbeOriginTier)
         XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 0)
         XCTAssertEqual(policy.applicationLimitedProbeCooldownSamplesRemaining, 0)
@@ -1268,6 +2295,57 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         XCTAssertEqual(policy.currentTier, .constrained)
         XCTAssertEqual(policy.roundTripTimeBaselineSeconds, 0.200)
         XCTAssertEqual(policy.healthyUpgradeSampleCount, 1)
+    }
+
+    func testCadenceChangeDiscardsIncompleteEvidenceButKeepsRouteBaseline() {
+        var policy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(policy.bind(toPeerGeneration: 1))
+
+        for sample in 1...3 {
+            XCTAssertNil(
+                policy.update(
+                    peerGeneration: 1,
+                    isCaptureActive: true,
+                    availableOutgoingBitrateBps: 47_500_000,
+                    currentRoundTripTimeSeconds: 0.020,
+                    outboundVideoPacketsSent: UInt64(sample * 100),
+                    outboundVideoTotalPacketSendDelaySeconds:
+                        Double(sample) * 0.5
+                )
+            )
+        }
+        XCTAssertEqual(policy.healthyUpgradeSampleCount, 1)
+        XCTAssertEqual(policy.roundTripTimeBaselineSeconds, 0.020)
+
+        policy.resetIncompleteEvidenceWindow()
+        XCTAssertEqual(policy.healthyUpgradeSampleCount, 0)
+        XCTAssertEqual(policy.roundTripTimeBaselineSeconds, 0.020)
+
+        XCTAssertNil(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 47_500_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 400,
+                outboundVideoTotalPacketSendDelaySeconds: 2
+            )
+        )
+        XCTAssertEqual(policy.currentTier, .survival)
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 47_500_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 500,
+                outboundVideoTotalPacketSendDelaySeconds: 2.5
+            )?.tier,
+            .full
+        )
     }
 
     func testLowRoundTripTimeOutlierCannotBlockRecoveryForever() {
@@ -1428,25 +2506,27 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         _ = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
-            availableOutgoingBitrateBps: 28_000,
+            availableOutgoingBitrateBps: 400_000,
             currentRoundTripTimeSeconds: 0.029,
             outboundVideoPacketsSent: packetsSent,
             outboundVideoTotalPacketSendDelaySeconds: totalPacketSendDelay
         )
 
-        var openedProbe = false
+        var openedProbe = policy.applicationLimitedProbeOriginTier
+            == .audioPriority
         for _ in 0..<WorldwideScreenVideoAdaptationPolicy
-            .requiredApplicationLimitedUpgradeSampleCount {
+            .requiredApplicationLimitedUpgradeSampleCount where !openedProbe {
             packetsSent += 40
-            let update = policy.update(
+            _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 28_000,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds: totalPacketSendDelay
             )
-            openedProbe = openedProbe || update?.tier == .emergency
+            openedProbe = openedProbe
+                || policy.applicationLimitedProbeOriginTier == .audioPriority
             XCTAssertNil(
                 policy.automaticSuspensionDecision(
                     isCaptureActive: true,
@@ -1460,7 +2540,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         _ = policy.update(
             peerGeneration: 1,
             isCaptureActive: true,
-            availableOutgoingBitrateBps: 28_000,
+            availableOutgoingBitrateBps: 400_000,
             currentRoundTripTimeSeconds: 0.130,
             outboundVideoPacketsSent: packetsSent,
             outboundVideoTotalPacketSendDelaySeconds: totalPacketSendDelay
@@ -1478,7 +2558,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 28_000,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds: totalPacketSendDelay
@@ -1494,7 +2574,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         }
 
         XCTAssertEqual(policy.currentTier, .audioPriority)
-        XCTAssertEqual(policy.currentRecommendation.maximumBitrateBps, 32_000)
+        XCTAssertGreaterThan(policy.currentRecommendation.maximumBitrateBps, 0)
         XCTAssertEqual(policy.currentRecommendation.maximumFramesPerSecond, 1)
         XCTAssertEqual(policy.currentRecommendation.scaleResolutionDownBy, 12)
         XCTAssertEqual(policy.automaticSuspensionPressureSampleCount, 0)
@@ -1546,28 +2626,33 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         )
         XCTAssertTrue(policy.bind(toPeerGeneration: 1))
 
-        XCTAssertEqual(
-            policy.update(
+        var packetsSent: UInt64 = 0
+        var totalPacketSendDelay = 0.0
+        var floorRecommendation: WorldwideScreenVideoEncodingRecommendation?
+        for _ in 0..<3 where policy.currentTier != .audioPriority {
+            packetsSent += 100
+            totalPacketSendDelay += 0.1
+            floorRecommendation = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
                 availableOutgoingBitrateBps: 50_000,
                 currentRoundTripTimeSeconds: 0.029,
-                outboundVideoPacketsSent: 100,
-                outboundVideoTotalPacketSendDelaySeconds: 0.1
-            )?.tier,
-            .audioPriority
-        )
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay
+            ) ?? floorRecommendation
+        }
+        XCTAssertEqual(floorRecommendation?.tier, .audioPriority)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
 
         var probeRecommendation: WorldwideScreenVideoEncodingRecommendation?
-        var packetsSent: UInt64 = 100
-        var totalPacketSendDelay = 0.1
-        for _ in 1...8 {
+        for _ in 0..<32 {
             packetsSent += 40
             totalPacketSendDelay += 0.004
             let update = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 251_000,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
@@ -1581,28 +2666,39 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     isAutomaticallySuspended: false
                 )
             )
-            if update?.tier == .emergency {
+            if policy.applicationLimitedProbeOriginTier == .audioPriority {
                 probeRecommendation = update
                 break
             }
         }
 
-        XCTAssertEqual(probeRecommendation?.tier, .emergency)
-        XCTAssertEqual(policy.currentTier, .emergency)
+        XCTAssertEqual(probeRecommendation?.tier, .audioPriority)
+        XCTAssertEqual(
+            probeRecommendation?.maximumBitrateBps,
+            policy.maximumTierVideoBitrateBps
+        )
+        XCTAssertEqual(probeRecommendation?.maximumFramesPerSecond, 1)
+        XCTAssertEqual(probeRecommendation?.scaleResolutionDownBy, 12)
+        XCTAssertEqual(policy.currentTier, .audioPriority)
+        XCTAssertEqual(policy.applicationLimitedProbeOriginTier, .audioPriority)
 
-        packetsSent += 40
-        totalPacketSendDelay += 0.004
-        XCTAssertNil(
-            policy.update(
+        var fullRecommendation:
+            WorldwideScreenVideoEncodingRecommendation?
+        for _ in 0..<8 where policy.currentTier != .full {
+            packetsSent += 40
+            totalPacketSendDelay += 0.004
+            fullRecommendation = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 517_000,
+                availableOutgoingBitrateBps: 50_000_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
                     totalPacketSendDelay
-            )
-        )
+            ) ?? fullRecommendation
+        }
+        XCTAssertEqual(fullRecommendation?.tier, .full)
+        XCTAssertEqual(policy.currentTier, .full)
         XCTAssertNil(policy.applicationLimitedProbeOriginTier)
         XCTAssertEqual(policy.applicationLimitedProbeFailureCount, 0)
         XCTAssertFalse(
@@ -1643,13 +2739,13 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
 
         var packetsSent: UInt64 = 100
         var totalPacketSendDelay = 0.1
-        for _ in 0..<8 where policy.applicationLimitedProbeOriginTier == nil {
+        for _ in 0..<32 where policy.applicationLimitedProbeOriginTier == nil {
             packetsSent += 40
             totalPacketSendDelay += 0.004
             _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 251_000,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
@@ -1717,20 +2813,24 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             )
         )
 
-        fixture.packetsSent += 40
-        fixture.totalPacketSendDelay += 0.004
-        XCTAssertNil(
-            policy.update(
+        var fullRecommendation:
+            WorldwideScreenVideoEncodingRecommendation?
+        for _ in 0..<8 where policy.currentTier != .full {
+            fixture.packetsSent += 40
+            fixture.totalPacketSendDelay += 0.004
+            fullRecommendation = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 517_000,
+                availableOutgoingBitrateBps: 50_000_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: fixture.packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
                     fixture.totalPacketSendDelay
-            )
-        )
+            ) ?? fullRecommendation
+        }
+        XCTAssertEqual(fullRecommendation?.tier, .full)
         policy.automaticResumeAttemptSucceeded()
+        XCTAssertEqual(policy.currentTier, .full)
         XCTAssertNil(policy.applicationLimitedProbeOriginTier)
         XCTAssertFalse(policy.belowReserveProbeDisprovedSenderLimitation)
         XCTAssertNil(
@@ -1799,8 +2899,9 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         reachStableAutomaticResumeDecision(&policy)
         policy.automaticResumeAttemptBegan()
 
-        for sample in 1...WorldwideScreenVideoAdaptationPolicy
-            .requiredUnavailableBandwidthUpgradeSampleCount {
+        let recoveryReportCount = WorldwideScreenVideoAdaptationPolicy
+            .requiredUnavailableBandwidthUpgradeSampleCount + 1
+        for sample in 1...recoveryReportCount {
             fixture.packetsSent += 40
             fixture.totalPacketSendDelay += 0.004
             let update = policy.update(
@@ -1818,8 +2919,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     isAutomaticallySuspended: false
                 )
             )
-            if sample < WorldwideScreenVideoAdaptationPolicy
-                .requiredUnavailableBandwidthUpgradeSampleCount {
+            if sample < recoveryReportCount {
                 XCTAssertNil(update)
                 XCTAssertEqual(policy.currentTier, .audioPriority)
             } else {
@@ -1918,7 +3018,11 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         move(&policy, to: .audioPriority)
         policy.invalidateSelectedRoute()
 
-        for sample in 1...10 {
+        let requiredSamples = WorldwideScreenVideoAdaptationPolicy
+            .roundTripTimeBootstrapSampleCount - 1
+            + WorldwideScreenVideoAdaptationPolicy
+            .requiredSuspendedHealthyUpgradeSampleCount
+        for sample in 1...requiredSamples {
             _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: false,
@@ -1931,7 +3035,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                     isCaptureActive: false,
                     isAutomaticallySuspended: true
                 ),
-                sample == 10 ? .resume : nil
+                sample == requiredSamples ? .resume : nil
             )
         }
 
@@ -2117,13 +3221,13 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         var packetsSent: UInt64 = 100
         var totalPacketSendDelay = 0.1
         var issuedProbe = false
-        for _ in 0..<8 {
+        for _ in 0..<32 {
             packetsSent += 40
             totalPacketSendDelay += 0.004
-            let update = policy.update(
+            _ = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 251_000,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
@@ -2137,7 +3241,7 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 file: file,
                 line: line
             )
-            if update?.tier == .emergency {
+            if policy.applicationLimitedProbeOriginTier == .audioPriority {
                 issuedProbe = true
                 break
             }
@@ -2208,13 +3312,13 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) -> Bool {
-        for _ in 0..<8 {
+        for _ in 0..<32 {
             packetsSent += 40
             totalPacketSendDelay += 0.004
             let update = policy.update(
                 peerGeneration: 1,
                 isCaptureActive: true,
-                availableOutgoingBitrateBps: 251_000,
+                availableOutgoingBitrateBps: 400_000,
                 currentRoundTripTimeSeconds: 0.029,
                 outboundVideoPacketsSent: packetsSent,
                 outboundVideoTotalPacketSendDelaySeconds:
@@ -2228,7 +3332,14 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
                 file: file,
                 line: line
             )
-            if update?.tier == .emergency {
+            if policy.applicationLimitedProbeOriginTier == .audioPriority {
+                XCTAssertEqual(update?.tier, .audioPriority, file: file, line: line)
+                XCTAssertEqual(
+                    update?.maximumBitrateBps,
+                    policy.maximumTierVideoBitrateBps,
+                    file: file,
+                    line: line
+                )
                 return true
             }
         }
@@ -2240,6 +3351,110 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
             configuredTotalRTPBitrateBps: 12_000_000,
             baseFramesPerSecond: 60
         )
+    }
+
+    private func makeFiftyMegabitPolicyAtFull(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> WorldwideScreenVideoAdaptationPolicy {
+        var policy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(
+            policy.bind(toPeerGeneration: 1),
+            file: file,
+            line: line
+        )
+        for _ in 0..<8 where policy.currentTier != .full {
+            _ = policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 50_000_000,
+                currentRoundTripTimeSeconds: 0.020
+            )
+        }
+        XCTAssertEqual(policy.currentTier, .full, file: file, line: line)
+        return policy
+    }
+
+    private func makeLiveCeilingProbeFromAudioPriority(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> (
+        policy: WorldwideScreenVideoAdaptationPolicy,
+        packetsSent: UInt64,
+        totalPacketSendDelay: Double
+    ) {
+        var policy = WorldwideScreenVideoAdaptationPolicy(
+            configuredTotalRTPBitrateBps: 50_000_000,
+            baseFramesPerSecond: 60
+        )
+        XCTAssertTrue(
+            policy.bind(toPeerGeneration: 1),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 100_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: 100,
+                outboundVideoTotalPacketSendDelaySeconds: 0.1
+            )?.tier,
+            .audioPriority,
+            file: file,
+            line: line
+        )
+        var packetsSent: UInt64 = 100
+        var totalPacketSendDelay = 0.1
+        for _ in 0..<16 where policy.applicationLimitedProbeOriginTier == nil {
+            packetsSent += 40
+            totalPacketSendDelay += 0.004
+            _ = policy.update(
+                peerGeneration: 1,
+                isCaptureActive: true,
+                availableOutgoingBitrateBps: 400_000,
+                currentRoundTripTimeSeconds: 0.020,
+                outboundVideoPacketsSent: packetsSent,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    totalPacketSendDelay
+            )
+        }
+        XCTAssertEqual(policy.currentTier, .audioPriority, file: file, line: line)
+        XCTAssertEqual(
+            policy.applicationLimitedProbeOriginTier,
+            .audioPriority,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumBitrateBps,
+            policy.maximumTierVideoBitrateBps,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumTotalRTPBitrateBps,
+            800_000,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            policy.currentRecommendation.maximumFramesPerSecond,
+            1,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            policy.currentRecommendation.scaleResolutionDownBy,
+            12,
+            file: file,
+            line: line
+        )
+        return (policy, packetsSent, totalPacketSendDelay)
     }
 
     private func move(
@@ -2308,12 +3523,14 @@ final class WorldwideScreenVideoAdaptationPolicyTests: XCTestCase {
     private func recommendation(
         _ tier: WorldwideScreenVideoAdaptationTier,
         bitrate: Int,
+        totalBitrate: Int,
         fps: Int,
         scale: Double
     ) -> WorldwideScreenVideoEncodingRecommendation {
         WorldwideScreenVideoEncodingRecommendation(
             tier: tier,
             maximumBitrateBps: bitrate,
+            maximumTotalRTPBitrateBps: totalBitrate,
             maximumFramesPerSecond: fps,
             scaleResolutionDownBy: scale
         )

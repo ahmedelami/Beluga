@@ -341,6 +341,100 @@ final class ScreenVideoFrameGeometryTests: XCTestCase {
         )
     }
 
+    func testWindowRectRoundTripsThroughLetterboxRetinaAndNegativeDisplayOrigin() throws {
+        let geometry = try XCTUnwrap(
+            ScreenVideoFrameGeometry(
+                surfaceWidth: 2_560,
+                surfaceHeight: 1_600,
+                contentRect: CGRect(x: 80, y: 50, width: 1_120, height: 750),
+                contentScale: 1,
+                scaleFactor: 2
+            )
+        )
+        let display = CGRect(x: -1_440, y: -900, width: 1_120, height: 750)
+        let window = CGRect(x: -1_240, y: -750, width: 600, height: 420)
+
+        let normalized = try XCTUnwrap(
+            geometry.frameNormalizedRect(forGlobalRect: window, in: display)
+        )
+        XCTAssertGreaterThan(normalized.minX, 0)
+        XCTAssertGreaterThan(normalized.minY, 0)
+        XCTAssertLessThan(normalized.maxX, 1)
+        XCTAssertLessThan(normalized.maxY, 1)
+        let roundTrip = try XCTUnwrap(
+            geometry.globalRect(forFrameNormalizedRect: normalized, in: display)
+        )
+        XCTAssertEqual(roundTrip.minX, window.minX, accuracy: 0.000_1)
+        XCTAssertEqual(roundTrip.minY, window.minY, accuracy: 0.000_1)
+        XCTAssertEqual(roundTrip.width, window.width, accuracy: 0.000_1)
+        XCTAssertEqual(roundTrip.height, window.height, accuracy: 0.000_1)
+    }
+
+    func testWindowRectInverseRejectsLetterboxAndOffDisplayRectangles() throws {
+        let geometry = try XCTUnwrap(
+            ScreenVideoFrameGeometry(
+                surfaceWidth: 1_920,
+                surfaceHeight: 1_200,
+                contentRect: CGRect(x: 0, y: 100, width: 1_920, height: 1_000),
+                contentScale: 1,
+                scaleFactor: 1
+            )
+        )
+        let display = CGRect(x: 400, y: -200, width: 1_920, height: 1_000)
+
+        XCTAssertNil(
+            geometry.globalRect(
+                forFrameNormalizedRect: CGRect(x: 0.2, y: 0.01, width: 0.3, height: 0.1),
+                in: display
+            )
+        )
+        XCTAssertNil(
+            geometry.frameNormalizedRect(
+                forGlobalRect: CGRect(x: 300, y: 0, width: 500, height: 400),
+                in: display
+            )
+        )
+
+        let offscreen = CGRect(x: 300, y: 0, width: 500, height: 400)
+        XCTAssertNil(
+            geometry.frameUnclippedNormalizedRect(forGlobalRect: offscreen, in: display)
+        )
+        XCTAssertNil(
+            geometry.frameNormalizedVisibleIntersection(forGlobalRect: offscreen, in: display)
+        )
+    }
+
+    func testOffscreenMoveFramesUseEncodedSurfaceAndAllowHalfPixelRounding() throws {
+        let geometry = try XCTUnwrap(
+            ScreenVideoFrameGeometry(
+                surfaceWidth: 100,
+                surfaceHeight: 100,
+                contentRect: CGRect(x: 0.5, y: 0.5, width: 99, height: 99),
+                contentScale: 1,
+                scaleFactor: 1
+            )
+        )
+        XCTAssertFalse(geometry.requiresCaptureFormatRenegotiation)
+        let display = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let offscreen = CGRect(x: -10, y: 20, width: 30, height: 40)
+
+        let full = try XCTUnwrap(
+            geometry.frameUnclippedNormalizedRect(forGlobalRect: offscreen, in: display)
+        )
+        let visible = try XCTUnwrap(
+            geometry.frameNormalizedVisibleIntersection(forGlobalRect: offscreen, in: display)
+        )
+
+        XCTAssertEqual(full.minX, -0.094, accuracy: 0.000_001)
+        XCTAssertEqual(full.minY, 0.203, accuracy: 0.000_001)
+        XCTAssertEqual(full.width, 0.297, accuracy: 0.000_001)
+        XCTAssertEqual(full.height, 0.396, accuracy: 0.000_001)
+        XCTAssertEqual(visible.minX, 0.005, accuracy: 0.000_001)
+        XCTAssertEqual(visible.minY, 0.203, accuracy: 0.000_001)
+        XCTAssertEqual(visible.width, 0.198, accuracy: 0.000_001)
+        XCTAssertEqual(visible.height, 0.396, accuracy: 0.000_001)
+    }
+
     func testMalformedOrOutOfSurfaceGeometryFailsClosed() {
         let invalidContentRects = [
             CGRect(x: -1, y: 0, width: 100, height: 100),

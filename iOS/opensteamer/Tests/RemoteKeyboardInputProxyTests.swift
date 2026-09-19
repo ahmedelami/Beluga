@@ -5,22 +5,22 @@ import XCTest
 
 /// Exercises the UIKit responder bridge without involving SwiftUI presentation timing.
 /// The security-critical oracles are generation-bound callbacks, no mirrored remote text, secure
-/// focus remaining closed, and exactly one Return action for software or hardware keyboards.
+/// entry traits, and exactly one Return action for software or hardware keyboards.
 final class RemoteKeyboardInputProxyTests: XCTestCase {
     @MainActor
-    func testSecureHostFocusIsNotEligibleForRemoteKeyboard() {
-        XCTAssertNil(
-            WorldwideSessionViewModel.remoteKeyboardGeneration(
-                for: .editable(generation: 8, secure: true)
-            )
+    func testSecureHostFocusRetainsRemoteKeyboardGeneration() {
+        let secureFocus = WorldwideSessionViewModel.remoteKeyboardFocus(
+            for: .editable(generation: 8, secure: true)
         )
-        XCTAssertEqual(
-            WorldwideSessionViewModel.remoteKeyboardGeneration(
-                for: .editable(generation: 9, secure: false)
-            ),
-            9
+        XCTAssertEqual(secureFocus?.generation, 8)
+        XCTAssertEqual(secureFocus?.secure, true)
+
+        let ordinaryFocus = WorldwideSessionViewModel.remoteKeyboardFocus(
+            for: .editable(generation: 9, secure: false)
         )
-        XCTAssertNil(WorldwideSessionViewModel.remoteKeyboardGeneration(for: .none))
+        XCTAssertEqual(ordinaryFocus?.generation, 9)
+        XCTAssertEqual(ordinaryFocus?.secure, false)
+        XCTAssertNil(WorldwideSessionViewModel.remoteKeyboardFocus(for: .none))
     }
 
     func testPendingFeedbackMetadataDoesNotRetainCommittedText() {
@@ -273,14 +273,64 @@ final class RemoteKeyboardInputProxyTests: XCTestCase {
     }
 
     @MainActor
-    func testActualSwiftUIWrapperRejectsSecureHostFocus() async throws {
+    func testSwiftUIWrapperKeepsFirstResponderAcrossVideoFormatTransition() async throws {
+        let state = RemoteKeyboardFormatTransitionHarnessState(
+            renderedVideoSize: CGSize(width: 540, height: 1_170)
+        )
+        let hostingController = UIHostingController(
+            rootView: RemoteKeyboardFormatTransitionHarness(state: state)
+        )
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first
+        let previousKeyWindow = scene?.windows.first(where: \.isKeyWindow)
+        let window: UIWindow
+        if let scene {
+            window = UIWindow(windowScene: scene)
+            window.frame = scene.screen.bounds
+        } else {
+            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        }
+        defer {
+            window.isHidden = true
+            previousKeyWindow?.makeKey()
+        }
+
+        window.rootViewController = hostingController
+        window.makeKeyAndVisible()
+        hostingController.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+
+        let originalProxy = try XCTUnwrap(
+            firstSubview(of: RemoteKeyboardInputProxy.self, in: hostingController.view)
+        )
+        XCTAssertTrue(originalProxy.isFirstResponder)
+        XCTAssertTrue(originalProxy.inputAvailable)
+
+        state.renderedVideoSize = nil
+        try await Task.sleep(for: .milliseconds(100))
+        hostingController.view.layoutIfNeeded()
+
+        let transitioningProxy = try XCTUnwrap(
+            firstSubview(of: RemoteKeyboardInputProxy.self, in: hostingController.view)
+        )
+        XCTAssertTrue(originalProxy === transitioningProxy)
+        XCTAssertTrue(transitioningProxy.inputAvailable)
+        XCTAssertEqual(transitioningProxy.focusGeneration, 314)
+        XCTAssertTrue(transitioningProxy.isFirstResponder)
+    }
+
+    @MainActor
+    func testActualSwiftUIWrapperPresentsPrivacyPreservingSecureKeyboard() async throws {
+        var inserted: [(String, UInt64)] = []
+        var deleted: [UInt64] = []
         let rootView = AnyView(
             RemoteKeyboardInputView(
                 inputAvailable: true,
                 focusGeneration: 315,
                 isSecure: true,
-                onInsertText: { _, _ in },
-                onDeleteBackward: { _ in },
+                onInsertText: { inserted.append(($0, $1)) },
+                onDeleteBackward: { deleted.append($0) },
                 onReturn: { _ in }
             )
             .frame(width: 1, height: 1)
@@ -312,10 +362,18 @@ final class RemoteKeyboardInputProxyTests: XCTestCase {
         let proxy = try XCTUnwrap(
             firstSubview(of: RemoteKeyboardInputProxy.self, in: hostingController.view)
         )
-        XCTAssertFalse(proxy.inputAvailable)
-        XCTAssertNil(proxy.focusGeneration)
-        XCTAssertFalse(proxy.isFirstResponder)
-        XCTAssertFalse(proxy.isSecureTextEntry)
+        XCTAssertTrue(proxy.inputAvailable)
+        XCTAssertEqual(proxy.focusGeneration, 315)
+        XCTAssertTrue(proxy.isFirstResponder)
+        XCTAssertTrue(proxy.isSecureTextEntry)
+
+        proxy.insertText("credential")
+        proxy.deleteBackward()
+        XCTAssertEqual(inserted.map(\.0), ["credential"])
+        XCTAssertEqual(inserted.map(\.1), [315])
+        XCTAssertEqual(deleted, [315])
+        XCTAssertTrue(proxy.subviews.isEmpty)
+        XCTAssertNil(proxy.accessibilityValue)
     }
 
     // MARK: - UIKit responder fixtures
@@ -353,5 +411,39 @@ final class RemoteKeyboardInputProxyTests: XCTestCase {
             }
         }
         return nil
+    }
+}
+
+@MainActor
+private final class RemoteKeyboardFormatTransitionHarnessState: ObservableObject {
+    @Published var renderedVideoSize: CGSize?
+
+    init(renderedVideoSize: CGSize?) {
+        self.renderedVideoSize = renderedVideoSize
+    }
+}
+
+private struct RemoteKeyboardFormatTransitionHarness: View {
+    @ObservedObject var state: RemoteKeyboardFormatTransitionHarnessState
+
+    var body: some View {
+        let availability = WorldwideScreenViewerView.remoteInputPresentationAvailability(
+            remoteInputAvailable: true,
+            renderedVideoSize: state.renderedVideoSize,
+            allowsPresentation: true,
+            screenMediaIsCovered: false,
+            scenePhase: .active
+        )
+        return RemoteKeyboardInputView(
+            inputAvailable: availability.keyboard,
+            focusGeneration: 314,
+            isSecure: false,
+            onInsertText: { _, _ in },
+            onDeleteBackward: { _ in },
+            onReturn: { _ in }
+        )
+        .frame(width: 1, height: 1)
+        .opacity(0.01)
+        .allowsHitTesting(false)
     }
 }

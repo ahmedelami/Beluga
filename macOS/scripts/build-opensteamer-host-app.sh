@@ -21,6 +21,8 @@ readonly REQUIRE_FRESH_RELEASE="${OPENSTEAMER_REQUIRE_FRESH_RELEASE:-0}"
 readonly ALLOW_PREBUILT_FOR_TESTS="${OPENSTEAMER_ALLOW_PREBUILT_FOR_TESTS:-0}"
 readonly SCRATCH_PATH_INPUT="${OPENSTEAMER_HOST_SCRATCH_PATH:-}"
 readonly EXPECTED_ARCHITECTURES="${OPENSTEAMER_EXPECTED_ARCHITECTURES:-}"
+readonly MEDIA_AUTOMATION_ENTITLEMENTS="$ROOT_DIR/macOS/OpensteamerHost/MediaAutomation.entitlements"
+readonly MEDIA_NATIVE_MANIFEST="$ROOT_DIR/macOS/OpensteamerHost/org.example.opensteamer.media.json"
 
 fail() {
     print -u2 -- "build-opensteamer-host-app: $*"
@@ -137,12 +139,16 @@ else
     export OTHER_CFLAGS="${OTHER_CFLAGS:-} -Werror"
     export OTHER_CPLUSPLUSFLAGS="${OTHER_CPLUSPLUSFLAGS:-} -Werror"
     if [[ -n "$SCRATCH_PATH" ]]; then
-        /usr/bin/swift build --scratch-path "$SCRATCH_PATH" -c release \
+        /usr/bin/swift build --scratch-path "$SCRATCH_PATH" --jobs 2 -c release \
             -Xswiftc -warnings-as-errors -Xcc -Werror --product CaptureServer
+        /usr/bin/swift build --scratch-path "$SCRATCH_PATH" --jobs 2 -c release \
+            -Xswiftc -warnings-as-errors -Xcc -Werror --product OpensteamerMediaBridge
         BIN_DIR="$(/usr/bin/swift build --scratch-path "$SCRATCH_PATH" -c release --show-bin-path)"
     else
-        /usr/bin/swift build -c release -Xswiftc -warnings-as-errors -Xcc -Werror \
+        /usr/bin/swift build --jobs 2 -c release -Xswiftc -warnings-as-errors -Xcc -Werror \
             --product CaptureServer
+        /usr/bin/swift build --jobs 2 -c release -Xswiftc -warnings-as-errors -Xcc -Werror \
+            --product OpensteamerMediaBridge
         BIN_DIR="$(/usr/bin/swift build -c release --show-bin-path)"
     fi
 fi
@@ -154,13 +160,18 @@ if [[ "$REQUIRE_FRESH_RELEASE" == 1 ]]; then
 fi
 readonly BIN_DIR
 readonly EXECUTABLE_SOURCE="$BIN_DIR/CaptureServer"
+readonly MEDIA_BRIDGE_SOURCE="$BIN_DIR/OpensteamerMediaBridge"
 readonly WEBRTC_FRAMEWORK_SOURCE="$BIN_DIR/LiveKitWebRTC.framework"
 readonly EXECUTABLE="$MACOS_DIR/CaptureServer"
+readonly MEDIA_BRIDGE="$MACOS_DIR/OpensteamerMediaBridge"
 readonly WEBRTC_FRAMEWORK="$FRAMEWORKS_DIR/LiveKitWebRTC.framework"
 readonly WEBRTC_EXECUTABLE="$WEBRTC_FRAMEWORK/LiveKitWebRTC"
 
 [[ -f "$EXECUTABLE_SOURCE" && ! -L "$EXECUTABLE_SOURCE" && -x "$EXECUTABLE_SOURCE" ]] || fail \
     "CaptureServer build product is not a safe executable"
+[[ -f "$MEDIA_BRIDGE_SOURCE" && ! -L "$MEDIA_BRIDGE_SOURCE" && -x "$MEDIA_BRIDGE_SOURCE" \
+    && "$(/usr/bin/stat -f '%l' "$MEDIA_BRIDGE_SOURCE")" == 1 ]] || fail \
+    "OpensteamerMediaBridge build product is not a safe executable"
 [[ -f "$PRIVATE_VIRTUAL_DISPLAY_IMPORT_VERIFIER" \
     && ! -L "$PRIVATE_VIRTUAL_DISPLAY_IMPORT_VERIFIER" \
     && -x "$PRIVATE_VIRTUAL_DISPLAY_IMPORT_VERIFIER" ]] \
@@ -170,6 +181,8 @@ run_private_virtual_display_import_verifier "$EXECUTABLE_SOURCE" \
 if [[ "$REQUIRE_FRESH_RELEASE" == 1 ]]; then
     [[ "$(/usr/bin/stat -f '%m' "$EXECUTABLE_SOURCE")" -ge "$BUILD_STARTED_AT" ]] || fail \
         "CaptureServer predates this fresh Release build"
+    [[ "$(/usr/bin/stat -f '%m' "$MEDIA_BRIDGE_SOURCE")" -ge "$BUILD_STARTED_AT" ]] || fail \
+        "OpensteamerMediaBridge predates this fresh Release build"
 fi
 [[ -d "$WEBRTC_FRAMEWORK_SOURCE" && ! -L "$WEBRTC_FRAMEWORK_SOURCE" ]] || fail \
     "LiveKitWebRTC.framework is not a safe directory"
@@ -177,12 +190,15 @@ fi
 /bin/mkdir "$APP_DIR" "$CONTENTS_DIR" "$MACOS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR" \
     || fail "could not create app layout"
 /bin/cp "$EXECUTABLE_SOURCE" "$EXECUTABLE" || fail "could not copy CaptureServer"
+/bin/cp "$MEDIA_BRIDGE_SOURCE" "$MEDIA_BRIDGE" || fail "could not copy OpensteamerMediaBridge"
 /usr/bin/ditto --noqtn "$WEBRTC_FRAMEWORK_SOURCE" "$WEBRTC_FRAMEWORK" \
     || fail "could not copy LiveKitWebRTC.framework"
 /bin/cp "$ROOT_DIR/macOS/OpensteamerHost/Info.plist" "$CONTENTS_DIR/Info.plist" \
     || fail "could not copy host Info.plist"
 /bin/cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$RESOURCES_DIR/ThirdPartyNotices.md" \
     || fail "could not copy third-party notices"
+/bin/cp "$MEDIA_NATIVE_MANIFEST" "$RESOURCES_DIR/org.example.opensteamer.media.json" \
+    || fail "could not copy browser native messaging manifest"
 
 # Require the exact five reviewed versioned-framework aliases before signing. Missing aliases,
 # aliases replaced by real entries, redirected aliases, and any extra symlink are all rejected.
@@ -290,11 +306,32 @@ done
 [[ "$(read_host_rpaths)" == "@executable_path/../Frameworks" ]] || fail \
     "host LC_RPATH normalization did not produce the exact reviewed value"
 
+# The Foundation/Darwin-only bridge uses absolute system dependencies and no search paths.
+read_bridge_rpaths() {
+    /usr/bin/otool -l "$MEDIA_BRIDGE" | /usr/bin/awk '
+        $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+        in_rpath && $1 == "path" { print $2; in_rpath = 0 }
+    '
+}
+for removal in {1..64}; do
+    rpaths="$(read_bridge_rpaths)" || fail "could not read media bridge rpaths"
+    [[ -n "$rpaths" ]] || break
+    rpath="${rpaths%%$'\n'*}"
+    before_count="$(print -r -- "$rpaths" | /usr/bin/awk 'NF { count += 1 } END { print count + 0 }')"
+    /usr/bin/install_name_tool -delete_rpath "$rpath" "$MEDIA_BRIDGE" \
+        || fail "could not remove media bridge rpath: $rpath"
+    after_rpaths="$(read_bridge_rpaths)" || fail "could not reread media bridge rpaths"
+    after_count="$(print -r -- "$after_rpaths" | /usr/bin/awk 'NF { count += 1 } END { print count + 0 }')"
+    (( after_count < before_count )) || fail "media bridge rpath removal made no progress"
+done
+[[ -z "$(read_bridge_rpaths)" ]] || fail "media bridge contains more than 64 LC_RPATH entries"
+
 # Remove inherited xattrs before signing; the verifier requires an exact empty xattr set.
 /usr/bin/xattr -cr "$APP_DIR" || fail "could not clear inherited extended attributes"
 /bin/chmod 755 "$APP_DIR" "$CONTENTS_DIR" "$MACOS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
-/bin/chmod 755 "$EXECUTABLE" "$WEBRTC_EXECUTABLE_REAL"
-/bin/chmod 644 "$CONTENTS_DIR/Info.plist" "$RESOURCES_DIR/ThirdPartyNotices.md"
+/bin/chmod 755 "$EXECUTABLE" "$MEDIA_BRIDGE" "$WEBRTC_EXECUTABLE_REAL"
+/bin/chmod 644 "$CONTENTS_DIR/Info.plist" "$RESOURCES_DIR/ThirdPartyNotices.md" \
+    "$RESOURCES_DIR/org.example.opensteamer.media.json"
 
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none "$WEBRTC_FRAMEWORK" \
     || fail "could not sign LiveKitWebRTC.framework"
@@ -305,12 +342,16 @@ post_sign_version_a_entries="$(/bin/ls -1A "$version_a" | LC_ALL=C /usr/bin/sort
 [[ -d "$version_a/_CodeSignature" && ! -L "$version_a/_CodeSignature" ]] || fail \
     "framework post-sign _CodeSignature is missing or unsafe"
 /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+    --identifier org.example.opensteamer.MediaBridge --timestamp=none "$MEDIA_BRIDGE" \
+    || fail "could not sign OpensteamerMediaBridge"
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$MEDIA_AUTOMATION_ENTITLEMENTS" \
     --identifier com.elamin.AudioStreamer.CaptureServer --timestamp=none "$EXECUTABLE" \
     || fail "could not sign CaptureServer"
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none "$APP_DIR" \
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$MEDIA_AUTOMATION_ENTITLEMENTS" \
+    --timestamp=none "$APP_DIR" \
     || fail "could not sign opensteamer Host.app"
 
-VERIFY_ARGUMENTS=("$APP_DIR")
+VERIFY_ARGUMENTS=(--media-integration-v1 "$APP_DIR")
 if [[ -n "$EXPECTED_TEAM_ID" || -n "$DESIGNATED_REQUIREMENT_REFERENCE" ]]; then
     VERIFY_ARGUMENTS+=("$EXPECTED_TEAM_ID")
 fi

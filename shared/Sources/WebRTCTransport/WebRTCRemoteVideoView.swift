@@ -176,6 +176,38 @@ struct WebRTCVideoPresentationDimensions: Equatable, Sendable {
     var size: CGSize {
         CGSize(width: width, height: height)
     }
+
+    static func isValidPresentationSize(_ size: CGSize) -> Bool {
+        guard size.width.isFinite,
+              size.height.isFinite,
+              (2 ... 32_768).contains(size.width),
+              (2 ... 32_768).contains(size.height) else {
+            return false
+        }
+        return size.width.rounded(.towardZero) == size.width
+            && size.height.rounded(.towardZero) == size.height
+    }
+}
+
+public enum WebRTCVideoPresentationInvalidation: Equatable, Sendable {
+    case formatTransition
+    case invalidGeometry
+
+    var retainsLastPresentedFrame: Bool {
+        self == .formatTransition
+    }
+}
+
+/// Opaque identity for one decoded presentation shape within one attached renderer binding.
+/// Dimensions can repeat, so callers must never replace this token with a width/height pair.
+public struct WebRTCVideoPresentationToken: Equatable, Hashable, Sendable {
+    public let bindingGeneration: UInt64
+    public let dimensionGeneration: UInt64
+
+    public init(bindingGeneration: UInt64, dimensionGeneration: UInt64) {
+        self.bindingGeneration = bindingGeneration
+        self.dimensionGeneration = dimensionGeneration
+    }
 }
 
 /// Computes a bounded decoded-pixel observation without retaining or exporting pixel data.
@@ -397,7 +429,8 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     private static let maximumRecentProofObservationCount = 32
 
     private let downstream: LKRTCVideoRenderer
-    private let invalidatePresentation: @Sendable (UInt64) -> Void
+    private let invalidatePresentation:
+        @Sendable (UInt64, WebRTCVideoPresentationInvalidation) -> Void
     private let publish: @Sendable (WebRTCVideoRenderObservation, UInt64) -> Void
     private let publishProof:
         @Sendable (WebRTCVideoPresentationProofObservation, UInt64) -> Void
@@ -429,7 +462,10 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
 
     init(
         downstream: LKRTCVideoRenderer,
-        invalidatePresentation: @escaping @Sendable (UInt64) -> Void,
+        invalidatePresentation: @escaping @Sendable (
+            UInt64,
+            WebRTCVideoPresentationInvalidation
+        ) -> Void,
         publish: @escaping @Sendable (WebRTCVideoRenderObservation, UInt64) -> Void,
         publishProof: @escaping @Sendable (
             WebRTCVideoPresentationProofObservation,
@@ -510,14 +546,20 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     }
 
     func setSize(_ size: CGSize) {
-        let invalidatedGeneration: UInt64? = lock.withLock {
-            guard !isInvalidated else { return nil }
+        lock.withLock {
+            guard !isInvalidated else { return }
             let invalidatedGeneration = advanceDimensionGenerationIfNeeded(to: size)
+            if let invalidatedGeneration {
+                // Record this boundary while the same lock still serializes generation
+                // advancement. A concurrent later setSize/render cannot overtake a fatal event.
+                invalidatePresentation(
+                    invalidatedGeneration,
+                    WebRTCVideoPresentationDimensions.isValidPresentationSize(size)
+                        ? .formatTransition
+                        : .invalidGeometry
+                )
+            }
             downstream.setSize(size)
-            return invalidatedGeneration
-        }
-        if let invalidatedGeneration {
-            invalidatePresentation(invalidatedGeneration)
         }
     }
 
@@ -554,7 +596,10 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                         // Enqueue revocation while this lock still serializes native frame
                         // replacement. The production callback only hops to the MainActor; it must
                         // be issued before Metal can receive and present the anomalous frame.
-                        invalidatePresentation(invalidatedGeneration)
+                        invalidatePresentation(
+                            invalidatedGeneration,
+                            .invalidGeometry
+                        )
                     }
                     downstream.renderFrame(frame)
                     return nil
@@ -585,12 +630,15 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                 return invalidatedGeneration
             } else {
                 pendingFrame = nil
-                downstream.renderFrame(nil)
+                // A native nil frame is a transport/rendering gap, not a privacy decision. The
+                // presentation owner installs an explicit cover at every Hide, authorization,
+                // lifecycle, and terminal boundary. Keep the last drawable until that cover or a
+                // replacement frame arrives so a recoverable gap cannot flash black.
                 return nil
             }
         }
         if let invalidatedGeneration {
-            invalidatePresentation(invalidatedGeneration)
+            invalidatePresentation(invalidatedGeneration, .formatTransition)
         }
     }
 
@@ -811,6 +859,86 @@ struct WebRTCVideoPresentationGenerationFence: Sendable {
     }
 }
 
+/// Records renderer events before their independent MainActor hops. Whichever callback reaches
+/// MainActor first drains every earlier invalidation in dimension order; fatal invalid geometry
+/// therefore cannot be lost behind a subsequently valid frame.
+final class WebRTCVideoPresentationEventLedger: @unchecked Sendable {
+    private let bindingGeneration: UInt64
+    private let lock = NSLock()
+    private var invalidations: [UInt64: WebRTCVideoPresentationInvalidation] = [:]
+    private var highestDeliveredInvalidationGeneration: UInt64 = 0
+    private var highestDeliveredInvalidGeometryGeneration: UInt64 = 0
+
+    init(bindingGeneration: UInt64) {
+        self.bindingGeneration = bindingGeneration
+    }
+
+    func record(
+        dimensionGeneration: UInt64,
+        invalidation: WebRTCVideoPresentationInvalidation
+    ) {
+        lock.withLock {
+            if invalidation == .invalidGeometry {
+                // Invalid geometry is fatal even if an independently scheduled newer format
+                // callback reached MainActor first. Keep one bounded fatal high-water mark so a
+                // late lower generation can still revoke state exactly once.
+                guard dimensionGeneration > highestDeliveredInvalidGeometryGeneration else {
+                    return
+                }
+            } else {
+                guard dimensionGeneration > highestDeliveredInvalidationGeneration else {
+                    return
+                }
+            }
+            if invalidations[dimensionGeneration] != .invalidGeometry {
+                invalidations[dimensionGeneration] = invalidation
+            }
+        }
+    }
+
+    func recordFormatTransitionIfAbsent(dimensionGeneration: UInt64) {
+        lock.withLock {
+            guard dimensionGeneration > highestDeliveredInvalidationGeneration,
+                  invalidations[dimensionGeneration] == nil else {
+                return
+            }
+            invalidations[dimensionGeneration] = .formatTransition
+        }
+    }
+
+    func takeInvalidations(
+        through dimensionGeneration: UInt64
+    ) -> [(WebRTCVideoPresentationToken, WebRTCVideoPresentationInvalidation)] {
+        lock.withLock {
+            let generations = invalidations.keys
+                .filter { $0 <= dimensionGeneration }
+                .sorted()
+            return generations.compactMap { generation in
+                guard let invalidation = invalidations.removeValue(forKey: generation) else {
+                    return nil
+                }
+                highestDeliveredInvalidationGeneration = max(
+                    highestDeliveredInvalidationGeneration,
+                    generation
+                )
+                if invalidation == .invalidGeometry {
+                    highestDeliveredInvalidGeometryGeneration = max(
+                        highestDeliveredInvalidGeometryGeneration,
+                        generation
+                    )
+                }
+                return (
+                    WebRTCVideoPresentationToken(
+                        bindingGeneration: bindingGeneration,
+                        dimensionGeneration: generation
+                    ),
+                    invalidation
+                )
+            }
+        }
+    }
+}
+
 /// The narrow UIKit boundary used by the SwiftUI iPhone client to render a remote track.
 @MainActor
 public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
@@ -835,8 +963,13 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
     /// The SwiftUI owner uses this exact size to distinguish video pixels from the
     /// renderer's letterbox area before forwarding a remote-input coordinate.
     public var onVideoSizeChanged: ((CGSize) -> Void)?
+    /// Distinguishes a safe decoder format transition from malformed presentation geometry.
+    /// The SwiftUI owner may preserve semantic state only for `formatTransition`.
+    public var onVideoPresentationInvalidated:
+        ((WebRTCVideoPresentationToken, WebRTCVideoPresentationInvalidation) -> Void)?
     /// Reports decoded frames only after their Metal drawable has been presented.
-    public var onVideoFrameRendered: ((WebRTCVideoRenderObservation) -> Void)?
+    public var onVideoFrameRendered:
+        ((WebRTCVideoRenderObservation, WebRTCVideoPresentationToken) -> Void)?
     /// Reports only exact RTP timestamps armed by the screen-resume owner. This callback is not
     /// subject to ordinary render-observation throttling.
     public var onVideoFramePresentedForProof:
@@ -912,12 +1045,35 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
         hasCurrentPresentedFrame = true
         updatePresentationCoverVisibility()
     }
+
+    public func debugBeginFormatTransitionForContinuityTests() {
+        onVideoPresentationInvalidated?(
+            WebRTCVideoPresentationToken(
+                bindingGeneration: presentationGenerationFence.bindingGeneration,
+                dimensionGeneration: 1
+            ),
+            .formatTransition
+        )
+        invalidateCurrentPresentation(retainingLastPresentedFrame: true)
+    }
+
+    public func debugInvalidateGeometryForContinuityTests() {
+        onVideoPresentationInvalidated?(
+            WebRTCVideoPresentationToken(
+                bindingGeneration: presentationGenerationFence.bindingGeneration,
+                dimensionGeneration: 2
+            ),
+            .invalidGeometry
+        )
+        invalidateCurrentPresentation()
+    }
     #endif
 
     /// Atomically detaches the previous renderer binding and attaches `track`.
     public func setTrack(_ track: WebRTCRemoteVideoTrack?) {
         guard currentTrack !== track else { return }
         let generation = presentationGenerationFence.advanceBinding()
+        let retainsLastPresentedFrame = hasCurrentPresentedFrame
 
         // Retire and drain the old renderer before attaching a new generation. Its already-
         // queued MainActor publication still carries the old generation and is rejected below.
@@ -927,13 +1083,17 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
         }
         metalDelegateProxy?.installDrawHandler(nil)
         observedRenderer = nil
-        hasCurrentPresentedFrame = false
         // A binding reset must not be deduplicated against LiveKit's asynchronous size callback.
-        invalidateCurrentPresentation()
+        invalidateCurrentPresentation(
+            retainingLastPresentedFrame: retainsLastPresentedFrame
+        )
 
         guard generation == presentationGenerationFence.bindingGeneration else { return }
         currentTrack = track
         guard let track else { return }
+        let presentationEventLedger = WebRTCVideoPresentationEventLedger(
+            bindingGeneration: generation
+        )
         if metalDelegateProxy == nil {
             // The native renderer remains usable if LiveKit changes its internal hierarchy, but
             // presentation cannot be proven and remote touch therefore remains disabled.
@@ -941,11 +1101,25 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
         }
         let observedRenderer = ObservedVideoRenderer(
             downstream: renderer,
-            invalidatePresentation: { [weak self] dimensionGeneration in
+            invalidatePresentation: {
+                [weak self] dimensionGeneration, invalidation in
+                presentationEventLedger.record(
+                    dimensionGeneration: dimensionGeneration,
+                    invalidation: invalidation
+                )
                 Task { @MainActor [weak self] in
                     guard let self,
                           self.currentTrack != nil,
-                          let observedRenderer = self.observedRenderer,
+                          self.presentationGenerationFence.bindingGeneration
+                            == generation else {
+                        return
+                    }
+                    for event in presentationEventLedger.takeInvalidations(
+                        through: dimensionGeneration
+                    ) {
+                        self.onVideoPresentationInvalidated?(event.0, event.1)
+                    }
+                    guard let observedRenderer = self.observedRenderer,
                           self.presentationGenerationFence.acceptsInvalidation(
                               bindingGeneration: generation,
                               dimensionGeneration: dimensionGeneration,
@@ -956,14 +1130,33 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
                           ) else {
                         return
                     }
-                    self.invalidateCurrentPresentation()
+                    self.invalidateCurrentPresentation(
+                        retainingLastPresentedFrame:
+                            invalidation.retainsLastPresentedFrame
+                    )
                 }
             },
             publish: { [weak self] observation, dimensionGeneration in
+                presentationEventLedger.recordFormatTransitionIfAbsent(
+                    dimensionGeneration: dimensionGeneration
+                )
                 Task { @MainActor [weak self] in
                     guard let self,
                           self.currentTrack != nil,
                           let observedRenderer = self.observedRenderer,
+                          self.presentationGenerationFence.bindingGeneration
+                            == generation,
+                          observedRenderer.isCurrentDimensionGeneration(
+                              dimensionGeneration
+                          ) else {
+                        return
+                    }
+                    for event in presentationEventLedger.takeInvalidations(
+                        through: dimensionGeneration
+                    ) {
+                        self.onVideoPresentationInvalidated?(event.0, event.1)
+                    }
+                    guard
                           self.presentationGenerationFence.acceptsPublication(
                               bindingGeneration: generation,
                               dimensionGeneration: dimensionGeneration,
@@ -974,9 +1167,17 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
                           ) else {
                         return
                     }
+                    let token = WebRTCVideoPresentationToken(
+                        bindingGeneration: generation,
+                        dimensionGeneration: dimensionGeneration
+                    )
+                    self.currentVideoSize = CGSize(
+                        width: observation.width,
+                        height: observation.height
+                    )
                     self.hasCurrentPresentedFrame = true
                     self.updatePresentationCoverVisibility()
-                    self.onVideoFrameRendered?(observation)
+                    self.onVideoFrameRendered?(observation, token)
                 }
             },
             publishProof: { [weak self] observation, dimensionGeneration in
@@ -1030,7 +1231,7 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
         track.addRenderer(observedRenderer)
     }
 
-    /// Removes the active track and clears the final rendered frame.
+    /// Removes the active track while retaining the final drawable until a replacement presents.
     public func detachTrack() {
         setTrack(nil)
     }
@@ -1115,23 +1316,19 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
         }
         guard size != currentVideoSize else { return }
         currentVideoSize = size
-        if metalDelegateProxy != nil {
-            // Do not leave an old drawable visible while a new aspect is awaiting presentation.
-            presentationCover.isHidden = false
-        }
         onVideoSizeChanged?(size)
     }
 
     /// Revokes the SwiftUI owner's cached post-presentation observation. A matching generation
     /// can authorize touch again only after Metal confirms that generation's drawable presented.
-    private func invalidateCurrentPresentation() {
+    private func invalidateCurrentPresentation(
+        retainingLastPresentedFrame: Bool = false
+    ) {
         currentVideoSize = .zero
-        hasCurrentPresentedFrame = false
-        if metalDelegateProxy != nil {
-            presentationCover.isHidden = false
-        } else {
-            updatePresentationCoverVisibility()
+        if !retainingLastPresentedFrame {
+            hasCurrentPresentedFrame = false
         }
+        updatePresentationCoverVisibility()
         onVideoSizeChanged?(.zero)
     }
 

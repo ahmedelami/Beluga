@@ -6,6 +6,440 @@ import RemoteSessionCore
 import UIKit
 import WebRTCTransport
 
+/// Session-local evidence only. A successful send never consumes the retained failure/history.
+struct IOSAudioDiagnosticsJournal {
+    private(set) var sessionID = UUID()
+    private(set) var snapshot = WebRTCAudioClientSnapshot()
+    private(set) var failureSnapshot: WebRTCAudioClientSnapshot?
+    private(set) var events: [WebRTCAudioClientEvent] = []
+    private var nextSequence: UInt64 = 1
+    private var nextEventSequence: UInt64 = 1
+    private var startedAt: UInt64 = 0
+    private var nativeObservedAt: UInt64?
+    private var inboundObservedAt: UInt64?
+    private var failureObservedAt: UInt64?
+    private var highestNativeFailureSequence: UInt64 = 0
+    private var latestNativeContextIdentity: NativeFailureIdentity?
+    private var lastNativeTargetRejectionIdentity: NativeFailureIdentity?
+    private var lastStatisticsSequence: UInt64?
+    private var lastStatisticsCollectedAt: Date?
+
+    mutating func reset(sessionID: UUID, policyID: UUID, at now: UInt64) {
+        self = Self()
+        self.sessionID = sessionID
+        startedAt = now
+        snapshot.audioPolicyID = policyID
+        record(.sessionStarted, at: now)
+    }
+
+    mutating func policyChanged(_ policyID: UUID, at now: UInt64) {
+        guard snapshot.audioPolicyID != policyID else { return }
+        snapshot.audioPolicyID = policyID
+        snapshot.native = nil
+        nativeObservedAt = nil
+        snapshot.targetMatched = nil
+        snapshot.authorization = .unknown
+        snapshot.authorityFailureCode = nil
+        snapshot.proofStage = .awaitingAuthorization
+        snapshot.failurePhase = .none
+        record(.policyChanged, at: now)
+    }
+
+    mutating func playbackChanged(_ state: WorldwideAudioLifecycleSnapshot, at now: UInt64) {
+        let next: WebRTCAudioClientPlaybackState = state.isPlaying ? .playing
+            : state.errorText != nil ? .failed
+            : state.requiresExplicitResume ? .paused
+            : state.isRemoteAudioAvailable ? .awaitingEvidence : .unavailable
+        guard next != snapshot.playbackState else { return }
+        snapshot.playbackState = next
+        if next == .playing {
+            snapshot.proofStage = .complete
+            snapshot.failurePhase = .none
+            record(.recovered, at: now)
+        } else if next == .failed {
+            fail(phase: snapshot.failurePhase == .none ? .unknown : snapshot.failurePhase, at: now)
+        }
+    }
+
+    mutating func policyFacts(peerConnected: Bool, iceConnected: Bool, controlOpen: Bool,
+                              applicationActive: Bool, remoteTrackAvailable: Bool,
+                              microphoneIntent: Bool, microphonePermissionGranted: Bool,
+                              microphoneBlockedByCall: Bool) {
+        snapshot.peerConnected = peerConnected
+        snapshot.iceConnected = iceConnected
+        snapshot.controlOpen = controlOpen
+        snapshot.applicationActive = applicationActive
+        snapshot.remoteTrackAvailable = remoteTrackAvailable
+        snapshot.microphoneIntent = microphoneIntent
+        snapshot.microphonePermissionGranted = microphonePermissionGranted
+        snapshot.microphoneBlockedByCall = microphoneBlockedByCall
+    }
+
+    mutating func retryRequested(at now: UInt64) {
+        snapshot.retryState = .requested
+        record(.retryRequested, at: now)
+    }
+
+    mutating func beginProof(recovery: Bool, at now: UInt64) {
+        if recovery {
+            guard snapshot.recoveryAttempt < UInt64.max else { return }
+            snapshot.recoveryAttempt += 1
+            snapshot.retryState = .executing
+        }
+        snapshot.targetMatched = nil
+        snapshot.authorityFailureCode = nil
+        snapshot.proofStage = recovery ? .awaitingAuthorization : .awaitingEvidence
+        snapshot.failurePhase = .none
+    }
+
+    mutating func observeNative(
+        _ native: WebRTCAudioClientNativeSnapshot,
+        policyID: UUID,
+        classifyFailure: Bool = true,
+        at now: UInt64
+    ) {
+        guard snapshot.audioPolicyID == policyID else { return }
+        let previous = snapshot.native
+        snapshot.native = native
+        nativeObservedAt = now
+        let hasDetailedRejection = observeNativeTargetRejection(native, at: now)
+        let newContext = native.failureContext.flatMap {
+            $0.eventSequence > highestNativeFailureSequence ? $0 : nil
+        }
+        if let newContext { highestNativeFailureSequence = newContext.eventSequence }
+        if classifyFailure, native.failureCode != 0,
+           previous?.failureCode != native.failureCode
+                || previous?.lastLifecycleStatus != native.lastLifecycleStatus
+                || previous?.failureContext?.eventSequence != native.failureContext?.eventSequence {
+            fail(phase: Self.failurePhase(native.failureCode), at: now)
+        } else if let newContext, newContext.failureCode != 0, !hasDetailedRejection {
+            // This was captured before rollback, possibly before this policy/attempt existed.
+            // Preserve the cause without labelling a healthy or not-yet-executed attempt failed.
+            var historical = WebRTCAudioClientSnapshot()
+            historical.native = native
+            historical.nativeObservationAgeMilliseconds = 0
+            historical.failurePhase = Self.failurePhase(newContext.failureCode)
+            historical.proofStage = .failed
+            if failureSnapshot == nil {
+                failureSnapshot = historical
+                failureObservedAt = now
+            } else if failureSnapshot?.native?.failureContext == nil {
+                // The POD is explicitly historical, not proof of the retained policy's cause.
+                // Keep its original generations even if a later native failure replaces current.
+                var retained = agedFailureSnapshot(at: now)
+                if retained?.native == nil {
+                    retained?.native = native
+                    retained?.nativeObservationAgeMilliseconds = 0
+                } else {
+                    retained?.native?.failureContext = newContext
+                }
+                failureSnapshot = retained
+                failureObservedAt = now
+            }
+            record(.failure, evidence: historical, at: now)
+        }
+    }
+
+    private struct NativeFailureIdentity: Equatable {
+        let device: UInt64
+        let event: UInt64
+        let system: UInt64
+        let configuration: UInt64
+        let operation: UInt64
+
+        init(_ context: WebRTCAudioClientFailureContext) {
+            device = context.deviceInstanceGeneration
+            event = context.eventSequence
+            system = context.systemAudioGeneration
+            configuration = context.configurationGeneration
+            operation = context.appOperationTagGeneration
+        }
+    }
+
+    /// Native target-proof rejection is historical evidence, not a reducer decision.
+    /// Its POD cannot establish a Swift policy UUID, so never assign it to the current
+    /// retry or overwrite the current controller's authorization/code (including 201).
+    private mutating func observeNativeTargetRejection(
+        _ native: WebRTCAudioClientNativeSnapshot, at now: UInt64
+    ) -> Bool {
+        guard let context = native.failureContext,
+              context.deviceInstanceGeneration != 0, context.eventSequence != 0 else { return false }
+        let identity = NativeFailureIdentity(context)
+        if let latest = latestNativeContextIdentity {
+            // Every observed native context retires older device/events, even when it
+            // contains no detailed receipt. The exact same context may gain detail once.
+            guard identity == latest || identity.device > latest.device
+                    || (identity.device == latest.device && identity.event > latest.event)
+                else { return context.targetPolicyRejection != nil }
+        }
+        latestNativeContextIdentity = identity
+        guard context.failureCode == 4, context.stage == .routeValidation,
+              context.reason == .policyMismatch,
+              let rejection = context.targetPolicyRejection else { return false }
+        if let last = lastNativeTargetRejectionIdentity {
+            // Native device identities and per-device failure events allocate monotonically.
+            // A fresh device may restart its event counter; a retired device may never replay.
+            guard identity.device > last.device
+                    || (identity.device == last.device && identity.event > last.event) else { return true }
+        }
+        lastNativeTargetRejectionIdentity = identity
+
+        var historical = WebRTCAudioClientSnapshot()
+        historical.native = native
+        historical.nativeObservationAgeMilliseconds = 0
+        historical.failurePhase = .route
+        historical.proofStage = .failed
+        historical.targetMatched = false
+        historical.authorityFailureCode = rejection.code
+
+        if failureSnapshot == nil || Self.isControllerOnlyPlaceholder(failureSnapshot) {
+            // The first concrete native cause supersedes an uncorrelated controller-only
+            // placeholder. Its old controller event remains bounded history. No concrete
+            // native cause is replaced, and no policy identity is invented by enrichment.
+            failureSnapshot = historical
+            failureObservedAt = now
+        } else if !(failureSnapshot?.authorityFailureCode.map { (301...329).contains($0) } ?? false),
+                  let retainedContext = failureSnapshot?.native?.failureContext,
+                  NativeFailureIdentity(retainedContext) == identity {
+            var retained = agedFailureSnapshot(at: now)
+            retained?.authorityFailureCode = rejection.code
+            failureSnapshot = retained
+            failureObservedAt = now
+        }
+        record(.failure, evidence: historical, at: now)
+        return true
+    }
+
+    private static func isControllerOnlyPlaceholder(_ evidence: WebRTCAudioClientSnapshot?) -> Bool {
+        guard let evidence else { return false }
+        if let code = evidence.authorityFailureCode, (301...329).contains(code) { return false }
+        guard let native = evidence.native else { return true }
+        return native.failureContext == nil && native.failureCode == 0
+            && native.lastLifecycleStatus == 0 && native.lastPlayoutStatus == 0
+    }
+
+    mutating func observeInbound(_ audio: WebRTCAudioStatistics?, at now: UInt64) {
+        snapshot.inboundAudioPackets = audio?.packets
+        snapshot.inboundAudioBytes = audio?.bytes
+        snapshot.inboundAudioPacketsLost = audio?.packetsLost
+        snapshot.inboundAudioConcealedSamples = audio?.concealedSamples
+        snapshot.inboundAudioTotalEnergy = audio?.totalAudioEnergy.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        }
+        snapshot.inboundAudioSamplesDuration = audio?.totalSamplesDuration.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        }
+        inboundObservedAt = audio == nil ? nil : now
+    }
+
+    mutating func observeStatistics(_ statistics: WebRTCStatisticsSnapshot,
+                                   at now: UInt64, wallNow: Date) {
+        if let sequence = statistics.collectionSequence {
+            guard lastStatisticsSequence.map({ sequence > $0 }) ?? true else { return }
+            lastStatisticsSequence = sequence
+        } else {
+            guard lastStatisticsSequence == nil,
+                  lastStatisticsCollectedAt.map({ statistics.collectedAt > $0 }) ?? true else { return }
+        }
+        lastStatisticsCollectedAt = statistics.collectedAt
+        observeInbound(statistics.inboundAudio, at: now)
+        let seconds = wallNow.timeIntervalSince(statistics.collectedAt)
+        guard statistics.inboundAudio != nil, seconds.isFinite, seconds >= 0,
+              seconds <= 86_400 else {
+            inboundObservedAt = nil
+            return
+        }
+        let age = UInt64((seconds * 1_000_000_000).rounded(.up))
+        inboundObservedAt = age <= now ? now - age : nil
+    }
+
+    mutating func nativeReceipt(accepted: Bool, targetMatched: Bool, at now: UInt64) {
+        snapshot.targetMatched = targetMatched
+        snapshot.retryState = accepted && targetMatched ? .accepted : .rejected
+        snapshot.authorization = accepted ? .valid : .rejected
+        if accepted { snapshot.authorityFailureCode = nil }
+        snapshot.proofStage = accepted && targetMatched ? .awaitingEvidence : .failed
+        record(.nativeReceipt, at: now)
+        if !accepted || !targetMatched {
+            fail(phase: snapshot.native.map { Self.failurePhase($0.failureCode) }
+                .flatMap { $0 == .none ? nil : $0 } ?? .authorization, at: now)
+        }
+    }
+
+    mutating func fail(phase: WebRTCAudioClientFailurePhase, at now: UInt64) {
+        snapshot.failurePhase = phase
+        snapshot.proofStage = .failed
+        if snapshot.retryState == .executing { snapshot.retryState = .failed }
+        if failureSnapshot == nil {
+            failureSnapshot = agedSnapshot(at: now)
+            failureObservedAt = now
+        } else if failureSnapshot?.audioPolicyID == snapshot.audioPolicyID,
+                  failureSnapshot?.recoveryAttempt == snapshot.recoveryAttempt,
+                  !Self.hasNativeFailure(failureSnapshot?.native),
+                  Self.hasNativeFailure(snapshot.native) {
+            // A controller failure can arrive between a healthy native read and the failed read.
+            // Enrich its missing native cause, preserving the first failure's identity/outcomes.
+            var retained = agedFailureSnapshot(at: now)
+            retained?.native = snapshot.native
+            retained?.nativeObservationAgeMilliseconds = Self.age(since: nativeObservedAt, at: now)
+            if retained?.failurePhase == .unknown { retained?.failurePhase = phase }
+            failureSnapshot = retained
+            failureObservedAt = now
+        }
+        record(.failure, at: now)
+    }
+
+    mutating func authorityFailure(_ decision: AudioTransactionDecision, at now: UInt64) {
+        guard let code = Self.authorityFailureCode(decision) else { return }
+        if let existing = snapshot.authorityFailureCode,
+           code == 201 || (301...329).contains(existing) {
+            return
+        }
+        snapshot.authorityFailureCode = code
+        snapshot.authorization = .rejected
+        fail(phase: .authorization, at: now)
+    }
+
+    mutating func categoryObservationFailure(_ code: UInt16, at now: UInt64) {
+        guard (301...329).contains(code),
+              snapshot.authorityFailureCode == nil || snapshot.authorityFailureCode == 201 else { return }
+        snapshot.authorityFailureCode = code
+        snapshot.authorization = .rejected
+        if failureSnapshot?.audioPolicyID == snapshot.audioPolicyID,
+           failureSnapshot?.recoveryAttempt == snapshot.recoveryAttempt,
+           failureSnapshot?.authorityFailureCode == 201 {
+            failureSnapshot?.authorityFailureCode = code
+        }
+        fail(phase: .authorization, at: now)
+    }
+
+    // Stable diagnostic codebook: reducer rejection 1...12, runtime 101...105,
+    // failed-closed 201; native category evidence 301...329. Unknown ABI values never
+    // become arbitrary wire strings. These bounded codes work with deployed v1 hosts.
+    static func authorityFailureCode(_ decision: AudioTransactionDecision) -> UInt16? {
+        switch decision {
+        case .rejected(let reason):
+            switch reason {
+            case .staleRevision: 1
+            case .staleAuthority: 2
+            case .staleOperation: 3
+            case .duplicate: 4
+            case .invalidInput: 5
+            case .targetMismatch: 6
+            case .blockerNotAllowed: 7
+            case .noCurrentOperation: 8
+            case .capacityExceeded: 9
+            case .blockerRequired: 10
+            case .counterExhausted: 11
+            case .unknown: 12
+            }
+        case .runtimeFailure(let reason):
+            switch reason {
+            case .unavailable: 101
+            case .abiMismatch: 102
+            case .nullPointer: 103
+            case .poisoned: 104
+            case .unknown: 105
+            }
+        case .failedClosed: 201
+        default: nil
+        }
+    }
+
+    mutating func record(_ kind: WebRTCAudioClientEventKind,
+                         evidence: WebRTCAudioClientSnapshot? = nil, at now: UInt64) {
+        guard nextEventSequence < UInt64.max else { return }
+        let historicalFailure = kind == .failure && evidence != nil
+        let evidence = evidence ?? snapshot
+        let event = WebRTCAudioClientEvent(
+            sequence: nextEventSequence,
+            elapsedMilliseconds: elapsed(now),
+            audioPolicyID: evidence.audioPolicyID,
+            recoveryAttempt: evidence.recoveryAttempt,
+            kind: kind,
+            failurePhase: evidence.failurePhase,
+            failureCode: historicalFailure
+                ? evidence.native?.failureContext?.failureCode ?? 0
+                : evidence.native?.failureCode ?? 0,
+            status: historicalFailure
+                ? evidence.native?.failureContext?.status ?? evidence.native?.lastLifecycleStatus ?? 0
+                : evidence.native?.lastLifecycleStatus ?? 0,
+            retryState: evidence.retryState,
+            authorization: evidence.authorization,
+            targetMatched: evidence.targetMatched,
+            authorityFailureCode: evidence.authorityFailureCode
+        )
+        nextEventSequence += 1
+        events.append(event)
+        if events.count > WebRTCAudioClientDiagnosticsHeartbeat.maximumEvents {
+            events.removeFirst(events.count - WebRTCAudioClientDiagnosticsHeartbeat.maximumEvents)
+        }
+    }
+
+    mutating func heartbeat(build: WebRTCAudioClientBuild, at now: UInt64)
+        -> WebRTCAudioClientDiagnosticsHeartbeat? {
+        guard nextSequence < UInt64.max else { return nil }
+        defer { nextSequence += 1 }
+        return WebRTCAudioClientDiagnosticsHeartbeat(
+            sequence: nextSequence, sessionID: sessionID, build: build,
+            snapshot: agedSnapshot(at: now), failureSnapshot: agedFailureSnapshot(at: now),
+            events: events, observedElapsedMilliseconds: elapsed(now)
+        )
+    }
+
+    private static func hasNativeFailure(_ native: WebRTCAudioClientNativeSnapshot?) -> Bool {
+        // A retained historical context is not evidence that this live observation failed.
+        (native?.failureCode ?? 0) != 0
+            || (native?.lastLifecycleStatus ?? 0) != 0
+            || (native?.lastPlayoutStatus ?? 0) != 0
+    }
+
+    private func agedFailureSnapshot(at now: UInt64) -> WebRTCAudioClientSnapshot? {
+        var retained = failureSnapshot
+        if let failureObservedAt {
+            let age = Self.age(since: failureObservedAt, at: now) ?? 0
+            let nativeAge = retained?.nativeObservationAgeMilliseconds.map {
+                min(86_400_000, $0 + age)
+            }
+            let inboundAge = retained?.inboundObservationAgeMilliseconds.map {
+                min(86_400_000, $0 + age)
+            }
+            retained?.nativeObservationAgeMilliseconds = nativeAge
+            retained?.inboundObservationAgeMilliseconds = inboundAge
+        }
+        return retained
+    }
+
+    private func agedSnapshot(at now: UInt64) -> WebRTCAudioClientSnapshot {
+        var result = snapshot
+        result.nativeObservationAgeMilliseconds = Self.age(since: nativeObservedAt, at: now)
+        result.inboundObservationAgeMilliseconds = Self.age(since: inboundObservedAt, at: now)
+        return result
+    }
+
+    private func elapsed(_ now: UInt64) -> UInt64 {
+        now >= startedAt ? (now - startedAt) / 1_000_000 : 0
+    }
+
+    private static func age(since time: UInt64?, at now: UInt64) -> UInt64? {
+        guard let time, now >= time else { return nil }
+        return min(86_400_000, (now - time) / 1_000_000)
+    }
+
+    static func failurePhase(_ code: Int32) -> WebRTCAudioClientFailurePhase {
+        switch code {
+        case 0: .none
+        case 1...3, 16, 17, 20, 21: .session
+        case 4, 18, 19: .route
+        case 5...11, 13, 22...24: .initialization
+        case 14: .start
+        case 12, 25: .render
+        case 15: .retirement
+        default: .unknown
+        }
+    }
+}
+
 /// Capability-like token that binds one screen presentation to one media-session generation.
 /// Views must present this exact lease on show, input, and teardown calls; a raw request ID is not
 /// sufficient because IDs may be reused by a replacement peer.
@@ -17,6 +451,135 @@ struct WorldwideScreenPresentationLease: Identifiable, Equatable, Sendable {
         self.id = id
         self.sessionGeneration = sessionGeneration
     }
+}
+
+enum FocusedWindowInteractionMode: Equatable {
+    case resize
+    case move
+}
+
+/// Current viewer geometry and exact ownership under which one focused-window interaction exists.
+/// Only a separately advertised, presented, exact-aspect transition for this interaction's mode may
+/// replace the geometry.
+struct FocusedWindowResizeBinding: Equatable {
+    let lease: WorldwideScreenPresentationLease
+    let inputSessionID: UUID
+    let screenRequestID: UInt64
+    let trackIdentity: ObjectIdentifier
+    let containerSize: CGSize
+    let viewerVideoSize: CGSize
+    let allowsRecoverableOffscreenMove: Bool
+}
+
+struct FocusedWindowInteractionTarget: Equatable {
+    let generation: UUID
+    let normalizedFrame: WebRTCNormalizedRect
+    let unclippedNormalizedFrame: WebRTCWindowMoveUnclippedNormalizedRect?
+
+    init(resize target: WebRTCWindowResizeTarget) {
+        generation = target.generation
+        normalizedFrame = target.normalizedFrame
+        unclippedNormalizedFrame = nil
+    }
+
+    init(move target: WebRTCWindowMoveTarget) {
+        generation = target.generation
+        normalizedFrame = target.normalizedFrame
+        unclippedNormalizedFrame = target.unclippedNormalizedFrame
+    }
+}
+
+enum FocusedWindowResizePendingOperation: Equatable {
+    case targetRequest(operationID: UUID, focusGeneration: UInt64?, focusIsSecure: Bool)
+    case selection(
+        operationID: UUID, focusGeneration: UInt64?, focusIsSecure: Bool,
+        mode: FocusedWindowInteractionMode = .resize
+    )
+    case commit(
+        operationID: UUID,
+        consumedTargetGeneration: UUID,
+        focusGeneration: UInt64?,
+        focusIsSecure: Bool,
+        mode: FocusedWindowInteractionMode = .resize
+    )
+
+    var operationID: UUID {
+        switch self {
+        case .targetRequest(let operationID, _, _),
+             .selection(let operationID, _, _, _),
+             .commit(let operationID, _, _, _, _):
+            operationID
+        }
+    }
+
+    var focusGeneration: UInt64? {
+        switch self {
+        case .targetRequest(_, let focusGeneration, _),
+             .selection(_, let focusGeneration, _, _),
+             .commit(_, _, let focusGeneration, _, _):
+            focusGeneration
+        }
+    }
+
+    var focusIsSecure: Bool {
+        switch self {
+        case .targetRequest(_, _, let secure),
+             .selection(_, _, let secure, _),
+             .commit(_, _, _, let secure, _):
+            secure
+        }
+    }
+
+    var mode: FocusedWindowInteractionMode {
+        switch self {
+        case .targetRequest: .resize
+        case .selection(_, _, _, let mode), .commit(_, _, _, _, let mode): mode
+        }
+    }
+
+    func matches(_ action: WebRTCInputAction) -> Bool {
+        switch (self, action) {
+        case (.targetRequest, .requestFocusedWindowResizeTarget),
+             (.selection(_, _, _, .resize), .selectWindowForResize),
+             (.selection(_, _, _, .move), .selectWindowForMove):
+            true
+        case (.commit(_, let consumedGeneration, _, _, .resize),
+              .commitFocusedWindowResize(let actionGeneration, _, _)),
+             (.commit(_, let consumedGeneration, _, _, .move),
+              .commitFocusedWindowMove(let actionGeneration, _, _, _)):
+            consumedGeneration == actionGeneration
+        default:
+            false
+        }
+    }
+}
+
+struct FocusedWindowResizeInteraction: Equatable {
+    let id: UUID
+    let mode: FocusedWindowInteractionMode
+    var binding: FocusedWindowResizeBinding
+    var target: FocusedWindowInteractionTarget?
+    var pending: FocusedWindowResizePendingOperation?
+    /// A decoded size has changed, but Metal has not yet presented a frame with that exact size.
+    /// Negotiated focused-window state may survive; every pointer gesture remains fenced meanwhile.
+    var awaitingPresentedVideoSize: CGSize? = nil
+    /// Renderer binding plus decoded-dimension generation that opened the format fence.
+    var awaitingPresentationToken: WebRTCVideoPresentationToken? = nil
+    /// Unique identity for the bounded presentation fence. Size can repeat across A -> B -> A,
+    /// so dimensions alone cannot keep a stale timeout from cancelling the newest transition.
+    var presentationRebindingID: UUID? = nil
+}
+
+enum FocusedWindowResizeState: Equatable {
+    case inactive
+    case active(FocusedWindowResizeInteraction)
+
+    var interaction: FocusedWindowResizeInteraction? {
+        guard case .active(let interaction) = self else { return nil }
+        return interaction
+    }
+
+    var isActive: Bool { interaction != nil }
 }
 
 /// Composite identity for an in-flight show/hide request across reconnect generations.
@@ -37,6 +600,28 @@ struct WorldwideScreenMediaViewerFence: Equatable, Sendable {
     let markerProof: ScreenVideoInBandMarkerNonce?
     let proofRequestRevision: UInt64
     let statusText: String?
+}
+
+/// Exact authority to reveal a privacy cover retained across one transport recovery. A later
+/// suspension on the same screen lease necessarily owns a different cover identity and must not
+/// be exposed by a delayed frame from the preceding recovery.
+private struct WorldwideScreenPresentationRecoveryRevealFence: Equatable {
+    let lease: WorldwideScreenPresentationLease
+    let coverID: UUID
+    let proofRequestRevision: UInt64
+
+    init(_ fence: WorldwideScreenMediaViewerFence) {
+        lease = fence.lease
+        coverID = fence.coverID
+        proofRequestRevision = fence.proofRequestRevision
+    }
+
+    func matches(_ fence: WorldwideScreenMediaViewerFence?) -> Bool {
+        guard let fence else { return false }
+        return fence.lease == lease
+            && fence.coverID == coverID
+            && fence.proofRequestRevision == proofRequestRevision
+    }
 }
 
 struct WorldwideScreenMediaPrimarySource: Equatable, Sendable {
@@ -259,6 +844,7 @@ struct WorldwideScreenPresentationDebugState {
     let sessionGeneration: UUID
     let currentLease: WorldwideScreenPresentationLease?
     let activeLease: WorldwideScreenPresentationLease?
+    let recoveringLease: WorldwideScreenPresentationLease?
     let activeScreenRequestID: UInt64?
     let isScreenVisible: Bool
     let inputAvailable: Bool
@@ -339,8 +925,12 @@ private final class IOSPlayoutProofAttempt {
     let postCallRecoveryMilestone:
         WorldwidePostCallMicrophoneRecoveryMilestone?
     let categoryProofClaim: WorldwideAudioCategoryProofClaim?
+    /// Exact reducer operation and pre-staged native capability for transaction-owned recovery.
+    /// Nil preserves the legacy/test-only proof path for initial non-recovery observation.
+    let recoveryTransaction: WorldwideAudioRecoveryTransaction?
     var stage: IOSPlayoutProofStage
     var recoveryAuthorization: WebRTCIOSPlayoutRecoveryAuthorization?
+    var nativeRecoveryReceiptWasConsumed = false
     /// Exact pre-request lifetime-cumulative snapshot; never post-request live observation.
     private(set) var recoveryBaseline: IOSPlayoutRecoveryBaseline?
     var callbackFloor: UInt64?
@@ -362,6 +952,7 @@ private final class IOSPlayoutProofAttempt {
         postCallRecoveryMilestone:
             WorldwidePostCallMicrophoneRecoveryMilestone? = nil,
         categoryProofClaim: WorldwideAudioCategoryProofClaim? = nil,
+        recoveryTransaction: WorldwideAudioRecoveryTransaction? = nil,
         stage: IOSPlayoutProofStage
     ) {
         self.proofAttemptID = proofAttemptID
@@ -372,6 +963,7 @@ private final class IOSPlayoutProofAttempt {
         self.postCallRecoveryMilestone =
             postCallRecoveryMilestone
         self.categoryProofClaim = categoryProofClaim
+        self.recoveryTransaction = recoveryTransaction
         self.stage = stage
     }
 
@@ -571,6 +1163,133 @@ struct WorldwideIOSHostedCallPlayoutDebugProjection: Equatable {
 }
 #endif
 
+/// Pure admission rule shared by the native-command callback and deterministic tests. Timeline
+/// metadata may advance while a command crosses onto MainActor, so a newer revision remains valid
+/// only while it still names the same media context and still permits the requested command.
+enum RemoteMediaCommandAdmission {
+    static func permits(
+        _ command: WebRTCRemoteMediaCommand,
+        contextID: String,
+        observedRevision: UInt64,
+        currentUpdate: WebRTCRemoteMediaStateUpdate?
+    ) -> Bool {
+        guard observedRevision > 0,
+              let currentUpdate,
+              currentUpdate.revision >= observedRevision,
+              let item = currentUpdate.item,
+              item.contextID == contextID,
+              item.capabilities.permits(command) else {
+            return false
+        }
+        return true
+    }
+}
+
+/// A remote-media state becomes command authority only after it is observed on the exact healthy
+/// transport generation. Negotiated capability alone is intentionally insufficient during an ICE
+/// or control-channel recovery boundary.
+enum RemoteMediaTransportAdmission {
+    static func permitsIncomingState(
+        isNegotiated: Bool,
+        isPeerConnected: Bool,
+        isICEConnected: Bool,
+        isControlChannelReady: Bool,
+        recoveryProofRequired: Bool
+    ) -> Bool {
+        isNegotiated
+            && isPeerConnected
+            && isICEConnected
+            && isControlChannelReady
+            && !recoveryProofRequired
+    }
+
+    static func permitsCommands(
+        isNegotiated: Bool,
+        hasPeer: Bool,
+        isPeerConnected: Bool,
+        isICEConnected: Bool,
+        isControlChannelReady: Bool,
+        recoveryProofRequired: Bool,
+        stateTransportGeneration: UUID?,
+        currentTransportGeneration: UUID,
+        hasMediaItem: Bool
+    ) -> Bool {
+        permitsIncomingState(
+            isNegotiated: isNegotiated,
+            isPeerConnected: isPeerConnected,
+            isICEConnected: isICEConnected,
+            isControlChannelReady: isControlChannelReady,
+            recoveryProofRequired: recoveryProofRequired
+        )
+            && hasPeer
+            && stateTransportGeneration == currentTransportGeneration
+            && hasMediaItem
+    }
+}
+
+/// Only a snapshot echoing this healthy boundary's nonce can reopen native commands. An early
+/// unsolicited update is never promoted to authority later, even when its item is unchanged.
+struct RemoteMediaRefreshGate {
+    struct Ticket: Equatable, Sendable {
+        let generation: UUID
+        let id: UUID
+    }
+
+    static let maximumImmediateAttempts = 3
+    private(set) var ticket: Ticket?
+    private(set) var attempts = 0
+    private(set) var hasAcceptedSnapshot = false
+
+    var retryDelay: Duration {
+        attempts < Self.maximumImmediateAttempts ? .seconds(1) : .seconds(10)
+    }
+
+    mutating func begin(generation: UUID) -> Ticket? {
+        guard ticket == nil else { return nil }
+        let ticket = Ticket(generation: generation, id: UUID())
+        self.ticket = ticket
+        attempts = 1
+        return ticket
+    }
+
+    mutating func retry(_ ticket: Ticket) -> Bool {
+        guard self.ticket == ticket, !hasAcceptedSnapshot else { return false }
+        attempts = min(attempts + 1, Self.maximumImmediateAttempts)
+        return true
+    }
+
+    mutating func accept(refreshID: UUID?, generation: UUID) -> Bool {
+        guard let ticket, !hasAcceptedSnapshot,
+              ticket.generation == generation, ticket.id == refreshID else { return false }
+        hasAcceptedSnapshot = true
+        return true
+    }
+
+    mutating func invalidate() {
+        ticket = nil
+        attempts = 0
+        hasAcceptedSnapshot = false
+    }
+}
+
+enum RemoteMediaStateAdmission {
+    static func accept(
+        _ state: WebRTCReceivedRemoteMediaState,
+        currentState: WebRTCReceivedRemoteMediaState?,
+        refresh: inout RemoteMediaRefreshGate,
+        generation: UUID,
+        transportIsReady: Bool
+    ) -> Bool {
+        guard transportIsReady, state.update.isValid else { return false }
+        if let currentState {
+            return refresh.hasAcceptedSnapshot
+                && currentState.isSameNegotiation(as: state)
+                && state.update.revision > currentState.update.revision
+        }
+        return refresh.accept(refreshID: state.refreshID, generation: generation)
+    }
+}
+
 /// Process-wide owner of an authenticated worldwide WebRTC media session.
 ///
 /// The model deliberately separates signaling/ICE, audio proof, screen presentation, and remote
@@ -581,8 +1300,13 @@ struct WorldwideIOSHostedCallPlayoutDebugProjection: Equatable {
 final class WorldwideSessionViewModel: ObservableObject {
     private static let macHostedCallChallengeAutomaticRetryDelay:
         Duration = .milliseconds(250)
+    private static let peerRetirementFailureMessage =
+        "The previous iPhone audio session could not be retired safely. Restart opensteamer before reconnecting."
+    private static let peerRetirementInProgressMessage =
+        "The previous iPhone audio session is still retiring. Try reconnecting in a moment."
     /// Never outrun the host's 60 Hz scroll budget during a sustained gesture.
     static let remoteScrollFlushInterval: Duration = .milliseconds(17)
+    private static let focusedWindowInteractionPresentationTimeout: Duration = .seconds(5)
 
     private struct MacHostedCallAnswerForwardedBinding: Equatable {
         let peerIdentity: ObjectIdentifier
@@ -616,6 +1340,8 @@ final class WorldwideSessionViewModel: ObservableObject {
             advanceScreenLivenessGeneration(clearRenderObservation: true)
         }
     }
+    @Published private var recoveringScreenPresentationLease:
+        WorldwideScreenPresentationLease?
     @Published private(set) var remoteVideoTrack: WebRTCRemoteVideoTrack? {
         willSet {
             let currentIdentity = remoteVideoTrack.map { ObjectIdentifier($0) }
@@ -625,7 +1351,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                 reason: "The remote video track changed during screen resume.",
                 notifyPeer: true
             )
-            discardPendingRemoteScrolls()
+            remoteVideoTrackIdentityWillChange()
         }
         didSet {
             let previousIdentity = oldValue.map { ObjectIdentifier($0) }
@@ -640,6 +1366,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         WorldwideScreenMediaViewerFence? {
         didSet {
             guard oldValue != screenMediaViewerFence else { return }
+            if screenMediaViewerFence?.forceCover == true {
+                cancelFocusedWindowResize()
+            }
+            if let recoveryRevealFence = screenPresentationRevealAfterRecoveryFence,
+               !recoveryRevealFence.matches(screenMediaViewerFence) {
+                screenPresentationRevealAfterRecoveryFence = nil
+            }
             refreshScreenLivenessDiagnostic()
         }
     }
@@ -670,11 +1403,23 @@ final class WorldwideSessionViewModel: ObservableObject {
     @Published private(set) var remoteInputCapability: WebRTCInputCapability?
     @Published private(set) var focusedInputGeneration: UInt64?
     @Published private(set) var focusedInputIsSecure = false
+    @Published private(set) var focusedWindowResizeState: FocusedWindowResizeState = .inactive
+
+    var focusedWindowInteractionState: FocusedWindowResizeState { focusedWindowResizeState }
 
     private var signaling: RendezvousSignalingClient?
+    /// Immutable for one admitted media generation. Temporary Debug viewers use the restricted
+    /// topology so connecting a test phone cannot acquire any local audio-session authority.
+    private var sessionMediaTopology: WebRTCTransportMediaTopology = .full
+    private var sessionOwnsAudio: Bool {
+        sessionMediaTopology == .full
+    }
     private var peer: WebRTCPeer? {
         didSet {
             guard oldValue !== peer else { return }
+            startAudioClientDiagnostics(for: sessionOwnsAudio ? peer : nil)
+            remoteMediaControlsNegotiated = false
+            clearRemoteMediaPresentation()
             cancelScreenMediaViewerSuspension(
                 reason: "The media peer changed during screen resume.",
                 notifyPeer: oldValue != nil
@@ -702,6 +1447,15 @@ final class WorldwideSessionViewModel: ObservableObject {
         let peerIdentity: ObjectIdentifier
         let transportAuthorizationGeneration: UUID
     }
+    private struct MicrophoneTransportSuspensionBinding: Equatable {
+        let sessionGeneration: UUID
+        let peerIdentity: ObjectIdentifier
+        let transportAuthorizationGeneration: UUID
+        let microphoneOperationGeneration: UUID
+        let retirementID: UUID
+        let tokenID: UUID
+        let operationID: UUID
+    }
     private var microphoneAutomaticRecoveryConsumedBinding:
         MicrophoneAutomaticRecoveryBinding?
     /// Holds admission closed while the output-only RemoteIO recovery is still being proved.
@@ -710,6 +1464,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var microphoneAdmissionRecoveryPendingBinding:
         MicrophoneAutomaticRecoveryBinding?
     private var microphoneAdmissionRecoveryProofAttemptID: UUID?
+    private var microphoneTransportSuspensionBinding:
+        MicrophoneTransportSuspensionBinding?
     private var ordinaryPlayoutAutomaticRecoveryConsumedSessionGeneration: UUID?
     private var ordinaryPlayoutAutomaticFailureWasPublished = false
     private var transportAuthorizationGeneration = UUID() {
@@ -722,6 +1478,16 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
     private var remoteAudioTrack: WebRTCRemoteAudioTrack?
     private let audioLifecycle: WorldwideAudioLifecycleController
+    private let backgroundPlayback = BackgroundPlaybackCoordinator.shared
+    private var remoteMediaCommandOwner: RemoteMediaCommandOwnerToken?
+    private var remoteMediaControlsNegotiated = false
+    private var currentRemoteMediaState: WebRTCReceivedRemoteMediaState?
+    private var currentRemoteMediaUpdate: WebRTCRemoteMediaStateUpdate? {
+        currentRemoteMediaState?.update
+    }
+    private var remoteMediaStateTransportAuthorizationGeneration: UUID?
+    private var remoteMediaRefresh = RemoteMediaRefreshGate()
+    private var remoteMediaRefreshTask: Task<Void, Never>?
     private var recoveryCoordinator: ICERecoveryCoordinator?
     private var nextICERestartRequestID: UInt64 = 1
     private var iceIsConnected = false
@@ -729,9 +1495,12 @@ final class WorldwideSessionViewModel: ObservableObject {
     /// Serializes process-global WebRTC audio ownership across peer replacement. A replacement
     /// session may be accepted immediately, but it cannot open the shared audio gate until every
     /// retiring peer has completed its terminal close.
-    private var sessionRetirementTask: Task<Void, Never>?
+    private var sessionRetirementTask: Task<Bool, Never>?
     private var sessionRetirementGeneration = UUID()
     private var peerEventTask: Task<Void, Never>?
+    /// Lossless reducer receipts remain alive through native peer retirement so the terminal
+    /// device barrier is consumed before a replacement peer may bind its sequence namespace.
+    private var audioTransactionEventTask: Task<Bool, Never>?
     private var audioPlayoutProofTask: Task<Void, Never>?
     private var macHostedCallEvidenceLeaseTask: Task<Void, Never>?
     private var macHostedCallChallengeSendTask: Task<Void, Never>?
@@ -768,6 +1537,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var audioPolicyGeneration = UUID() {
         didSet {
             if oldValue != audioPolicyGeneration {
+                audioDiagnostics.policyChanged(audioPolicyGeneration, at: Self.audioDiagnosticsNow())
                 invalidateRawMicrophoneOracle()
                 retireIOSHostedCallPlayoutAttempt()
             }
@@ -779,6 +1549,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         case background
     }
 
+    private enum IPhoneMicrophoneDeferredRecoveryResolution {
+        case noDeferredRecovery
+        case recoveryStarted
+        case retryableFailure
+        case reconnectRequired
+    }
+
     private var verifiedAudioPolicyGeneration: UUID?
     /// Remains armed until a native recovery establishes a new floor and then observes strictly
     /// advancing callbacks and frames.
@@ -787,7 +1564,12 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var microphoneOutputOnlyToken:
         WebRTCIOSOutputOnlyMicrophoneToken?
     private var microphonePermissionTask: Task<Void, Never>?
+    private var microphonePermissionReconciliationTask: Task<Void, Never>?
+    private var microphonePermissionReconciliationID: UUID?
     private var microphoneTask: Task<Void, Never>?
+    /// Exact view-model ownership for an asynchronous native output-only teardown. A route-loss
+    /// retry queues behind this task so recovery cannot race the retiring RemoteIO write.
+    private var microphoneNativeTeardownID: UUID?
     private var microphonePermissionOperationGeneration = UUID()
     private var microphoneOperationGeneration = UUID()
     private var microphonePermissionGranted = false
@@ -825,6 +1607,15 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var sessionGeneration = UUID() {
         didSet {
             if oldValue != sessionGeneration {
+                cancelDeferredIPhoneMicrophonePermission()
+                audioClientDiagnosticsTask?.cancel()
+                audioClientDiagnosticsTask = nil
+                audioDiagnosticsSampleTask?.cancel()
+                audioDiagnostics.reset(
+                    sessionID: sessionGeneration, policyID: audioPolicyGeneration,
+                    at: Self.audioDiagnosticsNow()
+                )
+                cancelFocusedWindowResize()
                 advanceScreenLivenessGeneration(clearRenderObservation: true)
                 beginMacHostedCallNegotiationBoundary()
                 transportAuthorizationGeneration = UUID()
@@ -847,12 +1638,20 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var activeRemoteScroll: ActiveRemoteScroll?
     private var remoteScrollFlushTask: Task<Void, Never>?
     private var remoteScrollSendAuthorization: WebRTCInputSendAuthorization?
+    private var focusedWindowResizeSendAuthorization: WebRTCInputSendAuthorization?
+    private var focusedWindowInteractionPresentationTimeoutTask: Task<Void, Never>?
     private var remoteInputLifecycleSendAuthorization:
         WebRTCInputSendAuthorization?
     private var applicationInputIsSuspended = false
     private var pendingRemoteInputs: [UInt64: PendingRemoteInput] = [:]
     private var pendingRemoteInputOrder: [UInt64] = []
     private var earlyRemoteInputFeedback: [UInt64: WebRTCInputFeedback] = [:]
+    private var retiredFocusedWindowResizeRequests: [
+        RetiredFocusedWindowResizeRequestKey: RetiredFocusedWindowResizeRequest
+    ] = [:]
+    private var retiredFocusedWindowResizeRequestKeyOrder: [
+        RetiredFocusedWindowResizeRequestKey
+    ] = []
     private var latestPointerIntentID: UInt64 = 0
     private var remoteInputAuthorization: WebRTCInputAuthorization?
     private var currentScreenPresentationLease: WorldwideScreenPresentationLease?
@@ -865,6 +1664,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         WebRTCVideoRenderObservation?
     private var latestScreenVideoPresentationUptimeNanoseconds: UInt64?
     private var nextScreenClientDiagnosticsSequence: UInt64 = 1
+    private var audioDiagnostics = IOSAudioDiagnosticsJournal()
+    private var audioClientDiagnosticsTask: Task<Void, Never>?
+    private var audioDiagnosticsSampleTask: Task<Void, Never>?
+    private var audioDiagnosticsSampleID: UUID?
+    private var audioDiagnosticsLastSentAt: UInt64?
+    private var audioDiagnosticsLastEventSequence: UInt64 = 0
+    private var audioDiagnosticsFastUntil: UInt64 = 0
     private var screenMediaViewerAttempt: WorldwideScreenMediaViewerAttempt?
     private var screenMediaCoveredHideTask: Task<Void, Never>?
     private var screenMediaMarkerPresentationTask: Task<Void, Never>?
@@ -875,11 +1681,16 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var screenShowOperationByLeaseID: [UUID: UUID] = [:]
     private var screenVisibilityQueue: [QueuedScreenVisibilityOperation] = []
     private var screenVisibilityDrainTask: Task<Void, Never>?
+    private var screenPresentationRecoveryTask: Task<Void, Never>?
+    private var screenPresentationRecoveryAttemptID: UUID?
+    private var screenPresentationRevealAfterRecoveryFence:
+        WorldwideScreenPresentationRecoveryRevealFence?
     private var screenVisibilityQueueGeneration = UUID()
     private var acceptsActiveScreenAcknowledgement = false
     private var remoteHideRequired = false
     private var screenVisibilityOperationGeneration = UUID()
     #if DEBUG
+    private var debugFocusedWindowResizeTrackOwner: NSObject?
     private var debugScreenVisibilityRequestSender: (@MainActor (Bool) async throws -> UInt64)?
     private var debugScreenVisibilityRequestSenderV2: (
         @MainActor (WorldwideScreenVisibilityDebugRequest) async throws -> UInt64
@@ -916,8 +1727,14 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var debugIOSPlayoutDiagnosticsReader: (
         @MainActor (WebRTCPeer) async -> WebRTCIOSPlayoutDiagnostics?
     )?
+    private var debugAudioClientDiagnosticsReader: (
+        @MainActor (WebRTCPeer) async -> WebRTCAudioClientNativeSnapshot?
+    )?
     private var debugIOSPlayoutRecoveryRequester: (
         @MainActor (WebRTCPeer, WebRTCIOSPlayoutRecoveryAuthorization) async -> Void
+    )?
+    private var debugIOSAudioSystemEventFenceRequester: (
+        @MainActor (WebRTCPeer, WebRTCIOSAudioTransactionDeviceBinding) async -> Bool
     )?
     private var debugIOSHostedCallPlayoutRecoveryRequester: (
         @MainActor (
@@ -970,6 +1787,8 @@ final class WorldwideSessionViewModel: ObservableObject {
         (@MainActor (WebRTCPeer, String) -> Void)?
     private var debugScreenLivenessUptimeClock:
         (@MainActor () -> UInt64)?
+    private var debugRemoteMediaCommandSender:
+        (@MainActor (RemoteMediaCommandDispatch) async throws -> Void)?
     #endif
 
     init(audioLifecycle: WorldwideAudioLifecycleController = WorldwideAudioLifecycleController()) {
@@ -994,10 +1813,35 @@ final class WorldwideSessionViewModel: ObservableObject {
             audioRequiresExplicitResume = snapshot.requiresExplicitResume
             audioError = snapshot.errorText
             audioDiagnostic = snapshot.diagnosticText
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.playbackChanged(snapshot, at: Self.audioDiagnosticsNow())
             reconcileIPhoneMicrophone(for: snapshot)
+            scheduleDeferredIPhoneMicrophonePermissionIfNeeded()
         }
-        audioLifecycle.onPlaybackRecoveryRequested = { [weak self] in
+        audioLifecycle.onDiagnosticsAuthorityFailure = { [weak self] decision in
             guard let self else { return }
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.authorityFailure(decision, at: Self.audioDiagnosticsNow())
+        }
+        audioLifecycle.onDiagnosticsCategoryObservationFailure = { [weak self] code in
+            guard let self else { return }
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.categoryObservationFailure(code, at: Self.audioDiagnosticsNow())
+        }
+        audioLifecycle.onDiagnosticsBoundary = { [weak self] kind in
+            guard let self else { return }
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.record(kind, at: Self.audioDiagnosticsNow())
+        }
+        #if DEBUG
+        // Production recovery is dispatched only through the transaction callback installed after
+        // the exact native device namespace binds. This legacy callback remains a test seam for
+        // controller fixtures that intentionally do not install a native transaction stream.
+        audioLifecycle.onPlaybackRecoveryRequested = { [weak self] in
+            guard let self,
+                  self.debugIOSPlayoutRecoveryRequester != nil else {
+                return
+            }
             self.beginIOSPlayoutProof(
                 requestRecovery: true,
                 postCallRecoveryMilestone:
@@ -1005,6 +1849,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                         .postCallMicrophoneRecoveryMilestone
             )
         }
+        #endif
         audioLifecycle.onHostedCallPlayoutRecoveryRequested = { [weak self] authorization in
             self?.beginIOSHostedCallPlayoutProof(authorization: authorization)
         }
@@ -1054,10 +1899,32 @@ final class WorldwideSessionViewModel: ObservableObject {
                 requiresFreshRecovery: requiresFreshRecovery
             )
         }
+        remoteMediaCommandOwner = backgroundPlayback.claimRemoteMediaCommandSender {
+            [weak self] dispatch in
+            Task { @MainActor [weak self] in
+                _ = self?.enqueueRemoteMediaCommand(dispatch)
+            }
+        }
+        reconcileRemoteMediaCommandAvailability()
     }
 
     deinit {
+        microphonePermissionReconciliationTask?.cancel()
+        audioClientDiagnosticsTask?.cancel()
+        audioDiagnosticsSampleTask?.cancel()
+        let remoteMediaCommandOwner = remoteMediaCommandOwner
+        audioTransactionEventTask?.cancel()
+        remoteMediaRefreshTask?.cancel()
+        focusedWindowInteractionPresentationTimeoutTask?.cancel()
         NotificationCenter.default.removeObserver(self)
+        if let remoteMediaCommandOwner {
+            Task { @MainActor in
+                BackgroundPlaybackCoordinator.shared
+                    .releaseRemoteMediaCommandSender(
+                        owner: remoteMediaCommandOwner
+                    )
+            }
+        }
     }
 
     // MARK: - Published capabilities
@@ -1100,8 +1967,27 @@ final class WorldwideSessionViewModel: ObservableObject {
         isRemoteInputAvailable && remoteInputCapability?.supportsScroll == true
     }
 
+    var isFocusedWindowResizeAvailable: Bool {
+        isRemoteInputAvailable
+            && remoteInputCapability?.supportsFocusedWindowResize == true
+    }
+
+    var isFocusedWindowMoveAvailable: Bool {
+        isRemoteInputAvailable
+            && remoteInputCapability?.supportsFocusedWindowMove == true
+    }
+
+    private func focusedWindowInteractionIsAvailable(_ mode: FocusedWindowInteractionMode) -> Bool {
+        switch mode {
+        case .resize: isFocusedWindowResizeAvailable
+        case .move: isFocusedWindowMoveAvailable
+        }
+    }
+
     var canResumeAudioPlayback: Bool {
-        hasActiveSession
+        sessionOwnsAudio
+            && hasActiveSession
+            && !audioLifecycle.audioRecoveryRequiresSessionReconnect
             && (audioRequiresExplicitResume || audioStateText == "Playback unavailable")
     }
 
@@ -1110,14 +1996,34 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     var canToggleIPhoneMicrophone: Bool {
-        hasActiveSession
+        sessionOwnsAudio
+            && hasActiveSession
             && peer != nil
             && !isMicrophoneAdmissionCleanupInProgress
+            && !audioLifecycle.audioRecoveryRequiresSessionReconnect
     }
 
     var iPhoneMicrophoneButtonTitle: String {
-        if microphoneAdmissionFailedSessionGeneration == sessionGeneration {
+        if audioLifecycle.audioRecoveryRequiresSessionReconnect {
+            return "iPhone Microphone Unavailable"
+        }
+        if microphoneAdmissionFailedSessionGeneration == sessionGeneration
+            || (microphoneIntentEnabled
+                && !isMicrophoneSending
+                && audioLifecycle
+                    .microphoneWaitsForDeferredAudioRecovery
+                && audioError != nil) {
             return "Retry iPhone Microphone"
+        }
+        if microphoneIntentEnabled,
+           !microphoneIsBlockedByCall,
+           audioLifecycle.isMicrophoneResumeRecoveryInProgress {
+            return "Cancel Microphone Recovery"
+        }
+        if microphoneIntentEnabled,
+           !microphoneIsBlockedByCall,
+           audioLifecycle.microphoneRequiresExplicitResume {
+            return "Resume iPhone Microphone"
         }
         return microphoneIntentEnabled
             ? "Turn Off iPhone Microphone"
@@ -1125,8 +2031,24 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     var iPhoneMicrophoneButtonSystemImage: String {
-        if microphoneAdmissionFailedSessionGeneration == sessionGeneration {
+        if audioLifecycle.audioRecoveryRequiresSessionReconnect {
+            return "mic.slash.fill"
+        }
+        if microphoneAdmissionFailedSessionGeneration == sessionGeneration
+            || (microphoneIntentEnabled
+                && !isMicrophoneSending
+                && audioLifecycle
+                    .microphoneWaitsForDeferredAudioRecovery
+                && audioError != nil)
+            || (microphoneIntentEnabled
+                && !microphoneIsBlockedByCall
+                && audioLifecycle.microphoneRequiresExplicitResume) {
             return "arrow.clockwise"
+        }
+        if microphoneIntentEnabled,
+           !microphoneIsBlockedByCall,
+           audioLifecycle.isMicrophoneResumeRecoveryInProgress {
+            return "xmark.circle.fill"
         }
         return microphoneIntentEnabled ? "mic.slash.fill" : "mic.fill"
     }
@@ -1138,6 +2060,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     func debugConnectWithInvitationForTests(
         invitationCode input: String,
         debugEndpointOverride: String? = nil,
+        mediaTopology: WebRTCTransportMediaTopology = .full,
         beforeAudioActivation: @MainActor () -> Void = {}
     ) -> Bool {
         guard !isConnecting, !hasActiveSession else { return false }
@@ -1173,7 +2096,22 @@ final class WorldwideSessionViewModel: ObservableObject {
         return connect(
             signalingClient: client,
             provenance: .unauthenticated,
+            mediaTopology: mediaTopology,
             beforeAudioActivation: beforeAudioActivation
+        )
+    }
+
+    /// Debug-device entry point for the temporary second viewer. It deliberately keeps the
+    /// existing audio-capable test constructor above unchanged for audio lifecycle fixtures.
+    @discardableResult
+    func debugConnectTemporaryTestViewer(
+        invitationCode input: String,
+        debugEndpointOverride: String? = nil
+    ) -> Bool {
+        debugConnectWithInvitationForTests(
+            invitationCode: input,
+            debugEndpointOverride: debugEndpointOverride,
+            mediaTopology: .videoControlOnly
         )
     }
     #endif
@@ -1186,21 +2124,36 @@ final class WorldwideSessionViewModel: ObservableObject {
     func connect(
         signalingClient client: RendezvousSignalingClient,
         provenance: MediaSessionProvenance = .unauthenticated,
+        mediaTopology: WebRTCTransportMediaTopology = .full,
         beforeAudioActivation: @MainActor () -> Void = {}
     ) -> Bool {
         guard !isConnecting, !hasActiveSession else { return false }
+        if mediaTopology == .full,
+           sessionRetirementTask == nil,
+           let retirementError = Self
+            .iOSPeerRetirementAdmissionErrorMessage() {
+            stateText = "Connection failed"
+            lastError = retirementError
+            return false
+        }
 
         // Validation is complete. Rotate every session-owned fence before lifecycle preparation so
         // a startup-connected-call authorization cannot bind to the retired media generation.
-        beforeAudioActivation()
+        if mediaTopology == .full {
+            beforeAudioActivation()
+        }
         resetPublishedSessionState()
+        sessionMediaTopology = mediaTopology
         sessionGeneration = UUID()
         audioPolicyGeneration = UUID()
         isConnecting = true
         stateText = "Connecting securely"
         signaling = client
         automaticMicrophoneEligibleSessionGeneration =
-            provenance == .authenticatedPairedCoordinatorHandoff ? sessionGeneration : nil
+            mediaTopology == .full
+                && provenance == .authenticatedPairedCoordinatorHandoff
+                    ? sessionGeneration
+                    : nil
         automaticMicrophoneAttemptedSessionGeneration = nil
         manuallyDisabledMicrophoneSessionGeneration = nil
         microphoneAdmissionFailedSessionGeneration = nil
@@ -1213,6 +2166,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAutomaticRecoveryConsumedBinding = nil
         microphoneAdmissionRecoveryPendingBinding = nil
         microphoneAdmissionRecoveryProofAttemptID = nil
+        microphoneTransportSuspensionBinding = nil
         ordinaryPlayoutAutomaticRecoveryConsumedSessionGeneration = nil
         ordinaryPlayoutAutomaticFailureWasPublished = false
         nextICERestartRequestID = 1
@@ -1225,24 +2179,66 @@ final class WorldwideSessionViewModel: ObservableObject {
         if let pendingRetirement = sessionRetirementTask {
             let retirementGeneration = sessionRetirementGeneration
             sessionTask = Task { @MainActor [weak self] in
-                await pendingRetirement.value
+                let retirementSucceeded = await pendingRetirement.value
                 guard let self,
                       !Task.isCancelled,
                       sessionGeneration == generation,
                       signaling != nil else { return }
+                guard retirementSucceeded else {
+                    failSession(
+                        Self.peerRetirementFailureMessage,
+                        generation: generation
+                    )
+                    return
+                }
                 if sessionRetirementGeneration == retirementGeneration {
                     sessionRetirementTask = nil
                 }
-                audioLifecycle.prepare(serverName: remoteDisplayName)
+                if sessionMediaTopology == .full,
+                   let retirementError = Self
+                       .iOSPeerRetirementAdmissionErrorMessage() {
+                    failSession(
+                        retirementError,
+                        generation: generation
+                    )
+                    return
+                }
+                if sessionOwnsAudio {
+                    audioLifecycle.prepare(serverName: remoteDisplayName)
+                }
                 await runSession(client: client, generation: generation)
             }
         } else {
-            audioLifecycle.prepare(serverName: remoteDisplayName)
+            if mediaTopology == .full,
+               let retirementError = Self
+                   .iOSPeerRetirementAdmissionErrorMessage() {
+                failSession(
+                    retirementError,
+                    generation: generation
+                )
+                return true
+            }
+            if mediaTopology == .full {
+                audioLifecycle.prepare(serverName: remoteDisplayName)
+            }
             sessionTask = Task { [weak self] in
                 await self?.runSession(client: client, generation: generation)
             }
         }
         return true
+    }
+
+    private static func iOSPeerRetirementAdmissionErrorMessage()
+        -> String? {
+        switch WebRTCPeer
+            .iOSAudioDeviceRetirementAdmissionState() {
+        case .available:
+            return nil
+        case .retirementInProgress:
+            return peerRetirementInProgressMessage
+        case .failed:
+            return peerRetirementFailureMessage
+        }
     }
 
     private func iOSPlayoutInputPolicyMatches(
@@ -1320,6 +2316,57 @@ final class WorldwideSessionViewModel: ObservableObject {
         stateText = "Not connected"
     }
 
+    /// Admits bootstrap/availability only after this process no longer owns media and the exact
+    /// preceding peer/signaling retirement has finished. This gate must run before availability
+    /// connects because the host may treat a new ready exchange as replacement authority.
+    func admitFreshConnectionPreparation() async -> Bool {
+        guard !hasActiveSession,
+              !isConnecting,
+              recoveringScreenPresentationLease == nil else {
+            return false
+        }
+        if sessionRetirementTask == nil,
+           let retirementError = Self
+            .iOSPeerRetirementAdmissionErrorMessage() {
+            stateText = "Connection failed"
+            lastError = retirementError
+            return false
+        }
+
+        let expectedSessionGeneration = sessionGeneration
+        if let pendingRetirement = sessionRetirementTask {
+            let expectedRetirementGeneration = sessionRetirementGeneration
+            let retirementSucceeded = await pendingRetirement.value
+            guard retirementSucceeded else {
+                stateText = "Connection failed"
+                lastError = Self.peerRetirementFailureMessage
+                return false
+            }
+            guard !Task.isCancelled,
+                  sessionGeneration == expectedSessionGeneration,
+                  !hasActiveSession,
+                  !isConnecting,
+                  recoveringScreenPresentationLease == nil else {
+                return false
+            }
+            if sessionRetirementGeneration == expectedRetirementGeneration {
+                sessionRetirementTask = nil
+            }
+        }
+
+        if let retirementError = Self
+            .iOSPeerRetirementAdmissionErrorMessage() {
+            stateText = "Connection failed"
+            lastError = retirementError
+            return false
+        }
+        return !Task.isCancelled
+            && sessionGeneration == expectedSessionGeneration
+            && !hasActiveSession
+            && !isConnecting
+            && recoveringScreenPresentationLease == nil
+    }
+
     /// Keeps authenticated audio playout alive while independently closing the screen/input
     /// presentation boundary for privacy.
     func handleAppBecameActive() {
@@ -1330,8 +2377,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         lastHandledApplicationLifecyclePhase = .active
         applicationIsActive = true
         refreshScreenLivenessDiagnostic()
+        guard sessionOwnsAudio else { return }
         recoverPassiveAudioLifecyclePreservingEstablishedMicrophone {
-            audioLifecycle.appBecameActive()
+            establishedMicrophoneAuthorization in
+            audioLifecycle.appBecameActive(
+                preservingEstablishedMicrophoneAuthorization:
+                    establishedMicrophoneAuthorization
+            )
         }
         establishAutomaticIPhoneMicrophoneIntentIfEligible()
         continueIPhoneMicrophoneEnablementIfPossible()
@@ -1343,6 +2395,11 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
         lastHandledApplicationLifecyclePhase = .inactive
         applicationIsActive = false
+        guard sessionOwnsAudio else {
+            suspendRemoteInputForApplicationLifecycle()
+            refreshScreenLivenessDiagnostic()
+            return
+        }
         pausePendingIPhoneMicrophoneForInactiveApp()
         audioLifecycle.appBecameInactive()
         // `.inactive` is also used for short system interruptions while the viewer remains the
@@ -1359,9 +2416,17 @@ final class WorldwideSessionViewModel: ObservableObject {
         lastHandledApplicationLifecyclePhase = .background
         applicationIsActive = false
         suspendRemoteInputForApplicationLifecycle()
+        guard sessionOwnsAudio else {
+            hideScreenForPassiveLifecycleIfNeeded()
+            return
+        }
         pausePendingIPhoneMicrophoneForInactiveApp()
         recoverPassiveAudioLifecyclePreservingEstablishedMicrophone {
-            audioLifecycle.appEnteredBackground()
+            establishedMicrophoneAuthorization in
+            audioLifecycle.appEnteredBackground(
+                preservingEstablishedMicrophoneAuthorization:
+                    establishedMicrophoneAuthorization
+            )
         }
         hideScreenForPassiveLifecycleIfNeeded()
     }
@@ -1375,15 +2440,33 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     private func recoverPassiveAudioLifecyclePreservingEstablishedMicrophone(
-        _ recovery: () -> Void
+        _ recovery: (WebRTCIOSMicrophoneAuthorization?) -> Bool
     ) {
         let authorization = microphoneAuthorization
-        preservesEstablishedMicrophoneAcrossNextPassiveProofInvalidation =
+        let establishedMicrophoneAuthorization =
             isMicrophoneSending && authorization?.isValid == true
+                ? authorization
+                : nil
+        preservesEstablishedMicrophoneAcrossNextPassiveProofInvalidation =
+            establishedMicrophoneAuthorization != nil
         defer {
             preservesEstablishedMicrophoneAcrossNextPassiveProofInvalidation = false
         }
-        recovery()
+        let recoveryWasDispatched = recovery(
+            establishedMicrophoneAuthorization
+        )
+        if establishedMicrophoneAuthorization != nil,
+           !recoveryWasDispatched {
+            // The preservation privilege covers only the atomic A-to-B handoff. If A could not
+            // retire/drain or B could not stage, immediately restore ordinary fail-closed mic
+            // teardown rather than leaving a live carrier outside reducer ownership.
+            preservesEstablishedMicrophoneAcrossNextPassiveProofInvalidation = false
+            suspendIPhoneMicrophone(
+                stateText: "Paused — audio recovery required",
+                preserveIntent: true,
+                reprovePlayout: false
+            )
+        }
     }
 
     private func pausePendingIPhoneMicrophoneForInactiveApp() {
@@ -1411,16 +2494,28 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     func resumeAudioPlayback() {
+        guard sessionOwnsAudio else { return }
+        audioDiagnostics.retryRequested(at: Self.audioDiagnosticsNow())
         ordinaryPlayoutLivenessTracker.reset()
         ordinaryPlayoutAutomaticRecoveryConsumedSessionGeneration = nil
         ordinaryPlayoutAutomaticFailureWasPublished = false
-        audioLifecycle.resumePlayback()
+        recoverPassiveAudioLifecyclePreservingEstablishedMicrophone {
+            establishedMicrophoneAuthorization in
+            audioLifecycle.resumePlayback(
+                preservingEstablishedMicrophoneAuthorization:
+                    establishedMicrophoneAuthorization
+            )
+        }
     }
 
     func toggleIPhoneMicrophone() {
+        guard sessionOwnsAudio else { return }
         guard !isMicrophoneAdmissionCleanupInProgress else { return }
 
         if microphoneAdmissionFailedSessionGeneration == sessionGeneration {
+            let retriesDeferredAudioRecovery =
+                audioLifecycle
+                    .microphoneWaitsForDeferredAudioRecovery
             microphoneAdmissionFailedSessionGeneration = nil
             microphoneAdmissionDeferredUntilTransportProof = nil
             microphoneAutomaticRecoveryConsumedBinding = nil
@@ -1428,9 +2523,80 @@ final class WorldwideSessionViewModel: ObservableObject {
             microphoneAdmissionRecoveryProofAttemptID = nil
             rawMicrophoneContinuityTracker.reset()
             microphoneError = nil
+            if retriesDeferredAudioRecovery {
+                microphoneStateText = "Recovering audio"
+                if audioLifecycle.snapshot.requiresExplicitResume {
+                    switch beginExplicitIPhoneMicrophoneResumeIfNeeded() {
+                    case .waiting:
+                        return
+                    case .notRequired, .ready:
+                        continueIPhoneMicrophoneEnablementIfPossible()
+                    }
+                } else {
+                    resumeAudioPlayback()
+                }
+                return
+            }
             microphoneStateText = "Starting"
-            continueIPhoneMicrophoneEnablementIfPossible()
+            switch beginExplicitIPhoneMicrophoneResumeIfNeeded() {
+            case .waiting:
+                return
+            case .notRequired, .ready:
+                continueIPhoneMicrophoneEnablementIfPossible()
+            }
             return
+        }
+
+        if microphoneIntentEnabled,
+           !isMicrophoneSending,
+           audioLifecycle.microphoneWaitsForDeferredAudioRecovery,
+           audioError != nil {
+            microphoneError = nil
+            microphoneStateText = "Recovering audio"
+            if audioLifecycle.snapshot.requiresExplicitResume {
+                switch beginExplicitIPhoneMicrophoneResumeIfNeeded() {
+                case .waiting:
+                    return
+                case .notRequired, .ready:
+                    continueIPhoneMicrophoneEnablementIfPossible()
+                }
+            } else {
+                resumeAudioPlayback()
+            }
+            return
+        }
+
+        if microphoneIntentEnabled,
+           !isMicrophoneSending,
+           audioLifecycle.isMicrophoneResumeRecoveryInProgress {
+            manuallyDisabledMicrophoneSessionGeneration = sessionGeneration
+            automaticMicrophoneAttemptedSessionGeneration = sessionGeneration
+            microphoneAdmissionFailedSessionGeneration = nil
+            microphoneAdmissionDeferredUntilTransportProof = nil
+            microphoneAutomaticRecoveryConsumedBinding = nil
+            microphoneAdmissionRecoveryPendingBinding = nil
+            microphoneAdmissionRecoveryProofAttemptID = nil
+            rawMicrophoneContinuityTracker.reset()
+            microphoneError = nil
+            audioLifecycle.cancelPendingMicrophoneInputResume()
+            suspendIPhoneMicrophone(
+                stateText: "Off",
+                preserveIntent: false,
+                reprovePlayout: false
+            )
+            return
+        }
+
+        if microphoneIntentEnabled,
+           !isMicrophoneSending,
+           audioLifecycle.microphoneRequiresExplicitResume {
+            switch beginExplicitIPhoneMicrophoneResumeIfNeeded() {
+            case .waiting:
+                return
+            case .notRequired, .ready:
+                continueIPhoneMicrophoneEnablementIfPossible()
+                return
+            }
         }
 
         if microphoneIntentEnabled {
@@ -1463,7 +2629,71 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAdmissionRecoveryProofAttemptID = nil
         rawMicrophoneContinuityTracker.reset()
         microphoneError = nil
-        continueIPhoneMicrophoneEnablementIfPossible()
+        switch beginExplicitIPhoneMicrophoneResumeIfNeeded() {
+        case .waiting:
+            return
+        case .notRequired, .ready:
+            continueIPhoneMicrophoneEnablementIfPossible()
+        }
+    }
+
+    private enum ExplicitMicrophoneResumeResult {
+        case notRequired
+        case waiting
+        case ready
+    }
+
+    /// Uses the microphone control as the explicit input-only recovery action after a private
+    /// output route disappears. A synchronous recovery can continue directly into admission;
+    /// transaction-backed recovery returns here and the lifecycle snapshot resumes admission.
+    private func beginExplicitIPhoneMicrophoneResumeIfNeeded()
+        -> ExplicitMicrophoneResumeResult {
+        guard audioLifecycle.snapshot.requiresExplicitResume else {
+            return .notRequired
+        }
+        guard !microphoneIsBlockedByCall else {
+            microphoneStateText = microphoneActivationBlockedStateText
+            return .waiting
+        }
+        if audioLifecycle.isMicrophoneResumeRecoveryInProgress {
+            microphoneStateText = "Recovering microphone"
+            return .waiting
+        }
+        guard audioLifecycle.microphoneRequiresExplicitResume else {
+            return audioLifecycle.microphoneActivationIsAllowed()
+                ? .ready
+                : .waiting
+        }
+
+        microphoneStateText = "Recovering microphone"
+        microphoneError = nil
+        let recoveryWasDispatched =
+            audioLifecycle.resumeMicrophoneInput(
+                deferRecoveryUntilNativeTeardownCompletes:
+                    microphoneNativeTeardownID != nil
+            )
+        if audioLifecycle.isMicrophoneResumeRecoveryInProgress {
+            return .waiting
+        }
+        guard recoveryWasDispatched,
+              audioLifecycle.microphoneActivationIsAllowed() else {
+            microphoneStateText = microphoneActivationBlockedStateText
+            return .waiting
+        }
+        return .ready
+    }
+
+    private var microphoneActivationBlockedStateText: String {
+        if microphoneIsBlockedByCall {
+            return "Muted — iPhone call active"
+        }
+        if audioLifecycle.isMicrophoneResumeRecoveryInProgress {
+            return "Recovering microphone"
+        }
+        if audioLifecycle.microphoneRequiresExplicitResume {
+            return "Paused — resume iPhone microphone"
+        }
+        return "Paused — audio unavailable"
     }
 
     private func establishAutomaticIPhoneMicrophoneIntentIfEligible() {
@@ -1485,15 +2715,77 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneError = nil
     }
 
+    private func cancelDeferredIPhoneMicrophonePermission() {
+        microphonePermissionReconciliationTask?.cancel()
+        microphonePermissionReconciliationTask = nil
+        microphonePermissionReconciliationID = nil
+    }
+
+    private func scheduleDeferredIPhoneMicrophonePermissionIfNeeded() {
+        guard sessionOwnsAudio,
+              microphoneIntentEnabled,
+              !microphonePermissionGranted,
+              microphonePermissionTask == nil,
+              microphonePermissionReconciliationTask == nil,
+              applicationIsActive,
+              canViewScreen,
+              !recoveryProofRequired,
+              audioLifecycle.snapshot.errorText == nil,
+              let expectedPeer = peer else { return }
+
+        let reconciliationID = UUID()
+        let expectedSessionGeneration = sessionGeneration
+        let expectedPermissionOperationGeneration =
+            microphonePermissionOperationGeneration
+        microphonePermissionReconciliationID = reconciliationID
+        // A recovered lifecycle snapshot can unblock the first permission request. Wait until
+        // its synchronous publication finishes; keep one owner through any reentrant CallKit read.
+        microphonePermissionReconciliationTask = Task { @MainActor [weak self, weak expectedPeer] in
+            guard let self,
+                  self.microphonePermissionReconciliationID == reconciliationID else { return }
+            defer {
+                if self.microphonePermissionReconciliationID == reconciliationID {
+                    self.microphonePermissionReconciliationTask = nil
+                    self.microphonePermissionReconciliationID = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  let expectedPeer,
+                  self.peer === expectedPeer,
+                  self.sessionGeneration == expectedSessionGeneration,
+                  self.microphonePermissionOperationGeneration
+                    == expectedPermissionOperationGeneration,
+                  self.sessionOwnsAudio,
+                  self.microphoneIntentEnabled,
+                  !self.microphonePermissionGranted,
+                  self.microphonePermissionTask == nil,
+                  self.applicationIsActive,
+                  self.canViewScreen,
+                  !self.recoveryProofRequired,
+                  self.audioLifecycle.snapshot.errorText == nil else { return }
+            self.continueIPhoneMicrophoneEnablementIfPossible()
+        }
+    }
+
     private func continueIPhoneMicrophoneEnablementIfPossible() {
+        let expectedSessionGeneration = sessionGeneration
+        let expectedPeer = peer
+        let expectedPermissionOperationGeneration =
+            microphonePermissionOperationGeneration
         guard microphoneIntentEnabled else { return }
         guard !microphoneAwaitsPostCallRecovery else {
             microphoneStateText = "Paused — restoring microphone"
             return
         }
-        guard !microphoneIsBlockedByCall,
-              audioLifecycle.microphoneActivationIsAllowed() else {
-            microphoneStateText = "Muted — iPhone call active"
+        let activationIsAllowed = !microphoneIsBlockedByCall
+            && audioLifecycle.microphoneActivationIsAllowed()
+        guard sessionGeneration == expectedSessionGeneration,
+              peer === expectedPeer,
+              microphonePermissionOperationGeneration
+                == expectedPermissionOperationGeneration,
+              microphoneIntentEnabled else { return }
+        guard activationIsAllowed else {
+            microphoneStateText = microphoneActivationBlockedStateText
             return
         }
 
@@ -1511,14 +2803,43 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         microphoneStateText = "Requesting permission"
         let permissionGeneration = UUID()
-        let expectedSessionGeneration = sessionGeneration
         microphonePermissionOperationGeneration = permissionGeneration
         microphonePermissionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.microphonePermissionOperationGeneration == permissionGeneration,
+                  self.sessionGeneration == expectedSessionGeneration,
+                  self.peer === expectedPeer,
+                  self.microphoneIntentEnabled else { return }
+            guard self.applicationIsActive else {
+                self.microphonePermissionTask = nil
+                self.microphoneStateText = "Paused — waiting for app"
+                return
+            }
+            let activationIsAllowed = !self.microphoneIsBlockedByCall
+                && self.audioLifecycle.microphoneActivationIsAllowed()
+            guard !Task.isCancelled,
+                  self.microphonePermissionOperationGeneration == permissionGeneration,
+                  self.sessionGeneration == expectedSessionGeneration,
+                  self.peer === expectedPeer,
+                  self.microphoneIntentEnabled else { return }
+            guard self.applicationIsActive, activationIsAllowed else {
+                self.microphonePermissionTask = nil
+                self.microphoneStateText = self.applicationIsActive
+                    ? self.microphoneActivationBlockedStateText
+                    : "Paused — waiting for app"
+                return
+            }
+            guard self.canViewScreen, !self.recoveryProofRequired else {
+                self.microphonePermissionTask = nil
+                self.microphoneStateText = "Paused — waiting for healthy connection"
+                return
+            }
             let granted = await self.requestIPhoneMicrophonePermission()
             guard !Task.isCancelled,
                   self.microphonePermissionOperationGeneration == permissionGeneration,
                   self.sessionGeneration == expectedSessionGeneration,
+                  self.peer === expectedPeer,
                   self.microphoneIntentEnabled else {
                 return
             }
@@ -1541,7 +2862,8 @@ final class WorldwideSessionViewModel: ObservableObject {
             }
             guard !self.microphoneIsBlockedByCall,
                   self.audioLifecycle.microphoneActivationIsAllowed() else {
-                self.microphoneStateText = "Muted — iPhone call active"
+                self.microphoneStateText =
+                    self.microphoneActivationBlockedStateText
                 return
             }
             self.microphoneStateText = "Starting"
@@ -1617,7 +2939,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
         guard !microphoneIsBlockedByCall,
               audioLifecycle.microphoneActivationIsAllowed() else {
-            microphoneStateText = "Muted — iPhone call active"
+            microphoneStateText = microphoneActivationBlockedStateText
             return
         }
         if microphoneAuthorization?.isValid == true {
@@ -1660,6 +2982,10 @@ final class WorldwideSessionViewModel: ObservableObject {
             microphoneStateText = "Paused — waiting for healthy connection"
             return
         }
+        guard audioLifecycle.hasBoundIOSAudioTransactionDevice else {
+            microphoneStateText = "Paused — waiting for audio policy"
+            return
+        }
 
         let operationGeneration = UUID()
         let expectedSessionGeneration = sessionGeneration
@@ -1680,10 +3006,23 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAuthorization = authorization
         isMicrophoneSending = false
         microphoneStateText = "Starting"
-        guard audioLifecycle.beginMicrophoneTopologyTransition(
-            isEnabled: true
-        ) != 0 else {
+        let topologyGeneration =
+            audioLifecycle.beginMicrophoneTopologyTransition(
+                isEnabled: true
+            )
+        let topologyTransactionWasBound = topologyGeneration != 0
+            && audioLifecycle.bindCurrentMicrophoneTopologyTransaction(
+                to: authorization,
+                generation: topologyGeneration
+            )
+        guard topologyTransactionWasBound else {
             authorization.revoke()
+            if topologyGeneration != 0 {
+                _ = audioLifecycle
+                    .abortCurrentMicrophoneTopologyTransition(
+                        generation: topologyGeneration
+                    )
+            }
             microphoneAuthorization = nil
             microphoneTask?.cancel()
             microphoneTask = nil
@@ -1754,28 +3093,79 @@ final class WorldwideSessionViewModel: ObservableObject {
                 isMicrophoneSending = false
                 microphoneStateText = "Recovering audio"
                 microphoneError = error.localizedDescription
-                _ = await self.performIPhoneMicrophoneDisable(
+                let nativeTeardownSucceeded =
+                    await self.performIPhoneMicrophoneDisable(
                     on: expectedPeer,
                     authorization: authorization,
                     outputOnlyToken: outputOnlyToken
                 )
-                clearIPhoneMicrophoneOutputOnlyToken(
-                    outputOnlyToken
-                )
                 guard microphoneAdmissionCleanupID == cleanupID else {
                     return
                 }
-                microphoneAdmissionCleanupID = nil
-                isMicrophoneAdmissionCleanupInProgress = false
                 guard microphoneOperationGeneration == operationGeneration,
                       sessionGeneration == expectedSessionGeneration,
                       peer === expectedPeer,
                       microphoneAuthorization == nil else {
-                    // This exact cleanup has retired, but a call or recovery may have replaced its
-                    // operation generation while it was suspended. Re-evaluate the current owned
-                    // intent so a one-shot post-call completion cannot be lost to stale cleanup.
+                    _ = transferTerminalIPhoneMicrophoneOutputOnlyCompletion(
+                        outputOnlyToken,
+                        nativeTeardownSucceeded:
+                            nativeTeardownSucceeded,
+                        expectedPeer: expectedPeer,
+                        expectedSessionGeneration:
+                            expectedSessionGeneration
+                    )
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
                     reconcileIPhoneMicrophone()
                     return
+                }
+                guard nativeTeardownSucceeded,
+                      outputOnlyToken?.state == .succeeded else {
+                    audioLifecycle.cancelPendingMicrophoneInputResume()
+                    if let outputOnlyToken,
+                       audioLifecycle
+                        .abandonCurrentOutputOnlyTransitionRequiringReconnect(
+                            outputOnlyToken
+                        ),
+                       microphoneOutputOnlyToken === outputOnlyToken {
+                        microphoneOutputOnlyToken = nil
+                    }
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone could not finish resetting. Reconnect this session to restore it."
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                }
+                let outputOnlyCompletion =
+                    clearIPhoneMicrophoneOutputOnlyToken(
+                        outputOnlyToken
+                    )
+                switch resolveIPhoneMicrophoneDeferredRecovery(
+                    outputOnlyCompletion,
+                    after: outputOnlyToken
+                ) {
+                case .recoveryStarted:
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                case .retryableFailure:
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone audio path could not recover automatically. Tap Retry iPhone Microphone."
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                case .reconnectRequired:
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone audio path could not recover automatically. Reconnect this session to restore it."
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                case .noDeferredRecovery:
+                    break
                 }
                 if shouldDeferUntilTransportProof {
                     microphoneStateText =
@@ -1806,9 +3196,16 @@ final class WorldwideSessionViewModel: ObservableObject {
                             expectedTransportAuthorizationGeneration,
                         operationGeneration: operationGeneration
                     )
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
                     return
                 }
-                beginIOSPlayoutProof(requestRecovery: true)
+                if stageFailureIsLifecycleControlled {
+                    _ = audioLifecycle
+                        .requestTransactionalRuntimePlayoutRecovery(
+                            requiresRemoteAudio: false
+                        )
+                }
+                finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
                 if shouldDeferUntilTransportProof,
                    microphoneAdmissionDeferredUntilTransportProof == nil {
                     reconcileIPhoneMicrophone()
@@ -1842,16 +3239,84 @@ final class WorldwideSessionViewModel: ObservableObject {
                     armIPhoneMicrophoneOutputOnlyToken(
                         ownerEpoch: expectedSessionGeneration
                     )
+                let cleanupID = UUID()
+                microphoneAdmissionCleanupID = cleanupID
+                isMicrophoneAdmissionCleanupInProgress = true
                 authorization.revoke()
-                _ = await self.performIPhoneMicrophoneDisable(
+                let nativeTeardownSucceeded =
+                    await self.performIPhoneMicrophoneDisable(
                     on: expectedPeer,
                     authorization: authorization,
                     outputOnlyToken: outputOnlyToken
                 )
-                clearIPhoneMicrophoneOutputOnlyToken(
-                    outputOnlyToken
-                )
-                return
+                let ownsCleanup =
+                    microphoneAdmissionCleanupID == cleanupID
+                guard ownsCleanup,
+                      microphoneOperationGeneration == operationGeneration,
+                      sessionGeneration == expectedSessionGeneration,
+                      peer === expectedPeer,
+                      microphoneAuthorization === authorization else {
+                    _ = transferTerminalIPhoneMicrophoneOutputOnlyCompletion(
+                        outputOnlyToken,
+                        nativeTeardownSucceeded:
+                            nativeTeardownSucceeded,
+                        expectedPeer: expectedPeer,
+                        expectedSessionGeneration:
+                            expectedSessionGeneration
+                    )
+                    if ownsCleanup {
+                        finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    }
+                    return
+                }
+                microphoneAuthorization = nil
+                guard nativeTeardownSucceeded,
+                      outputOnlyToken?.state == .succeeded else {
+                    audioLifecycle.cancelPendingMicrophoneInputResume()
+                    if let outputOnlyToken,
+                       audioLifecycle
+                        .abandonCurrentOutputOnlyTransitionRequiringReconnect(
+                            outputOnlyToken
+                        ),
+                       microphoneOutputOnlyToken === outputOnlyToken {
+                        microphoneOutputOnlyToken = nil
+                    }
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone could not finish resetting. Reconnect this session to restore it."
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                }
+                let outputOnlyCompletion =
+                    clearIPhoneMicrophoneOutputOnlyToken(
+                        outputOnlyToken
+                    )
+                switch resolveIPhoneMicrophoneDeferredRecovery(
+                    outputOnlyCompletion,
+                    after: outputOnlyToken
+                ) {
+                case .recoveryStarted, .noDeferredRecovery:
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                case .retryableFailure:
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone audio path could not recover automatically. Tap Retry iPhone Microphone."
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                case .reconnectRequired:
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone audio path could not recover automatically. Reconnect this session to restore it."
+                    finishIPhoneMicrophoneAdmissionCleanup(cleanupID)
+                    return
+                }
             }
             invalidateRawMicrophoneOracle()
             microphoneAdmissionFailedSessionGeneration = nil
@@ -1862,7 +3327,9 @@ final class WorldwideSessionViewModel: ObservableObject {
             #if DEBUG
             debugIPhoneMicrophoneDidCommitObserver?(authorization)
             #endif
-            beginIOSPlayoutProof(requestRecovery: false)
+            if !audioLifecycle.snapshot.requiresExplicitResume {
+                beginIOSPlayoutProof(requestRecovery: false)
+            }
         }
     }
 
@@ -1870,6 +3337,12 @@ final class WorldwideSessionViewModel: ObservableObject {
         on peer: WebRTCPeer,
         authorization: WebRTCIOSMicrophoneAuthorization
     ) async throws {
+        defer {
+            recordNativeAudioTransactionTag(
+                authorization.stagedTransactionTagGeneration,
+                context: authorization.transaction
+            )
+        }
         #if DEBUG
         if let handler = debugIPhoneMicrophoneNativeEnableHandler {
             try await handler(authorization)
@@ -1963,17 +3436,40 @@ final class WorldwideSessionViewModel: ObservableObject {
         authorization: WebRTCIOSMicrophoneAuthorization?,
         outputOnlyToken: WebRTCIOSOutputOnlyMicrophoneToken? = nil
     ) async -> Bool {
+        let result: Bool
         #if DEBUG
         if let handler = debugIPhoneMicrophoneNativeDisableHandler {
-            return await handler(
+            result = await handler(
                 authorization,
                 outputOnlyToken
             )
+        } else {
+            result = await peer.disableIPhoneMicrophone(
+                authorization: authorization,
+                outputOnlyToken: outputOnlyToken
+            )
         }
-        #endif
-        return await peer.disableIPhoneMicrophone(
+        #else
+        result = await peer.disableIPhoneMicrophone(
             authorization: authorization,
             outputOnlyToken: outputOnlyToken
+        )
+        #endif
+        recordNativeAudioTransactionTag(
+            outputOnlyToken?.stagedTransactionTagGeneration,
+            context: outputOnlyToken?.transaction
+        )
+        return result
+    }
+
+    private func recordNativeAudioTransactionTag(
+        _ tagGeneration: UInt64?,
+        context: WebRTCIOSAudioTransactionContext?
+    ) {
+        guard let tagGeneration, let context else { return }
+        audioLifecycle.recordNativeAudioTransactionTag(
+            tagGeneration,
+            for: context
         )
     }
 
@@ -1998,6 +3494,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
 
         if !preserveIntent {
+            cancelDeferredIPhoneMicrophonePermission()
             microphoneIntentEnabled = false
             microphoneAdmissionFailedSessionGeneration = nil
             microphoneAdmissionDeferredUntilTransportProof = nil
@@ -2008,6 +3505,12 @@ final class WorldwideSessionViewModel: ObservableObject {
         let authorization = microphoneAuthorization
         let expectedPeer = peer
         let expectedSessionGeneration = sessionGeneration
+        let expectedAutomaticRecoveryBinding =
+            microphoneAdmissionRecoveryPendingBinding.flatMap {
+                $0 == currentMicrophoneAutomaticRecoveryBinding()
+                    ? $0
+                    : nil
+            }
         let topologyMayChange = authorization != nil || isMicrophoneSending
         let outputOnlyToken: WebRTCIOSOutputOnlyMicrophoneToken?
         if topologyMayChange, performNativeTeardown {
@@ -2038,19 +3541,97 @@ final class WorldwideSessionViewModel: ObservableObject {
         guard topologyMayChange, let expectedPeer else { return }
         guard performNativeTeardown else { return }
         invalidateAudioPolicyProof(requiresFreshRecovery: false)
+        let nativeTeardownID = UUID()
+        microphoneNativeTeardownID = nativeTeardownID
         microphoneTask = Task { @MainActor [weak self] in
-            _ = await self?.performIPhoneMicrophoneDisable(
+            let nativeTeardownSucceeded = await self?
+                .performIPhoneMicrophoneDisable(
                 on: expectedPeer,
                 authorization: authorization,
                 outputOnlyToken: outputOnlyToken
-            )
+            ) ?? false
             guard let self else { return }
-            clearIPhoneMicrophoneOutputOnlyToken(outputOnlyToken)
-            guard
+            let ownsNativeTeardown =
+                microphoneNativeTeardownID == nativeTeardownID
+            if ownsNativeTeardown {
+                microphoneNativeTeardownID = nil
+            }
+            guard ownsNativeTeardown,
                   sessionGeneration == expectedSessionGeneration,
                   peer === expectedPeer else {
                 return
             }
+            guard nativeTeardownSucceeded,
+                  outputOnlyToken?.state == .succeeded else {
+                audioLifecycle.cancelPendingMicrophoneInputResume()
+                if let outputOnlyToken,
+                   audioLifecycle
+                    .abandonCurrentOutputOnlyTransitionRequiringReconnect(
+                        outputOnlyToken
+                    ),
+                   microphoneOutputOnlyToken === outputOnlyToken {
+                    microphoneOutputOnlyToken = nil
+                }
+                if expectedAutomaticRecoveryBinding != nil {
+                    failPendingAutomaticMicrophoneRecoveryIfOwned(
+                        by: expectedAutomaticRecoveryBinding,
+                        message:
+                            "The iPhone microphone could not finish its automatic audio reset. Reconnect this session to restore it."
+                    )
+                    return
+                }
+                guard microphoneIntentEnabled else {
+                    microphoneStateText = "Off"
+                    microphoneError = nil
+                    return
+                }
+                if audioLifecycle.audioRecoveryRequiresSessionReconnect {
+                    microphoneAdmissionFailedSessionGeneration =
+                        expectedSessionGeneration
+                    microphoneStateText = "Unavailable"
+                    microphoneError =
+                        "The iPhone microphone could not finish resetting. Reconnect this session to restore it."
+                    return
+                }
+                microphoneStateText =
+                    microphoneActivationBlockedStateText
+                microphoneError =
+                    "The iPhone microphone could not finish resetting. Tap Resume iPhone Microphone to retry."
+                return
+            }
+            let outputOnlyCompletion =
+                clearIPhoneMicrophoneOutputOnlyToken(outputOnlyToken)
+            switch resolveIPhoneMicrophoneDeferredRecovery(
+                outputOnlyCompletion,
+                after: outputOnlyToken
+            ) {
+            case .noDeferredRecovery:
+                guard expectedAutomaticRecoveryBinding == nil else {
+                    failPendingAutomaticMicrophoneRecoveryIfOwned(
+                        by: expectedAutomaticRecoveryBinding,
+                        message:
+                            "Automatic microphone recovery was superseded. Tap Retry iPhone Microphone."
+                    )
+                    return
+                }
+            case .retryableFailure:
+                failPendingAutomaticMicrophoneRecoveryIfOwned(
+                    by: expectedAutomaticRecoveryBinding,
+                    message:
+                        "The iPhone microphone audio path could not recover automatically. Tap Retry iPhone Microphone."
+                )
+                return
+            case .reconnectRequired:
+                failPendingAutomaticMicrophoneRecoveryIfOwned(
+                    by: expectedAutomaticRecoveryBinding,
+                    message:
+                        "The iPhone microphone audio path could not recover automatically. Reconnect this session to restore it."
+                )
+                return
+            case .recoveryStarted:
+                return
+            }
+            _ = audioLifecycle.resumePendingMicrophoneInputIfPossible()
             if reprovePlayout {
                 beginIOSPlayoutProof(requestRecovery: false)
             }
@@ -2077,15 +3658,143 @@ final class WorldwideSessionViewModel: ObservableObject {
         return token
     }
 
+    private func finishIPhoneMicrophoneAdmissionCleanup(
+        _ cleanupID: UUID
+    ) {
+        guard microphoneAdmissionCleanupID == cleanupID else {
+            return
+        }
+        microphoneAdmissionCleanupID = nil
+        isMicrophoneAdmissionCleanupInProgress = false
+    }
+
+    @discardableResult
     private func clearIPhoneMicrophoneOutputOnlyToken(
         _ token: WebRTCIOSOutputOnlyMicrophoneToken?
-    ) {
-        guard let token else { return }
+    ) -> WorldwideIPhoneMicrophoneOutputOnlyCompletion {
+        guard let token else { return .noDeferredRecovery }
         if microphoneOutputOnlyToken === token {
             microphoneOutputOnlyToken = nil
         }
-        audioLifecycle
+        return audioLifecycle
             .iPhoneMicrophoneOutputOnlyTransitionDidComplete(token)
+    }
+
+    /// A peer can finish C immediately before transport uncertainty, leaving no native teardown
+    /// for the peer-owned suspension handler to prepare. If the original VM continuation still
+    /// owns the same peer/session/token, transfer that terminal C directly to the validated
+    /// transport path instead of abandoning it behind an invalidated operation generation.
+    @discardableResult
+    private func transferTerminalIPhoneMicrophoneOutputOnlyCompletion(
+        _ token: WebRTCIOSOutputOnlyMicrophoneToken?,
+        nativeTeardownSucceeded: Bool,
+        expectedPeer: WebRTCPeer,
+        expectedSessionGeneration: UUID
+    ) -> Bool {
+        guard let token,
+              sessionGeneration == expectedSessionGeneration,
+              peer === expectedPeer,
+              microphoneTransportSuspensionBinding == nil,
+              microphoneOutputOnlyToken === token,
+              token.state != .armed,
+              token.state != .executing else {
+            return false
+        }
+
+        let completionWasAccepted = nativeTeardownSucceeded
+            && token.state == .succeeded
+            && audioLifecycle
+                .completeValidatedTransportOutputOnlyTransition(token)
+        if completionWasAccepted {
+            microphoneOutputOnlyToken = nil
+            return true
+        }
+
+        let abandoned = audioLifecycle
+            .abandonCurrentOutputOnlyTransitionRequiringReconnect(token)
+        if abandoned {
+            microphoneOutputOnlyToken = nil
+        }
+        audioLifecycle.cancelPendingMicrophoneInputResume()
+        microphoneAdmissionFailedSessionGeneration =
+            expectedSessionGeneration
+        microphoneStateText = "Unavailable"
+        microphoneError =
+            "The iPhone microphone could not finish its transport reset. Reconnect this session to restore it."
+        return true
+    }
+
+    private func resolveIPhoneMicrophoneDeferredRecovery(
+        _ completion: WorldwideIPhoneMicrophoneOutputOnlyCompletion,
+        after token: WebRTCIOSOutputOnlyMicrophoneToken?
+    ) -> IPhoneMicrophoneDeferredRecoveryResolution {
+        switch completion {
+        case .noDeferredRecovery:
+            return .noDeferredRecovery
+        case .recoveryFailed:
+            guard let token,
+                  audioLifecycle
+                    .authorizeDeferredAudioRecoveryRetryAfterNativeSuccess(
+                        token
+                    ) else {
+                if let token {
+                    audioLifecycle
+                        .deferredAudioRecoveryRequiresReconnect(
+                            after: token
+                        )
+                }
+                return .reconnectRequired
+            }
+            return .retryableFailure
+        case .recoveryReady(let receipt):
+            guard let token,
+                  audioLifecycle.resumeDeferredAudioRecovery(
+                    receipt,
+                    after: token
+                  ) else {
+                if let token {
+                    audioLifecycle
+                        .deferredAudioRecoveryRequiresReconnect(
+                            after: token
+                        )
+                }
+                return .reconnectRequired
+            }
+            return .recoveryStarted
+        }
+    }
+
+    private func requireReconnectForDroppedDeferredRecovery(
+        _ completion: WorldwideIPhoneMicrophoneOutputOnlyCompletion,
+        after token: WebRTCIOSOutputOnlyMicrophoneToken?
+    ) {
+        guard let token else { return }
+        switch completion {
+        case .noDeferredRecovery:
+            return
+        case .recoveryReady, .recoveryFailed:
+            // A stale async owner must never consume the one-shot receipt. Close only the exact
+            // still-tracked C chain; this is a no-op after a new session or newer recovery wins.
+            audioLifecycle.deferredAudioRecoveryRequiresReconnect(
+                after: token
+            )
+        }
+    }
+
+    private func failPendingAutomaticMicrophoneRecoveryIfOwned(
+        by binding: MicrophoneAutomaticRecoveryBinding?,
+        message: String
+    ) {
+        guard let binding,
+              microphoneAdmissionRecoveryPendingBinding == binding,
+              binding == currentMicrophoneAutomaticRecoveryBinding() else {
+            return
+        }
+        microphoneAdmissionRecoveryPendingBinding = nil
+        microphoneAdmissionRecoveryProofAttemptID = nil
+        microphoneAdmissionFailedSessionGeneration = sessionGeneration
+        microphoneStateText = "Unavailable"
+        microphoneError = message
     }
 
     // MARK: - Screen presentation ownership
@@ -2130,17 +3839,46 @@ final class WorldwideSessionViewModel: ObservableObject {
             && isScreenVisible
     }
 
+    func screenPresentationShouldRemainMounted(
+        _ lease: WorldwideScreenPresentationLease
+    ) -> Bool {
+        screenPresentationIsVisible(lease)
+            || (screenPresentationIsCurrent(lease)
+                && recoveringScreenPresentationLease == lease)
+    }
+
+    func screenVideoTrack(
+        for lease: WorldwideScreenPresentationLease
+    ) -> WebRTCRemoteVideoTrack? {
+        screenPresentationIsVisible(lease) ? remoteVideoTrack : nil
+    }
+
     func remoteInputIsAvailable(for lease: WorldwideScreenPresentationLease) -> Bool {
         screenPresentationIsVisible(lease) && isRemoteInputAvailable
     }
 
     func retireScreenPresentationLease(_ lease: WorldwideScreenPresentationLease) {
         guard currentScreenPresentationLease == lease else { return }
+        if focusedWindowResizeState.interaction?.binding.lease == lease {
+            cancelFocusedWindowResize()
+        }
+        if recoveringScreenPresentationLease == lease {
+            recoveringScreenPresentationLease = nil
+            screenPresentationRecoveryTask?.cancel()
+            screenPresentationRecoveryTask = nil
+            screenPresentationRecoveryAttemptID = nil
+        }
+        if screenPresentationRevealAfterRecoveryFence?.lease == lease {
+            screenPresentationRevealAfterRecoveryFence = nil
+        }
         if screenMediaViewerAttempt?.lease == lease {
             cancelScreenMediaViewerSuspension(
                 reason: "The screen presentation lease was retired.",
                 notifyPeer: true
             )
+        }
+        if screenMediaViewerFence?.lease == lease {
+            screenMediaViewerFence = nil
         }
         revokeScreenPresentationLocally(for: lease, clearActiveOwnership: false)
         currentScreenPresentationLease = nil
@@ -2191,7 +3929,10 @@ final class WorldwideSessionViewModel: ObservableObject {
         for lease: WorldwideScreenPresentationLease,
         completion: @escaping @MainActor () -> Void = {}
     ) -> Bool {
-        claimScreenTeardown(
+        if focusedWindowResizeState.interaction?.binding.lease == lease {
+            cancelFocusedWindowResize()
+        }
+        return claimScreenTeardown(
             for: lease,
             allowSupersededSameSessionLease: false,
             completion: { _ in completion() }
@@ -2283,6 +4024,133 @@ final class WorldwideSessionViewModel: ObservableObject {
                 renderObservation: renderObservation
             )
         )
+    }
+
+    private static func audioDiagnosticsNow() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private static var audioDiagnosticsBuild: WebRTCAudioClientBuild {
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "").split(separator: ".").map { UInt16($0) }
+        return WebRTCAudioClientBuild(
+            versionMajor: version.indices.contains(0) ? version[0] ?? 0 : 0,
+            versionMinor: version.indices.contains(1) ? version[1] ?? 0 : 0,
+            versionPatch: version.indices.contains(2) ? version[2] ?? 0 : 0,
+            buildNumber: UInt32(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
+                as? String ?? "") ?? 0
+        )
+    }
+
+    private func startAudioClientDiagnostics(for sourcePeer: WebRTCPeer?) {
+        audioClientDiagnosticsTask?.cancel()
+        audioClientDiagnosticsTask = nil
+        // Keep the one in-flight slot until its reader actually returns, even across reconnects.
+        audioDiagnosticsSampleTask?.cancel()
+        audioDiagnosticsLastSentAt = nil
+        audioDiagnosticsLastEventSequence = 0
+        audioDiagnosticsFastUntil = 0
+        guard let sourcePeer else { return }
+        let generation = sessionGeneration
+        audioDiagnostics.reset(
+            sessionID: generation, policyID: audioPolicyGeneration,
+            at: Self.audioDiagnosticsNow()
+        )
+        // No dependency on Show, playout readiness, or a successful statistics read. A failed
+        // native path must still report its last evidence with an increasing observation age.
+        audioClientDiagnosticsTask = Task { [weak self, weak sourcePeer] in
+            while !Task.isCancelled {
+                guard let sourcePeer else { return }
+                self?.scheduleAudioDiagnosticsSample(from: sourcePeer, generation: generation)
+                await self?.sendAudioClientDiagnostics(through: sourcePeer, generation: generation)
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            }
+        }
+    }
+
+    private func sendAudioClientDiagnostics(through sourcePeer: WebRTCPeer, generation: UUID) async {
+        guard !Task.isCancelled, peer === sourcePeer, sessionGeneration == generation else { return }
+        let now = Self.audioDiagnosticsNow()
+        if let latestEvent = audioDiagnostics.events.last,
+           latestEvent.sequence != audioDiagnosticsLastEventSequence {
+            audioDiagnosticsLastEventSequence = latestEvent.sequence
+            audioDiagnosticsFastUntil = now.addingReportingOverflow(30_000_000_000).partialValue
+        }
+        let interval: UInt64 = now <= audioDiagnosticsFastUntil ? 1_000_000_000 : 5_000_000_000
+        if let last = audioDiagnosticsLastSentAt, now >= last, now - last < interval { return }
+        guard let context = await sourcePeer.audioClientDiagnosticsContext() else { return }
+        guard !Task.isCancelled, context.isValid,
+              peer === sourcePeer, sessionGeneration == generation else { return }
+        updateAudioDiagnosticsPolicyFacts()
+        guard let heartbeat = audioDiagnostics.heartbeat(
+            build: Self.audioDiagnosticsBuild, at: Self.audioDiagnosticsNow()
+        ) else { return }
+        audioDiagnosticsLastSentAt = now
+        do {
+            try await sourcePeer.sendAudioClientDiagnosticsHeartbeat(heartbeat, context: context)
+        } catch {
+            // Best-effort telemetry neither changes media policy nor schedules a retry backlog.
+        }
+    }
+
+    private func updateAudioDiagnosticsPolicyFacts() {
+        audioDiagnostics.policyFacts(
+            peerConnected: isPeerConnected, iceConnected: iceIsConnected,
+            controlOpen: isControlChannelReady, applicationActive: applicationIsActive,
+            remoteTrackAvailable: remoteAudioTrack != nil, microphoneIntent: microphoneIntentEnabled,
+            microphonePermissionGranted: microphonePermissionGranted,
+            microphoneBlockedByCall: microphoneIsBlockedByCall
+        )
+    }
+
+    private func scheduleAudioDiagnosticsSample(from sourcePeer: WebRTCPeer, generation: UUID) {
+        guard audioDiagnosticsSampleTask == nil, peer === sourcePeer,
+              generation == sessionGeneration else { return }
+        let sampleID = UUID()
+        audioDiagnosticsSampleID = sampleID
+        audioDiagnosticsSampleTask = Task { [weak self, weak sourcePeer] in
+            guard let self else { return }
+            defer {
+                if audioDiagnosticsSampleID == sampleID {
+                    audioDiagnosticsSampleTask = nil
+                    audioDiagnosticsSampleID = nil
+                }
+            }
+            guard let sourcePeer else { return }
+            await captureAudioClientDiagnostics(from: sourcePeer, generation: generation)
+        }
+    }
+
+    private func captureAudioClientDiagnostics(
+        from sourcePeer: WebRTCPeer,
+        generation: UUID
+    ) async {
+        guard !Task.isCancelled, generation == sessionGeneration, peer === sourcePeer else { return }
+        updateAudioDiagnosticsPolicyFacts()
+        let policyID = audioPolicyGeneration
+        let attemptID = iosPlayoutProofAttempt?.proofAttemptID
+        let attemptStage = iosPlayoutProofAttempt?.stage
+        let diagnostics = await readAudioClientNativeSnapshot(from: sourcePeer)
+        guard !Task.isCancelled, generation == sessionGeneration, peer === sourcePeer,
+              policyID == audioPolicyGeneration,
+              attemptID == iosPlayoutProofAttempt?.proofAttemptID,
+              attemptStage == iosPlayoutProofAttempt?.stage, let diagnostics else { return }
+        audioDiagnostics.observeNative(
+            diagnostics,
+            policyID: policyID,
+            classifyFailure: attemptStage != .awaitingRecoveryBaseline,
+            at: Self.audioDiagnosticsNow()
+        )
+    }
+
+    private func readAudioClientNativeSnapshot(from sourcePeer: WebRTCPeer) async
+        -> WebRTCAudioClientNativeSnapshot? {
+        #if DEBUG
+        if let debugAudioClientDiagnosticsReader {
+            return await debugAudioClientDiagnosticsReader(sourcePeer)
+        }
+        #endif
+        return await sourcePeer.iOSAudioClientDiagnostics()
     }
 
     private func sendScreenClientDiagnosticsHeartbeat(
@@ -2425,8 +4293,41 @@ final class WorldwideSessionViewModel: ObservableObject {
         for lease: WorldwideScreenPresentationLease
     ) {
         recordScreenVideoRenderObservation(observation, for: lease)
+        revealRecoveredScreenPresentationIfReady(for: lease)
         considerScreenMediaProofCandidate(observation, for: lease)
         validateScreenMediaSourceContinuity(for: lease)
+    }
+
+    /// A transport interruption may arrive while the negotiated bandwidth-suspension protocol has
+    /// an opaque privacy cover installed. Keep that cover through the fresh Show acknowledgement,
+    /// then remove it only when the replacement renderer binding presents its first current frame.
+    private func revealRecoveredScreenPresentationIfReady(
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard let recoveryRevealFence = screenPresentationRevealAfterRecoveryFence,
+              recoveryRevealFence.lease == lease else { return }
+        // `WebRTCRemoteVideoView` publishes this callback only from its current, attached binding
+        // generation. Visibility therefore makes this the first admissible post-recovery frame;
+        // stale detached-renderer callbacks are rejected before they reach this boundary.
+        guard screenPresentationIsVisible(lease) else { return }
+        guard let currentFence = screenMediaViewerFence,
+              recoveryRevealFence.matches(currentFence),
+              currentFence.forceCover else {
+            screenPresentationRevealAfterRecoveryFence = nil
+            return
+        }
+        screenMediaViewerFence = WorldwideScreenMediaViewerFence(
+            lease: currentFence.lease,
+            coverID: currentFence.coverID,
+            forceCover: false,
+            minimumAcceptedRTPTimestamp:
+                currentFence.minimumAcceptedRTPTimestamp,
+            proofRTPTimestamps: [],
+            markerProof: nil,
+            proofRequestRevision: currentFence.proofRequestRevision,
+            statusText: nil
+        )
+        screenPresentationRevealAfterRecoveryFence = nil
     }
 
     func screenVideoMarkerFrameDidPresentForProof(
@@ -2554,6 +4455,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         to size: CGSize,
         for lease: WorldwideScreenPresentationLease
     ) {
+        if let interaction = focusedWindowResizeState.interaction,
+           interaction.binding.lease == lease,
+           interaction.awaitingPresentationToken == nil {
+            beginFocusedWindowInteractionUntypedSizeFence(size, for: lease)
+        } else {
+            recordFocusedWindowInteractionAnnouncedVideoSize(size, for: lease)
+        }
         guard let attempt = screenMediaViewerAttempt,
               screenMediaViewerAttemptIsCurrent(attempt),
               attempt.lease == lease else {
@@ -2595,6 +4503,279 @@ final class WorldwideSessionViewModel: ObservableObject {
                 notifyPeer: true
             )
         }
+    }
+
+    /// The native renderer distinguishes a recoverable decoded-format transition from malformed
+    /// geometry. Only the former may keep negotiated focused-window state behind a presentation
+    /// fence.
+    func screenVideoPresentationDidInvalidate(
+        _ invalidation: WebRTCVideoPresentationInvalidation,
+        token: WebRTCVideoPresentationToken,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        switch invalidation {
+        case .formatTransition:
+            beginFocusedWindowInteractionFormatTransition(token: token, for: lease)
+        case .invalidGeometry:
+            if focusedWindowResizeState.interaction?.binding.lease == lease {
+                cancelFocusedWindowResize()
+            }
+        }
+    }
+
+    /// A typed renderer-format boundary may preserve only a selected, idle target or Resize's
+    /// initial non-mutating target request. A native size callback alone is never authorization.
+    private func beginFocusedWindowInteractionFormatTransition(
+        token: WebRTCVideoPresentationToken,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard var interaction = focusedWindowResizeState.interaction,
+              interaction.binding.lease == lease else {
+            return
+        }
+        guard focusedWindowInteractionMaySurviveFormatTransition(interaction) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        beginFocusedWindowInteractionPresentationFence(
+            for: &interaction,
+            awaiting: .zero,
+            token: token
+        )
+    }
+
+    /// A native size callback has no presentation token, so it can only close the gesture gate.
+    /// The later typed renderer event and exact Metal-presented frame remain mandatory before the
+    /// binding can change. This handles either callback ordering without trusting an untyped size.
+    private func beginFocusedWindowInteractionUntypedSizeFence(
+        _ size: CGSize,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard size != .zero,
+              var interaction = focusedWindowResizeState.interaction,
+              interaction.binding.lease == lease,
+              interaction.awaitingPresentationToken == nil else {
+            return
+        }
+        guard interaction.binding.viewerVideoSize != size else {
+            return
+        }
+        guard focusedWindowInteractionMaySurviveFormatTransition(interaction),
+              let oldSize = Self.remoteInputVideoSize(
+                  from: interaction.binding.viewerVideoSize
+              ),
+              let newSize = Self.remoteInputVideoSize(from: size),
+              Self.hasExactlyEqualAspectRatio(oldSize, newSize) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        beginFocusedWindowInteractionPresentationFence(
+            for: &interaction,
+            awaiting: .zero,
+            token: nil
+        )
+    }
+
+    /// Records the renderer's optional native size hint only inside an already-authorized format
+    /// fence. Delayed size callbacks after presentation are harmless and cannot hide input again.
+    private func recordFocusedWindowInteractionAnnouncedVideoSize(
+        _ size: CGSize,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard size != .zero,
+              var interaction = focusedWindowResizeState.interaction,
+              interaction.binding.lease == lease,
+              let token = interaction.awaitingPresentationToken else {
+            return
+        }
+        guard focusedWindowInteractionMaySurviveFormatTransition(interaction),
+              let oldSize = Self.remoteInputVideoSize(
+                  from: interaction.binding.viewerVideoSize
+              ),
+              let newSize = Self.remoteInputVideoSize(from: size),
+              Self.hasExactlyEqualAspectRatio(oldSize, newSize) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        // This callback is not token-bound. A delayed report for the old binding must not replace
+        // the expected size for a newer typed transition.
+        guard interaction.binding.viewerVideoSize != size else {
+            return
+        }
+        beginFocusedWindowInteractionPresentationFence(
+            for: &interaction,
+            awaiting: size,
+            token: token
+        )
+    }
+
+    /// Installs a new focused-window coordinate binding only after the renderer proves that exact
+    /// decoded size reached the screen. An older rapid-transition frame cannot reopen input.
+    func focusedWindowInteractionVideoFrameDidPresent(
+        size: CGSize,
+        token: WebRTCVideoPresentationToken,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard var interaction = focusedWindowResizeState.interaction,
+              interaction.binding.lease == lease else {
+            return
+        }
+        guard let awaitedToken = interaction.awaitingPresentationToken else {
+            // An untyped native-size callback may fence immediately, but it cannot authorize a
+            // replacement binding even if a matching frame callback races ahead of its typed event.
+            if interaction.awaitingPresentedVideoSize != nil {
+                return
+            }
+            // A differing presentation without its typed format event is never allowed to rebind.
+            if interaction.binding.viewerVideoSize != size {
+                cancelFocusedWindowResize()
+            }
+            return
+        }
+        guard awaitedToken == token else {
+            if awaitedToken.bindingGeneration == token.bindingGeneration,
+               token.dimensionGeneration > awaitedToken.dimensionGeneration {
+                cancelFocusedWindowResize()
+            }
+            return
+        }
+        if let awaitedSize = interaction.awaitingPresentedVideoSize,
+           awaitedSize != .zero,
+           awaitedSize != size {
+            cancelFocusedWindowResize()
+            return
+        }
+        guard
+              focusedWindowResizeInteractionIsCurrent(interaction),
+              let oldSize = Self.remoteInputVideoSize(
+                  from: interaction.binding.viewerVideoSize
+              ),
+              let newSize = Self.remoteInputVideoSize(from: size),
+              focusedWindowInteractionSupportsScaleRebinding(interaction.mode),
+              Self.hasExactlyEqualAspectRatio(oldSize, newSize),
+              let binding = focusedWindowResizeBinding(
+                  mode: interaction.mode,
+                  for: lease,
+                  containerSize: interaction.binding.containerSize,
+                  viewerVideoSize: size
+              ) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        guard focusedWindowInteractionMaySurviveFormatTransition(interaction) else {
+            cancelFocusedWindowResize()
+            return
+        }
+        focusedWindowInteractionPresentationTimeoutTask?.cancel()
+        focusedWindowInteractionPresentationTimeoutTask = nil
+        interaction.binding = binding
+        interaction.awaitingPresentedVideoSize = nil
+        interaction.awaitingPresentationToken = nil
+        interaction.presentationRebindingID = nil
+        focusedWindowResizeState = .active(interaction)
+    }
+
+    private func beginFocusedWindowInteractionPresentationFence(
+        for interaction: inout FocusedWindowResizeInteraction,
+        awaiting size: CGSize,
+        token: WebRTCVideoPresentationToken?
+    ) {
+        focusedWindowInteractionPresentationTimeoutTask?.cancel()
+        let rebindingID = UUID()
+        interaction.awaitingPresentedVideoSize = size
+        interaction.awaitingPresentationToken = token
+        interaction.presentationRebindingID = rebindingID
+        focusedWindowResizeState = .active(interaction)
+        let interactionID = interaction.id
+        let lease = interaction.binding.lease
+        focusedWindowInteractionPresentationTimeoutTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(
+                    for: Self.focusedWindowInteractionPresentationTimeout
+                )
+            } catch {
+                return
+            }
+            self?.focusedWindowInteractionPresentationTimeoutDidFire(
+                interactionID: interactionID,
+                lease: lease,
+                awaitedSize: size,
+                token: token,
+                rebindingID: rebindingID
+            )
+        }
+    }
+
+    /// Retires only the exact stalled presentation generation. Keyboard authorization is owned
+    /// independently and remains intact.
+    func focusedWindowInteractionPresentationTimeoutDidFire(
+        interactionID: UUID,
+        lease: WorldwideScreenPresentationLease,
+        awaitedSize: CGSize,
+        token: WebRTCVideoPresentationToken?,
+        rebindingID: UUID
+    ) {
+        guard let interaction = focusedWindowResizeState.interaction,
+              interaction.id == interactionID,
+              interaction.binding.lease == lease,
+              interaction.awaitingPresentedVideoSize == awaitedSize,
+              interaction.awaitingPresentationToken == token,
+              interaction.presentationRebindingID == rebindingID else {
+            return
+        }
+        focusedWindowInteractionPresentationTimeoutTask = nil
+        cancelFocusedWindowResize()
+    }
+
+    private func focusedWindowInteractionMaySurviveFormatTransition(
+        _ interaction: FocusedWindowResizeInteraction
+    ) -> Bool {
+        let hasSelectedIdleTarget = interaction.pending == nil
+            && interaction.target != nil
+        let hasInitialResizeTargetRequest: Bool
+        if interaction.mode == .resize,
+           case .targetRequest? = interaction.pending,
+           interaction.target == nil {
+            hasInitialResizeTargetRequest = true
+        } else {
+            hasInitialResizeTargetRequest = false
+        }
+        return (hasSelectedIdleTarget || hasInitialResizeTargetRequest)
+            && focusedWindowResizeInteractionIsCurrent(interaction)
+            && focusedWindowInteractionSupportsScaleRebinding(interaction.mode)
+    }
+
+    private func focusedWindowInteractionSupportsScaleRebinding(
+        _ mode: FocusedWindowInteractionMode
+    ) -> Bool {
+        guard let capability = remoteInputCapability else { return false }
+        return switch mode {
+        case .resize:
+            capability.supportsFocusedWindowResize
+                && capability.supportsFocusedWindowResizeScaleRebinding
+        case .move:
+            capability.supportsFocusedWindowMove
+                && capability.supportsFocusedWindowMoveScaleRebinding
+        }
+    }
+
+    func focusedWindowResizeContainerGeometryDidChange(
+        to containerSize: CGSize,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard let binding = focusedWindowResizeState.interaction?.binding,
+              binding.lease == lease,
+              binding.containerSize != containerSize else {
+            return
+        }
+        cancelFocusedWindowResize()
+    }
+
+    func focusedWindowInteractionContainerGeometryDidChange(
+        to containerSize: CGSize,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        focusedWindowResizeContainerGeometryDidChange(to: containerSize, for: lease)
     }
 
     private func receiveScreenMediaSuspension(
@@ -3750,11 +5931,415 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     // MARK: - Remote input serialization
 
+    @discardableResult
+    func beginFocusedWindowResize(
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> Bool {
+        beginFocusedWindowInteraction(
+            .resize, for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    @discardableResult
+    func beginFocusedWindowMove(
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> Bool {
+        beginFocusedWindowInteraction(
+            .move, for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    private func beginFocusedWindowInteraction(
+        _ mode: FocusedWindowInteractionMode,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> Bool {
+        // During a decoded-format fence, the old binding exists only so the active control can
+        // remain available as a Done action. It must never authorize a different mode using stale
+        // presentation geometry.
+        if let interaction = focusedWindowResizeState.interaction,
+           interaction.awaitingPresentationToken != nil
+            || interaction.awaitingPresentedVideoSize != nil {
+            return false
+        }
+        guard let binding = focusedWindowResizeBinding(
+            mode: mode,
+            for: lease,
+            containerSize: containerSize,
+            viewerVideoSize: viewerVideoSize
+        ) else {
+            cancelFocusedWindowResize()
+            return false
+        }
+
+        cancelFocusedWindowResize()
+        discardPendingRemoteScrolls()
+        retireRemotePointerIntentPreservingKeyboardFocus()
+        let interactionID = UUID()
+        // Move requires an explicit safe selection before any target can be committed.
+        let operation: FocusedWindowResizePendingOperation? = mode == .resize
+            ? .targetRequest(
+                operationID: UUID(),
+                focusGeneration: focusedInputGeneration,
+                focusIsSecure: focusedInputIsSecure
+            )
+            : nil
+        focusedWindowResizeState = .active(
+            FocusedWindowResizeInteraction(
+                id: interactionID,
+                mode: mode,
+                binding: binding,
+                target: nil,
+                pending: operation
+            )
+        )
+        let sendAuthorization = currentFocusedWindowResizeSendAuthorization()
+        if let operation {
+            enqueueRemoteInput(
+                .requestFocusedWindowResizeTarget,
+                viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
+                sendAuthorization: sendAuthorization,
+                focusedWindowResizeInteractionID: interactionID,
+                focusedWindowResizeOperation: operation
+            )
+        }
+        return focusedWindowResizeState.interaction?.id == interactionID
+            && sendAuthorization.isValid
+    }
+
+    func selectWindowForFocusedResize(
+        at normalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        selectWindowForFocusedInteraction(
+            .resize, at: normalizedPoint, for: lease,
+            containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    func selectWindowForFocusedMove(
+        at normalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        selectWindowForFocusedInteraction(
+            .move, at: normalizedPoint, for: lease,
+            containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    private func selectWindowForFocusedInteraction(
+        _ mode: FocusedWindowInteractionMode,
+        at normalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        guard Self.isValidNormalizedRemoteInputPoint(normalizedPoint),
+              var interaction = currentFocusedWindowResizeInteraction(
+                  for: lease,
+                  containerSize: containerSize,
+                  viewerVideoSize: viewerVideoSize
+              ),
+              interaction.mode == mode,
+              interaction.pending == nil,
+              let sendAuthorization = focusedWindowResizeSendAuthorization,
+              sendAuthorization.isValid else {
+            return
+        }
+
+        let operation = FocusedWindowResizePendingOperation.selection(
+            operationID: UUID(),
+            focusGeneration: focusedInputGeneration,
+            focusIsSecure: focusedInputIsSecure,
+            mode: mode
+        )
+        interaction.target = nil
+        interaction.pending = operation
+        focusedWindowResizeState = .active(interaction)
+        let point = WebRTCNormalizedPoint(
+            x: Double(normalizedPoint.x), y: Double(normalizedPoint.y)
+        )
+        enqueueRemoteInput(
+            mode == .resize ? .selectWindowForResize(at: point) : .selectWindowForMove(at: point),
+            viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
+            sendAuthorization: sendAuthorization,
+            focusedWindowResizeInteractionID: interaction.id,
+            focusedWindowResizeOperation: operation
+        )
+    }
+
+    func commitFocusedWindowResize(
+        targetGeneration: UUID,
+        startNormalizedPoint: CGPoint,
+        endNormalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        commitFocusedWindowInteraction(
+            .resize, targetGeneration: targetGeneration,
+            startNormalizedPoint: startNormalizedPoint, endNormalizedPoint: endNormalizedPoint,
+            for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    func commitFocusedWindowMove(
+        targetGeneration: UUID,
+        startNormalizedPoint: CGPoint,
+        endNormalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        commitFocusedWindowInteraction(
+            .move, targetGeneration: targetGeneration,
+            startNormalizedPoint: startNormalizedPoint, endNormalizedPoint: endNormalizedPoint,
+            for: lease, containerSize: containerSize, viewerVideoSize: viewerVideoSize
+        )
+    }
+
+    private func commitFocusedWindowInteraction(
+        _ mode: FocusedWindowInteractionMode,
+        targetGeneration: UUID,
+        startNormalizedPoint: CGPoint,
+        endNormalizedPoint: CGPoint,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) {
+        guard Self.isValidNormalizedRemoteInputPoint(startNormalizedPoint),
+              Self.isValidNormalizedRemoteInputPoint(endNormalizedPoint),
+              var interaction = currentFocusedWindowResizeInteraction(
+                  for: lease,
+                  containerSize: containerSize,
+                  viewerVideoSize: viewerVideoSize
+              ),
+              interaction.mode == mode,
+              interaction.pending == nil,
+              interaction.target?.generation == targetGeneration,
+              let sendAuthorization = focusedWindowResizeSendAuthorization,
+              sendAuthorization.isValid else {
+            return
+        }
+
+        let operation = FocusedWindowResizePendingOperation.commit(
+            operationID: UUID(),
+            consumedTargetGeneration: targetGeneration,
+            focusGeneration: focusedInputGeneration,
+            focusIsSecure: focusedInputIsSecure,
+            mode: mode
+        )
+        // The consumed generation is one-shot. Feedback may install only a fresh successor.
+        interaction.target = nil
+        interaction.pending = operation
+        focusedWindowResizeState = .active(interaction)
+        let start = WebRTCNormalizedPoint(
+            x: Double(startNormalizedPoint.x), y: Double(startNormalizedPoint.y)
+        )
+        let end = WebRTCNormalizedPoint(
+            x: Double(endNormalizedPoint.x), y: Double(endNormalizedPoint.y)
+        )
+        let action: WebRTCInputAction = mode == .resize
+            ? .commitFocusedWindowResize(targetGeneration: targetGeneration, start: start, end: end)
+            : .commitFocusedWindowMove(
+                targetGeneration: targetGeneration,
+                start: start,
+                end: end,
+                allowsRecoverableOffscreen: interaction.binding.allowsRecoverableOffscreenMove
+            )
+        enqueueRemoteInput(
+            action,
+            viewerVideoSize: Self.remoteInputVideoSize(from: viewerVideoSize),
+            sendAuthorization: sendAuthorization,
+            focusedWindowResizeInteractionID: interaction.id,
+            focusedWindowResizeOperation: operation
+        )
+    }
+
+    func cancelFocusedWindowInteraction() {
+        cancelFocusedWindowResize()
+    }
+
+    /// Revokes focused-window work. Keyboard focus and ordinary text packets remain
+    /// owned by their independent authenticated generations.
+    func cancelFocusedWindowResize() {
+        focusedWindowInteractionPresentationTimeoutTask?.cancel()
+        focusedWindowInteractionPresentationTimeoutTask = nil
+        focusedWindowResizeSendAuthorization?.revoke()
+        focusedWindowResizeSendAuthorization = nil
+        remoteInputQueue.removeAll(where: {
+            $0.focusedWindowResizeOperation != nil
+        })
+        let pendingRequests: [(
+            requestID: UInt64,
+            operation: FocusedWindowResizePendingOperation,
+            requestScope: RemoteInputRequestScope
+        )] = pendingRemoteInputs.compactMap { requestID, pending in
+            guard case .focusedWindowResize(_, let operation) = pending.kind else {
+                return nil
+            }
+            return (
+                requestID: requestID,
+                operation: operation,
+                requestScope: pending.requestScope
+            )
+        }
+        for (requestID, operation, requestScope) in pendingRequests {
+            pendingRemoteInputs.removeValue(forKey: requestID)
+            earlyRemoteInputFeedback.removeValue(forKey: requestID)
+            retireFocusedWindowResizeRequestID(
+                requestID,
+                operation: operation,
+                requestScope: requestScope
+            )
+        }
+        if !pendingRequests.isEmpty {
+            let retired = Set(pendingRequests.map(\.requestID))
+            pendingRemoteInputOrder.removeAll(where: retired.contains)
+        }
+        focusedWindowResizeState = .inactive
+    }
+
+    private func remoteVideoTrackIdentityWillChange() {
+        discardPendingRemoteScrolls()
+        cancelFocusedWindowResize()
+    }
+
+    private func retireFocusedWindowResizeRequestID(
+        _ requestID: UInt64,
+        operation: FocusedWindowResizePendingOperation,
+        requestScope: RemoteInputRequestScope
+    ) {
+        let key = RetiredFocusedWindowResizeRequestKey(
+            requestID: requestID,
+            requestScope: requestScope
+        )
+        guard retiredFocusedWindowResizeRequests[key] == nil else {
+            return
+        }
+        retiredFocusedWindowResizeRequests[key] =
+            RetiredFocusedWindowResizeRequest(operation: operation)
+        retiredFocusedWindowResizeRequestKeyOrder.append(key)
+        while retiredFocusedWindowResizeRequestKeyOrder.count > 256 {
+            let oldest = retiredFocusedWindowResizeRequestKeyOrder.removeFirst()
+            retiredFocusedWindowResizeRequests.removeValue(forKey: oldest)
+        }
+    }
+
+    private func focusedWindowResizeBinding(
+        mode: FocusedWindowInteractionMode,
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> FocusedWindowResizeBinding? {
+        guard remoteInputIsAvailable(for: lease),
+              focusedWindowInteractionIsAvailable(mode),
+              let capability = remoteInputCapability,
+              let trackIdentity = focusedWindowResizeTrackIdentity(for: lease),
+              containerSize.width.isFinite,
+              containerSize.height.isFinite,
+              containerSize.width > 0,
+              containerSize.height > 0,
+              Self.remoteInputVideoSize(from: viewerVideoSize) != nil else {
+            return nil
+        }
+        return FocusedWindowResizeBinding(
+            lease: lease,
+            inputSessionID: capability.inputSessionID,
+            screenRequestID: capability.screenRequestID,
+            trackIdentity: trackIdentity,
+            containerSize: containerSize,
+            viewerVideoSize: viewerVideoSize,
+            allowsRecoverableOffscreenMove: mode == .move
+                && capability.supportsFocusedWindowMoveRecoverableOffscreen
+        )
+    }
+
+    private func currentFocusedWindowResizeInteraction(
+        for lease: WorldwideScreenPresentationLease,
+        containerSize: CGSize,
+        viewerVideoSize: CGSize
+    ) -> FocusedWindowResizeInteraction? {
+        guard let interaction = focusedWindowResizeState.interaction else {
+            return nil
+        }
+        // A stale gesture callback may arrive while the decoded-size transition is waiting for
+        // its typed event or first presented frame. Ignore it without tearing down the preserved
+        // focused-window selection.
+        guard interaction.awaitingPresentedVideoSize == nil else {
+            return nil
+        }
+        guard
+              interaction.binding.lease == lease,
+              interaction.binding.containerSize == containerSize,
+              interaction.binding.viewerVideoSize == viewerVideoSize,
+              focusedWindowResizeInteractionIsCurrent(interaction) else {
+            cancelFocusedWindowResize()
+            return nil
+        }
+        return interaction
+    }
+
+    private func focusedWindowResizeInteractionIsCurrent(
+        _ interaction: FocusedWindowResizeInteraction
+    ) -> Bool {
+        let binding = interaction.binding
+        return remoteInputIsAvailable(for: binding.lease)
+            && focusedWindowInteractionIsAvailable(interaction.mode)
+            && remoteInputCapability?.inputSessionID == binding.inputSessionID
+            && remoteInputCapability?.screenRequestID == binding.screenRequestID
+            && focusedWindowResizeTrackIdentity(for: binding.lease)
+                == binding.trackIdentity
+            && focusedWindowResizeSendAuthorization?.isValid == true
+    }
+
+    private func focusedWindowResizeTrackIdentity(
+        for lease: WorldwideScreenPresentationLease
+    ) -> ObjectIdentifier? {
+        if let track = screenVideoTrack(for: lease) {
+            return ObjectIdentifier(track)
+        }
+        #if DEBUG
+        if screenPresentationIsVisible(lease),
+           let debugFocusedWindowResizeTrackOwner {
+            return ObjectIdentifier(debugFocusedWindowResizeTrackOwner)
+        }
+        #endif
+        return nil
+    }
+
+    private func currentFocusedWindowResizeSendAuthorization()
+        -> WebRTCInputSendAuthorization {
+        if let focusedWindowResizeSendAuthorization,
+           focusedWindowResizeSendAuthorization.isValid {
+            return focusedWindowResizeSendAuthorization
+        }
+        let authorization = WebRTCInputSendAuthorization()
+        focusedWindowResizeSendAuthorization = authorization
+        return authorization
+    }
+
+    private static func isValidNormalizedRemoteInputPoint(_ point: CGPoint) -> Bool {
+        point.x.isFinite && point.y.isFinite
+            && (0 ... 1).contains(point.x)
+            && (0 ... 1).contains(point.y)
+    }
+
     func sendRemoteTap(
         normalizedPoint: CGPoint,
         viewerVideoSize: CGSize
     ) {
         guard isRemoteInputAvailable,
+              !focusedWindowResizeState.isActive,
               normalizedPoint.x.isFinite,
               normalizedPoint.y.isFinite,
               let viewerVideoSize = Self.remoteInputVideoSize(from: viewerVideoSize) else {
@@ -3780,6 +6365,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         viewerVideoSize: CGSize
     ) {
         guard isRemotePrimaryDragAvailable,
+              !focusedWindowResizeState.isActive,
               startNormalizedPoint.x.isFinite,
               startNormalizedPoint.y.isFinite,
               endNormalizedPoint.x.isFinite,
@@ -3813,6 +6399,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         viewerVideoSize: CGSize
     ) -> UUID? {
         guard isRemoteScrollAvailable,
+              !focusedWindowResizeState.isActive,
               normalizedAnchor.x.isFinite,
               normalizedAnchor.y.isFinite,
               (0 ... 1).contains(normalizedAnchor.x),
@@ -3934,6 +6521,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private func suspendRemoteInputForApplicationLifecycle() {
         guard !applicationInputIsSuspended else { return }
         applicationInputIsSuspended = true
+        cancelFocusedWindowResize()
         discardQueuedRemoteInputsForInactiveLifecycle()
         clearRemoteKeyboardFocus()
     }
@@ -4075,11 +6663,27 @@ final class WorldwideSessionViewModel: ObservableObject {
         return WebRTCInputVideoSize(width: Int(width), height: Int(height))
     }
 
+    private static func hasExactlyEqualAspectRatio(
+        _ lhs: WebRTCInputVideoSize,
+        _ rhs: WebRTCInputVideoSize
+    ) -> Bool {
+        Int64(lhs.width) * Int64(rhs.height)
+            == Int64(rhs.width) * Int64(lhs.height)
+    }
+
     private func beginRemotePointerIntent() -> UInt64 {
         latestPointerIntentID &+= 1
         if latestPointerIntentID == 0 { latestPointerIntentID = 1 }
         clearRemoteKeyboardFocus()
         return latestPointerIntentID
+    }
+
+    private func retireRemotePointerIntentPreservingKeyboardFocus() {
+        latestPointerIntentID &+= 1
+        if latestPointerIntentID == 0 { latestPointerIntentID = 1 }
+        remoteInputQueue.removeAll(where: {
+            $0.focusedWindowResizeOperation == nil && $0.action.isOrdinaryPointerAction
+        })
     }
 
     func sendRemoteText(_ text: String, focusGeneration: UInt64) {
@@ -4103,8 +6707,19 @@ final class WorldwideSessionViewModel: ObservableObject {
         pointerIntentID: UInt64? = nil,
         viewerVideoSize: WebRTCInputVideoSize? = nil,
         scrollGestureID: UUID? = nil,
-        sendAuthorization: WebRTCInputSendAuthorization? = nil
+        sendAuthorization: WebRTCInputSendAuthorization? = nil,
+        focusedWindowResizeInteractionID: UUID? = nil,
+        focusedWindowResizeOperation: FocusedWindowResizePendingOperation? = nil
     ) {
+        let hasResizeMetadata = focusedWindowResizeInteractionID != nil
+            || focusedWindowResizeOperation != nil
+        guard action.isFocusedWindowResizeAction == hasResizeMetadata,
+              !hasResizeMetadata
+                || (focusedWindowResizeInteractionID != nil
+                    && focusedWindowResizeOperation?.matches(action) == true) else {
+            cancelFocusedWindowResize()
+            return
+        }
         guard let capability = remoteInputCapability,
               let authorization = remoteInputAuthorization,
               authorization.isValid,
@@ -4130,7 +6745,9 @@ final class WorldwideSessionViewModel: ObservableObject {
                 pointerIntentID: pointerIntentID,
                 viewerVideoSize: viewerVideoSize,
                 scrollGestureID: scrollGestureID,
-                sendAuthorization: sendAuthorization
+                sendAuthorization: sendAuthorization,
+                focusedWindowResizeInteractionID: focusedWindowResizeInteractionID,
+                focusedWindowResizeOperation: focusedWindowResizeOperation
             )
         )
         startRemoteInputDrainIfNeeded()
@@ -4146,7 +6763,13 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     private func remoteInputActionMatchesCurrentFocus(_ action: WebRTCInputAction) -> Bool {
         switch action {
-        case .tap, .primaryDrag, .scroll:
+        case .tap, .primaryDrag, .scroll,
+             .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
             return true
         case .insertText(_, let generation),
              .backspace(let generation),
@@ -4189,6 +6812,11 @@ final class WorldwideSessionViewModel: ObservableObject {
                 guard !Task.isCancelled,
                       queued.authorization.isValid,
                       queued.sendAuthorization?.isValid != false else { continue }
+                let requestScope = RemoteInputRequestScope(
+                    sessionGeneration: queued.sessionGeneration,
+                    peer: peer,
+                    capability: queued.capability
+                )
                 let requestID = try await sendRemoteInput(
                     queued.action,
                     viewerVideoSize: queued.viewerVideoSize,
@@ -4203,13 +6831,44 @@ final class WorldwideSessionViewModel: ObservableObject {
                       self.peer === peer,
                       queued.capability == remoteInputCapability,
                       queued.authorization === remoteInputAuthorization,
-                      queued.authorization.isValid else {
+                      queued.authorization.isValid,
+                      queued.sendAuthorization?.isValid != false else {
+                    // A non-cooperative send may return after a replacement peer has restarted
+                    // request IDs. Its bounded tombstone remains safe because the scope is part of
+                    // the key, but it must never consume bare-ID early feedback from a replacement.
+                    let requestScopeIsCurrent = queued.sessionGeneration == sessionGeneration
+                        && self.peer === peer
+                        && queued.capability == remoteInputCapability
+                    if let operation = queued.focusedWindowResizeOperation {
+                        retireFocusedWindowResizeRequestID(
+                            requestID,
+                            operation: operation,
+                            requestScope: requestScope
+                        )
+                    }
+                    guard requestScopeIsCurrent else { continue }
+                    if queued.focusedWindowResizeOperation != nil {
+                        if let feedback = earlyRemoteInputFeedback.removeValue(
+                            forKey: requestID
+                        ) {
+                            handleRemoteInputFeedback(feedback)
+                        }
+                    } else {
+                        earlyRemoteInputFeedback.removeValue(forKey: requestID)
+                    }
                     continue
                 }
                 pendingRemoteInputs[requestID] = PendingRemoteInput(
-                    kind: PendingRemoteInputKind(queued.action),
+                    kind: PendingRemoteInputKind(
+                        queued.action,
+                        focusedWindowResizeInteractionID:
+                            queued.focusedWindowResizeInteractionID,
+                        focusedWindowResizeOperation:
+                            queued.focusedWindowResizeOperation
+                    ),
                     pointerIntentID: queued.pointerIntentID,
-                    sendAuthorization: queued.sendAuthorization
+                    sendAuthorization: queued.sendAuthorization,
+                    requestScope: requestScope
                 )
                 pendingRemoteInputOrder.append(requestID)
 
@@ -4235,9 +6894,15 @@ final class WorldwideSessionViewModel: ObservableObject {
                 }
                 if let transportError = error as? WebRTCTransportError,
                    transportError == .invalidInputRequest {
-                    clearRemoteKeyboardFocus()
-                    remoteInputQueue.removeAll(where: { $0.action.requiresRemoteFocus })
-                    lastDiagnostic = "The remote input action was not valid."
+                    if let operation = queued.focusedWindowResizeOperation {
+                        cancelFocusedWindowResize()
+                        let mode = operation.mode == .resize ? "resize" : "move"
+                        lastDiagnostic = "The focused-window \(mode) request was not valid."
+                    } else {
+                        clearRemoteKeyboardFocus()
+                        remoteInputQueue.removeAll(where: { $0.action.requiresRemoteFocus })
+                        lastDiagnostic = "The remote input action was not valid."
+                    }
                     continue
                 }
                 lastDiagnostic = "Remote input paused because its secure control path is unavailable."
@@ -4337,9 +7002,24 @@ final class WorldwideSessionViewModel: ObservableObject {
                 configuration: WebRTCTransportConfiguration(
                     role: .viewer,
                     iceServers: iceServers,
-                    icePolicy: .directPreferred
+                    icePolicy: .directPreferred,
+                    mediaTopology: sessionMediaTopology,
+                    supportsRemoteMediaControls: sessionOwnsAudio,
+                    supportsAudioClientDiagnostics: sessionOwnsAudio
                 )
             )
+            if sessionOwnsAudio {
+                guard let audioTransactionDeviceBinding =
+                        newPeer.iOSAudioTransactionDeviceBinding,
+                      audioLifecycle.bindIOSAudioTransactionDevice(
+                        audioTransactionDeviceBinding
+                      ) else {
+                    _ = await newPeer.close(reason: .protocolError)
+                    throw WebRTCTransportError.nativeFailure(
+                        "The native iPhone audio transaction authority could not bind the current peer."
+                    )
+                }
+            }
             let coordinator = ICERecoveryCoordinator(
                 restart: { [weak self] in
                     guard let self else { throw CancellationError() }
@@ -4353,14 +7033,34 @@ final class WorldwideSessionViewModel: ObservableObject {
                 }
             )
             peer = newPeer
-            let newPeerIdentity = ObjectIdentifier(newPeer)
-            await newPeer.installIPhoneMicrophoneTransportSuspensionHandler {
-                [weak self] retirementContext in
-                guard let self else { return nil }
-                return prepareIPhoneMicrophoneForTransportSuspension(
-                    retirementContext: retirementContext,
-                    expectedPeerIdentity: newPeerIdentity,
-                    expectedSessionGeneration: generation
+            if sessionOwnsAudio {
+                startAudioTransactionEventLoop(
+                    peer: newPeer,
+                    generation: generation
+                )
+                let newPeerIdentity = ObjectIdentifier(newPeer)
+                await newPeer.installIPhoneMicrophoneTransportSuspensionHandlers(
+                    preparation: { [weak self] retirementContext in
+                        guard let self else { return nil }
+                        return prepareIPhoneMicrophoneForTransportSuspension(
+                            retirementContext: retirementContext,
+                            expectedPeerIdentity: newPeerIdentity,
+                            expectedSessionGeneration: generation
+                        )
+                    },
+                    completion: {
+                        [weak self] retirementContext,
+                        outputOnlyToken,
+                        succeeded in
+                        guard let self else { return }
+                        completeIPhoneMicrophoneTransportSuspension(
+                            retirementContext: retirementContext,
+                            outputOnlyToken: outputOnlyToken,
+                            succeeded: succeeded,
+                            expectedPeerIdentity: newPeerIdentity,
+                            expectedSessionGeneration: generation
+                        )
+                    }
                 )
             }
             recoveryCoordinator = coordinator
@@ -4444,6 +7144,151 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
     }
 
+    private func startAudioTransactionEventLoop(
+        peer sourcePeer: WebRTCPeer,
+        generation: UUID
+    ) {
+        precondition(audioTransactionEventTask == nil)
+        installAudioTransactionCallbacks(
+            peer: sourcePeer,
+            generation: generation
+        )
+        let events = sourcePeer.iOSAudioTransactionEvents
+        audioTransactionEventTask = Task { [weak self] in
+            var teardownResult: Bool?
+            for await event in events {
+                guard !Task.isCancelled else { return false }
+                if let result = self?.handleAudioTransactionEvent(
+                    event,
+                    peer: sourcePeer,
+                    generation: generation
+                ) {
+                    teardownResult = result
+                }
+            }
+            if let teardownResult { return teardownResult }
+            guard !Task.isCancelled,
+                  let self,
+                  generation == sessionGeneration,
+                  peer === sourcePeer,
+                  hasActiveSession else {
+                return false
+            }
+            failSession(
+                "The native iPhone audio transaction stream closed.",
+                generation: generation
+            )
+            return false
+        }
+    }
+
+    private func installAudioTransactionCallbacks(
+        peer sourcePeer: WebRTCPeer,
+        generation: UUID
+    ) {
+        audioLifecycle.onInterruptionEndNativeFenceRequested = {
+            [weak self, weak sourcePeer] in
+            guard let self, let sourcePeer,
+                  !Task.isCancelled,
+                  generation == self.sessionGeneration,
+                  self.peer === sourcePeer,
+                  let binding = sourcePeer.iOSAudioTransactionDeviceBinding else {
+                return false
+            }
+            let completed: Bool
+            #if DEBUG
+            if let requester = self.debugIOSAudioSystemEventFenceRequester {
+                completed = await requester(sourcePeer, binding)
+            } else {
+                let receipt = await sourcePeer.awaitIOSAudioSystemEventFence(
+                    expectedBinding: binding
+                )
+                completed = receipt?.binding == binding
+            }
+            #else
+            let receipt = await sourcePeer.awaitIOSAudioSystemEventFence(
+                expectedBinding: binding
+            )
+            completed = receipt?.binding == binding
+            #endif
+            return completed
+                && !Task.isCancelled
+                && generation == self.sessionGeneration
+                && self.peer === sourcePeer
+                && sourcePeer.iOSAudioTransactionDeviceBinding == binding
+        }
+        audioLifecycle.onPlayoutRecoveryTransactionStagingRequested = {
+            [weak self, weak sourcePeer] context, inputRequired in
+            guard let self, let sourcePeer,
+                  generation == self.sessionGeneration,
+                  self.peer === sourcePeer else {
+                return nil
+            }
+            let authorization = WebRTCIOSPlayoutRecoveryAuthorization(
+                transaction: context
+            )
+            guard sourcePeer.stageIOSPlayoutRecoveryTransaction(
+                authorization: authorization,
+                inputRequired: inputRequired
+            ) else {
+                authorization.revoke()
+                return nil
+            }
+            return authorization
+        }
+        audioLifecycle.onTransactionalPlaybackRecoveryRequested = {
+            [weak self, weak sourcePeer] transaction in
+            guard let self, let sourcePeer,
+                  generation == self.sessionGeneration,
+                  self.peer === sourcePeer else {
+                transaction.authorization.revoke()
+                return
+            }
+            self.beginIOSPlayoutProof(
+                transaction: transaction,
+                postCallRecoveryMilestone:
+                    self.audioLifecycle
+                        .postCallMicrophoneRecoveryMilestone
+            )
+        }
+        audioLifecycle.onAudioTransactionDrainRequested = {
+            [weak self, weak sourcePeer] request in
+            guard let self, let sourcePeer,
+                  generation == self.sessionGeneration,
+                  self.peer === sourcePeer else {
+                return false
+            }
+            return sourcePeer.requestIOSAudioCategoryDrain(
+                transaction: request.operation.nativeContext,
+                tagGeneration: request.tagGeneration
+            )
+        }
+    }
+
+    private func handleAudioTransactionEvent(
+        _ event: WebRTCIOSAudioTransactionEvent,
+        peer sourcePeer: WebRTCPeer,
+        generation: UUID
+    ) -> Bool? {
+        switch event {
+        case .observation(let receipt):
+            guard generation == sessionGeneration,
+                  peer === sourcePeer else { return nil }
+            audioLifecycle.consumeIOSAudioCategoryObservation(receipt)
+            return nil
+        case .drain(let receipt):
+            guard generation == sessionGeneration,
+                  peer === sourcePeer else { return nil }
+            audioLifecycle.consumeIOSAudioCategoryDrain(receipt)
+            return nil
+        case .deviceTeardown(let receipt):
+            // Teardown is intentionally accepted after sessionGeneration rotates and `peer`
+            // clears. The replacement session awaits this task before binding its own device.
+            return audioLifecycle
+                .consumeIOSAudioTransactionDeviceTeardown(receipt)
+        }
+    }
+
     private func peerEventStreamEnded(peer: WebRTCPeer, generation: UUID) {
         guard generation == sessionGeneration,
               self.peer === peer,
@@ -4490,7 +7335,8 @@ final class WorldwideSessionViewModel: ObservableObject {
                         epoch: epoch
                     )
                 }
-                if case .answer = payload {
+                if case .answer = payload,
+                   sessionOwnsAudio {
                     macHostedCallAnswerWasForwardedIfCurrent(
                         sourcePeer: sourcePeer,
                         sourceGeneration: generation,
@@ -4505,6 +7351,7 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         case .peerStateChanged(let state):
             await handlePeerState(state, generation: generation)
+            reconcileRemoteMediaCommandAvailability()
 
         case .iceStateChanged(let state):
             iceStateText = state.displayText
@@ -4518,7 +7365,6 @@ final class WorldwideSessionViewModel: ObservableObject {
                 iceIsConnected = true
                 await markViewerTransportHealthyIfPossible(state)
             case .disconnected, .failed:
-                iceIsConnected = false
                 markTransportUncertain("Recovering secure media")
                 await recoveryCoordinator?.iceStateChanged(state)
             case .closed:
@@ -4530,25 +7376,29 @@ final class WorldwideSessionViewModel: ObservableObject {
                     || isScreenVisible
                     || remoteInputCapability != nil
                 if crossedHealthyBoundary {
-                    iceIsConnected = false
                     markTransportUncertain("Recovering secure media")
                     await recoveryCoordinator?.iceStateChanged(.disconnected)
                 }
             }
+            reconcileRemoteMediaCommandAvailability()
 
         case .iceGatheringStateChanged:
             break
 
         case .dataChannelStateChanged(let state):
-            isControlChannelReady = state == .open
             if state == .open {
+                isControlChannelReady = true
                 await markViewerTransportHealthyIfPossible(.connected)
             } else if state == .closing || state == .closed {
                 // The Mac also stops capture on these states. A recovered channel therefore
                 // requires a fresh acknowledged Show instead of silently resuming video.
                 markTransportUncertain("Recovering secure media")
+                isControlChannelReady = false
                 await recoveryCoordinator?.iceStateChanged(.failed)
+            } else {
+                isControlChannelReady = false
             }
+            reconcileRemoteMediaCommandAvailability()
 
         case .controlRequestReceived:
             // Only the Mac host receives viewer control requests.
@@ -4571,6 +7421,49 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         case .inputSessionInvalidated:
             invalidateRemoteInputState()
+
+        case .remoteMediaControlsAvailabilityChanged(let isAvailable):
+            remoteMediaControlsNegotiated = isAvailable
+            if !isAvailable {
+                clearRemoteMediaPresentation()
+            }
+            reconcileRemoteMediaCommandAvailability()
+
+        case .remoteMediaStateChanged(let receivedState):
+            guard RemoteMediaStateAdmission.accept(
+                receivedState,
+                currentState: currentRemoteMediaState,
+                refresh: &remoteMediaRefresh,
+                generation: transportAuthorizationGeneration,
+                transportIsReady: RemoteMediaTransportAdmission.permitsIncomingState(
+                    isNegotiated: remoteMediaControlsNegotiated,
+                    isPeerConnected: isPeerConnected,
+                    isICEConnected: iceIsConnected,
+                    isControlChannelReady: isControlChannelReady,
+                    recoveryProofRequired: recoveryProofRequired
+                )
+            ) else { break }
+            remoteMediaRefreshTask?.cancel()
+            remoteMediaRefreshTask = nil
+            currentRemoteMediaState = receivedState
+            remoteMediaStateTransportAuthorizationGeneration =
+                transportAuthorizationGeneration
+            if let remoteMediaCommandOwner {
+                backgroundPlayback.publishRemoteMedia(
+                    receivedState,
+                    owner: remoteMediaCommandOwner
+                )
+            }
+            reconcileRemoteMediaCommandAvailability()
+
+        case .remoteMediaCommandAcknowledgementReceived:
+            // The host state stream remains authoritative; acknowledgements only terminate the
+            // command request and must not optimistically rewrite Now Playing metadata.
+            break
+
+        case .remoteMediaCommandReceived, .remoteMediaStateRefreshRequested:
+            // Only the Mac host receives viewer-originated media commands.
+            break
 
         case .screenMediaSuspensionReceived(let notice):
             receiveScreenMediaSuspension(
@@ -4622,6 +7515,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             break
 
         case .macHostedCallEvidenceChanged(let evidence):
+            guard sessionOwnsAudio else { break }
             handleMacHostedCallEvidence(
                 evidence,
                 sourcePeer: sourcePeer,
@@ -4636,10 +7530,16 @@ final class WorldwideSessionViewModel: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !displayName.isEmpty {
                 remoteDisplayName = displayName
-                audioLifecycle.updateServerName(displayName)
+                if sessionOwnsAudio {
+                    audioLifecycle.updateServerName(displayName)
+                }
             }
 
         case .remoteAudioTrack(let track):
+            guard sessionOwnsAudio else {
+                track.setEnabled(false)
+                break
+            }
             remoteAudioTrack = track
             audioLifecycle.remoteAudioBecameAvailable(track)
             if !ordinaryIOSPlayoutProofIsSuppressedByHostedCall {
@@ -4655,7 +7555,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         case .routeChanged(let route):
             routeText = route.kind.displayText
 
-        case .statistics(let snapshot):
+        case .statistics(let snapshot, wholePeerReportWasCollected: _):
             await handleWorldwideSessionStatistics(
                 snapshot,
                 from: sourcePeer,
@@ -4687,11 +7587,12 @@ final class WorldwideSessionViewModel: ObservableObject {
             let crossedHealthyBoundary = isPeerConnected
                 || isScreenVisible
                 || remoteInputCapability != nil
-            isPeerConnected = false
             if crossedHealthyBoundary {
                 markTransportUncertain("Recovering secure media")
+                isPeerConnected = false
                 await recoveryCoordinator?.iceStateChanged(.disconnected)
             } else {
+                isPeerConnected = false
                 stateText = "Connecting media"
             }
         case .connected:
@@ -4700,13 +7601,13 @@ final class WorldwideSessionViewModel: ObservableObject {
             await markViewerTransportHealthyIfPossible(.connected)
         case .disconnected:
             retireIOSHostedCallPlayoutAttempt()
-            isPeerConnected = false
             markTransportUncertain("Recovering secure media")
+            isPeerConnected = false
             await recoveryCoordinator?.iceStateChanged(.disconnected)
         case .failed:
             retireIOSHostedCallPlayoutAttempt()
-            isPeerConnected = false
             markTransportUncertain("Recovering secure media")
+            isPeerConnected = false
             await recoveryCoordinator?.iceStateChanged(.failed)
         case .closed:
             retireIOSHostedCallPlayoutAttempt()
@@ -4730,6 +7631,14 @@ final class WorldwideSessionViewModel: ObservableObject {
             through: sourcePeer,
             generation: generation
         )
+        guard sessionOwnsAudio else { return }
+        audioDiagnostics.observeStatistics(
+            snapshot,
+            at: Self.audioDiagnosticsNow(),
+            wallNow: Date()
+        )
+        // Optional native telemetry must never suspend the sequential peer-event consumer.
+        scheduleAudioDiagnosticsSample(from: sourcePeer, generation: generation)
         if hasOwnedIOSHostedCallPlayoutPolicy {
             await refreshIOSHostedCallPlayoutProof(
                 from: sourcePeer,
@@ -5018,6 +7927,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     private func tearDown(reason: RemoteSessionEndReason) {
+        cancelDeferredIPhoneMicrophonePermission()
+        let retiringSessionOwnedAudio = sessionOwnsAudio
         invalidateRawMicrophoneOracle()
         ordinaryPlayoutLivenessTracker.reset()
         microphoneAutomaticRecoveryConsumedBinding = nil
@@ -5040,6 +7951,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAuthorization = nil
         microphoneTask?.cancel()
         microphoneTask = nil
+        microphoneNativeTeardownID = nil
         microphoneOperationGeneration = UUID()
         microphoneIntentEnabled = false
         isMicrophoneSending = false
@@ -5055,7 +7967,10 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAdmissionCleanupID = nil
         isMicrophoneAdmissionCleanupInProgress = false
         microphoneOutputOnlyToken = nil
-        audioLifecycle.stop()
+        microphoneTransportSuspensionBinding = nil
+        if retiringSessionOwnedAudio {
+            audioLifecycle.stop()
+        }
         audioPolicyGeneration = UUID()
         verifiedAudioPolicyGeneration = nil
         audioPolicyRequiresFreshRecovery = false
@@ -5078,6 +7993,8 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         let oldSignaling = signaling
         let oldPeer = peer
+        let oldAudioTransactionEventTask =
+            audioTransactionEventTask
         let precedingRetirement = sessionRetirementTask
         sessionRetirementGeneration = UUID()
         #if DEBUG
@@ -5085,6 +8002,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         #endif
         sessionTask = nil
         peerEventTask = nil
+        audioTransactionEventTask = nil
         audioPlayoutProofTask = nil
         signaling = nil
         peer = nil
@@ -5092,18 +8010,37 @@ final class WorldwideSessionViewModel: ObservableObject {
         nextICERestartRequestID = 1
 
         let retirementTask = Task { @MainActor in
-            await precedingRetirement?.value
+            let precedingRetirementSucceeded =
+                await precedingRetirement?.value ?? true
             #if DEBUG
             await beforeRetiredPeerClose?()
             #endif
-            await oldPeer?.close(reason: reason)
+            let peerRetirementSucceeded: Bool
+            if let oldPeer {
+                peerRetirementSucceeded = await oldPeer.close(reason: reason)
+            } else {
+                oldAudioTransactionEventTask?.cancel()
+                peerRetirementSucceeded = true
+            }
+            // Native close synchronously yields teardown and then finishes the stream. Waiting for
+            // this consumer proves the old reducer namespace was reset before admission returns.
+            let audioTransactionRetirementSucceeded =
+                await oldAudioTransactionEventTask?.value
+                    ?? (!retiringSessionOwnedAudio || oldPeer == nil)
             await oldRecoveryCoordinator?.cancel()
             await oldSignaling?.close()
+            return precedingRetirementSucceeded
+                && peerRetirementSucceeded
+                && audioTransactionRetirementSucceeded
         }
         sessionRetirementTask = retirementTask
+        sessionMediaTopology = .full
     }
 
     private func resetPublishedSessionState() {
+        remoteMediaControlsNegotiated = false
+        clearRemoteMediaPresentation()
+        reconcileRemoteMediaCommandAvailability()
         ordinaryPlayoutLivenessTracker.reset()
         microphoneAutomaticRecoveryConsumedBinding = nil
         microphoneAdmissionRecoveryPendingBinding = nil
@@ -5153,6 +8090,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAdmissionCleanupID = nil
         isMicrophoneAdmissionCleanupInProgress = false
         microphoneOutputOnlyToken = nil
+        microphoneTransportSuspensionBinding = nil
         routeText = "Unknown"
         iceStateText = "Inactive"
         remoteDisplayName = "Mac mini"
@@ -5167,6 +8105,11 @@ final class WorldwideSessionViewModel: ObservableObject {
     private func macHostedCallChallengeChanged(
         _ challenge: WebRTCMacHostedCallChallenge?
     ) {
+        guard sessionOwnsAudio else {
+            retireMacHostedCallChallengeSendAttempt()
+            currentMacHostedCallChallenge = nil
+            return
+        }
         if currentMacHostedCallChallenge != challenge {
             retireMacHostedCallChallengeSendAttempt()
         }
@@ -5203,7 +8146,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     /// answer has already crossed signaling. The peer independently rechecks native health and the
     /// bidirectional SDP capability before touching the wire.
     private func sendMacHostedCallChallengeIfPossible() {
-        guard let challenge = currentMacHostedCallChallenge,
+        guard sessionOwnsAudio,
+              let challenge = currentMacHostedCallChallenge,
               challenge.isValid,
               let sourcePeer = peer,
               isPeerConnected,
@@ -5389,7 +8333,8 @@ final class WorldwideSessionViewModel: ObservableObject {
         sourcePeer: WebRTCPeer,
         sourceGeneration: UUID
     ) {
-        guard sourceGeneration == sessionGeneration,
+        guard sessionOwnsAudio,
+              sourceGeneration == sessionGeneration,
               peer === sourcePeer else {
             return
         }
@@ -5529,19 +8474,47 @@ final class WorldwideSessionViewModel: ObservableObject {
     /// snapshot establishes the new cumulative-counter floor.
     @discardableResult
     private func beginIOSPlayoutProof(
+        transaction: WorldwideAudioRecoveryTransaction,
+        postCallRecoveryMilestone:
+            WorldwidePostCallMicrophoneRecoveryMilestone? = nil
+    ) -> Task<Void, Never>? {
+        let task = beginIOSPlayoutProof(
+            requestRecovery: true,
+            postCallRecoveryMilestone: postCallRecoveryMilestone,
+            recoveryTransaction: transaction
+        )
+        if task == nil {
+            audioLifecycle.updateTransactionalRuntimePlayout(
+                transaction: transaction,
+                isReady: false,
+                failureMessage:
+                    "The iPhone 48 kHz stereo render path did not start.",
+                diagnostic:
+                    "The exact recovery proof could not start on the current peer."
+            )
+        }
+        return task
+    }
+
+    @discardableResult
+    private func beginIOSPlayoutProof(
         requestRecovery: Bool,
         postCallRecoveryMilestone:
             WorldwidePostCallMicrophoneRecoveryMilestone? = nil,
         categoryProofClaim:
-            WorldwideAudioCategoryProofClaim? = nil
+            WorldwideAudioCategoryProofClaim? = nil,
+        recoveryTransaction:
+            WorldwideAudioRecoveryTransaction? = nil
     ) -> Task<Void, Never>? {
         guard !ordinaryIOSPlayoutProofIsSuppressedByHostedCall else {
+            recoveryTransaction?.authorization.revoke()
             return nil
         }
         let pendingMicrophoneRecoveryIsCurrent =
             microphoneAdmissionRecoveryPendingBinding
                 == currentMicrophoneAutomaticRecoveryBinding()
-        if pendingMicrophoneRecoveryIsCurrent,
+        if recoveryTransaction == nil,
+           pendingMicrophoneRecoveryIsCurrent,
            categoryProofClaim == nil,
            let currentAttempt = iosPlayoutProofAttempt,
            microphoneAdmissionRecoveryProofAttemptID
@@ -5555,6 +8528,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         audioPlayoutProofTask?.cancel()
         audioPlayoutProofTask = nil
         guard let proofPeer = peer else {
+            recoveryTransaction?.authorization.revoke()
             if let categoryProofClaim {
                 // The claimed refresh is the only completion path for a category notification
                 // blocked by a same-target tombstone. A peer disappearing before the bounded
@@ -5573,8 +8547,23 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
 
         let requiresRecovery = requestRecovery
+            || recoveryTransaction != nil
             || audioPolicyRequiresFreshRecovery
             || pendingMicrophoneRecoveryIsCurrent
+        #if DEBUG
+        let permitsLegacyUntransactionalRecovery =
+            debugIOSPlayoutRecoveryRequester != nil
+        #else
+        let permitsLegacyUntransactionalRecovery = false
+        #endif
+        if requiresRecovery,
+           recoveryTransaction == nil,
+           !permitsLegacyUntransactionalRecovery {
+            _ = audioLifecycle.requestTransactionalRuntimePlayoutRecovery(
+                requiresRemoteAudio: !pendingMicrophoneRecoveryIsCurrent
+            )
+            return nil
+        }
         let proofAudioPolicyGeneration = audioPolicyGeneration
         verifiedAudioPolicyGeneration = nil
         audioPlayoutOracle = nil
@@ -5591,9 +8580,11 @@ final class WorldwideSessionViewModel: ObservableObject {
                     ? postCallRecoveryMilestone
                     : nil,
             categoryProofClaim: categoryProofClaim,
+            recoveryTransaction: recoveryTransaction,
             stage: requiresRecovery ? .awaitingRecoveryBaseline : .awaitingInitialFloor
         )
         iosPlayoutProofAttempt = attempt
+        audioDiagnostics.beginProof(recovery: requiresRecovery, at: Self.audioDiagnosticsNow())
         if pendingMicrophoneRecoveryIsCurrent {
             microphoneAdmissionRecoveryProofAttemptID =
                 attempt.proofAttemptID
@@ -5641,7 +8632,31 @@ final class WorldwideSessionViewModel: ObservableObject {
                     return
                 }
 
-                let authorization = WebRTCIOSPlayoutRecoveryAuthorization()
+                let authorization: WebRTCIOSPlayoutRecoveryAuthorization
+                if let recoveryTransaction {
+                    authorization = recoveryTransaction.authorization
+                } else {
+                    #if DEBUG
+                    guard debugIOSPlayoutRecoveryRequester != nil else {
+                        failIOSPlayoutProofTimeout(attempt)
+                        return
+                    }
+                    authorization = WebRTCIOSPlayoutRecoveryAuthorization()
+                    #else
+                    failIOSPlayoutProofTimeout(attempt)
+                    return
+                    #endif
+                }
+                if let recoveryTransaction {
+                    guard recoveryTransaction.authorization === authorization,
+                          authorization.transaction
+                            == recoveryTransaction.operation.nativeContext,
+                          authorization.stagedTransactionTagGeneration != nil else {
+                        authorization.revoke()
+                        failIOSPlayoutProofTimeout(attempt)
+                        return
+                    }
+                }
                 attempt.recoveryAuthorization = authorization
                 attempt.stage = .awaitingRecoveryAuthorization
                 audioPlayoutRecoveryAuthorization = authorization
@@ -5652,10 +8667,13 @@ final class WorldwideSessionViewModel: ObservableObject {
                     authorization.revoke()
                     return
                 }
-                await requestIOSPlayoutRecovery(
+                guard await requestIOSPlayoutRecovery(
                     on: proofPeer,
                     authorization: authorization
-                )
+                ) else {
+                    failIOSPlayoutProofTimeout(attempt)
+                    return
+                }
                 guard iosPlayoutProofAttemptIsOwned(attempt),
                       attempt.recoveryAuthorization === authorization,
                       audioPlayoutRecoveryAuthorization === authorization else {
@@ -5738,6 +8756,13 @@ final class WorldwideSessionViewModel: ObservableObject {
               iosPlayoutProofAttemptIsOwned(attempt),
               attempt.expectedPeer === proofPeer else { return nil }
         if let diagnostics {
+            updateAudioDiagnosticsPolicyFacts()
+            audioDiagnostics.observeNative(
+                WebRTCAudioClientNativeSnapshot(diagnostics: diagnostics),
+                policyID: attempt.audioPolicyGeneration,
+                classifyFailure: attempt.stage != .awaitingRecoveryBaseline,
+                at: Self.audioDiagnosticsNow()
+            )
             publishIOSPlayoutOracle(
                 diagnostics,
                 from: proofPeer,
@@ -5892,14 +8917,16 @@ final class WorldwideSessionViewModel: ObservableObject {
     private func requestIOSPlayoutRecovery(
         on proofPeer: WebRTCPeer,
         authorization: WebRTCIOSPlayoutRecoveryAuthorization
-    ) async {
+    ) async -> Bool {
         #if DEBUG
         if let debugIOSPlayoutRecoveryRequester {
             await debugIOSPlayoutRecoveryRequester(proofPeer, authorization)
-            return
+            return true
         }
         #endif
-        await proofPeer.requestIOSPlayoutRecovery(authorization: authorization)
+        return await proofPeer.requestIOSPlayoutRecovery(
+            authorization: authorization
+        )
     }
 
     private static let iosHostedCallPlayoutSetupTimeout: Duration = .seconds(2)
@@ -7052,6 +10079,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             && !diagnostics.categoryOptionsAreEmpty
             && diagnostics.categoryOptionsAreMixWithOthers
             && diagnostics.routeSharingPolicyIsDefault
+            && !diagnostics.routeSharingPolicyIsLongFormAudio
             && diagnostics.hasOutputRoute
             && diagnostics.hostedCallMode
             && diagnostics.audioUnitSubType == kAudioUnitSubType_RemoteIO
@@ -7277,18 +10305,33 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     private func failIOSPlayoutProofTimeout(_ attempt: IOSPlayoutProofAttempt) {
         guard iosPlayoutProofAttemptIsOwned(attempt) else { return }
+        audioDiagnostics.fail(phase: .evidence, at: Self.audioDiagnosticsNow())
         failPendingMicrophoneAdmissionRecoveryIfOwned(
             by: attempt,
             message:
                 "The iPhone microphone audio path did not recover in time. Tap Retry iPhone Microphone."
         )
-        retireIOSPlayoutRecoveryAttempt(attempt)
-        audioLifecycle.updateRuntimePlayout(
-            isReady: false,
-            failureMessage: "The iPhone 48 kHz stereo render path did not start.",
-            diagnostic: "RemoteIO produced no verified playout callback within two seconds.",
-            categoryProofClaim: attempt.categoryProofClaim
-        )
+        let failureMessage =
+            "The iPhone 48 kHz stereo render path did not start."
+        let diagnostic =
+            "RemoteIO produced no verified playout callback within two seconds."
+        if let recoveryTransaction = attempt.recoveryTransaction {
+            audioLifecycle.updateTransactionalRuntimePlayout(
+                transaction: recoveryTransaction,
+                isReady: false,
+                failureMessage: failureMessage,
+                diagnostic: diagnostic
+            )
+            retireIOSPlayoutRecoveryAttempt(attempt)
+        } else {
+            retireIOSPlayoutRecoveryAttempt(attempt)
+            audioLifecycle.updateRuntimePlayout(
+                isReady: false,
+                failureMessage: failureMessage,
+                diagnostic: diagnostic,
+                categoryProofClaim: attempt.categoryProofClaim
+            )
+        }
     }
 
     /// Returns true when this exact proof window reaches a terminal healthy or failed state.
@@ -7301,12 +10344,59 @@ final class WorldwideSessionViewModel: ObservableObject {
 
         if let authorization = attempt.recoveryAuthorization {
             guard audioPlayoutRecoveryAuthorization === authorization else { return false }
-            guard authorization.terminalGeneration
-                    == authorization.generation,
-                  authorization.terminalOutcome == .accepted else {
-                // Pending, rejected, and revoked claims cannot move a recovery attempt onto a
-                // healthy post-recovery floor. The bounded proof timeout owns eventual cleanup.
-                return false
+            if attempt.recoveryTransaction != nil {
+                guard let terminalReceipt = authorization.terminalReceipt else {
+                    return false
+                }
+                if !attempt.nativeRecoveryReceiptWasConsumed {
+                    audioDiagnostics.observeNative(
+                        WebRTCAudioClientNativeSnapshot(diagnostics: diagnostics),
+                        policyID: attempt.audioPolicyGeneration, at: Self.audioDiagnosticsNow()
+                    )
+                    audioDiagnostics.nativeReceipt(
+                        accepted: terminalReceipt.outcome == .accepted,
+                        targetMatched: terminalReceipt.policyMatchesRequestedTarget,
+                        at: Self.audioDiagnosticsNow()
+                    )
+                    audioLifecycle.consumeIOSPlayoutRecoveryReceipt(
+                        terminalReceipt,
+                        diagnostic: [
+                            "Native recovery outcome=\(terminalReceipt.outcome)",
+                            "targetMatched=\(terminalReceipt.policyMatchesRequestedTarget)",
+                            "initialized=\(diagnostics.initialized)",
+                            "playoutInitialized=\(diagnostics.playoutInitialized)",
+                            "playing=\(diagnostics.playing)",
+                            "sessionActive=\(diagnostics.sessionActive)",
+                            "input=\(diagnostics.inputBusEnabled)",
+                            "output=\(diagnostics.outputBusEnabled)",
+                            "hasOutputRoute=\(diagnostics.hasOutputRoute)",
+                            "categoryPlayback=\(diagnostics.categoryIsMediaPlayback)",
+                            "categoryPlayAndRecord=\(diagnostics.categoryIsMediaPlayAndRecord)",
+                            "modeDefault=\(diagnostics.modeIsDefault)",
+                            "failure=\(diagnostics.failureCode)",
+                            "status=\(diagnostics.lastLifecycleStatus)",
+                            "renderStatus=\(diagnostics.lastPlayoutStatus)",
+                        ].joined(separator: ", ")
+                    )
+                    attempt.nativeRecoveryReceiptWasConsumed = true
+                }
+                guard terminalReceipt.outcome == .accepted,
+                      terminalReceipt.policyMatchesRequestedTarget else {
+                    return failIOSPlayoutProof(
+                        attempt,
+                        diagnostics: diagnostics,
+                        diagnosticOverride:
+                            "Native recovery rejected or installed a policy that did not match its exact transaction target."
+                    )
+                }
+            } else {
+                guard authorization.terminalGeneration
+                        == authorization.generation,
+                      authorization.terminalOutcome == .accepted else {
+                    // Legacy proof-only test attempts carry no reducer identity. They may observe
+                    // terminal capability state, but can never synthesize a native receipt.
+                    return false
+                }
             }
             if attempt.stage == .awaitingRecoveryAuthorization {
                 attempt.stage = .awaitingPostRecoveryFloor
@@ -7434,11 +10524,19 @@ final class WorldwideSessionViewModel: ObservableObject {
                 inboundAudio: statistics?.inboundAudio
             )
         }
-        retireIOSPlayoutRecoveryAttempt(attempt)
-        audioLifecycle.updateRuntimePlayout(
-            isReady: true,
-            categoryProofClaim: attempt.categoryProofClaim
-        )
+        if let recoveryTransaction = attempt.recoveryTransaction {
+            audioLifecycle.updateTransactionalRuntimePlayout(
+                transaction: recoveryTransaction,
+                isReady: true
+            )
+            retireIOSPlayoutRecoveryAttempt(attempt)
+        } else {
+            retireIOSPlayoutRecoveryAttempt(attempt)
+            audioLifecycle.updateRuntimePlayout(
+                isReady: true,
+                categoryProofClaim: attempt.categoryProofClaim
+            )
+        }
         if completedMicrophoneAdmissionRecovery {
             // Runtime-proof publication normally reconciles synchronously. Redrive explicitly as
             // well so a lifecycle observer that coalesces an unchanged snapshot cannot strand the
@@ -7498,6 +10596,15 @@ final class WorldwideSessionViewModel: ObservableObject {
         diagnosticOverride: String? = nil
     ) -> Bool {
         guard iosPlayoutProofAttemptIsOwned(attempt) else { return false }
+        audioDiagnostics.observeNative(
+            WebRTCAudioClientNativeSnapshot(diagnostics: diagnostics),
+            policyID: attempt.audioPolicyGeneration, at: Self.audioDiagnosticsNow()
+        )
+        audioDiagnostics.fail(
+            phase: diagnostics.failureCode == 0 ? .evidence
+                : IOSAudioDiagnosticsJournal.failurePhase(Int32(clamping: diagnostics.failureCode)),
+            at: Self.audioDiagnosticsNow()
+        )
         let message = Self.iOSPlayoutFailureMessage(
             inputPolicyMatches: iOSPlayoutInputPolicyMatches(diagnostics),
             diagnostics: diagnostics
@@ -7510,13 +10617,23 @@ final class WorldwideSessionViewModel: ObservableObject {
             message:
                 "The iPhone microphone audio path could not recover automatically. Tap Retry iPhone Microphone."
         )
-        retireIOSPlayoutRecoveryAttempt(attempt)
-        audioLifecycle.updateRuntimePlayout(
-            isReady: false,
-            failureMessage: message,
-            diagnostic: diagnostic,
-            categoryProofClaim: attempt.categoryProofClaim
-        )
+        if let recoveryTransaction = attempt.recoveryTransaction {
+            audioLifecycle.updateTransactionalRuntimePlayout(
+                transaction: recoveryTransaction,
+                isReady: false,
+                failureMessage: message,
+                diagnostic: diagnostic
+            )
+            retireIOSPlayoutRecoveryAttempt(attempt)
+        } else {
+            retireIOSPlayoutRecoveryAttempt(attempt)
+            audioLifecycle.updateRuntimePlayout(
+                isReady: false,
+                failureMessage: message,
+                diagnostic: diagnostic,
+                categoryProofClaim: attempt.categoryProofClaim
+            )
+        }
         return true
     }
 
@@ -7764,6 +10881,9 @@ final class WorldwideSessionViewModel: ObservableObject {
             remoteScreenOwnerLease = pending.lease
             activeScreenRequestID = pending.key.requestID
             isScreenVisible = true
+            if recoveringScreenPresentationLease == pending.lease {
+                recoveringScreenPresentationLease = nil
+            }
             acceptsActiveScreenAcknowledgement = false
             remoteHideRequired = true
             installRemoteInputCapability(
@@ -7903,15 +11023,22 @@ final class WorldwideSessionViewModel: ObservableObject {
         isPeerConnected = true
         isControlChannelReady = true
         isConnecting = false
-        resetScreenPresentationState(rotateQueueGeneration: true)
+        resetScreenPresentationState(
+            rotateQueueGeneration: true,
+            preservingRecoveryPresentation: true
+        )
         stateText = "Connected"
         // The authenticated, current-generation inactive acknowledgement is the recovery proof
         // that permits remote audio to leave the fail-closed mute gate.
         recordViewerTransportHealthProof()
-        audioLifecycle.transportBecameHealthy()
-        establishAutomaticIPhoneMicrophoneIntentIfEligible()
-        continueIPhoneMicrophoneEnablementIfPossible()
+        reconcileRemoteMediaCommandAvailability()
+        if sessionOwnsAudio {
+            audioLifecycle.transportBecameHealthy()
+            establishAutomaticIPhoneMicrophoneIntentIfEligible()
+            continueIPhoneMicrophoneEnablementIfPossible()
+        }
         await recoveryCoordinator?.iceStateChanged(.connected)
+        scheduleScreenPresentationRecoveryIfNeeded()
     }
 
     static func acknowledgementReachedVisibilityTarget(
@@ -7945,13 +11072,34 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     private func handleRemoteInputFeedback(_ feedback: WebRTCInputFeedback) {
         guard let capability = remoteInputCapability,
+              let peer,
               feedback.screenRequestID == capability.screenRequestID,
               feedback.inputSessionID == capability.inputSessionID else {
             invalidateRemoteInputState()
             return
         }
+        let requestScope = RemoteInputRequestScope(
+            sessionGeneration: sessionGeneration,
+            peer: peer,
+            capability: capability
+        )
+        let retiredKey = RetiredFocusedWindowResizeRequestKey(
+            requestID: feedback.id,
+            requestScope: requestScope
+        )
+        if var retired = retiredFocusedWindowResizeRequests[retiredKey] {
+            earlyRemoteInputFeedback.removeValue(forKey: feedback.id)
+            guard !retired.didHandleFeedback else { return }
+            retired.didHandleFeedback = true
+            retiredFocusedWindowResizeRequests[retiredKey] = retired
+            handleRetiredFocusedWindowResizeFeedback(
+                feedback,
+                operation: retired.operation
+            )
+            return
+        }
 
-        guard let pending = pendingRemoteInputs.removeValue(forKey: feedback.id) else {
+        guard let pending = pendingRemoteInputs[feedback.id] else {
             guard earlyRemoteInputFeedback.count < 32 else {
                 lastDiagnostic = "Remote input feedback arrived out of bounds."
                 invalidateRemoteInputState()
@@ -7960,29 +11108,321 @@ final class WorldwideSessionViewModel: ObservableObject {
             earlyRemoteInputFeedback[feedback.id] = feedback
             return
         }
+        guard pending.requestScope == requestScope else {
+            invalidateRemoteInputState()
+            return
+        }
+        pendingRemoteInputs.removeValue(forKey: feedback.id)
         if let index = pendingRemoteInputOrder.firstIndex(of: feedback.id) {
             pendingRemoteInputOrder.remove(at: index)
         }
         guard pending.sendAuthorization?.isValid != false else { return }
+        if case .pointer = pending.kind,
+           pending.pointerIntentID != latestPointerIntentID {
+            if feedback.result == .rejected,
+               Self.isTerminalRemoteInputRejection(feedback.rejectionReason) {
+                handleRemoteInputRejection(
+                    feedback.rejectionReason,
+                    screenFormatChanging: feedback.screenFormatChanging
+                )
+            }
+            return
+        }
 
         guard feedback.result == .accepted else {
-            clearRemoteKeyboardFocus()
-            handleRemoteInputRejection(feedback.rejectionReason)
+            if case .focusedWindowResize(let interactionID, let operation) = pending.kind {
+                handleRejectedFocusedWindowResizeFeedback(
+                    feedback,
+                    interactionID: interactionID,
+                    operation: operation
+                )
+                handleRemoteInputRejection(
+                    feedback.rejectionReason,
+                    screenFormatChanging: feedback.screenFormatChanging
+                )
+                return
+            }
+            // The optional context distinguishes an owned format rebuild from genuine keyboard
+            // throttling while keeping the established `.rateLimited` reason compatible.
+            if !Self.preservesRemoteKeyboardFocus(
+                after: feedback.rejectionReason,
+                screenFormatChanging: feedback.screenFormatChanging,
+                for: pending.kind
+            ) {
+                clearRemoteKeyboardFocus()
+            }
+            handleRemoteInputRejection(
+                feedback.rejectionReason,
+                screenFormatChanging: feedback.screenFormatChanging
+            )
             return
         }
 
         switch pending.kind {
         case .pointer:
-            guard pending.pointerIntentID == latestPointerIntentID else { return }
+            guard feedback.windowResize == nil, feedback.windowMove == nil else {
+                invalidateRemoteInputState()
+                return
+            }
             applyRemoteInputFocus(feedback.focus)
 
         case .keyboard(let generation):
+            guard feedback.windowResize == nil, feedback.windowMove == nil else {
+                invalidateRemoteInputState()
+                return
+            }
             guard focusedInputGeneration == generation else { return }
             applyRemoteInputFocus(feedback.focus)
+
+        case .focusedWindowResize(let interactionID, let operation):
+            handleAcceptedFocusedWindowResizeFeedback(
+                feedback,
+                interactionID: interactionID,
+                operation: operation
+            )
         }
     }
 
-    private func handleRemoteInputRejection(_ reason: WebRTCInputRejectionReason?) {
+    /// A locally canceled window interaction can never restore its target or preview. Its host
+    /// result still carries authoritative focus and terminal permission/session state, so retain
+    /// only enough bounded correlation to apply those revocations exactly once.
+    private func handleRetiredFocusedWindowResizeFeedback(
+        _ feedback: WebRTCInputFeedback,
+        operation: FocusedWindowResizePendingOperation
+    ) {
+        guard feedback.result == .accepted else {
+            applyRetiredFocusedWindowResizeFocusRevocation(
+                feedback.focus,
+                expectedGeneration: operation.focusGeneration,
+                expectedSecure: operation.focusIsSecure
+            )
+            handleRemoteInputRejection(
+                feedback.rejectionReason,
+                screenFormatChanging: feedback.screenFormatChanging
+            )
+            return
+        }
+
+        guard Self.focusedWindowFeedbackTarget(feedback, matches: operation) != nil,
+              Self.focusedWindowResizeFocus(
+                  feedback.focus,
+                  matches: operation.focusGeneration,
+                  secure: operation.focusIsSecure
+              ) else {
+            revokeRemoteKeyboardFocusIfOwned(
+                by: operation.focusGeneration
+            )
+            lastDiagnostic = Self.mismatchedFocusedWindowFeedbackDiagnostic(operation.mode)
+            return
+        }
+        applyRetiredFocusedWindowResizeFocusRevocation(
+            feedback.focus,
+            expectedGeneration: operation.focusGeneration,
+            expectedSecure: operation.focusIsSecure
+        )
+    }
+
+    /// Late feedback for locally canceled window work may revoke the exact focus generation that
+    /// existed when the request was sent, but it can never install or resurrect editable focus.
+    private func applyRetiredFocusedWindowResizeFocusRevocation(
+        _ focus: WebRTCInputFocus,
+        expectedGeneration: UInt64?,
+        expectedSecure: Bool
+    ) {
+        guard Self.focusedWindowResizeFocus(
+            focus,
+            matches: expectedGeneration,
+            secure: expectedSecure
+        ) else {
+            revokeRemoteKeyboardFocusIfOwned(by: expectedGeneration)
+            return
+        }
+        if case .none = focus {
+            revokeRemoteKeyboardFocusIfOwned(by: expectedGeneration)
+        }
+    }
+
+    private func revokeRemoteKeyboardFocusIfOwned(by generation: UInt64?) {
+        guard focusedInputGeneration == generation else { return }
+        clearRemoteKeyboardFocus()
+    }
+
+    private func handleAcceptedFocusedWindowResizeFeedback(
+        _ feedback: WebRTCInputFeedback,
+        interactionID: UUID,
+        operation: FocusedWindowResizePendingOperation
+    ) {
+        guard var interaction = focusedWindowResizeState.interaction,
+              interaction.id == interactionID,
+              interaction.pending == operation else {
+            return
+        }
+        guard focusedWindowResizeInteractionIsCurrent(interaction),
+              interaction.mode == operation.mode,
+              let target = Self.focusedWindowFeedbackTarget(
+                  feedback,
+                  matches: operation
+              ),
+              interaction.mode != .move
+                || !interaction.binding.allowsRecoverableOffscreenMove
+                || target.unclippedNormalizedFrame != nil,
+              Self.focusedWindowResizeFocus(
+                  feedback.focus,
+                  matches: operation.focusGeneration,
+                  secure: operation.focusIsSecure
+              ) else {
+            clearRemoteKeyboardFocus()
+            cancelFocusedWindowResize()
+            lastDiagnostic = Self.mismatchedFocusedWindowFeedbackDiagnostic(operation.mode)
+            return
+        }
+
+        applyRemoteInputFocus(feedback.focus)
+        interaction.pending = nil
+        interaction.target = target
+        focusedWindowResizeState = .active(interaction)
+    }
+
+    private func handleRejectedFocusedWindowResizeFeedback(
+        _ feedback: WebRTCInputFeedback,
+        interactionID: UUID,
+        operation: FocusedWindowResizePendingOperation
+    ) {
+        guard let interaction = focusedWindowResizeState.interaction,
+              interaction.id == interactionID,
+              interaction.pending == operation else {
+            return
+        }
+        if Self.focusedWindowResizeFocus(
+            feedback.focus,
+            matches: operation.focusGeneration,
+            secure: operation.focusIsSecure
+        ) {
+            applyRemoteInputFocus(feedback.focus)
+        } else {
+            clearRemoteKeyboardFocus()
+        }
+        cancelFocusedWindowResize()
+    }
+
+    private static func mismatchedFocusedWindowFeedbackDiagnostic(
+        _ mode: FocusedWindowInteractionMode
+    ) -> String {
+        let operation = mode == .resize ? "resize" : "move"
+        return "The Mac returned mismatched focused-window \(operation) feedback."
+    }
+
+    private static func focusedWindowFeedbackTarget(
+        _ feedback: WebRTCInputFeedback,
+        matches operation: FocusedWindowResizePendingOperation
+    ) -> FocusedWindowInteractionTarget? {
+        let target: FocusedWindowInteractionTarget
+        let committedGeneration: UUID?
+        let isTargetRequest: Bool
+        let isSelection: Bool
+        let isCommit: Bool
+        switch operation.mode {
+        case .resize:
+            guard let resize = feedback.windowResize, feedback.windowMove == nil else { return nil }
+            target = .init(resize: resize.target)
+            committedGeneration = resize.committedTargetGeneration
+            isTargetRequest = resize.kind == .targetAcquired
+            isSelection = resize.kind == .windowSelected
+            isCommit = resize.kind == .resizeCommitted
+        case .move:
+            guard let move = feedback.windowMove, feedback.windowResize == nil else { return nil }
+            target = .init(move: move.target)
+            committedGeneration = move.committedTargetGeneration
+            isTargetRequest = move.kind == .targetAcquired
+            isSelection = move.kind == .windowSelected
+            isCommit = move.kind == .moveCommitted
+        }
+        guard focusedWindowResizeTargetIsValid(target) else { return nil }
+        let matches: Bool
+        switch operation {
+        case .targetRequest:
+            matches = isTargetRequest && committedGeneration == nil
+        case .selection:
+            matches = isSelection && committedGeneration == nil
+        case .commit(_, let consumedTargetGeneration, _, _, _):
+            matches = isCommit
+                && committedGeneration == consumedTargetGeneration
+                && target.generation != consumedTargetGeneration
+        }
+        return matches ? target : nil
+    }
+
+    private static func focusedWindowResizeFocus(
+        _ focus: WebRTCInputFocus,
+        matches expectedGeneration: UInt64?,
+        secure expectedSecure: Bool
+    ) -> Bool {
+        switch focus {
+        case .none:
+            return true
+        case .editable(let generation, let secure):
+            return expectedGeneration == generation && expectedSecure == secure
+        }
+    }
+
+    private static func focusedWindowResizeTargetIsValid(
+        _ target: FocusedWindowInteractionTarget
+    ) -> Bool {
+        let frame = target.normalizedFrame
+        guard target.generation != zeroUUID
+            && frame.x.isFinite && frame.y.isFinite
+            && frame.width.isFinite && frame.height.isFinite
+            && frame.x >= 0 && frame.y >= 0
+            && frame.width > 0 && frame.height > 0
+            && frame.x + frame.width <= 1
+            && frame.y + frame.height <= 1 else { return false }
+        guard let full = target.unclippedNormalizedFrame else { return true }
+        let tolerance = 0.000_000_001
+        return full.x.isFinite && full.y.isFinite
+            && full.width.isFinite && full.height.isFinite
+            && full.width > 0 && full.height > 0
+            && frame.x >= full.x - tolerance
+            && frame.y >= full.y - tolerance
+            && frame.x + frame.width <= full.x + full.width + tolerance
+            && frame.y + frame.height <= full.y + full.height + tolerance
+    }
+
+    private static let zeroUUID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
+
+    private static func preservesRemoteKeyboardFocus(
+        after rejection: WebRTCInputRejectionReason?,
+        screenFormatChanging: Bool,
+        for pendingKind: PendingRemoteInputKind
+    ) -> Bool {
+        guard rejection == .rateLimited,
+              screenFormatChanging else { return false }
+        if case .keyboard = pendingKind {
+            return true
+        }
+        return false
+    }
+
+    private static func isTerminalRemoteInputRejection(
+        _ rejection: WebRTCInputRejectionReason?
+    ) -> Bool {
+        switch rejection {
+        case .accessibilityPermissionRequired,
+             .eventPostingPermissionRequired,
+             .inputDisabled,
+             .staleSession,
+             nil:
+            true
+        case .rateLimited, .injectionFailed, .invalidRequest, .invalidFocus:
+            false
+        }
+    }
+
+    private func handleRemoteInputRejection(
+        _ reason: WebRTCInputRejectionReason?,
+        screenFormatChanging: Bool = false
+    ) {
         switch reason {
         case .accessibilityPermissionRequired:
             lastError = "Remote control needs Accessibility permission on the Mac."
@@ -7996,7 +11436,9 @@ final class WorldwideSessionViewModel: ObservableObject {
         case .staleSession:
             invalidateRemoteInputState()
         case .rateLimited:
-            lastDiagnostic = "Remote input was rate-limited."
+            lastDiagnostic = screenFormatChanging
+                ? "Mac screen format changed during remote input."
+                : "Remote input was rate-limited."
         case .injectionFailed:
             lastError = "The Mac could not post that remote input event."
         case .invalidRequest:
@@ -8009,22 +11451,21 @@ final class WorldwideSessionViewModel: ObservableObject {
     }
 
     private func applyRemoteInputFocus(_ focus: WebRTCInputFocus) {
-        guard let generation = Self.remoteKeyboardGeneration(for: focus) else {
-            if case .editable(_, secure: true) = focus {
-                lastDiagnostic = "Secure Mac text fields stay local and cannot receive remote typing."
-            }
+        guard let keyboardFocus = Self.remoteKeyboardFocus(for: focus) else {
             clearRemoteKeyboardFocus()
             return
         }
-        focusedInputGeneration = generation
-        focusedInputIsSecure = false
+        focusedInputGeneration = keyboardFocus.generation
+        focusedInputIsSecure = keyboardFocus.secure
     }
 
-    /// A second, viewer-side fail-closed boundary for older or compromised hosts.
-    /// The current Mac host never advertises editable focus for secure AX controls.
-    static func remoteKeyboardGeneration(for focus: WebRTCInputFocus) -> UInt64? {
-        guard case .editable(let generation, secure: false) = focus else { return nil }
-        return generation
+    /// Maps any host-proven editable focus into the generation and keyboard privacy mode used by
+    /// the viewer. A secure field keeps the same capability checks as ordinary editable focus.
+    static func remoteKeyboardFocus(
+        for focus: WebRTCInputFocus
+    ) -> (generation: UInt64, secure: Bool)? {
+        guard case .editable(let generation, let secure) = focus else { return nil }
+        return (generation, secure)
     }
 
     private func clearRemoteKeyboardFocus() {
@@ -8035,6 +11476,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private func invalidateRemoteInputState() {
         // Revoke both final-send gates before cancelling actor work. A send already inside the
         // gates linearizes before this call; queued work cannot enter afterward.
+        cancelFocusedWindowResize()
         revokeRemoteScrollSendAuthorization()
         revokeRemoteInputLifecycleSendAuthorization()
         remoteInputAuthorization?.revoke()
@@ -8047,6 +11489,8 @@ final class WorldwideSessionViewModel: ObservableObject {
         pendingRemoteInputs.removeAll(keepingCapacity: false)
         pendingRemoteInputOrder.removeAll(keepingCapacity: false)
         earlyRemoteInputFeedback.removeAll(keepingCapacity: false)
+        retiredFocusedWindowResizeRequests.removeAll(keepingCapacity: false)
+        retiredFocusedWindowResizeRequestKeyOrder.removeAll(keepingCapacity: false)
         latestPointerIntentID = 0
         remoteInputCapability = nil
         clearRemoteKeyboardFocus()
@@ -8114,6 +11558,14 @@ final class WorldwideSessionViewModel: ObservableObject {
         debugSessionRunner = runner
     }
 
+    var debugSessionMediaTopologyForTests: WebRTCTransportMediaTopology {
+        sessionMediaTopology
+    }
+
+    var debugCurrentPeerForTests: WebRTCPeer? {
+        peer
+    }
+
     func debugInstallIPhoneMicrophonePermissionRequester(
         _ requester: @escaping @MainActor () async -> Bool
     ) {
@@ -8122,6 +11574,14 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     func debugCacheIPhoneMicrophonePermissionForTests() {
         microphonePermissionGranted = true
+    }
+
+    var debugDeferredIPhoneMicrophonePermissionTaskForTests: Task<Void, Never>? {
+        microphonePermissionReconciliationTask
+    }
+
+    var debugIPhoneMicrophonePermissionTaskForTests: Task<Void, Never>? {
+        microphonePermissionTask
     }
 
     func debugIOSPlayoutInputPolicyMatchesForTests(
@@ -8207,10 +11667,20 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneAuthorization
     }
 
+    func debugWaitForIPhoneMicrophoneTaskForTests() async {
+        await microphoneTask?.value
+    }
+
     func debugInstallIOSPlayoutDiagnosticsReader(
         _ reader: @escaping @MainActor (WebRTCPeer) async -> WebRTCIOSPlayoutDiagnostics?
     ) {
         debugIOSPlayoutDiagnosticsReader = reader
+    }
+
+    func debugInstallAudioClientDiagnosticsReader(
+        _ reader: @escaping @MainActor (WebRTCPeer) async -> WebRTCAudioClientNativeSnapshot?
+    ) {
+        debugAudioClientDiagnosticsReader = reader
     }
 
     func debugInstallIOSPlayoutRecoveryRequester(
@@ -8220,6 +11690,14 @@ final class WorldwideSessionViewModel: ObservableObject {
         ) async -> Void
     ) {
         debugIOSPlayoutRecoveryRequester = requester
+    }
+
+    func debugSetIOSAudioSystemEventFenceRequester(
+        _ requester: (
+            @MainActor (WebRTCPeer, WebRTCIOSAudioTransactionDeviceBinding) async -> Bool
+        )?
+    ) {
+        debugIOSAudioSystemEventFenceRequester = requester
     }
 
     func debugInstallIOSHostedCallPlayoutRecoveryRequester(
@@ -8382,6 +11860,32 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     var debugAudioPolicyGeneration: UUID {
         audioPolicyGeneration
+    }
+
+    func debugAudioDiagnosticsHeartbeatForTests(at now: UInt64? = nil)
+        -> WebRTCAudioClientDiagnosticsHeartbeat? {
+        audioDiagnostics.heartbeat(build: Self.audioDiagnosticsBuild, at: now ?? Self.audioDiagnosticsNow())
+    }
+
+    func debugCaptureAudioDiagnosticsForTests(from sourcePeer: WebRTCPeer,
+                                             statistics: WebRTCStatisticsSnapshot) async {
+        audioDiagnostics.observeStatistics(statistics, at: Self.audioDiagnosticsNow(), wallNow: Date())
+        await captureAudioClientDiagnostics(
+            from: sourcePeer, generation: sessionGeneration
+        )
+    }
+
+    func debugScheduleAudioDiagnosticsSampleForTests(from sourcePeer: WebRTCPeer) {
+        scheduleAudioDiagnosticsSample(from: sourcePeer, generation: sessionGeneration)
+    }
+
+    func debugWaitForAudioDiagnosticsSampleForTests() async {
+        await audioDiagnosticsSampleTask?.value
+    }
+
+    func debugSetAudioDiagnosticsBaselineStageForTests(_ isBaseline: Bool) {
+        precondition(iosPlayoutProofAttempt != nil)
+        iosPlayoutProofAttempt?.stage = isBaseline ? .awaitingRecoveryBaseline : .awaitingRecoveryAuthorization
     }
 
     func debugRotateAudioPolicyForTests() {
@@ -8581,6 +12085,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         #endif
         lastDiagnostic = diagnostic
         let action = queuedAction ?? .returnKey(focusGeneration: focusGeneration)
+        let pointerIntentID: UInt64?
+        if action.isOrdinaryPointerAction {
+            latestPointerIntentID = 1
+            pointerIntentID = 1
+        } else {
+            pointerIntentID = nil
+        }
         remoteInputQueue = [
             QueuedRemoteInput(
                 action: action,
@@ -8588,10 +12099,12 @@ final class WorldwideSessionViewModel: ObservableObject {
                 authorization: authorization,
                 sessionGeneration: sessionGeneration,
                 inputGeneration: remoteInputGeneration,
-                pointerIntentID: action.requiresRemoteFocus ? nil : 1,
+                pointerIntentID: pointerIntentID,
                 viewerVideoSize: viewerVideoSize,
                 scrollGestureID: nil,
-                sendAuthorization: currentRemoteInputLifecycleSendAuthorization()
+                sendAuthorization: currentRemoteInputLifecycleSendAuthorization(),
+                focusedWindowResizeInteractionID: nil,
+                focusedWindowResizeOperation: nil
             )
         ]
         return authorization
@@ -8603,6 +12116,11 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     func debugDeliverRemoteInputFeedbackForRaceTests(_ feedback: WebRTCInputFeedback) {
         handleRemoteInputFeedback(feedback)
+    }
+
+    func debugSetRemoteKeyboardFocusForTests(_ generation: UInt64?, secure: Bool = false) {
+        focusedInputGeneration = generation
+        focusedInputIsSecure = generation != nil && secure
     }
 
     /// Routes tests through the production terminal-session path without requiring live media.
@@ -8649,7 +12167,9 @@ final class WorldwideSessionViewModel: ObservableObject {
                 pointerIntentID: nil,
                 viewerVideoSize: nil,
                 scrollGestureID: nil,
-                sendAuthorization: currentRemoteInputLifecycleSendAuthorization()
+                sendAuthorization: currentRemoteInputLifecycleSendAuthorization(),
+                focusedWindowResizeInteractionID: nil,
+                focusedWindowResizeOperation: nil
             )
         ]
         return authorization
@@ -8664,8 +12184,13 @@ final class WorldwideSessionViewModel: ObservableObject {
             focusGeneration: focusedInputGeneration,
             queuedActionCount: remoteInputQueue.count,
             pendingActionCount: pendingRemoteInputs.count,
+            earlyFeedbackCount: earlyRemoteInputFeedback.count,
+            retiredRequestIDCount: retiredFocusedWindowResizeRequests.count,
             inputGeneration: remoteInputGeneration,
             activeScrollGestureID: activeRemoteScroll?.gestureID,
+            focusedWindowResizeState: focusedWindowResizeState,
+            focusedWindowResizeSendAuthorizationIsValid:
+                focusedWindowResizeSendAuthorization?.isValid == true,
             latestPointerIntentID: latestPointerIntentID,
             inputAvailable: isRemoteInputAvailable,
             acceptsActiveScreenAcknowledgement: acceptsActiveScreenAcknowledgement,
@@ -8677,16 +12202,28 @@ final class WorldwideSessionViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
     func debugInstallScreenSessionForTests(
         peer newPeer: WebRTCPeer,
         generation: UUID = UUID(),
         visible: Bool = false,
-        provenance: MediaSessionProvenance = .unauthenticated
-    ) {
+        provenance: MediaSessionProvenance = .unauthenticated,
+        bindAudioTransactionDevice: Bool = false
+    ) -> Bool {
+        debugFocusedWindowResizeTrackOwner = nil
         resetScreenPresentationState(
             rotateQueueGeneration: true,
             clearRequestHistory: true
         )
+        if bindAudioTransactionDevice {
+            guard let binding =
+                    newPeer.iOSAudioTransactionDeviceBinding,
+                  audioLifecycle.bindIOSAudioTransactionDevice(
+                    binding
+                  ) else {
+                return false
+            }
+        }
         peer = newPeer
         sessionGeneration = generation
         automaticMicrophoneEligibleSessionGeneration =
@@ -8704,6 +12241,13 @@ final class WorldwideSessionViewModel: ObservableObject {
         isScreenVisible = visible
         acceptsActiveScreenAcknowledgement = visible
         remoteHideRequired = visible
+        if bindAudioTransactionDevice {
+            startAudioTransactionEventLoop(
+                peer: newPeer,
+                generation: generation
+            )
+        }
+        return true
     }
 
     func debugMarkViewerTransportHealthyForAutomaticMicrophoneTests() async {
@@ -8755,7 +12299,12 @@ final class WorldwideSessionViewModel: ObservableObject {
         generation: UUID = UUID(),
         leaseID: UUID = UUID(),
         screenRequestID: UInt64 = 1,
-        supportsScroll: Bool = false
+        supportsScroll: Bool = false,
+        supportsFocusedWindowResize: Bool = false,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false,
+        supportsFocusedWindowMove: Bool = false,
+        supportsFocusedWindowMoveScaleRebinding: Bool = false,
+        supportsFocusedWindowMoveRecoverableOffscreen: Bool = false
     ) -> WorldwideScreenPresentationDebugFixture {
         debugInstallScreenSessionForTests(
             peer: newPeer,
@@ -8770,9 +12319,20 @@ final class WorldwideSessionViewModel: ObservableObject {
             inputSessionID: UUID(),
             screenRequestID: screenRequestID,
             supportsPrimaryDrag: true,
-            supportsScroll: supportsScroll
+            supportsScroll: supportsScroll,
+            supportsFocusedWindowResize: supportsFocusedWindowResize,
+            supportsFocusedWindowResizeScaleRebinding:
+                supportsFocusedWindowResizeScaleRebinding,
+            supportsFocusedWindowMove: supportsFocusedWindowMove,
+            supportsFocusedWindowMoveScaleRebinding:
+                supportsFocusedWindowMoveScaleRebinding,
+            supportsFocusedWindowMoveRecoverableOffscreen:
+                supportsFocusedWindowMoveRecoverableOffscreen
         )
         let authorization = WebRTCInputAuthorization()
+        debugFocusedWindowResizeTrackOwner = supportsFocusedWindowResize || supportsFocusedWindowMove
+            ? NSObject()
+            : nil
         remoteInputCapability = capability
         remoteInputAuthorization = authorization
         focusedInputGeneration = screenRequestID
@@ -8790,6 +12350,46 @@ final class WorldwideSessionViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
+    func debugReplaceRemoteInputCapabilityForTests(
+        inputSessionID: UUID = UUID(),
+        supportsFocusedWindowResize: Bool = true,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false,
+        supportsFocusedWindowMove: Bool = false,
+        supportsFocusedWindowMoveScaleRebinding: Bool = false,
+        supportsFocusedWindowMoveRecoverableOffscreen: Bool = false
+    ) -> WebRTCInputAuthorization? {
+        guard let current = remoteInputCapability else { return nil }
+        let replacement = WebRTCInputCapability(
+            inputSessionID: inputSessionID,
+            screenRequestID: current.screenRequestID,
+            protocolVersion: current.protocolVersion,
+            maxMessageBytes: current.maxMessageBytes,
+            supportsPrimaryDrag: current.supportsPrimaryDrag,
+            supportsScroll: current.supportsScroll,
+            supportsFocusedWindowResize: supportsFocusedWindowResize,
+            supportsFocusedWindowResizeScaleRebinding:
+                supportsFocusedWindowResizeScaleRebinding,
+            supportsFocusedWindowMove: supportsFocusedWindowMove,
+            supportsFocusedWindowMoveScaleRebinding:
+                supportsFocusedWindowMoveScaleRebinding,
+            supportsFocusedWindowMoveRecoverableOffscreen:
+                supportsFocusedWindowMoveRecoverableOffscreen
+        )
+        let authorization = WebRTCInputAuthorization()
+        installRemoteInputCapability(
+            replacement,
+            authorization: authorization
+        )
+        return authorization
+    }
+
+    func debugReplaceFocusedWindowResizeTrackForTests() {
+        guard debugFocusedWindowResizeTrackOwner != nil else { return }
+        remoteVideoTrackIdentityWillChange()
+        debugFocusedWindowResizeTrackOwner = NSObject()
+    }
+
     func debugScreenPeerIs(_ expectedPeer: WebRTCPeer) -> Bool {
         peer === expectedPeer
     }
@@ -8798,6 +12398,40 @@ final class WorldwideSessionViewModel: ObservableObject {
         _ observer: @escaping @MainActor (WebRTCPeer, String) -> Void
     ) {
         debugScreenMediaCancellationObserver = observer
+    }
+
+    func debugInstallCompletedScreenMediaFenceForTests(
+        lease: WorldwideScreenPresentationLease,
+        minimumAcceptedRTPTimestamp: UInt32
+    ) {
+        guard screenPresentationIsVisible(lease) else { return }
+        screenMediaViewerFence = WorldwideScreenMediaViewerFence(
+            lease: lease,
+            coverID: UUID(),
+            forceCover: false,
+            minimumAcceptedRTPTimestamp: minimumAcceptedRTPTimestamp,
+            proofRTPTimestamps: [],
+            markerProof: nil,
+            proofRequestRevision: 1,
+            statusText: nil
+        )
+    }
+
+    func debugInstallForcedScreenMediaFenceForTests(
+        lease: WorldwideScreenPresentationLease,
+        minimumAcceptedRTPTimestamp: UInt32
+    ) {
+        guard screenPresentationIsVisible(lease) else { return }
+        screenMediaViewerFence = WorldwideScreenMediaViewerFence(
+            lease: lease,
+            coverID: UUID(),
+            forceCover: true,
+            minimumAcceptedRTPTimestamp: minimumAcceptedRTPTimestamp,
+            proofRTPTimestamps: [],
+            markerProof: nil,
+            proofRequestRevision: 1,
+            statusText: "Screen paused for privacy"
+        )
     }
 
     func debugInstallScreenLivenessUptimeClock(
@@ -8822,6 +12456,7 @@ final class WorldwideSessionViewModel: ObservableObject {
             sessionGeneration: sessionGeneration,
             currentLease: currentScreenPresentationLease,
             activeLease: activeScreenPresentationLease,
+            recoveringLease: recoveringScreenPresentationLease,
             activeScreenRequestID: activeScreenRequestID,
             isScreenVisible: isScreenVisible,
             inputAvailable: isRemoteInputAvailable,
@@ -9016,9 +12651,38 @@ final class WorldwideSessionViewModel: ObservableObject {
 
     private func resetScreenPresentationState(
         rotateQueueGeneration: Bool,
-        clearRequestHistory: Bool = false
+        clearRequestHistory: Bool = false,
+        preservingRecoveryPresentation: Bool = false
     ) {
-        retireScreenMediaViewerAttempt(preservingFence: false)
+        let recoveryLease: WorldwideScreenPresentationLease? = if
+            preservingRecoveryPresentation {
+            recoveringScreenPresentationLease
+                ?? {
+                    guard isScreenVisible,
+                          currentScreenPresentationLease
+                            == activeScreenPresentationLease else {
+                        return nil
+                    }
+                    return currentScreenPresentationLease
+                }()
+        } else {
+            nil
+        }
+        let recoveryRevealFence: WorldwideScreenPresentationRecoveryRevealFence? = if
+            let recoveryLease,
+            let screenMediaViewerFence,
+            screenMediaViewerFence.lease == recoveryLease,
+            screenMediaViewerFence.forceCover {
+            WorldwideScreenPresentationRecoveryRevealFence(screenMediaViewerFence)
+        } else {
+            nil
+        }
+        screenPresentationRecoveryTask?.cancel()
+        screenPresentationRecoveryTask = nil
+        screenPresentationRecoveryAttemptID = nil
+        recoveringScreenPresentationLease = nil
+        screenPresentationRevealAfterRecoveryFence = nil
+        retireScreenMediaViewerAttempt(preservingFence: recoveryLease != nil)
         activeScreenRequestID = nil
         controlAcknowledgementTimeoutTask?.cancel()
         controlAcknowledgementTimeoutTask = nil
@@ -9063,6 +12727,15 @@ final class WorldwideSessionViewModel: ObservableObject {
         debugCurrentScreenPresentationLease = nil
         debugActiveScreenPresentationLease = nil
         #endif
+        if let recoveryLease,
+           recoveryLease.sessionGeneration == sessionGeneration {
+            currentScreenPresentationLease = recoveryLease
+            recoveringScreenPresentationLease = recoveryLease
+            screenPresentationRevealAfterRecoveryFence = recoveryRevealFence
+            #if DEBUG
+            debugCurrentScreenPresentationLease = recoveryLease
+            #endif
+        }
         clearEarlyControlAcknowledgements()
         if clearRequestHistory {
             retiredScreenVisibilityRequestKeys.removeAll(keepingCapacity: false)
@@ -9087,11 +12760,88 @@ final class WorldwideSessionViewModel: ObservableObject {
             stateText = "Connected"
         }
         recordViewerTransportHealthProof()
-        audioLifecycle.transportBecameHealthy()
-        await activatePendingIOSStartupConnectedCallPlayoutIfPossible()
-        establishAutomaticIPhoneMicrophoneIntentIfEligible()
-        continueIPhoneMicrophoneEnablementIfPossible()
+        reconcileRemoteMediaCommandAvailability()
+        if sessionOwnsAudio {
+            audioLifecycle.transportBecameHealthy()
+            await activatePendingIOSStartupConnectedCallPlayoutIfPossible()
+            establishAutomaticIPhoneMicrophoneIntentIfEligible()
+            continueIPhoneMicrophoneEnablementIfPossible()
+        }
         await recoveryCoordinator?.iceStateChanged(state)
+        scheduleScreenPresentationRecoveryIfNeeded()
+    }
+
+    private func scheduleScreenPresentationRecoveryIfNeeded() {
+        guard screenPresentationRecoveryTask == nil,
+              !recoveryProofRequired,
+              canViewScreen,
+              let recoveryLease = recoveringScreenPresentationLease,
+              screenPresentationIsCurrent(recoveryLease),
+              let expectedPeer = peer else {
+            return
+        }
+
+        let expectedGeneration = sessionGeneration
+        let attemptID = UUID()
+        screenPresentationRecoveryAttemptID = attemptID
+        stateText = "Restoring screen"
+        screenPresentationRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.screenPresentationRecoveryAttemptID == attemptID {
+                    self.screenPresentationRecoveryTask = nil
+                    self.screenPresentationRecoveryAttemptID = nil
+                }
+            }
+            let maximumShowAttempts = 2
+            for showAttempt in 1...maximumShowAttempts {
+                let restored = await self.setScreenVisible(true, for: recoveryLease)
+                guard self.screenPresentationRecoveryAttemptID == attemptID,
+                      self.sessionGeneration == expectedGeneration,
+                      self.peer === expectedPeer else {
+                    return
+                }
+                if restored {
+                    if self.recoveringScreenPresentationLease == recoveryLease {
+                        self.recoveringScreenPresentationLease = nil
+                    }
+                    return
+                }
+
+                guard self.canViewScreen,
+                      self.screenPresentationIsCurrent(recoveryLease),
+                      self.recoveringScreenPresentationLease == recoveryLease else {
+                    return
+                }
+                if self.screenPresentationNeedsRemoteHide(recoveryLease) {
+                    self.stateText = "Securing screen recovery"
+                    let hidden = await self.setScreenVisible(false, for: recoveryLease)
+                    guard self.screenPresentationRecoveryAttemptID == attemptID,
+                          self.sessionGeneration == expectedGeneration,
+                          self.peer === expectedPeer else {
+                        return
+                    }
+                    guard hidden else {
+                        if self.hasActiveSession {
+                            self.failSession(
+                                "The Mac may still be sharing its screen after recovery, so the session was closed for privacy.",
+                                generation: expectedGeneration
+                            )
+                        }
+                        return
+                    }
+                }
+
+                guard showAttempt < maximumShowAttempts else {
+                    self.lastError =
+                        "The Mac could not resume screen capture automatically."
+                    self.stateText = "Connected"
+                    self.retireScreenPresentationLease(recoveryLease)
+                    return
+                }
+                self.stateText = "Restoring screen"
+            }
+        }
     }
 
     private func recordViewerTransportHealthProof() {
@@ -9106,23 +12856,265 @@ final class WorldwideSessionViewModel: ObservableObject {
         microphoneError = nil
     }
 
+    @discardableResult
+    private func enqueueRemoteMediaCommand(
+        _ dispatch: RemoteMediaCommandDispatch
+    ) -> Task<Void, Never>? {
+        let command = dispatch.command
+        guard dispatch.authorization.isValid,
+              let contextID = dispatch.state.update.item?.contextID,
+              let currentRemoteMediaState,
+              currentRemoteMediaState.isSameNegotiation(as: dispatch.state),
+              remoteMediaControlsNegotiated,
+              let sourcePeer = peer,
+              isPeerConnected,
+              iceIsConnected,
+              isControlChannelReady,
+              !recoveryProofRequired,
+              remoteMediaStateTransportAuthorizationGeneration
+                == transportAuthorizationGeneration,
+              RemoteMediaCommandAdmission.permits(
+                command,
+                contextID: contextID,
+                observedRevision: dispatch.state.update.revision,
+                currentUpdate: currentRemoteMediaUpdate
+              ) else {
+            reconcileRemoteMediaCommandAvailability()
+            return nil
+        }
+        let sourceGeneration = sessionGeneration
+        let sourceTransportGeneration = transportAuthorizationGeneration
+        return Task { @MainActor [weak self, weak sourcePeer] in
+            guard let self, let sourcePeer,
+                  dispatch.authorization.isValid,
+                  self.peer === sourcePeer,
+                  self.sessionGeneration == sourceGeneration,
+                  self.transportAuthorizationGeneration
+                    == sourceTransportGeneration,
+                  self.remoteMediaControlsNegotiated,
+                  self.isPeerConnected,
+                  self.iceIsConnected,
+                  self.isControlChannelReady,
+                  !self.recoveryProofRequired,
+                  self.remoteMediaStateTransportAuthorizationGeneration
+                    == sourceTransportGeneration,
+                  let currentState = self.currentRemoteMediaState,
+                  currentState.isSameNegotiation(as: dispatch.state),
+                  RemoteMediaCommandAdmission.permits(
+                    command,
+                    contextID: contextID,
+                    observedRevision: dispatch.state.update.revision,
+                    currentUpdate: self.currentRemoteMediaUpdate
+                  ) else {
+                return
+            }
+            do {
+                #if DEBUG
+                if let sender = self.debugRemoteMediaCommandSender {
+                    try await sender(dispatch)
+                } else {
+                    try await sourcePeer.requestRemoteMediaCommand(
+                        command,
+                        state: dispatch.state,
+                        authorization: dispatch.authorization
+                    )
+                }
+                #else
+                try await sourcePeer.requestRemoteMediaCommand(
+                    command,
+                    state: dispatch.state,
+                    authorization: dispatch.authorization
+                )
+                #endif
+            } catch {
+                guard self.peer === sourcePeer,
+                      self.sessionGeneration == sourceGeneration,
+                      self.transportAuthorizationGeneration == sourceTransportGeneration,
+                      dispatch.authorization.isValid else { return }
+                // Backpressure rejects this press, not the healthy presentation. Never replay
+                // Next/Previous; actual transport events independently revoke command authority.
+                self.reconcileRemoteMediaCommandAvailability()
+            }
+        }
+    }
+
+    private func reconcileRemoteMediaCommandAvailability() {
+        let transportIsReady = RemoteMediaTransportAdmission.permitsIncomingState(
+            isNegotiated: remoteMediaControlsNegotiated,
+            isPeerConnected: isPeerConnected,
+            isICEConnected: iceIsConnected,
+            isControlChannelReady: isControlChannelReady,
+            recoveryProofRequired: recoveryProofRequired
+        )
+        if !transportIsReady {
+            clearRemoteMediaPresentation()
+        } else if let peer,
+                  let ticket = remoteMediaRefresh.begin(
+                    generation: transportAuthorizationGeneration
+                  ) {
+            requestRemoteMediaRefresh(ticket, through: peer)
+        }
+        let ready = RemoteMediaTransportAdmission.permitsCommands(
+            isNegotiated: remoteMediaControlsNegotiated,
+            hasPeer: peer != nil,
+            isPeerConnected: isPeerConnected,
+            isICEConnected: iceIsConnected,
+            isControlChannelReady: isControlChannelReady,
+            recoveryProofRequired: recoveryProofRequired,
+            stateTransportGeneration:
+                remoteMediaStateTransportAuthorizationGeneration,
+            currentTransportGeneration: transportAuthorizationGeneration,
+            hasMediaItem: currentRemoteMediaUpdate?.item != nil
+        )
+        if let remoteMediaCommandOwner {
+            backgroundPlayback.setRemoteMediaTransportReady(
+                ready,
+                owner: remoteMediaCommandOwner
+            )
+        }
+    }
+
+    private func clearRemoteMediaPresentation() {
+        remoteMediaRefreshTask?.cancel()
+        remoteMediaRefreshTask = nil
+        remoteMediaRefresh.invalidate()
+        currentRemoteMediaState = nil
+        remoteMediaStateTransportAuthorizationGeneration = nil
+        guard let remoteMediaCommandOwner else { return }
+        backgroundPlayback.clearRemoteMedia(owner: remoteMediaCommandOwner)
+    }
+
+    private func requestRemoteMediaRefresh(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer
+    ) {
+        let sourceSessionGeneration = sessionGeneration
+        remoteMediaRefreshTask = Task { @MainActor [weak self, weak sourcePeer] in
+            guard let sourcePeer else { return }
+            while !Task.isCancelled {
+                guard let delay = await self?.sendRemoteMediaRefreshIfCurrent(
+                    ticket, through: sourcePeer, session: sourceSessionGeneration
+                ) else { return }
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+                guard self?.retryRemoteMediaRefreshIfCurrent(
+                    ticket, through: sourcePeer, session: sourceSessionGeneration
+                ) == true else { return }
+            }
+        }
+    }
+
+    private func remoteMediaRefreshIsCurrent(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer,
+        session: UUID
+    ) -> Bool {
+        peer === sourcePeer && sessionGeneration == session
+            && transportAuthorizationGeneration == ticket.generation
+            && remoteMediaRefresh.ticket == ticket
+            && !remoteMediaRefresh.hasAcceptedSnapshot
+            && RemoteMediaTransportAdmission.permitsIncomingState(
+                isNegotiated: remoteMediaControlsNegotiated,
+                isPeerConnected: isPeerConnected,
+                isICEConnected: iceIsConnected,
+                isControlChannelReady: isControlChannelReady,
+                recoveryProofRequired: recoveryProofRequired
+            )
+    }
+
+    private func sendRemoteMediaRefreshIfCurrent(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer,
+        session: UUID
+    ) async -> Duration? {
+        guard remoteMediaRefreshIsCurrent(ticket, through: sourcePeer, session: session)
+        else { return nil }
+        do {
+            try await sourcePeer.requestRemoteMediaStateRefresh(id: ticket.id)
+        } catch {
+            // Only the idempotent snapshot may retry, with slow probes after the short episode.
+        }
+        guard remoteMediaRefreshIsCurrent(ticket, through: sourcePeer, session: session)
+        else { return nil }
+        return remoteMediaRefresh.retryDelay
+    }
+
+    private func retryRemoteMediaRefreshIfCurrent(
+        _ ticket: RemoteMediaRefreshGate.Ticket,
+        through sourcePeer: WebRTCPeer,
+        session: UUID
+    ) -> Bool {
+        remoteMediaRefreshIsCurrent(ticket, through: sourcePeer, session: session)
+            && remoteMediaRefresh.retry(ticket)
+    }
+
+    #if DEBUG
+    func debugInstallRemoteMediaCommandPathForTests(
+        peer newPeer: WebRTCPeer,
+        state: WebRTCReceivedRemoteMediaState,
+        sender: @escaping @MainActor (RemoteMediaCommandDispatch) async throws -> Void
+    ) {
+        clearRemoteMediaPresentation()
+        peer = newPeer
+        remoteMediaControlsNegotiated = true
+        isPeerConnected = true
+        iceIsConnected = true
+        isControlChannelReady = true
+        recoveryProofRequired = false
+        let ticket = remoteMediaRefresh.begin(generation: transportAuthorizationGeneration)!
+        _ = remoteMediaRefresh.accept(refreshID: ticket.id, generation: ticket.generation)
+        currentRemoteMediaState = state
+        remoteMediaStateTransportAuthorizationGeneration = transportAuthorizationGeneration
+        debugRemoteMediaCommandSender = sender
+        if let remoteMediaCommandOwner {
+            backgroundPlayback.publishRemoteMedia(state, owner: remoteMediaCommandOwner)
+        }
+        reconcileRemoteMediaCommandAvailability()
+    }
+
+    func debugEnqueueRemoteMediaCommandForTests(
+        _ dispatch: RemoteMediaCommandDispatch
+    ) -> Task<Void, Never>? {
+        enqueueRemoteMediaCommand(dispatch)
+    }
+    #endif
+
     private func markTransportUncertain(
         _ state: String,
         requiresProof: Bool = false
     ) {
-        cancelScreenMediaViewerSuspension(
-            reason: "The secure media transport changed during screen resume.",
-            notifyPeer: true
-        )
+        if sessionOwnsAudio {
+            audioDiagnostics.record(
+                .transportChanged,
+                at: Self.audioDiagnosticsNow()
+            )
+        }
+        if screenMediaViewerAttempt?.phase == .resumed {
+            // A completed resume may still carry an RTP freshness floor. Keep that non-covering
+            // fence with the retained drawable so transport recovery cannot reinstall black or
+            // admit packets older than the last proven presentation.
+            retireScreenMediaViewerAttempt(preservingFence: true)
+        } else {
+            cancelScreenMediaViewerSuspension(
+                reason: "The secure media transport changed during screen resume.",
+                notifyPeer: true
+            )
+        }
         transportAuthorizationGeneration = UUID()
+        clearRemoteMediaPresentation()
         invalidateMacHostedCallEvidence(notifyLifecycle: false)
         retireIOSHostedCallPlayoutAttempt()
-        audioLifecycle.transportBecameUncertain()
-        suspendIPhoneMicrophone(
-            stateText: "Paused — reconnecting",
-            preserveIntent: true,
-            reprovePlayout: false
-        )
+        if sessionOwnsAudio {
+            audioLifecycle.transportBecameUncertain()
+            suspendIPhoneMicrophone(
+                stateText: "Paused — reconnecting",
+                preserveIntent: true,
+                reprovePlayout: false
+            )
+        }
         let answerWasAwaitingSend = restartAnswerAwaitingSendEpoch != nil
         if let requestKey = pendingRecoveryProbe?.requestKey {
             earlyControlAcknowledgements.removeValue(forKey: requestKey)?
@@ -9135,7 +13127,10 @@ final class WorldwideSessionViewModel: ObservableObject {
         restartAnswerAwaitingSendEpoch = answerWasAwaitingSend
             ? recoveryProofEpoch
             : nil
-        resetScreenPresentationState(rotateQueueGeneration: true)
+        resetScreenPresentationState(
+            rotateQueueGeneration: true,
+            preservingRecoveryPresentation: true
+        )
         iceIsConnected = false
         stateText = state
     }
@@ -9152,6 +13147,12 @@ final class WorldwideSessionViewModel: ObservableObject {
               ObjectIdentifier(peer) == expectedPeerIdentity else {
             return nil
         }
+
+        // Ownership is transferring from any older VM disable task to the peer's exact
+        // retirement context. Invalidate the old task before publishing the transport binding so
+        // a late return cannot clear or drain the token selected below.
+        microphoneNativeTeardownID = nil
+        microphoneTransportSuspensionBinding = nil
 
         retireMacHostedCallChallengeSendAttempt()
         retireIOSHostedCallPlayoutAttempt()
@@ -9182,8 +13183,12 @@ final class WorldwideSessionViewModel: ObservableObject {
                     ) else {
                     return nil
                 }
-                microphoneOutputOnlyToken = executingToken
-                return executingToken
+                return bindIPhoneMicrophoneTransportSuspensionToken(
+                    executingToken,
+                    retirementContext: retirementContext,
+                    expectedPeerIdentity: expectedPeerIdentity,
+                    expectedSessionGeneration: expectedSessionGeneration
+                )
             }
 
             if let selectedToken = retirementContext.selectedToken {
@@ -9203,8 +13208,13 @@ final class WorldwideSessionViewModel: ObservableObject {
                         ) else {
                         return nil
                     }
-                    microphoneOutputOnlyToken = selectedToken
-                    return selectedToken
+                    return bindIPhoneMicrophoneTransportSuspensionToken(
+                        selectedToken,
+                        retirementContext: retirementContext,
+                        expectedPeerIdentity: expectedPeerIdentity,
+                        expectedSessionGeneration:
+                            expectedSessionGeneration
+                    )
 
                 case .armed:
                     audioLifecycle
@@ -9242,13 +13252,139 @@ final class WorldwideSessionViewModel: ObservableObject {
             let selectedToken =
                 retirementContext.selectToken(candidate)
             if selectedToken === candidate {
-                microphoneOutputOnlyToken = candidate
-                return candidate
+                return bindIPhoneMicrophoneTransportSuspensionToken(
+                    candidate,
+                    retirementContext: retirementContext,
+                    expectedPeerIdentity: expectedPeerIdentity,
+                    expectedSessionGeneration: expectedSessionGeneration
+                )
             }
         }
     }
 
+    private func bindIPhoneMicrophoneTransportSuspensionToken(
+        _ token: WebRTCIOSOutputOnlyMicrophoneToken,
+        retirementContext: WebRTCIOSMicrophoneRetirementContext,
+        expectedPeerIdentity: ObjectIdentifier,
+        expectedSessionGeneration: UUID
+    ) -> WebRTCIOSOutputOnlyMicrophoneToken? {
+        guard expectedSessionGeneration == sessionGeneration,
+              token.ownerEpoch == expectedSessionGeneration,
+              retirementContext.selectedToken === token else {
+            return nil
+        }
+        microphoneOutputOnlyToken = token
+        microphoneTransportSuspensionBinding =
+            MicrophoneTransportSuspensionBinding(
+                sessionGeneration: expectedSessionGeneration,
+                peerIdentity: expectedPeerIdentity,
+                transportAuthorizationGeneration:
+                    transportAuthorizationGeneration,
+                microphoneOperationGeneration:
+                    microphoneOperationGeneration,
+                retirementID: retirementContext.retirementID,
+                tokenID: token.tokenID,
+                operationID: token.operationID
+            )
+        return token
+    }
+
+    private func completeIPhoneMicrophoneTransportSuspension(
+        retirementContext: WebRTCIOSMicrophoneRetirementContext,
+        outputOnlyToken: WebRTCIOSOutputOnlyMicrophoneToken,
+        succeeded: Bool,
+        expectedPeerIdentity: ObjectIdentifier,
+        expectedSessionGeneration: UUID
+    ) {
+        guard let binding = microphoneTransportSuspensionBinding,
+              binding.sessionGeneration == expectedSessionGeneration,
+              binding.peerIdentity == expectedPeerIdentity,
+              binding.retirementID == retirementContext.retirementID,
+              binding.tokenID == outputOnlyToken.tokenID,
+              binding.operationID == outputOnlyToken.operationID,
+              microphoneOutputOnlyToken === outputOnlyToken else {
+            return
+        }
+
+        microphoneTransportSuspensionBinding = nil
+        recordNativeAudioTransactionTag(
+            outputOnlyToken.stagedTransactionTagGeneration,
+            context: outputOnlyToken.transaction
+        )
+        let bindingIsFresh =
+            expectedSessionGeneration == sessionGeneration
+            && peer.map(ObjectIdentifier.init)
+                == expectedPeerIdentity
+            && outputOnlyToken.ownerEpoch
+                == expectedSessionGeneration
+            && retirementContext.selectedToken
+                === outputOnlyToken
+            && binding.transportAuthorizationGeneration
+                == transportAuthorizationGeneration
+            && binding.microphoneOperationGeneration
+                == microphoneOperationGeneration
+        let completionWasAccepted = bindingIsFresh
+            && succeeded
+            && outputOnlyToken.state == .succeeded
+            && audioLifecycle
+                .completeValidatedTransportOutputOnlyTransition(
+                    outputOnlyToken
+                )
+        if completionWasAccepted {
+            microphoneOutputOnlyToken = nil
+            return
+        }
+
+        let abandoned = audioLifecycle
+            .abandonCurrentOutputOnlyTransitionRequiringReconnect(
+                outputOnlyToken
+            )
+        if abandoned {
+            microphoneOutputOnlyToken = nil
+        }
+        audioLifecycle.cancelPendingMicrophoneInputResume()
+        microphoneAdmissionFailedSessionGeneration =
+            expectedSessionGeneration
+        microphoneStateText = "Unavailable"
+        microphoneError =
+            "The iPhone microphone could not finish its transport reset. Reconnect this session to restore it."
+    }
+
     #if DEBUG
+    func debugInstallIPhoneMicrophoneTransportSuspensionHandlersForTests(
+        peer expectedPeer: WebRTCPeer
+    ) async {
+        guard peer === expectedPeer else { return }
+        let expectedPeerIdentity = ObjectIdentifier(expectedPeer)
+        let expectedSessionGeneration = sessionGeneration
+        await expectedPeer
+            .installIPhoneMicrophoneTransportSuspensionHandlers(
+                preparation: { [weak self] retirementContext in
+                    guard let self else { return nil }
+                    return prepareIPhoneMicrophoneForTransportSuspension(
+                        retirementContext: retirementContext,
+                        expectedPeerIdentity: expectedPeerIdentity,
+                        expectedSessionGeneration:
+                            expectedSessionGeneration
+                    )
+                },
+                completion: {
+                    [weak self] retirementContext,
+                    outputOnlyToken,
+                    succeeded in
+                    guard let self else { return }
+                    completeIPhoneMicrophoneTransportSuspension(
+                        retirementContext: retirementContext,
+                        outputOnlyToken: outputOnlyToken,
+                        succeeded: succeeded,
+                        expectedPeerIdentity: expectedPeerIdentity,
+                        expectedSessionGeneration:
+                            expectedSessionGeneration
+                    )
+                }
+            )
+    }
+
     func debugPrepareIPhoneMicrophoneForTransportSuspensionForTests(
         peer expectedPeer: WebRTCPeer
     ) -> WebRTCIOSOutputOnlyMicrophoneToken? {
@@ -9268,6 +13404,17 @@ final class WorldwideSessionViewModel: ObservableObject {
     private func hideScreenForPassiveLifecycleIfNeeded() {
         guard let lease = currentScreenPresentationLease else {
             suspendRemoteInputPresentation()
+            return
+        }
+        if recoveringScreenPresentationLease == lease {
+            // Backgrounding is an explicit privacy boundary, not a recoverable transport gap.
+            // Retire the retained drawable and cancel any automatic Show before the app can
+            // become active again. If a Show already reached the transport, queue the matching
+            // fail-closed Hide first so capture cannot outlive the local presentation.
+            if screenPresentationNeedsRemoteHide(lease) {
+                _ = beginPassiveScreenTeardown(for: lease)
+            }
+            retireScreenPresentationLease(lease)
             return
         }
         guard screenPresentationNeedsRemoteHide(lease) else {
@@ -9363,8 +13510,12 @@ struct WorldwideRemoteInputDebugState: Equatable {
     let focusGeneration: UInt64?
     let queuedActionCount: Int
     let pendingActionCount: Int
+    let earlyFeedbackCount: Int
+    let retiredRequestIDCount: Int
     let inputGeneration: UUID
     let activeScrollGestureID: UUID?
+    let focusedWindowResizeState: FocusedWindowResizeState
+    let focusedWindowResizeSendAuthorizationIsValid: Bool
     let latestPointerIntentID: UInt64
     let inputAvailable: Bool
     let acceptsActiveScreenAcknowledgement: Bool
@@ -9397,6 +13548,8 @@ private struct QueuedRemoteInput {
     let viewerVideoSize: WebRTCInputVideoSize?
     let scrollGestureID: UUID?
     let sendAuthorization: WebRTCInputSendAuthorization?
+    let focusedWindowResizeInteractionID: UUID?
+    let focusedWindowResizeOperation: FocusedWindowResizePendingOperation?
 }
 
 private struct ActiveRemoteScroll {
@@ -9417,9 +13570,47 @@ private struct ActiveRemoteScroll {
 }
 
 private extension WebRTCInputAction {
-    var requiresRemoteFocus: Bool {
+    var isFocusedWindowResizeAction: Bool {
+        switch self {
+        case .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
+            true
+        case .tap, .primaryDrag, .scroll,
+             .insertText, .backspace, .returnKey:
+            false
+        }
+    }
+
+    var isOrdinaryPointerAction: Bool {
         switch self {
         case .tap, .primaryDrag, .scroll:
+            true
+        case .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove,
+             .insertText,
+             .backspace,
+             .returnKey:
+            false
+        }
+    }
+
+    var requiresRemoteFocus: Bool {
+        switch self {
+        case .tap, .primaryDrag, .scroll,
+             .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
             false
         case .insertText, .backspace, .returnKey:
             true
@@ -9433,16 +13624,92 @@ private struct PendingRemoteInput {
     let kind: PendingRemoteInputKind
     let pointerIntentID: UInt64?
     let sendAuthorization: WebRTCInputSendAuthorization?
+    let requestScope: RemoteInputRequestScope
+}
+
+/// Request IDs are allocated by a peer and can restart at one after replacement. Carry the full
+/// non-sensitive ownership scope beside every pending/retired correlation so an old completion
+/// cannot claim a replacement peer's numerically identical request.
+private struct RemoteInputRequestScope: Hashable {
+    let sessionGeneration: UUID
+    let peerIdentity: ObjectIdentifier
+    let protocolVersion: Int
+    let inputSessionID: UUID
+    let screenRequestID: UInt64
+    let maxMessageBytes: Int
+    let supportsPrimaryDrag: Bool
+    let supportsScroll: Bool
+    let supportsFocusedWindowResize: Bool
+    let supportsFocusedWindowResizeScaleRebinding: Bool
+    let supportsFocusedWindowMove: Bool
+    let supportsFocusedWindowMoveScaleRebinding: Bool
+    let supportsFocusedWindowMoveRecoverableOffscreen: Bool
+
+    init(
+        sessionGeneration: UUID,
+        peer: WebRTCPeer,
+        capability: WebRTCInputCapability
+    ) {
+        self.sessionGeneration = sessionGeneration
+        peerIdentity = ObjectIdentifier(peer)
+        protocolVersion = capability.protocolVersion
+        inputSessionID = capability.inputSessionID
+        screenRequestID = capability.screenRequestID
+        maxMessageBytes = capability.maxMessageBytes
+        supportsPrimaryDrag = capability.supportsPrimaryDrag
+        supportsScroll = capability.supportsScroll
+        supportsFocusedWindowResize = capability.supportsFocusedWindowResize
+        supportsFocusedWindowResizeScaleRebinding =
+            capability.supportsFocusedWindowResizeScaleRebinding
+        supportsFocusedWindowMove = capability.supportsFocusedWindowMove
+        supportsFocusedWindowMoveScaleRebinding =
+            capability.supportsFocusedWindowMoveScaleRebinding
+        supportsFocusedWindowMoveRecoverableOffscreen =
+            capability.supportsFocusedWindowMoveRecoverableOffscreen
+    }
+}
+
+private struct RetiredFocusedWindowResizeRequestKey: Hashable {
+    let requestID: UInt64
+    let requestScope: RemoteInputRequestScope
+}
+
+private struct RetiredFocusedWindowResizeRequest {
+    let operation: FocusedWindowResizePendingOperation
+    var didHandleFeedback = false
 }
 
 enum PendingRemoteInputKind: Equatable {
     case pointer
     case keyboard(focusGeneration: UInt64)
+    case focusedWindowResize(
+        interactionID: UUID,
+        operation: FocusedWindowResizePendingOperation
+    )
 
-    init(_ action: WebRTCInputAction) {
+    init(
+        _ action: WebRTCInputAction,
+        focusedWindowResizeInteractionID: UUID? = nil,
+        focusedWindowResizeOperation: FocusedWindowResizePendingOperation? = nil
+    ) {
         switch action {
         case .tap, .primaryDrag, .scroll:
             self = .pointer
+        case .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize,
+             .requestFocusedWindowMoveTarget,
+             .selectWindowForMove,
+             .commitFocusedWindowMove:
+            precondition(
+                focusedWindowResizeInteractionID != nil
+                    && focusedWindowResizeOperation?.matches(action) == true,
+                "Focused-window actions require exact interaction metadata."
+            )
+            self = .focusedWindowResize(
+                interactionID: focusedWindowResizeInteractionID!,
+                operation: focusedWindowResizeOperation!
+            )
         case .insertText(_, let focusGeneration),
              .backspace(let focusGeneration),
              .returnKey(let focusGeneration):

@@ -45,6 +45,7 @@ enum NativeScreenDiagnosticsEvent: Sendable {
 /// Native delegates arrive on WebRTC queues; only channel ownership and synchronous authorization
 /// revocation live here. Higher-level protocol state is consumed by `WebRTCPeer`'s actor.
 final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
+    let audioDiagnosticsLane = AudioClientDiagnosticsLane()
     let events: AsyncStream<NativePeerEvent>
     let screenDiagnosticsEvents: AsyncStream<NativeScreenDiagnosticsEvent>
 
@@ -55,6 +56,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
     private var dataChannel: LKRTCDataChannel?
     private var screenDiagnosticsChannel: LKRTCDataChannel?
     private var inputAuthorization: WebRTCInputAuthorization?
+    private var mediaCommandAuthorization: WebRTCControlAuthorization?
     private var peerState: WebRTCPeerState = .new
     private var iceState: WebRTCICEState = .new
     private var dataChannelState: WebRTCDataChannelState = .connecting
@@ -78,6 +80,11 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
     }
 
     func installDataChannel(_ channel: LKRTCDataChannel) {
+        if channel.label as String == AudioClientDiagnosticsLane.label,
+           channel.protocol as String == AudioClientDiagnosticsLane.channelProtocol {
+            audioDiagnosticsLane.install(channel)
+            return
+        }
         if channel.label as String == WebRTCWireConstants.screenDiagnosticsChannelLabel,
            channel.protocol as String == WebRTCWireConstants.screenDiagnosticsProtocol {
             installScreenDiagnosticsChannel(channel)
@@ -101,11 +108,13 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
             let isReplacement = previous != nil && previous !== channel
             let authorization = isReplacement ? inputAuthorization : nil
             if isReplacement {
+                revokeMediaCommandAuthorizationLocked()
                 inputAuthorization = nil
             }
             dataChannel = channel
             dataChannelState = channel.readyState.transportValue
             if dataChannelState != .open {
+                revokeMediaCommandAuthorizationLocked()
                 let stateAuthorization = inputAuthorization
                 inputAuthorization = nil
                 return (previous, authorization ?? stateAuthorization, true)
@@ -193,6 +202,29 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
                 && nativeTransportIsHealthyLocked()
                 && authorization.isValid
         }
+    }
+
+    @discardableResult
+    func installMediaCommandAuthorization(_ authorization: WebRTCControlAuthorization?) -> Bool {
+        channelLock.withLock {
+            if mediaCommandAuthorization !== authorization {
+                revokeMediaCommandAuthorizationLocked()
+            }
+            guard let authorization else { return true }
+            guard !isClosed, !eventDeliveryFailed,
+                  nativeTransportIsHealthyLocked(), authorization.isValid else {
+                authorization.revoke()
+                return false
+            }
+            mediaCommandAuthorization = authorization
+            return true
+        }
+    }
+
+    /// This independent gate is only queried through isValid, never held while acquiring our lock.
+    private func revokeMediaCommandAuthorizationLocked() {
+        mediaCommandAuthorization?.revoke()
+        mediaCommandAuthorization = nil
     }
 
     func didFailEventDelivery() -> Bool {
@@ -306,6 +338,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
             authorization: WebRTCInputAuthorization?
         ) in
             isClosed = true
+            revokeMediaCommandAuthorizationLocked()
             defer {
                 dataChannel = nil
                 screenDiagnosticsChannel = nil
@@ -322,6 +355,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
         resources.screenDiagnosticsChannel?.close()
         screenDiagnosticsContinuation.finish()
         continuation.finish()
+        audioDiagnosticsLane.close()
     }
 
     private func emit(_ event: NativePeerEvent) {
@@ -392,6 +426,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
                 return (false, nil, nil, nil)
             }
             eventDeliveryFailed = true
+            revokeMediaCommandAuthorizationLocked()
             let channel = dataChannel
             let screenDiagnosticsChannel = screenDiagnosticsChannel
             let authorization = inputAuthorization
@@ -409,6 +444,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
         resources.screenDiagnosticsChannel?.delegate = nil
         resources.screenDiagnosticsChannel?.close()
         continuation.finish()
+        audioDiagnosticsLane.close()
     }
 
     private func nativeTransportIsHealthyLocked() -> Bool {
@@ -419,6 +455,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
 
     private func failInputAuthorizationSynchronously() {
         let authorization = channelLock.withLock { () -> WebRTCInputAuthorization? in
+            revokeMediaCommandAuthorizationLocked()
             defer { inputAuthorization = nil }
             return inputAuthorization
         }
@@ -431,6 +468,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
         let authorization = channelLock.withLock { () -> WebRTCInputAuthorization? in
             peerState = state
             guard state != .connected else { return nil }
+            revokeMediaCommandAuthorizationLocked()
             defer { inputAuthorization = nil }
             return inputAuthorization
         }
@@ -442,6 +480,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
         let authorization = channelLock.withLock { () -> WebRTCInputAuthorization? in
             iceState = state
             guard state != .connected && state != .completed else { return nil }
+            revokeMediaCommandAuthorizationLocked()
             defer { inputAuthorization = nil }
             return inputAuthorization
         }
@@ -465,6 +504,7 @@ final class WebRTCDelegateProxy: NSObject, @unchecked Sendable {
             if state == .open {
                 authorization = nil
             } else {
+                revokeMediaCommandAuthorizationLocked()
                 authorization = inputAuthorization
                 inputAuthorization = nil
             }

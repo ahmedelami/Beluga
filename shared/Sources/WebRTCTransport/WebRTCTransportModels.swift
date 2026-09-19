@@ -9,23 +9,44 @@ public enum WebRTCICEPolicy: String, Codable, Sendable {
     case relayOnly
 }
 
+/// Immutable native media topology selected before a peer factory or transceiver exists.
+///
+/// The restricted topology is used by auxiliary screen viewers that must never allocate host
+/// audio capture, receive a phone microphone, or advertise an audio media section.
+public enum WebRTCTransportMediaTopology: Equatable, Sendable {
+    case full
+    case videoControlOnly
+}
+
 /// Immutable inputs used to construct one role-specific WebRTC peer.
 public struct WebRTCTransportConfiguration: Sendable {
     public let role: RemotePeerRole
     public let iceServers: [RemoteICEServer]
     public let icePolicy: WebRTCICEPolicy
     public let maximumVideoBitrate: Int?
+    public let mediaTopology: WebRTCTransportMediaTopology
+    /// Explicit local opt-in for the versioned Mac Now Playing control protocol.
+    /// Both peers must independently enable and negotiate it before any wire message is sent.
+    public let supportsRemoteMediaControls: Bool
+    /// Optional, content-free telemetry to the authenticated peer only; requires exact SDP echo.
+    public let supportsAudioClientDiagnostics: Bool
 
     public init(
         role: RemotePeerRole,
         iceServers: [RemoteICEServer],
         icePolicy: WebRTCICEPolicy = .directPreferred,
-        maximumVideoBitrate: Int? = nil
+        maximumVideoBitrate: Int? = nil,
+        mediaTopology: WebRTCTransportMediaTopology = .full,
+        supportsRemoteMediaControls: Bool = false,
+        supportsAudioClientDiagnostics: Bool = true
     ) {
         self.role = role
         self.iceServers = iceServers
         self.icePolicy = icePolicy
         self.maximumVideoBitrate = maximumVideoBitrate
+        self.mediaTopology = mediaTopology
+        self.supportsRemoteMediaControls = supportsRemoteMediaControls
+        self.supportsAudioClientDiagnostics = supportsAudioClientDiagnostics
     }
 }
 
@@ -66,8 +87,8 @@ public enum WebRTCDataChannelState: String, Codable, Sendable {
     case closed
 }
 
-/// Typed native boundary for a staged iPhone microphone request. Only the first six reasons are
-/// eligible for one bounded audio-recovery retry; lifecycle and authorization reasons remain
+/// Typed native boundary for a staged iPhone microphone request. Only the startup/recovery reasons
+/// are eligible for one bounded audio-recovery retry; lifecycle and authorization reasons remain
 /// fail-closed until their owning boundary changes.
 public enum WebRTCIOSMicrophoneStageFailureReason:
     String,
@@ -80,6 +101,8 @@ public enum WebRTCIOSMicrophoneStageFailureReason:
     case nativeRecoveryRequired
     case topologyRebuildFailed
     case topologyStillNotStaged
+    case captureDeliveryDidNotStart
+    case outboundRTPDidNotStart
     case hostedCall
     case interrupted
     case explicitResumeRequired
@@ -95,7 +118,9 @@ public enum WebRTCIOSMicrophoneStageFailureReason:
              .playoutNotReady,
              .nativeRecoveryRequired,
              .topologyRebuildFailed,
-             .topologyStillNotStaged:
+             .topologyStillNotStaged,
+             .captureDeliveryDidNotStart,
+             .outboundRTPDidNotStart:
             true
         case .hostedCall,
              .interrupted,
@@ -118,6 +143,8 @@ public enum WebRTCIOSMicrophoneStageFailureReason:
              .nativeRecoveryRequired,
              .topologyRebuildFailed,
              .topologyStillNotStaged,
+             .captureDeliveryDidNotStart,
+             .outboundRTPDidNotStart,
              .authorizationInvalid,
              .recordingGenerationBindFailed,
              .deviceUnavailable,
@@ -151,6 +178,18 @@ public enum WebRTCTransportEvent: Sendable {
     case inputFeedbackReceived(WebRTCInputFeedback)
     /// The input capability was fail-closed independently of screen media/control state.
     case inputSessionInvalidated(String)
+    /// Whether the exact current offer/answer generation negotiated Mac media controls.
+    case remoteMediaControlsAvailabilityChanged(Bool)
+    /// Authoritative Mac system Now Playing state. A nil item clears a prior source.
+    case remoteMediaStateChanged(WebRTCReceivedRemoteMediaState)
+    /// A current viewer requests a fresh snapshot after its native presentation is ready.
+    case remoteMediaStateRefreshRequested(WebRTCReceivedRemoteMediaStateRefreshRequest)
+    /// A validated viewer command that the Mac host must execute and acknowledge at most once.
+    case remoteMediaCommandReceived(WebRTCReceivedRemoteMediaCommand)
+    /// The Mac's terminal result for one viewer media command.
+    case remoteMediaCommandAcknowledgementReceived(
+        WebRTCRemoteMediaCommandAcknowledgement
+    )
     /// A current-peer viewer challenge that the Mac must satisfy with a fresh native process scan.
     case macHostedCallChallengeReceived(WebRTCMacHostedCallChallenge)
     /// Current-peer Mac-hosted call proof, or nil when any evidence boundary is uncertain.
@@ -188,7 +227,10 @@ public enum WebRTCTransportEvent: Sendable {
     case remoteAudioTrack(WebRTCRemoteAudioTrack)
     case remoteVideoTrack(WebRTCRemoteVideoTrack)
     case routeChanged(WebRTCICERouteDiagnostics)
-    case statistics(WebRTCStatisticsSnapshot)
+    case statistics(
+        WebRTCStatisticsSnapshot,
+        wholePeerReportWasCollected: Bool
+    )
     case iceCandidateError(WebRTCIceCandidateError)
     case negotiationNeeded
     case ended(RemoteSessionEndReason)

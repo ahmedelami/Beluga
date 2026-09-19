@@ -1,0 +1,7 @@
+{
+  "name": "org.example.opensteamer.media",
+  "description": "opensteamer browser media bridge",
+  "path": "/Applications/opensteamer Host.app/Contents/MacOS/OpensteamerMediaBridge",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://dhmdpbpcldmnkjfibepklolofapiceab/"]
+}

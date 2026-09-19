@@ -257,6 +257,84 @@ commit_all "$FROZEN_LOCAL_MONO_CONTRACTS"
 "$FROZEN_LOCAL_MONO_CONTRACTS/scripts/check-product-branding.sh" \
   "$FROZEN_LOCAL_MONO_CONTRACTS" >/dev/null
 
+SCOPED_COMPATIBILITY="$TEMPORARY_ROOT/scoped-compatibility"
+initialize_repository "$SCOPED_COMPATIBILITY"
+PHYSICAL_TEST_PATH="iOS/opensteamer/Tests/WebRTCAudioPlaybackSessionTests.swift"
+DIAGNOSTIC_TEST_PATH="macOS/Tests/CaptureServerTests/DiagnosticDriverV2ResumeContractTests.swift"
+DIAGNOSTIC_RUST_PATHS=(
+  macOS/scripts/opensteamer-diagnostic-driver-v1-update-controller.rs
+  macOS/scripts/opensteamer-diagnostic-driver-v2-resume-stager.rs
+  macOS/scripts/opensteamer-diagnostic-driver-v2-update-controller.rs
+)
+mkdir -p "$SCOPED_COMPATIBILITY/${PHYSICAL_TEST_PATH:h}" \
+  "$SCOPED_COMPATIBILITY/${DIAGNOSTIC_TEST_PATH:h}" "$SCOPED_COMPATIBILITY/macOS/scripts"
+print -r -- '        guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev" else {
+        try require(Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev", "The distinct spare development app is required.")' \
+  >"$SCOPED_COMPATIBILITY/$PHYSICAL_TEST_PATH"
+print -r -- '                "/Applications/AudioStreamer Host.app/Contents/MacOS/CaptureServer",
+                "com.elamin.audiostreamer.worldwide",
+            "com.elamin.AudioStreamer.CaptureServer.WorldwidePairing", ".v1",
+            "AudioStreamer Host.app",' >"$SCOPED_COMPATIBILITY/$DIAGNOSTIC_TEST_PATH"
+for relative_path in "${DIAGNOSTIC_RUST_PATHS[@]}"; do
+  print -r -- 'const HOST_IDENTIFIER: &str = "com.elamin.AudioStreamer.CaptureServer";
+const HOST_RENDEZVOUS_URL: &str = "wss://audiostreamer-rendezvous.elaminahmed03.workers.dev";
+const HOST_LOCK: &str = "/Users/ahmed/Library/Application Support/com.elamin.AudioStreamer.CaptureServer.runtime/worldwide-host.lock";
+const LEGACY_EXECUTABLE: &str = "/Applications/AudioStreamer Host.app/Contents/MacOS/CaptureServer";
+    "/Users/ahmed/Library/LaunchAgents/com.elamin.audiostreamer.worldwide.plist";
+const LEGACY_LABEL: &str = "com.elamin.audiostreamer.worldwide";' \
+    >"$SCOPED_COMPATIBILITY/$relative_path"
+done
+print -r -- '        "com.elamin.AudioStreamer.CaptureServer.WorldwidePairing",
+        "streamer-failed-20260720-102747-44276/AudioStreamer Host.app",' \
+  >>"$SCOPED_COMPATIBILITY/${DIAGNOSTIC_RUST_PATHS[2]}"
+commit_all "$SCOPED_COMPATIBILITY"
+"$SCOPED_COMPATIBILITY/scripts/check-product-branding.sh" "$SCOPED_COMPATIBILITY" >/dev/null
+
+require_scoped_content_rejected() {
+  local name=$1 relative_path=$2 content=$3 token=$4
+  local repository="$TEMPORARY_ROOT/$name"
+  initialize_repository "$repository"
+  mkdir -p "$repository/${relative_path:h}"
+  print -r -- "$content" >"$repository/$relative_path"
+  commit_all "$repository"
+  require_failure "$repository" "$relative_path:1:$token"
+}
+
+require_scoped_content_rejected physical-identity-wrong-path \
+  iOS/opensteamer/Tests/UnreviewedTests.swift \
+  'guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev" else {' AudioStreamer.dev
+require_scoped_content_rejected physical-identity-wrong-token "$PHYSICAL_TEST_PATH" \
+  'guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev.preview" else {' AudioStreamer.dev.preview
+require_scoped_content_rejected physical-identity-wrong-context "$PHYSICAL_TEST_PATH" \
+  'Text("org.example.AudioStreamer.dev")' AudioStreamer.dev
+require_scoped_content_rejected physical-identity-trailing-brand "$PHYSICAL_TEST_PATH" \
+  'guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev" else { // AudioStreamer' AudioStreamer.dev
+require_scoped_content_rejected physical-brand-display "$PHYSICAL_TEST_PATH" \
+  'Text("AudioStreamer")' AudioStreamer
+for relative_path in "${DIAGNOSTIC_RUST_PATHS[@]}"; do
+  require_scoped_content_rejected "diagnostic-wrong-context-${relative_path:t}" "$relative_path" \
+    'println!("com.elamin.AudioStreamer.CaptureServer");' AudioStreamer.CaptureServer
+  require_scoped_content_rejected "diagnostic-brand-display-${relative_path:t}" "$relative_path" \
+    'println!("AudioStreamer");' AudioStreamer
+done
+require_scoped_content_rejected diagnostic-unreviewed-version \
+  macOS/scripts/opensteamer-diagnostic-driver-v3-update-controller.rs \
+  'const HOST_IDENTIFIER: &str = "com.elamin.AudioStreamer.CaptureServer";' AudioStreamer.CaptureServer
+require_scoped_content_rejected diagnostic-identity-wrong-token "${DIAGNOSTIC_RUST_PATHS[1]}" \
+  'const HOST_IDENTIFIER: &str = "com.elamin.AudioStreamer.CaptureServer.v2";' AudioStreamer.CaptureServer.v2
+require_scoped_content_rejected diagnostic-host-wrong-token "${DIAGNOSTIC_RUST_PATHS[1]}" \
+  'const HOST_RENDEZVOUS_URL: &str = "wss://audiostreamer-rendezvous.elaminahmed04.workers.dev";' \
+  audiostreamer-rendezvous.elaminahmed04.workers.dev
+require_scoped_content_rejected diagnostic-lock-wrong-path "${DIAGNOSTIC_RUST_PATHS[1]}" \
+  'const HOST_LOCK: &str = "/Users/other/Library/Application Support/com.elamin.AudioStreamer.CaptureServer.runtime/worldwide-host.lock";' \
+  AudioStreamer.CaptureServer.runtime
+require_scoped_content_rejected diagnostic-resume-only-fragment "${DIAGNOSTIC_RUST_PATHS[1]}" \
+  '"com.elamin.AudioStreamer.CaptureServer.WorldwidePairing",' AudioStreamer.CaptureServer.WorldwidePairing
+require_scoped_content_rejected diagnostic-test-wrong-context "$DIAGNOSTIC_TEST_PATH" \
+  'Text("AudioStreamer Host.app")' AudioStreamer
+require_scoped_content_rejected diagnostic-test-wrong-token "$DIAGNOSTIC_TEST_PATH" \
+  '"com.elamin.AudioStreamer.CaptureServer.WorldwidePairing.v2", ".v1",' AudioStreamer.CaptureServer.WorldwidePairing.v2
+
 PAIRED_V7_WRONG_PATH="$TEMPORARY_ROOT/paired-v7-wrong-path"
 initialize_repository "$PAIRED_V7_WRONG_PATH"
 mkdir -p "$PAIRED_V7_WRONG_PATH/macOS/scripts"
@@ -426,5 +504,19 @@ print -r -- '.navigationTitle("opensteamer")' \
   >"$STALE_BELUGA_DISPLAY/iOS/opensteamer/Sources/Views/BrowserView.swift"
 commit_all "$STALE_BELUGA_DISPLAY"
 require_failure "$STALE_BELUGA_DISPLAY" "superseded app display branding remains"
+
+CAPTURE_USAGE_DISPLAY="$TEMPORARY_ROOT/capture-usage-display"
+initialize_repository "$CAPTURE_USAGE_DISPLAY"
+mkdir -p "$CAPTURE_USAGE_DISPLAY/macOS/Sources/CaptureServer"
+print -r -- '<key>NSAppleEventsUsageDescription</key>
+<string>Beluga reads playback information and controls Chrome and Music when you enable media integration.</string>' \
+  >"$CAPTURE_USAGE_DISPLAY/macOS/Sources/CaptureServer/Info.plist"
+commit_all "$CAPTURE_USAGE_DISPLAY"
+"$CAPTURE_USAGE_DISPLAY/scripts/check-product-branding.sh" "$CAPTURE_USAGE_DISPLAY" >/dev/null
+print -r -- '<key>NSAppleEventsUsageDescription</key>
+<string>opensteamer reads playback information and controls Chrome and Music when you enable media integration.</string>' \
+  >"$CAPTURE_USAGE_DISPLAY/macOS/Sources/CaptureServer/Info.plist"
+commit_all "$CAPTURE_USAGE_DISPLAY"
+require_failure "$CAPTURE_USAGE_DISPLAY" "superseded app display branding remains"
 
 print -- "Beluga branding regression tests passed"

@@ -750,7 +750,7 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'EXPECTED_CONFIGURATION="TestFlight"' 1 \
   'side-by-side TestFlight configuration guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_BUILD_NUMBER="57"' 1 \
+  'EXPECTED_BUILD_NUMBER="80"' 1 \
   'side-by-side TestFlight build-number guard'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'PRIVATE_TEMPORARY_ROOT="/private/tmp"' 1 \
@@ -1020,6 +1020,12 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'function verify_reviewed_cache_directory_metadata() {' 1 \
   'side-by-side TestFlight reviewed cache-directory metadata verifier'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '[[ "${directory_identity%%:*}" == "${parent_identity%%:*}" ]]' 1 \
+  'side-by-side TestFlight persistent parent-edge same-device proof'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'local required_identity=${3:-}' 1 \
+  'side-by-side TestFlight verified cache-child identity constraint'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'TESTFLIGHT_DERIVED_DATA_BACKUP_EXCLUSION_XATTR="com.apple.metadata:com_apple_backup_excludeItem"' 1 \
   'side-by-side TestFlight exact Xcode backup-exclusion xattr'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
@@ -1035,11 +1041,17 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   '/bin/mv -- "${pending_contract}" "${TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH}"' 1 \
   'side-by-side TestFlight atomic cache-contract publication'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  '"${EXPECTED_PACKAGE_MANIFEST_SHA256}"' 3 \
-  'side-by-side TestFlight cache and release package-manifest binding'
+  '"${EXPECTED_PACKAGE_MANIFEST_SHA256}"' 2 \
+  'side-by-side TestFlight current release package-manifest binding'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  '"${EXPECTED_PACKAGE_RESOLVED_SHA256}"' 3 \
-  'side-by-side TestFlight cache and release resolved-package binding'
+  '"${EXPECTED_PACKAGE_RESOLVED_STATE}"' 2 \
+  'side-by-side TestFlight current release absent-lock binding'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256}"' 3 \
+  'side-by-side TestFlight cache-enrollment package-manifest provenance'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"${EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256}"' 3 \
+  'side-by-side TestFlight cache-enrollment resolved-package provenance'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'TESTFLIGHT_BUILD_WORKSPACE_KEY=$(string_vector_sha256 "${REPOSITORY_ROOT}")' 1 \
   'side-by-side TestFlight checkout-specific DerivedData identity'
@@ -1049,6 +1061,105 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'local workspace_root="${workspaces_root}/${TESTFLIGHT_BUILD_WORKSPACE_KEY}"' 1 \
   'side-by-side TestFlight stable checkout workspace cache'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'function initialize_or_provision_workspace_directory() {' 1 \
+  'side-by-side TestFlight atomic checkout-workspace provisioner'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'local pending_workspace_root="${workspaces_root}/.workspace-${TESTFLIGHT_BUILD_WORKSPACE_KEY}.pending"' 1 \
+  'side-by-side TestFlight deterministic checkout-workspace staging path'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'run-tmp|DerivedData|Products|Intermediates)' 2 \
+  'side-by-side TestFlight exact staged workspace child whitelist'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '(( ${#children[@]} == 4 )) || return 1' 1 \
+  'side-by-side TestFlight exact staged workspace cardinality'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '[[ "${child_identity%%:*}" == "${workspace_identity%%:*}" ]]' 1 \
+  'side-by-side TestFlight staged workspace child same-device proof'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '== "${pending_workspace_identity%%:*}" ]] || return 1' 2 \
+  'side-by-side TestFlight pending workspace child same-device proof'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'function populate_or_verify_pending_workspace_directory() {' 1 \
+  'side-by-side TestFlight safe partial workspace-staging recovery'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'function verify_existing_workspace_directory() {' 1 \
+  'side-by-side TestFlight existing workspace fail-closed verifier'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'function publish_workspace_directory_exclusively() {' 1 \
+  'side-by-side TestFlight exclusive workspace publisher'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'Fiddle.dlopen(nil)["renameatx_np"]' 1 \
+  'side-by-side TestFlight Darwin exclusive same-volume rename primitive'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'rename_excl = 0x4; rename_nofollow_any = 0x10;' 1 \
+  'side-by-side TestFlight exclusive no-follow workspace rename flags'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'rename_resolve_beneath = 0x20;' 1 \
+  'side-by-side TestFlight descriptor-beneath workspace rename flag'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'ruby_library_root = "/System/Library/Frameworks/Ruby.framework/Versions/2.6/usr/lib/ruby/2.6.0";' 1 \
+  'side-by-side TestFlight sealed system Ruby library root'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '$LOAD_PATH.replace([ruby_library_root, "#{ruby_library_root}/universal-darwin25"]);' 1 \
+  'side-by-side TestFlight sealed Ruby load path'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '$LOADED_FEATURES.grep(/fiddle/).all? { |feature| feature.start_with?(ruby_library_root) }' 1 \
+  'side-by-side TestFlight sealed Fiddle feature provenance'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '/usr/bin/ruby --disable=gems,rubyopt -e "${rename_program}" --' 1 \
+  'side-by-side TestFlight environment-scrubbed system exclusive rename caller'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'parent_file = File.open(ARGV.fetch(0), File::RDONLY | File::NOFOLLOW);' 1 \
+  'side-by-side TestFlight no-follow workspace-parent descriptor'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'parent_stat.dev == Integer(ARGV.fetch(1), 10) && parent_stat.ino == Integer(ARGV.fetch(2), 10)' 1 \
+  'side-by-side TestFlight workspace-parent descriptor identity proof'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1' 1 \
+  'side-by-side TestFlight exclusive checkout-workspace publication'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  populate_or_verify_pending_workspace_directory \\\n    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1\n\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' 1 \
+  'side-by-side TestFlight atomic checkout-workspace lock fencing'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' 1 \
+  'side-by-side TestFlight atomic checkout-workspace lock fencing'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  populate_or_verify_pending_workspace_directory \\\n    "${pending_workspace_root}" "${pending_workspace_identity}" || return 1\n\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' 1 \
+  'side-by-side TestFlight durable checkout-workspace publication'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  publish_workspace_directory_exclusively \\\n    "${pending_workspace_root}" "${workspace_root}" "${workspaces_root}" \\\n    "${workspaces_root_identity}" \\\n    || return 1\n  /bin/sync\n  verify_build_cache_lock_identity || return 1' 1 \
+  'side-by-side TestFlight durable checkout-workspace publication'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'      && "$(stat_identity "${workspace_root}")" \\\n        == "${pending_workspace_identity}" ]] || return 1' 1 \
+  'side-by-side TestFlight published workspace inode proof'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'TESTFLIGHT_BUILD_SANDBOX_IDENTITY="${pending_workspace_identity}"' 1 \
+  'side-by-side TestFlight published workspace identity handoff'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'TESTFLIGHT_BUILD_SANDBOX_IDENTITY="${existing_workspace_identity}"' 1 \
+  'side-by-side TestFlight existing workspace identity handoff'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'function capture_verified_workspace_child_identities() {' 1 \
+  'side-by-side TestFlight workspace-child identity handoff'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_DERIVED_DATA_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_DERIVED_DATA_IDENTITY}" || return 1\n  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_BUILD_PRODUCTS_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_PRODUCTS_IDENTITY}" || return 1\n  initialize_or_pin_cache_directory \\\n    "${TESTFLIGHT_BUILD_INTERMEDIATES_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_INTERMEDIATES_IDENTITY}" || return 1' 1 \
+  'side-by-side TestFlight verified workspace-child identity consumption'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  initialize_or_migrate_run_tmp_parent_directory \\\n    "${TESTFLIGHT_BUILD_RUN_TMP_PARENT_DIRECTORY}" "${workspace_root}" \\\n    "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \\\n    "${TESTFLIGHT_BUILD_EXPECTED_RUN_TMP_PARENT_IDENTITY}" || return 1' 1 \
+  'side-by-side TestFlight verified run-TMP identity consumption'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'workspaces_root_identity=$(stat_identity "${workspaces_root}") || return 1' 1 \
+  'side-by-side TestFlight checkout-workspace parent identity fencing'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  [[ -n "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" \\\n      && "$(stat_identity "${TESTFLIGHT_BUILD_SANDBOX_DIRECTORY}")" \\\n        == "${TESTFLIGHT_BUILD_SANDBOX_IDENTITY}" ]] || return 1' 1 \
+  'side-by-side TestFlight verified workspace identity consumption'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  TESTFLIGHT_BUILD_CACHE_CONTRACT_PATH="${cache_v1}/cache-contract.plist"\n  if (( TESTFLIGHT_BUILD_CACHE_INITIALIZE_MODE == 0 )); then' 1 \
+  'side-by-side TestFlight immutable contract pin before routine workspace handling'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'  initialize_or_provision_workspace_directory \\\n    "${workspace_root}" "${workspaces_root}" || return 1' 1 \
+  'side-by-side TestFlight scoped atomic checkout-workspace provisioning call'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'remove_exact_private_file "${TESTFLIGHT_BUILD_KEY_PATH}"' 1 \
   'side-by-side TestFlight failed-enrollment key rollback'
@@ -1158,8 +1269,8 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'TESTFLIGHT_XCODEBUILD_PINNED_ENVIRONMENT_SHA256' 6 \
   'side-by-side TestFlight immutable scrubbed Xcode environment'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  '/usr/bin/env -i' 2 \
-  'side-by-side TestFlight empty inherited Xcode environment'
+  '/usr/bin/env -i' 3 \
+  'side-by-side TestFlight empty inherited Xcode and exclusive-rename environments'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'function run_xcodebuild_command_for_destination_contract() {' 1 \
   'side-by-side TestFlight destination-scoped Xcode sandbox routing'
@@ -1185,11 +1296,47 @@ assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   'function resolve_pinned_package_dependencies() {' 1 \
   'side-by-side TestFlight one-time native package resolution'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"' 1 \
+  'EXPECTED_PACKAGE_MANIFEST_SHA256="443fe7a76bfbe8cda2d193c047cc04122c01479f8763ccd9e2d5871b7e504f82"' 1 \
   'side-by-side TestFlight exact package manifest pin'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
-  'EXPECTED_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"' 1 \
-  'side-by-side TestFlight exact resolved package pin'
+  'EXPECTED_PACKAGE_RESOLVED_STATE="absent"' 1 \
+  'side-by-side TestFlight exact absent-lock state'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '&& ! -e "${PACKAGE_RESOLVED_PATH}" && ! -L "${PACKAGE_RESOLVED_PATH}"' 1 \
+  'side-by-side TestFlight rejects stale remote dependency lock'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'VENDOR_ARCHIVE_PATH="${REPOSITORY_ROOT}/shared/Vendor/LiveKitWebRTC/LiveKitWebRTC.xcframework.zip"' 1 \
+  'side-by-side TestFlight exact local vendor path'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'EXPECTED_VENDOR_ARCHIVE_SHA256="1399ee6f9a34a6926d2abe9196c1361a40a7fbc9551becd5d13b15a73f510cf7"' 1 \
+  'side-by-side TestFlight unprepared vendor artifact is release-blocked'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'&& verify_pinned_vendor_archive \\\n      "${VENDOR_ARCHIVE_PATH}" "${EXPECTED_VENDOR_ARCHIVE_SHA256}"' 1 \
+  'side-by-side TestFlight package contract requires exact vendor bytes'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"$(sha256_file "${archive_path}")" == "${expected_sha256}"' 1 \
+  'side-by-side TestFlight one exact vendor digest verification'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"$(vendor_archive_identity "${archive_path}")" == "${identity}"' 1 \
+  'side-by-side TestFlight vendor hash identity fence'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  '"${identity}" == "${TESTFLIGHT_VENDOR_ARCHIVE_IDENTITY}"' 1 \
+  'side-by-side TestFlight unchanged vendor artifact reuse'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_MANIFEST_SHA256="b1bbbff9772b71d850ffec63a8fb1afef9d5e470c1abcedaeb7373b2c98d6d44"' 1 \
+  'side-by-side TestFlight exact enrolled package-manifest pin'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'EXPECTED_TESTFLIGHT_BUILD_CACHE_ENROLLMENT_PACKAGE_RESOLVED_SHA256="161213e9507513e41f0acba0d7439fcf633b9d03d78c22b1e4b15fa9f83a01d9"' 1 \
+  'side-by-side TestFlight exact enrolled resolved-package pin'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  'build-cache enrollment provenance pins do not match the current package inputs' 1 \
+  'side-by-side TestFlight fresh enrollment provenance gate'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'function run_initialize_build_cache() {\n  verify_package_dependency_contract \\\n    || fail "current package inputs changed before build-cache enrollment"' 1 \
+  'side-by-side TestFlight fresh enrollment current-package verification'
+assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
+  $'verify_static_contract\nverify_package_dependency_contract \\\n  || fail "current package inputs do not match the reviewed release pins"\npin_export_options_identity' 1 \
+  'side-by-side TestFlight entrypoint current-package verification'
 assert_literal_count "$SIDE_BY_SIDE_TESTFLIGHT_SCRIPT" \
   '/usr/bin/sandbox-exec -p "${profile_text}"' 1 \
   'side-by-side TestFlight protected-path Xcode sandbox'
@@ -2055,7 +2202,7 @@ assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
   'dataStore: WorldwideKeychainDataStore()' 1 \
   'explicit opensteamer pairing-store composition'
 assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
-  'fflush(stdout)' 1 'immediate one-time pairing-code flush'
+  'fflush(stdout)' 2 'immediate primary and secondary one-time pairing-code flushes'
 if require_directory macOS/Sources; then
   PROTECTED_PAIRING_SOURCE_MATCHES=$(find "$ROOT/macOS/Sources" -type f -name '*.swift' \
     -exec grep -lF -- \

@@ -1,7 +1,16 @@
 import AVFAudio
 import AudioToolbox
+import CallKit
+import CryptoKit
+import Darwin
+@preconcurrency import LiveKitWebRTC
+@preconcurrency import MediaPlayer
+import ObjectiveC
+import os
 import RemoteSessionCore
+import UIKit
 import XCTest
+@testable import opensteamer
 @testable import WebRTCTransport
 
 /// Verifies the native WebRTC audio-device contract and recovery authorization boundary.
@@ -9,6 +18,1273 @@ import XCTest
 /// revocation rules; the physical-device test remains the hardware RemoteIO oracle.
 @MainActor
 final class WebRTCAudioPlaybackSessionTests: XCTestCase {
+    func testPackagedDynamicFrameworkRetriesItsRealCustomAudioDevice() throws {
+        #if !targetEnvironment(simulator)
+        throw XCTSkip("This byte-bound artifact smoke check uses Xcode's unmodified Simulator framework; physical RemoteIO has a separate oracle.")
+        #else
+        XCTAssertTrue(LKRTCInitializeSSL())
+        let device = DynamicFrameworkRetryDevice()
+        var factory: LKRTCPeerConnectionFactory? = LKRTCPeerConnectionFactory(
+            encoderFactory: nil, decoderFactory: nil, audioDevice: device
+        )
+        let configuration = LKRTCConfiguration()
+        configuration.iceServers = []
+        configuration.sdpSemantics = .unifiedPlan
+        var peer = factory?.peerConnection(
+            with: configuration,
+            constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil),
+            delegate: nil
+        )
+        defer {
+            peer?.close()
+            peer = nil
+            factory = nil
+            let final = device.snapshot
+            XCTAssertEqual(final.initializations, 1)
+            XCTAssertEqual(final.terminations, 1)
+            XCTAssertFalse(final.initialized)
+            XCTAssertFalse(final.playing)
+            XCTAssertFalse(final.delegateBound)
+            XCTAssertEqual(final.recordingInitializations, 0)
+            XCTAssertEqual(final.recordingStarts, 0)
+            XCTAssertEqual(final.recordingStops, 1, "The real media engine performs one harmless recording stop during teardown.")
+            XCTAssertFalse(final.wrongWorker)
+        }
+        XCTAssertNotNil(peer)
+        XCTAssertTrue(device.snapshot.initialized)
+        XCTAssertEqual(device.snapshot.playoutInitializations, 0)
+        let proof = try XCTUnwrap(device.exerciseRetry())
+        XCTAssertTrue(proof.supportsRetry)
+        let image = try XCTUnwrap(proof.imagePath)
+        let imageURL = URL(fileURLWithPath: image).resolvingSymlinksInPath().standardizedFileURL
+        let factoryImage = try XCTUnwrap(Bundle(for: LKRTCPeerConnectionFactory.self).executableURL)
+            .resolvingSymlinksInPath().standardizedFileURL
+        XCTAssertEqual(imageURL, factoryImage,
+                       "The factory and retry implementation must execute from the same dynamic framework.")
+        // Pinned Xcode injects its build-products framework through DYLD_FRAMEWORK_PATH
+        // during hosted Simulator tests. Bind the actual loaded image to the exact verified
+        // Simulator artifact bytes instead of assuming it uses the app's re-signed copy.
+        let imageDigest = SHA256.hash(data: try Data(contentsOf: imageURL))
+            .map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(imageDigest,
+                       "89ad833585353cc20f8bad3272170a574c0ae4c7dea433c8abd45ff2b53d2abe")
+        XCTAssertEqual(proof.accepted, [false, true, true])
+        XCTAssertEqual(proof.snapshots.map(\.playoutInitializations), [1, 2, 2])
+        XCTAssertEqual(proof.snapshots.map(\.playoutStarts), [0, 1, 1])
+        XCTAssertEqual(proof.snapshots.map(\.playing), [false, true, true])
+        XCTAssertTrue(proof.snapshots.allSatisfy {
+            $0.initialized && !$0.wrongWorker
+                && $0.recordingInitializations == 0 && $0.recordingStarts == 0
+                && $0.recordingStops == 0
+        })
+        XCTAssertEqual(proof.inactivePCM?.status, noErr)
+        XCTAssertEqual(proof.activePCM?.status, noErr)
+        XCTAssertEqual(proof.inactivePCM?.flags, .unitRenderAction_OutputIsSilence)
+        XCTAssertEqual(proof.activePCM?.flags, [])
+        XCTAssertEqual(proof.inactivePCM?.allZero, true)
+        XCTAssertEqual(proof.activePCM?.allZero, true, "No track is present; this proves wrapper dispatch, not audibility.")
+        #endif
+    }
+
+    func testOutputOnlyPolicyRepairIsOneShotAndKeepsExactTransactionFences() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugOutputOnlyPolicyRepairForTesting()
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+        XCTAssertEqual(try value("ordinaryOutputPolicy").intValue, 1)
+        XCTAssertEqual(try value("microphonePolicy").intValue, 0)
+        XCTAssertEqual(try value("hostedPolicy").intValue, 0)
+        for target in ["input", "output", "hosted"] {
+            for policy in ["default", "longFormAudio", "independent", "video", "unknown"] {
+                let expected = target == "input"
+                    ? ["default", "longFormAudio"].contains(policy)
+                    : policy == (target == "hosted" ? "default" : "longFormAudio")
+                XCTAssertEqual(try value("\(target).\(policy).exact").boolValue, expected,
+                               "\(target) must accept only effective policies in its exact named profile: \(policy)")
+            }
+        }
+        for policy in ["default", "longFormAudio"] {
+            for negative in ["wrongCategoryRejected", "wrongModeRejected", "wrongOptionsRejected", "hostedInputRejected"] {
+                XCTAssertTrue(try value("input.\(policy).\(negative)").boolValue, "\(policy): \(negative)")
+            }
+            for check in ["prepared", "starting", "consumed", "revalidated", "unsupportedRejected"] {
+                XCTAssertTrue(try value("input.\(policy).route.\(check)").boolValue, "\(policy): \(check)")
+            }
+        }
+        for (policy, raw) in [("default", 0), ("longFormAudio", 1), ("independent", 2), ("video", 3), ("unknown", -1)] {
+            let accepted = raw == 0 || raw == 1
+            for state in ["pending", "prepared", "starting", "consumed"] {
+                let prefix = "input.\(policy).\(state)."
+                XCTAssertEqual(try value(prefix + "accepted").boolValue, accepted, prefix)
+                XCTAssertEqual(try value(prefix + "profileMatches").boolValue, accepted, prefix)
+                XCTAssertEqual(try value(prefix + "requestedRaw").intValue, 0, "The setter still requests default.")
+                XCTAssertEqual(try value(prefix + "observedRaw").intValue, raw, "Readback must not be normalized.")
+                XCTAssertTrue(try value(prefix + "identityPreserved").boolValue, prefix)
+            }
+        }
+        for key in ["outputRoutePrepare", "outputRouteStart", "outputRouteCommit", "outputRouteConsumed",
+                    "wrongPoliciesRejectedAcrossRouteStates"] {
+            XCTAssertTrue(try value(key).boolValue, key)
+        }
+        let scenarios = ["converged", "persistent", "exact", "setterRejected", "ownershipChanged",
+                         "systemChanged", "targetChanged", "outputChanged", "configurationChanged",
+                         "expired", "priorRejected", "queuedRejected", "wrongCategory",
+                         "recordingIntentChanged", "privacyLatchChanged", "wrongMode", "wrongOptions", "unknownPolicy"]
+        let expectedRejections: [String: (first: Int, repeated: Int)] = [
+            "converged": (0, 0), "persistent": (1072, 1040), "exact": (0, 0),
+            "setterRejected": (1064, 1040), "ownershipChanged": (1737, 1041),
+            "systemChanged": (1057, 1041), "targetChanged": (1857, 1041),
+            "outputChanged": (1945, 1041), "configurationChanged": (1761, 1041),
+            "expired": (1809, 1041), "priorRejected": (1048, 1048),
+            "queuedRejected": (1057, 1041), "wrongCategory": (1400, 1400),
+            "recordingIntentChanged": (1697, 1041), "privacyLatchChanged": (1721, 1041),
+            "wrongMode": (1408, 1408), "wrongOptions": (1416, 1416), "unknownPolicy": (1076, 1044),
+        ]
+        for scenario in scenarios {
+            let succeeds = scenario == "converged" || scenario == "exact"
+            let calls = ["exact", "priorRejected", "wrongCategory", "wrongMode", "wrongOptions"].contains(scenario) ? 0 : 1
+            XCTAssertTrue(try value(scenario + "FixtureReady").boolValue, scenario)
+            XCTAssertEqual(try value(scenario + "Accepted").boolValue, succeeds, scenario)
+            XCTAssertEqual(try value(scenario + "Repeated").boolValue, succeeds, scenario)
+            XCTAssertEqual(try value(scenario + "FirstCalls").intValue, calls, scenario)
+            XCTAssertEqual(try value(scenario + "TotalCalls").intValue, calls, "No second setter: \(scenario)")
+            let expected = try XCTUnwrap(expectedRejections[scenario])
+            XCTAssertEqual(try value(scenario + "RejectionCode").intValue, expected.first, scenario)
+            XCTAssertEqual(try value(scenario + "RepeatedRejectionCode").intValue, expected.repeated, scenario)
+            if scenario != "systemChanged" && scenario != "expired" {
+                XCTAssertTrue(try value(scenario + "IdentityPreserved").boolValue, scenario)
+            }
+        }
+        XCTAssertTrue(try value("priorRejectedRejectedRemainedRejected").boolValue)
+        XCTAssertTrue(try value("queuedRejectedRejectedRemainedRejected").boolValue)
+        XCTAssertEqual(try value("setterRejectedError").intValue, -777)
+        XCTAssertTrue(try value("rejectionRetainedBeforeRollback").boolValue)
+        XCTAssertTrue(try value("healthyRetainsTargetPolicyRejection").boolValue)
+        XCTAssertTrue(try value("noAudioIO").boolValue)
+    }
+
+    func testPendingCategoryRouteCursorRequiresExactChainedTransactionEvidence() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugOutputOnlyPolicyRepairForTesting()
+        for key in ["boundExact", "unboundExact", "reasonEightDispositionUnchanged"] {
+            XCTAssertTrue(try XCTUnwrap(result["categoryCursor." + key], key).boolValue, key)
+        }
+        for rejected in ["notExpected", "notCurrent", "prepared", "starting", "consumed",
+                         "rejected", "none", "reasonEight", "oldSequence", "expired",
+                         "configuration", "system", "missingFingerprints", "unchained",
+                         "policy", "output", "ownership", "inactive"] {
+            let key = "categoryCursor.reject." + rejected
+            XCTAssertTrue(try XCTUnwrap(result[key], key).boolValue, key)
+        }
+        for policy in ["default", "longFormAudio"] {
+            for proof in ["beforeRejected", "handlerExpectedCategory", "advancedExactly",
+                          "startSettlementUntouched", "gatesStayedClosed", "afterPrepared"] {
+                let key = "categoryCursor." + policy + "." + proof
+                XCTAssertTrue(try XCTUnwrap(result[key], key).boolValue, key)
+            }
+        }
+    }
+
+    func testFrameworkMicrophoneStopClosesCaptureWithoutStealingOutputOnlyTransaction() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugOutputOnlyPolicyRepairForTesting()
+        for scenario in ["none", "output", "microphone"] {
+            for proof in ["published", "stopped", "privacyClosed", "noPolicyMutation",
+                          "truthfulConfiguredInput", "bareStartRejected", "pendingPreserved"] {
+                let key = "frameworkStop." + scenario + "." + proof
+                XCTAssertTrue(try XCTUnwrap(result[key], key).boolValue, key)
+            }
+        }
+        for proof in ["microphone.outputCannotBorrow", "output.competingEnableRejected",
+                      "output.exactCClaimed", "output.nextArmTagged", "output.receiptCorrelated"] {
+            let key = "frameworkStop." + proof
+            XCTAssertTrue(try XCTUnwrap(result[key], key).boolValue, key)
+        }
+        XCTAssertTrue(try XCTUnwrap(result["noAudioIO"]).boolValue)
+    }
+
+    func testConfigurationGenerationRecoveryUsesMonotonicAllocationAfterRollback() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugConfigurationGenerationRecoveryForTesting()
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+        XCTAssertEqual(try value("initialGeneration").uint64Value, 1)
+        for attempt in 1...3 {
+            let prefix = "attempt\(attempt)"
+            XCTAssertTrue(try value(prefix + "RollbackClearedActive").boolValue)
+            XCTAssertEqual(try value(prefix + "Generation").uint64Value, UInt64(attempt + 1))
+            XCTAssertTrue(try value(prefix + "BaselinesExact").boolValue)
+            XCTAssertTrue(try value(prefix + "MismatchesRejected").boolValue)
+            XCTAssertTrue(try value(prefix + "Accepted").boolValue, "\(result)")
+        }
+        XCTAssertTrue(try value("systemBoundaryRejectsOldTag").boolValue)
+        XCTAssertEqual(try value("exhaustedAllocation").uint64Value, 0)
+        XCTAssertEqual(try value("exhaustedStage").uint64Value, 0)
+        XCTAssertEqual(try value("exhaustedActive").uint64Value, 0)
+        XCTAssertTrue(try value("inputRemainedClosed").boolValue)
+    }
+
+    func testExactRecoveryReconfiguresAfterInitialPlayoutFailureBeforeStart() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRetryAfterFailedInitialPlayoutForTesting()
+
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+
+        XCTAssertTrue(try value("initialInitializeFailed").boolValue)
+        XCTAssertFalse(try value("initialPlaying").boolValue)
+        XCTAssertFalse(try value("initialPlayoutInitialized").boolValue)
+        let initialConfigurations = try value("initialConfigurationCount").intValue
+        XCTAssertGreaterThan(initialConfigurations, 0)
+        for attempt in 1...2 {
+            let prefix = "attempt\(attempt)"
+            XCTAssertTrue(try value(prefix + "Accepted").boolValue, "\(result)")
+            XCTAssertTrue(try value(prefix + "PolicyMatches").boolValue, "\(result)")
+            XCTAssertTrue(try value(prefix + "ExactDrain").boolValue, "\(result)")
+            XCTAssertFalse(try value(prefix + "InputBusEnabled").boolValue)
+            XCTAssertTrue(try value(prefix + "Playing").boolValue, "\(result)")
+            XCTAssertTrue(try value(prefix + "SessionActive").boolValue, "\(result)")
+            XCTAssertEqual(try value(prefix + "DelegateRetryCount").intValue, attempt)
+        }
+        let firstConfigurations = try value("attempt1ConfigurationCount").intValue
+        XCTAssertGreaterThan(
+            firstConfigurations,
+            initialConfigurations,
+            "An exact retry after failed initialization must attempt configuration, not only retire its tag. \(result)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            try value("attempt2ConfigurationCount").intValue,
+            firstConfigurations
+        )
+    }
+
+    func testExactRecoveryMissingVendorHookClosesNativeOnlyPlayback() throws {
+        let result = try assertExactRetryFailure(.missingHook)
+        XCTAssertTrue(try retryValue("initialPlaying", in: result).boolValue)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("failureCode", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("failureStatus", in: result).intValue, Int(kAudio_ParamError))
+    }
+
+    func testExactRecoveryRejectedVendorHookRollsBackNativeStart() throws {
+        let result = try assertExactRetryFailure(.rejectedAfterNativeStart)
+        XCTAssertFalse(try retryValue("initialPlaying", in: result).boolValue)
+        XCTAssertTrue(try retryValue("nativePlayingInsideHook", in: result).boolValue)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 1)
+        XCTAssertGreaterThan(try retryValue("configurationDelta", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("failureCode", in: result).intValue, 1)
+    }
+
+    func testExactRecoveryPreservesNativeInitializationFailureDetails() throws {
+        let result = try assertExactRetryFailure(.nativeInitializationFailure)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 1)
+        XCTAssertGreaterThan(try retryValue("configurationDelta", in: result).intValue, 0)
+        XCTAssertGreaterThan(try retryValue("failureCode", in: result).intValue, 1)
+        XCTAssertTrue(try retryValue("nativeFailurePreserved", in: result).boolValue)
+    }
+
+    func testRealSessionPolicyAPIKeepsExactCanonicalTargetsThroughOutputActivationWithoutAudioIO() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugProbeRealSessionPolicySetterForTesting()
+        let attachment = XCTAttachment(
+            data: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
+            uniformTypeIdentifier: "public.json"
+        )
+        attachment.name = "real-session-policy-api-output-activation-scalars"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        for key in ["configurationLockAcquired", "ownershipLockAcquired", "initiallyQuiescent",
+                    "initialTupleRestorable", "restored", "restoredTupleExact", "nativeRemainedQuiescent"] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+        XCTAssertEqual(try retryValue("restoreError", in: result).intValue, 0)
+        for prior in 0...1 {
+            for target in ["output", "input"] {
+                let prefix = "prior\(prior).\(target)."
+                for key in ["priorApplied", "applied", "categoryMatches", "modeMatches", "optionsMatch",
+                            "exactTupleAccepted", "oppositePolicyRejected"] {
+                    XCTAssertTrue(try retryValue(prefix + key, in: result).boolValue,
+                                  "\(prefix + key): \(result)")
+                }
+                for key in ["priorError", "error"] {
+                    XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 0,
+                                   "\(prefix + key): \(result)")
+                }
+                for key in ["requestedRaw", "observedRaw"] {
+                    XCTAssertEqual(try retryValue(prefix + key, in: result).intValue,
+                                   target == "output" ? 1 : 0, "\(prefix + key): \(result)")
+                }
+                XCTAssertEqual(try retryValue(prefix + "priorRequestedRaw", in: result).intValue, prior)
+                XCTAssertEqual(try retryValue(prefix + "priorObservedRaw", in: result).intValue, prior,
+                               "\(prefix): \(result)")
+                if target == "output" {
+                    for key in ["activated", "activeTupleExact", "deactivated"] {
+                        XCTAssertTrue(try retryValue(prefix + key, in: result).boolValue,
+                                      "\(prefix + key): \(result)")
+                    }
+                    for key in ["activationError", "deactivationError"] {
+                        XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 0,
+                                       "\(prefix + key): \(result)")
+                    }
+                    for key in ["activeObservedRaw", "inactiveObservedRaw"] {
+                        XCTAssertEqual(try retryValue(prefix + key, in: result).intValue, 1,
+                                       "\(prefix + key): \(result)")
+                    }
+                    XCTAssertEqual(try retryValue(prefix + "activationCount", in: result).intValue, 1)
+                    XCTAssertEqual(try retryValue(prefix + "deactivationCount", in: result).intValue, 1)
+                } else {
+                    XCTAssertNil(result[prefix + "activationCount"])
+                    XCTAssertNil(result[prefix + "deactivationCount"])
+                }
+            }
+        }
+    }
+
+    func testPhysicalPolicyScenarioOriginalOrder() throws {
+        try checkPhysicalPolicyScenario(0)
+    }
+
+    func testPhysicalPolicyScenarioInitialIdle() throws {
+        try checkPhysicalPolicyScenario(1)
+    }
+
+    func testPhysicalPolicyScenarioPostInputRead() throws {
+        try checkPhysicalPolicyScenario(2)
+    }
+
+    func testPhysicalPolicyScenarioColdDuplexFirst() throws {
+        try checkPhysicalPolicyScenario(3)
+    }
+
+    func testPhysicalPolicyScenarioProductionOrder() throws {
+        try checkPhysicalPolicyScenario(4)
+    }
+
+    private func checkPhysicalPolicyScenario(_ scenario: UInt) throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("This comparison requires one selected scenario per fresh physical test-host process.")
+        #else
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugProbeRealSessionPolicySetterScenarioForTesting(scenario)
+        let attachment = XCTAttachment(
+            data: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
+            uniformTypeIdentifier: "public.json"
+        )
+        attachment.name = "physical-policy-scenario-\(scenario)"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        for key in ["scenarioIsValid", "firstScenarioInvocation", "sequenceCompleted",
+                    "configurationLockAcquired", "ownershipLockAcquired", "initiallyQuiescent",
+                    "initialTupleRestorable", "cleanupOutputDeactivated", "restored", "nativeRemainedQuiescent"] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+        XCTAssertEqual(try retryValue("inputActivationCount", in: result).intValue, 0)
+        // These experiments characterize the actual result; attachment values, not test
+        // success, establish whether a sequence obtained the canonical policy.
+        #endif
+    }
+
+    func testPhysicalInertPolicyAfterRemoteCommandCenterShared() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.remoteCommandCenterShared)
+    }
+
+    func testPhysicalInertPolicyAfterDisabledPlayCommandTarget() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.disabledPlayCommandTarget)
+    }
+
+    func testPhysicalInertPolicyAfterNowPlayingInfoCenterDefault() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.nowPlayingInfoCenterDefault)
+    }
+
+    func testPhysicalInertPolicyAfterClearingNowPlayingInfo() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.clearingNowPlayingInfo)
+    }
+
+    func testPhysicalInertPolicyAfterStoppedPlaybackState() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.stoppedPlaybackState)
+    }
+
+    func testPhysicalInertPolicyAfterPlayCommandTargetOnly() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.playCommandTargetOnly)
+    }
+
+    func testPhysicalInertPolicyAfterDisablingPlayCommandOnly() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.disablingPlayCommandOnly)
+    }
+
+    func testPhysicalInertPolicyAfterDisabledPlayTargetRemoval() async throws {
+        try await checkPhysicalInertMediaPlayerPolicy(.disabledPlayTargetRemoval)
+    }
+
+    func testPhysicalInertPolicyRestoresCapturedDefaultAfterTargetRemoval() async throws {
+        try await checkPhysicalInertMediaPlayerSetterPolicy(.restoreAfterTargetRemoval)
+    }
+
+    func testPhysicalInertPolicyRegistersTargetAfterInactiveDuplexSetter() async throws {
+        try await checkPhysicalInertMediaPlayerSetterPolicy(.duplexBeforeTarget)
+    }
+
+    func testPhysicalInertPolicySetsInactiveDuplexWhileTargetIsRegistered() async throws {
+        try await checkPhysicalInertMediaPlayerSetterPolicy(.duplexWhileTargetRegistered)
+    }
+
+    /// Characterizes only UIApplication's legacy remote-control registration boundary.
+    /// No MediaPlayer objects, responders, audio I/O, or native audio devices are touched.
+    func testPhysicalInertPolicyAfterBeginReceivingRemoteControlEvents() async throws {
+        executionTimeAllowance = 90
+        #if !DEBUG
+        throw XCTSkip("Remote-control registration characterization requires a DEBUG test host.")
+        #elseif targetEnvironment(simulator)
+        throw XCTSkip("This characterization requires a fresh physical inert development host.")
+        #else
+        var result: [String: Any] = [
+            "processID": ProcessInfo.processInfo.processIdentifier,
+            "inertAppRoot": OpensteamerAppRootMode.isPhysicalUpdateValidationHost,
+            "bundleIdentifier": Bundle.main.bundleIdentifier ?? "<missing>",
+            "applicationStateAtStartRaw": UIApplication.shared.applicationState.rawValue,
+            "mediaPlayerAccessed": false, "firstResponderChanged": false,
+            "audioActivationCount": 0, "captureAttempted": false,
+            "nativeAudioDeviceCreated": false,
+        ]
+        var ownsRemoteControlRegistration = false
+        var beginCount = 0
+        var endCount = 0
+        var restoreCount = 0
+        func endOwnedRegistration() {
+            guard ownsRemoteControlRegistration else { return }
+            ownsRemoteControlRegistration = false
+            UIApplication.shared.endReceivingRemoteControlEvents()
+            endCount += 1
+        }
+        defer {
+            endOwnedRegistration()
+            result["beginReceivingCount"] = beginCount
+            result["endReceivingCount"] = endCount
+            result["capturedInitialRestoreCount"] = restoreCount
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                attachment.name = "physical-inert-begin-receiving-remote-control-events-policy"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else {
+                XCTFail("Could not encode remote-control registration scalar evidence.")
+            }
+        }
+        guard OpensteamerAppRootMode.isPhysicalUpdateValidationHost else {
+            return XCTFail("The actual app root is not the inert physical update-validation host.")
+        }
+        guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev" else {
+            return XCTFail("The experiment is restricted to the distinct spare-phone development app.")
+        }
+        guard !Self.physicalMediaPlayerPolicyExperimentWasInvoked else {
+            return XCTFail("Select exactly one experiment per fresh test-host process.")
+        }
+        Self.physicalMediaPlayerPolicyExperimentWasInvoked = true
+        let clock = ContinuousClock()
+        let activationDeadline = clock.now.advanced(by: .seconds(2))
+        while UIApplication.shared.applicationState != .active, clock.now < activationDeadline {
+            try await clock.sleep(until: min(activationDeadline, clock.now.advanced(by: .milliseconds(25))))
+        }
+        result["applicationStateAfterActivationWaitRaw"] = UIApplication.shared.applicationState.rawValue
+        guard UIApplication.shared.applicationState == .active else {
+            return XCTFail("The experiment host did not become active within two seconds.")
+        }
+        let session = AVAudioSession.sharedInstance()
+        let initialCategory = session.category
+        let initialMode = session.mode
+        let initialOptions = session.categoryOptions
+        let initialPolicy = session.routeSharingPolicy
+        func readTuple() -> [String: Any] {
+            ["category": session.category.rawValue, "mode": session.mode.rawValue,
+             "optionsRaw": session.categoryOptions.rawValue, "policyRaw": session.routeSharingPolicy.rawValue,
+             "matchesCapturedInitial": session.category == initialCategory && session.mode == initialMode
+                && session.categoryOptions == initialOptions && session.routeSharingPolicy == initialPolicy]
+        }
+        result["beforeAPI"] = readTuple()
+        guard initialCategory == .soloAmbient, initialMode == .default,
+              initialOptions.isEmpty, initialPolicy == .default else {
+            return XCTFail("A supported pre-registration soloAmbient/default/options0/policy0 baseline is required; no APIs or setters ran.")
+        }
+        let registrationStart = clock.now
+        let registrationUptime = ProcessInfo.processInfo.systemUptime
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        ownsRemoteControlRegistration = true
+        beginCount += 1
+        result["afterAPI"] = readTuple()
+        result["afterAPIElapsedMilliseconds"] =
+            (ProcessInfo.processInfo.systemUptime - registrationUptime) * 1_000
+        do {
+            for milliseconds in [100, 250, 1_000] {
+                try await clock.sleep(until: registrationStart.advanced(by: .milliseconds(milliseconds)))
+                result["after\(milliseconds)Milliseconds"] = readTuple()
+                result["after\(milliseconds)MillisecondsActualElapsed"] =
+                    (ProcessInfo.processInfo.systemUptime - registrationUptime) * 1_000
+            }
+        } catch {
+            result["measurementWaitCancelled"] = true
+            result["measurementWaitErrorCode"] = (error as NSError).code
+            XCTFail("The bounded remote-control observation was interrupted: \(error)")
+        }
+        endOwnedRegistration()
+        result["afterEndReceiving"] = readTuple()
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { result["endReceivingSettleWaitCancelled"] = true }
+        result["afterEndReceiving100Milliseconds"] = readTuple()
+        restoreCount += 1
+        do {
+            try session.setCategory(initialCategory, mode: initialMode,
+                                    policy: initialPolicy, options: initialOptions)
+            result["capturedInitialRestoreApplied"] = true
+        } catch {
+            result["capturedInitialRestoreApplied"] = false
+            result["capturedInitialRestoreErrorCode"] = (error as NSError).code
+            result["capturedInitialRestoreErrorDomain"] = (error as NSError).domain
+            XCTFail("The single captured-baseline restoration attempt failed: \(error)")
+        }
+        result["afterCapturedInitialRestore"] = readTuple()
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { result["restoreReadWaitCancelled"] = true }
+        result["afterCapturedInitialRestore100Milliseconds"] = readTuple()
+        XCTAssertEqual(beginCount, 1)
+        XCTAssertEqual(endCount, 1)
+        XCTAssertEqual(restoreCount, 1)
+        XCTAssertEqual(session.category, initialCategory)
+        XCTAssertEqual(session.mode, initialMode)
+        XCTAssertEqual(session.categoryOptions, initialOptions)
+        XCTAssertEqual(session.routeSharingPolicy, initialPolicy)
+        // API-time tuples are observations, not expectations of policy0 or proof of input.
+        #endif
+    }
+
+    /// Explicit setup only: the operator approves the real system prompt on the spare dev phone.
+    /// This test does not configure, activate, or capture audio, and is separate from every probe.
+    func testPhysicalInertDevelopmentHostMicrophonePermissionSetup() async throws {
+        executionTimeAllowance = 90
+        #if !DEBUG
+        throw XCTSkip("Permission setup is available only in a DEBUG test host.")
+        #elseif targetEnvironment(simulator)
+        throw XCTSkip("This setup requires the authorized spare physical development phone.")
+        #else
+        var result: [String: Any] = [
+            "processID": ProcessInfo.processInfo.processIdentifier,
+            "inertAppRoot": OpensteamerAppRootMode.isPhysicalUpdateValidationHost,
+            "bundleIdentifier": Bundle.main.bundleIdentifier ?? "<missing>",
+            "applicationStateAtStartRaw": UIApplication.shared.applicationState.rawValue,
+            "permissionBeforeRaw": AVAudioApplication.shared.recordPermission.rawValue,
+            "permissionRequestCount": 0,
+            "audioConfigurationAttempted": false, "audioActivationAttempted": false,
+            "captureAttempted": false, "mediaPlayerAccessed": false,
+            "nativeAudioDeviceCreated": false,
+        ]
+        defer {
+            result["permissionAfterRaw"] = AVAudioApplication.shared.recordPermission.rawValue
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                attachment.name = "physical-inert-development-microphone-permission-setup"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else {
+                XCTFail("Could not encode permission-setup scalar evidence.")
+            }
+        }
+        guard OpensteamerAppRootMode.isPhysicalUpdateValidationHost else {
+            return XCTFail("The actual app root is not the inert physical update-validation host.")
+        }
+        guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev" else {
+            return XCTFail("Permission setup is restricted to the distinct spare-phone development app.")
+        }
+        let activationClock = ContinuousClock()
+        let activationDeadline = activationClock.now.advanced(by: .seconds(2))
+        while UIApplication.shared.applicationState != .active,
+              activationClock.now < activationDeadline {
+            try await activationClock.sleep(until: min(
+                activationDeadline, activationClock.now.advanced(by: .milliseconds(25))
+            ))
+        }
+        result["applicationStateAfterActivationWaitRaw"] = UIApplication.shared.applicationState.rawValue
+        guard UIApplication.shared.applicationState == .active else {
+            return XCTFail("The permission-setup host did not become active within two seconds.")
+        }
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted:
+            result["alreadyGranted"] = true
+        case .denied:
+            return XCTFail("Microphone permission is denied; setup will not retry or change Settings.")
+        case .undetermined:
+            result["permissionRequestCount"] = 1
+            let granted = await withCheckedContinuation { continuation in
+                AVAudioApplication.requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+            result["permissionCallbackGranted"] = granted
+            XCTAssertTrue(granted, "The real system permission prompt was not approved.")
+        @unknown default:
+            return XCTFail("Unknown microphone permission state; no permission request was made.")
+        }
+        XCTAssertEqual(AVAudioApplication.shared.recordPermission, .granted,
+                       "Permission setup alone must leave the spare development app granted.")
+        #endif
+    }
+
+    func testPhysicalInertInputTapCharacterizesRegisteredMediaCommandPolicy() async throws {
+        executionTimeAllowance = 90
+        #if targetEnvironment(simulator)
+        throw XCTSkip("This bounded microphone characterization requires a fresh physical inert development host.")
+        #else
+        var result: [String: Any] = [
+            "processID": ProcessInfo.processInfo.processIdentifier,
+            "inertAppRoot": OpensteamerAppRootMode.isPhysicalUpdateValidationHost,
+            "bundleIdentifier": Bundle.main.bundleIdentifier ?? "<missing>",
+            "applicationStateAtStartRaw": UIApplication.shared.applicationState.rawValue,
+            "permissionWasAlreadyGranted": false,
+            "productionAdmissionWasExercised": false, "storedPCMBufferCount": 0,
+            "nativeScenario4Invoked": false, "captureWithPolicyOneProved": false,
+        ]
+        defer {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                attachment.name = "physical-inert-input-tap-registered-media-command-policy"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else {
+                XCTFail("Could not encode input-tap scalar evidence.")
+            }
+        }
+        guard OpensteamerAppRootMode.isPhysicalUpdateValidationHost else {
+            return XCTFail("The actual app root is not the inert physical update-validation host.")
+        }
+        guard Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev" else {
+            return XCTFail("The test host is not the distinct development app: \(Bundle.main.bundleIdentifier ?? "<missing>").")
+        }
+        // Hosted XCTest may enter just before the real scene becomes active. Yield only
+        // for that startup boundary; do not activate audio or manufacture scene activation.
+        let activationClock = ContinuousClock()
+        let activationDeadline = activationClock.now.advanced(by: .seconds(2))
+        let activationWaitStart = ProcessInfo.processInfo.systemUptime
+        while UIApplication.shared.applicationState != .active,
+              activationClock.now < activationDeadline {
+            try await activationClock.sleep(until: min(
+                activationDeadline, activationClock.now.advanced(by: .milliseconds(25))
+            ))
+        }
+        result["activationWaitMilliseconds"] =
+            (ProcessInfo.processInfo.systemUptime - activationWaitStart) * 1_000
+        result["applicationStateAfterActivationWaitRaw"] = UIApplication.shared.applicationState.rawValue
+        guard UIApplication.shared.applicationState == .active else {
+            return XCTFail("The test host scene did not become active within the two-second startup wait; state=\(UIApplication.shared.applicationState.rawValue).")
+        }
+        guard !Self.physicalMediaPlayerPolicyExperimentWasInvoked else {
+            return XCTFail("Select exactly one experiment per fresh test-host process.")
+        }
+        Self.physicalMediaPlayerPolicyExperimentWasInvoked = true
+        guard AVAudioApplication.shared.recordPermission == .granted else {
+            return XCTFail("Microphone permission must already be granted; this test never requests it.")
+        }
+        result["permissionWasAlreadyGranted"] = true
+        let calls = CXCallObserver()
+        guard calls.calls.allSatisfy(\.hasEnded) else {
+            return XCTFail("A nonended system call forbids this standalone input probe.")
+        }
+        let session = AVAudioSession.sharedInstance()
+        let initialCategory = session.category
+        let initialMode = session.mode
+        let initialOptions = session.categoryOptions
+        let initialPolicy = session.routeSharingPolicy
+        let duplexOptions: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
+        func readTuple() -> [String: Any] {
+            ["category": session.category.rawValue, "mode": session.mode.rawValue,
+             "optionsRaw": session.categoryOptions.rawValue, "policyRaw": session.routeSharingPolicy.rawValue,
+             "inputChannels": session.inputNumberOfChannels, "sampleRate": session.sampleRate,
+             "builtInInput": session.currentRoute.inputs.contains { $0.portType == .builtInMic }]
+        }
+        func require(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw PhysicalInputTapProbeError.requirement(message) }
+        }
+        result["beforeMediaPlayer"] = readTuple()
+        guard initialCategory == .soloAmbient, initialMode == .default,
+              initialOptions.isEmpty, initialPolicy == .default else {
+            return XCTFail("The captured pre-MediaPlayer tuple must be soloAmbient/default/options0/policy0.")
+        }
+
+        let quiescence = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = quiescence.debugTerminateForTesting() }
+        guard quiescence.debugRealSessionIsQuiescentForTesting() else {
+            return XCTFail("A native audio owner or configuration operation is present.")
+        }
+        var engine: AVAudioEngine?
+        var input: AVAudioInputNode?
+        var tapWasInstalled = false
+        var journal: PhysicalInputTapJournal?
+        var callFence: PhysicalInputTapCallFence?
+        var interruptionObserver: NSObjectProtocol?
+        var installedTarget: (command: MPRemoteCommand, target: Any)?
+        var activationAttemptCount = 0
+        var activationSuccessCount = 0
+        var deactivationAttemptCount = 0
+        var targetRemovalCount = 0
+        var phase = "register target"
+        do {
+            let play = MPRemoteCommandCenter.shared().playCommand
+            let target = play.addTarget { @Sendable _ in .commandFailed }
+            installedTarget = (play, target)
+            result["afterRegistration"] = readTuple()
+            try await Task.sleep(for: .milliseconds(100))
+            result["afterRegistration100Milliseconds"] = readTuple()
+            phase = "set inactive canonical duplex"
+            try session.setCategory(.playAndRecord, mode: .default,
+                                    policy: .default, options: duplexOptions)
+            result["afterDuplexSetter"] = readTuple()
+            try require(UIApplication.shared.applicationState == .active, "App became inactive before activation.")
+            try require(calls.calls.allSatisfy(\.hasEnded), "Call state changed before activation.")
+            try require(quiescence.debugRealSessionIsQuiescentForTesting(), "Native ownership changed before activation.")
+            phase = "activate once"
+            result["beforeActivation"] = readTuple()
+            activationAttemptCount += 1
+            try session.setActive(true)
+            activationSuccessCount += 1
+            result["afterActivation"] = readTuple()
+            try require(calls.calls.allSatisfy(\.hasEnded), "Call state changed during activation.")
+            try require(session.currentRoute.inputs.contains { $0.portType == .builtInMic }, "The selected route is not built-in input; do not force a route.")
+
+            phase = "construct sole engine and verify raw input"
+            let ownedEngine = AVAudioEngine()
+            engine = ownedEngine
+            let ownedInput = ownedEngine.inputNode
+            input = ownedInput
+            func recordRawInput(_ label: String) throws {
+                result[label + "VoiceProcessingEnabled"] = ownedInput.isVoiceProcessingEnabled
+                try require(!ownedInput.isVoiceProcessingEnabled, "Voice processing was enabled.")
+                let unit = try XCTUnwrap(ownedInput.audioUnit, "Input node has no AudioUnit.")
+                let component = try XCTUnwrap(AudioComponentInstanceGetComponent(unit))
+                var description = AudioComponentDescription()
+                let status = AudioComponentGetDescription(component, &description)
+                result[label + "ComponentStatus"] = status
+                result[label + "ComponentType"] = description.componentType
+                result[label + "ComponentSubType"] = description.componentSubType
+                try require(status == noErr && description.componentType == kAudioUnitType_Output
+                    && description.componentSubType == kAudioUnitSubType_RemoteIO, "The engine input is not raw RemoteIO.")
+            }
+            try recordRawInput("beforeStart")
+            let format = ownedInput.outputFormat(forBus: 0)
+            result["tapFormatSampleRate"] = format.sampleRate
+            result["tapFormatChannels"] = format.channelCount
+            result["tapFormatInterleaved"] = format.isInterleaved
+            try require(format.sampleRate.isFinite && format.sampleRate > 0
+                && format.channelCount > 0 && format.channelCount <= 8
+                && format.commonFormat == .pcmFormatFloat32, "The actual input-node format is unavailable or unsupported by this scalar probe.")
+            let measurements = PhysicalInputTapJournal(sampleRate: format.sampleRate, channels: format.channelCount)
+            journal = measurements
+            let fence = PhysicalInputTapCallFence(journal: measurements)
+            callFence = fence
+            calls.setDelegate(fence, queue: .main)
+            try require(calls.calls.allSatisfy(\.hasEnded), "Call state changed before tap installation.")
+            interruptionObserver = NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification, object: session, queue: nil
+            ) { @Sendable notification in
+                if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                   raw == AVAudioSession.InterruptionType.began.rawValue {
+                    measurements.closeForPrivacyBoundary()
+                }
+            }
+            ownedInput.installTap(onBus: 0, bufferSize: 1_024, format: format) { @Sendable buffer, time in
+                measurements.observe(buffer, when: time)
+            }
+            tapWasInstalled = true
+            phase = "start engine once"
+            ownedEngine.prepare()
+            try ownedEngine.start()
+            try recordRawInput("afterStart")
+            result["afterStart"] = readTuple()
+            var policyOneAtCaptureBoundaries = session.routeSharingPolicy == .longFormAudio
+            var previous = measurements.snapshot
+            result["windowBaseline"] = previous.scalars
+            var bothWindowsAdvanced = true
+            for window in 1...2 {
+                phase = "capture window \(window)"
+                try await Task.sleep(for: .milliseconds(500))
+                let current = measurements.snapshot
+                result["window\(window)"] = current.scalars
+                result["afterWindow\(window)"] = readTuple()
+                let advanced = current.advanced(since: previous)
+                result["window\(window)Advanced"] = advanced
+                bothWindowsAdvanced = bothWindowsAdvanced && advanced
+                policyOneAtCaptureBoundaries = policyOneAtCaptureBoundaries && session.routeSharingPolicy == .longFormAudio
+                try require(calls.calls.allSatisfy(\.hasEnded) && !current.privacyBoundaryObserved,
+                            "Call or interruption invalidated this capture window.")
+                try require(ownedEngine.isRunning && !ownedInput.isVoiceProcessingEnabled
+                    && session.currentRoute.inputs.contains { $0.portType == .builtInMic }
+                    && session.category == .playAndRecord && session.mode == .default
+                    && session.categoryOptions == duplexOptions,
+                    "The engine, built-in input route, or requested category tuple changed during capture.")
+                previous = current
+            }
+            result["policyOneAtCaptureBoundaries"] = policyOneAtCaptureBoundaries
+            result["bothCaptureWindowsAdvanced"] = bothWindowsAdvanced
+            result["captureWithPolicyOneProved"] = policyOneAtCaptureBoundaries && bothWindowsAdvanced
+            XCTAssertTrue(policyOneAtCaptureBoundaries, "Engine startup or capture changed the observed policy; do not claim capture under policy1.")
+            XCTAssertTrue(bothWindowsAdvanced, "Both independent 500 ms windows require real, finite, nonzero input and advancing sample times.")
+        } catch {
+            result["failurePhase"] = phase
+            result["failureErrorCode"] = (error as NSError).code
+            result["failureErrorDomain"] = (error as NSError).domain
+            XCTFail("Standalone input characterization failed during \(phase): \(error)")
+        }
+
+        journal?.closeForPrivacyBoundary()
+        engine?.stop()
+        if tapWasInstalled { input?.removeTap(onBus: 0) }
+        engine?.reset()
+        result["engineStopped"] = engine?.isRunning != true
+        result["tapRemoved"] = !tapWasInstalled || input != nil
+        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
+        calls.setDelegate(nil, queue: nil)
+        withExtendedLifetime(callFence) {}
+        input = nil
+        engine = nil
+        if activationSuccessCount == 1 {
+            deactivationAttemptCount += 1
+            do {
+                try session.setActive(false, options: .notifyOthersOnDeactivation)
+                result["deactivationSucceeded"] = true
+            } catch {
+                result["deactivationSucceeded"] = false
+                result["deactivationErrorCode"] = (error as NSError).code
+                XCTFail("The single activation-release attempt failed: \(error)")
+            }
+        }
+        if let installedTarget {
+            installedTarget.command.removeTarget(installedTarget.target)
+            targetRemovalCount += 1
+        }
+        result["afterTargetRemoval"] = readTuple()
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { result["targetRemovalWaitCancelled"] = true }
+        result["afterTargetRemovalWait"] = readTuple()
+        result["capturedInitialRestoreAttemptCount"] = 1
+        do {
+            try session.setCategory(initialCategory, mode: initialMode,
+                                    policy: initialPolicy, options: initialOptions)
+            result["capturedInitialRestoreSucceeded"] = true
+        } catch {
+            result["capturedInitialRestoreSucceeded"] = false
+            result["capturedInitialRestoreErrorCode"] = (error as NSError).code
+            XCTFail("The single captured-baseline restoration attempt failed: \(error)")
+        }
+        result["afterCapturedInitialRestore"] = readTuple()
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { result["restoreReadWaitCancelled"] = true }
+        result["afterCapturedInitialRestoreWait"] = readTuple()
+        result["activationAttemptCount"] = activationAttemptCount
+        result["activationSuccessCount"] = activationSuccessCount
+        result["deactivationAttemptCount"] = deactivationAttemptCount
+        result["targetRemovalCount"] = targetRemovalCount
+        XCTAssertEqual(deactivationAttemptCount, activationSuccessCount)
+        XCTAssertEqual(targetRemovalCount, 1)
+        XCTAssertEqual(session.category, initialCategory)
+        XCTAssertEqual(session.mode, initialMode)
+        XCTAssertEqual(session.categoryOptions, initialOptions)
+        XCTAssertEqual(session.routeSharingPolicy, initialPolicy)
+        #endif
+    }
+
+    private enum PhysicalMediaPlayerSetterOperation: String {
+        case restoreAfterTargetRemoval
+        case duplexBeforeTarget
+        case duplexWhileTargetRegistered
+    }
+
+    /// These inactive-only experiments restore the supported tuple captured before registration,
+    /// never the potentially unsupported tuple that MediaPlayer later reports. No ADM is created.
+    private func checkPhysicalInertMediaPlayerSetterPolicy(
+        _ operation: PhysicalMediaPlayerSetterOperation
+    ) async throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("Inactive MediaPlayer setter characterization requires a fresh physical inert test host.")
+        #else
+        guard OpensteamerAppRootMode.isPhysicalUpdateValidationHost else {
+            return XCTFail("Run only with OPENSTEAMER_UPDATE_VALIDATION_HOST.")
+        }
+        guard !Self.physicalMediaPlayerPolicyExperimentWasInvoked else {
+            return XCTFail("Select exactly one MediaPlayer experiment per fresh test-host process.")
+        }
+        Self.physicalMediaPlayerPolicyExperimentWasInvoked = true
+        let session = AVAudioSession.sharedInstance()
+        let initialCategory = session.category
+        let initialMode = session.mode
+        let initialOptions = session.categoryOptions
+        let initialPolicy = session.routeSharingPolicy
+        let duplexOptions: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
+        func readTuple() -> [String: Any] {
+            [
+                "category": session.category.rawValue,
+                "mode": session.mode.rawValue,
+                "optionsRaw": session.categoryOptions.rawValue,
+                "policyRaw": session.routeSharingPolicy.rawValue,
+                "matchesCapturedInitial": session.category == initialCategory && session.mode == initialMode
+                    && session.categoryOptions == initialOptions && session.routeSharingPolicy == initialPolicy,
+                "matchesCanonicalDuplex": session.category == .playAndRecord && session.mode == .default
+                    && session.categoryOptions == duplexOptions && session.routeSharingPolicy == .default,
+            ]
+        }
+        var result: [String: Any] = [
+            "operation": operation.rawValue,
+            "processID": ProcessInfo.processInfo.processIdentifier,
+            "inertAppRoot": true,
+            "firstExperimentInvocation": true,
+            "inputActivationCount": 0,
+            "outputActivationCount": 0,
+            "nativeScenario4Invoked": false,
+            "beforeAPI": readTuple(),
+        ]
+        var installedTarget: (command: MPRemoteCommand, target: Any)?
+        var targetRegistrationCount = 0
+        var targetRemovalCount = 0
+        var duplexSetterCount = 0
+        var capturedInitialRestoreCount = 0
+        func removeExactTarget() {
+            guard let owned = installedTarget else { return }
+            installedTarget = nil
+            owned.command.removeTarget(owned.target)
+            targetRemovalCount += 1
+        }
+        func applyDuplex(prefix: String) {
+            duplexSetterCount += 1
+            do {
+                try session.setCategory(.playAndRecord, mode: .default,
+                                        policy: .default, options: duplexOptions)
+                result[prefix + "Applied"] = true
+                result[prefix + "ErrorCode"] = 0
+            } catch {
+                result[prefix + "Applied"] = false
+                result[prefix + "ErrorCode"] = (error as NSError).code
+                result[prefix + "ErrorDomain"] = (error as NSError).domain
+            }
+            result[prefix + "Immediate"] = readTuple()
+        }
+        defer {
+            removeExactTarget()
+            result["targetRegistrationCount"] = targetRegistrationCount
+            result["targetRemovalCount"] = targetRemovalCount
+            result["duplexSetterCount"] = duplexSetterCount
+            result["capturedInitialRestoreCount"] = capturedInitialRestoreCount
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                attachment.name = "physical-inert-mediaplayer-setter-\(operation.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else {
+                XCTFail("Could not encode inactive setter characterization evidence.")
+            }
+        }
+        guard initialCategory == .soloAmbient, initialMode == .default,
+              initialOptions.isEmpty, initialPolicy == .default else {
+            result["skipReason"] = "Required pre-registration soloAmbient/default/options0/policy0 baseline was absent; no APIs or setters ran."
+            return
+        }
+        do {
+            if operation == .duplexBeforeTarget {
+                applyDuplex(prefix: "duplexBeforeTarget")
+            }
+            let play = MPRemoteCommandCenter.shared().playCommand
+            let target = play.addTarget { @Sendable _ in .commandFailed }
+            installedTarget = (play, target)
+            targetRegistrationCount += 1
+            result["afterRegistration"] = readTuple()
+            try await Task.sleep(for: .milliseconds(100))
+            result["afterRegistration100Milliseconds"] = readTuple()
+            if operation == .duplexWhileTargetRegistered {
+                result["targetRegisteredDuringDuplexSetter"] = installedTarget != nil
+                applyDuplex(prefix: "duplexWhileTargetRegistered")
+                try await Task.sleep(for: .milliseconds(100))
+                result["duplexWhileTargetRegistered100Milliseconds"] = readTuple()
+            }
+            removeExactTarget()
+            result["afterRemoval"] = readTuple()
+            if operation == .restoreAfterTargetRemoval {
+                try await Task.sleep(for: .milliseconds(100))
+                result["afterRemoval100Milliseconds"] = readTuple()
+            }
+        } catch {
+            result["measurementWaitCancelled"] = true
+            result["measurementWaitErrorCode"] = (error as NSError).code
+        }
+        removeExactTarget()
+        // This is A's sole measured restoration and B/C's sole final restoration, even if
+        // an earlier setter failed. A failed restoration is recorded, never retried.
+        capturedInitialRestoreCount += 1
+        do {
+            try session.setCategory(initialCategory, mode: initialMode,
+                                    policy: initialPolicy, options: initialOptions)
+            result["capturedInitialRestoreApplied"] = true
+            result["capturedInitialRestoreErrorCode"] = 0
+        } catch {
+            result["capturedInitialRestoreApplied"] = false
+            result["capturedInitialRestoreErrorCode"] = (error as NSError).code
+            result["capturedInitialRestoreErrorDomain"] = (error as NSError).domain
+        }
+        result["afterCapturedInitialRestore"] = readTuple()
+        do {
+            try await Task.sleep(for: .milliseconds(100))
+            result["afterCapturedInitialRestore100Milliseconds"] = readTuple()
+        } catch {
+            result["restoreReadWaitCancelled"] = true
+            result["afterCancelledRestoreReadWait"] = readTuple()
+        }
+        XCTAssertEqual(targetRegistrationCount, 1)
+        XCTAssertEqual(targetRemovalCount, 1)
+        XCTAssertEqual(capturedInitialRestoreCount, 1)
+        XCTAssertEqual(duplexSetterCount, operation == .restoreAfterTargetRemoval ? 0 : 1)
+        // Test completion proves only the bounded experiment ran. Setter errors and tuple
+        // readbacks in the attachment determine the result; no microphone capture was attempted.
+        #endif
+    }
+
+    private enum PhysicalMediaPlayerPolicyOperation: String {
+        case remoteCommandCenterShared
+        case disabledPlayCommandTarget
+        case nowPlayingInfoCenterDefault
+        case clearingNowPlayingInfo
+        case stoppedPlaybackState
+        case playCommandTargetOnly
+        case disablingPlayCommandOnly
+        case disabledPlayTargetRemoval
+    }
+
+    private static var physicalMediaPlayerPolicyExperimentWasInvoked = false
+
+    /// One selected API in an otherwise inert, fresh physical process. A contaminated tuple is
+    /// evidence, not permission to try setters that cannot restore the original session state.
+    private func checkPhysicalInertMediaPlayerPolicy(
+        _ operation: PhysicalMediaPlayerPolicyOperation
+    ) async throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("MediaPlayer policy characterization requires a fresh physical inert test host.")
+        #else
+        guard OpensteamerAppRootMode.isPhysicalUpdateValidationHost else {
+            return XCTFail("Run only with OPENSTEAMER_UPDATE_VALIDATION_HOST; production startup contaminates this experiment.")
+        }
+        guard !Self.physicalMediaPlayerPolicyExperimentWasInvoked else {
+            return XCTFail("Select exactly one MediaPlayer experiment per fresh test-host process.")
+        }
+        Self.physicalMediaPlayerPolicyExperimentWasInvoked = true
+        let session = AVAudioSession.sharedInstance()
+        func readTuple() -> [String: Any] {
+            [
+                "category": session.category.rawValue,
+                "mode": session.mode.rawValue,
+                "optionsRaw": session.categoryOptions.rawValue,
+                "policyRaw": session.routeSharingPolicy.rawValue,
+            ]
+        }
+        func tupleAllowsSafeNativeScenario() -> Bool {
+            let categories: [AVAudioSession.Category] = [.soloAmbient, .ambient, .playback]
+            return categories.contains(session.category)
+                && session.mode == .default
+                && session.categoryOptions.isEmpty
+                && session.routeSharingPolicy == .default
+        }
+        var result: [String: Any] = [
+            "operation": operation.rawValue,
+            "processID": ProcessInfo.processInfo.processIdentifier,
+            "inertAppRoot": true,
+            "firstExperimentInvocation": true,
+            "apiExecuted": false,
+            "nativeScenario4Invoked": false,
+            "inputActivationCount": 0,
+            "beforeAPI": readTuple(),
+        ]
+        var removeInstalledTarget: (() -> Void)?
+        defer {
+            removeInstalledTarget?()
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                attachment.name = "physical-inert-mediaplayer-policy-\(operation.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else {
+                XCTFail("Could not encode MediaPlayer policy characterization evidence.")
+            }
+        }
+        guard tupleAllowsSafeNativeScenario() else {
+            result["skipReason"] = "Initial tuple is not a known restorable default-policy tuple; neither the selected API nor native setters ran."
+            return
+        }
+
+        switch operation {
+        case .remoteCommandCenterShared:
+            _ = MPRemoteCommandCenter.shared()
+        case .disabledPlayCommandTarget, .playCommandTargetOnly, .disabledPlayTargetRemoval:
+            let play = MPRemoteCommandCenter.shared().playCommand
+            let target = play.addTarget { @Sendable _ in .commandFailed }
+            removeInstalledTarget = { play.removeTarget(target) }
+            if operation != .playCommandTargetOnly { play.isEnabled = false }
+        case .disablingPlayCommandOnly:
+            MPRemoteCommandCenter.shared().playCommand.isEnabled = false
+        case .nowPlayingInfoCenterDefault:
+            _ = MPNowPlayingInfoCenter.default()
+        case .clearingNowPlayingInfo:
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        case .stoppedPlaybackState:
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+        }
+        result["apiExecuted"] = true
+        result["afterAPI"] = readTuple()
+        try await Task.sleep(for: .milliseconds(100))
+        result["after100Milliseconds"] = readTuple()
+        if operation == .disabledPlayTargetRemoval {
+            XCTAssertNotNil(removeInstalledTarget)
+            removeInstalledTarget?()
+            removeInstalledTarget = nil
+            result["exactTargetRemovedBeforeNativeScenario"] = true
+            result["afterRemoval"] = readTuple()
+            try await Task.sleep(for: .milliseconds(100))
+            result["afterRemoval100Milliseconds"] = readTuple()
+        }
+        guard tupleAllowsSafeNativeScenario() else {
+            result["skipReason"] = "The selected API left a nonrestorable or nondefault tuple; no native scenario or restoration setters ran."
+            return
+        }
+
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        result["nativeScenario4Invoked"] = true
+        let native = harness.debugProbeRealSessionPolicySetterScenarioForTesting(4)
+        result["nativeScenario4"] = native
+        if try retryValue("initialTupleRejectedBeforeMutation", in: native).boolValue {
+            XCTAssertFalse(try retryValue("restoreAttempted", in: native).boolValue)
+            result["skipReason"] = "The tuple changed before native entry; the native guard rejected it without mutation or restoration."
+            return
+        }
+        for key in ["scenarioIsValid", "firstScenarioInvocation", "sequenceCompleted",
+                    "configurationLockAcquired", "ownershipLockAcquired", "initiallyQuiescent",
+                    "initialTupleRestorable", "cleanupOutputDeactivated", "restored",
+                    "restoredTupleExact", "nativeRemainedQuiescent"] {
+            XCTAssertTrue(try retryValue(key, in: native).boolValue, "\(key): \(native)")
+        }
+        XCTAssertEqual(try retryValue("inputActivationCount", in: native).intValue, 0)
+        XCTAssertTrue(try retryValue("restoreAttempted", in: native).boolValue)
+        XCTAssertEqual(try retryValue("restoreError", in: native).intValue, 0)
+        // Success only means this selected experiment completed safely. The attachment's
+        // inputImmediate tuple reports the setter outcome; this is never microphone proof.
+        #endif
+    }
+
+    func testNativeFailureContextRetainsRouteFactsBeforeInnerRollback() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRetainedFailureContextForTesting()
+        for key in [
+            "initiallyAbsent", "innerFailure", "routeChangedDuringInnerCleanup",
+            "innerSessionAvailable", "innerSessionActive", "innerOwnsActivation",
+            "innerInputRequired", "innerHasOutputRoute", "innerCategoryRecord",
+            "innerDefaultMode", "innerMicrophoneOptions", "originalIdentityPreserved",
+            "liveRolledBack", "healthyStateIsSeparate",
+        ] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+        XCTAssertEqual(try retryValue("activationCount", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("deactivationCount", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("innerStage", in: result).intValue, 3)
+        XCTAssertEqual(try retryValue("innerReason", in: result).intValue, 2)
+        XCTAssertEqual(try retryValue("innerCode", in: result).intValue, 4)
+        XCTAssertEqual(try retryValue("innerStatus", in: result).intValue, Int(kAudio_ParamError))
+        XCTAssertEqual(try retryValue("innerRate", in: result).doubleValue, 44100)
+        XCTAssertEqual(try retryValue("innerDuration", in: result).doubleValue, 0.02)
+        XCTAssertEqual(try retryValue("innerInputChannels", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("innerOutputChannels", in: result).intValue, 1)
+    }
+
+    func testNativeFailureContextSeparatesInitStartAndRejectsOlderEvents() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRetainedFailureContextForTesting()
+        XCTAssertEqual(try retryValue("initializationStage", in: result).intValue, 7)
+        XCTAssertEqual(try retryValue("initializationStatus", in: result).intValue, -10868)
+        XCTAssertEqual(try retryValue("initializationRate", in: result).doubleValue, 48000)
+        XCTAssertTrue(try retryValue("initializationActive", in: result).boolValue)
+        XCTAssertEqual(try retryValue("startStage", in: result).intValue, 10)
+        XCTAssertEqual(try retryValue("startStatus", in: result).intValue, -66635)
+        for key in ["monotonicEvents", "staleRecordRejected", "laterHealthyRetainsLastFailure"] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)")
+        }
+    }
+
+    func testOptionalNativeDiagnosticsRejectsContentionWithoutPartialSnapshot() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugBoundedDiagnosticsReadForTesting()
+        for key in [
+            "ownershipUnavailable", "ownershipOutputUntouched",
+            "failureUnavailable", "failureOutputUntouched",
+            "publicationUnavailable", "publicationOutputUntouched",
+            "generationUnavailable", "generationOutputUntouched",
+            "healthyReadAccepted", "healthyPlaying", "healthySessionActive",
+        ] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, key)
+        }
+        XCTAssertEqual(try retryValue("boundedAttempts", in: result).intValue, 8)
+        XCTAssertEqual(try retryValue("healthyAttempts", in: result).intValue, 1)
+        XCTAssertEqual(try retryValue("healthyCallbackCount", in: result).uint64Value, 0)
+    }
+
+    func testExactRecoveryRevokedWhileQueuedNeverInvokesVendorHook() throws {
+        let result = try assertExactRetryFailure(.revokedWhileQueued)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("configurationDelta", in: result).intValue, 0)
+    }
+
+    func testExactRecoveryRetiredTagWhileQueuedNeverInvokesVendorHook() throws {
+        let result = try assertExactRetryFailure(.retiredTagWhileQueued)
+        XCTAssertEqual(try retryValue("delegateRetryCount", in: result).intValue, 0)
+        XCTAssertEqual(try retryValue("configurationDelta", in: result).intValue, 0)
+    }
+
+    private func assertExactRetryFailure(
+        _ scenario: WebRTCIOSPlayoutRetryFailureTestScenario,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [String: NSNumber] {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugPlayoutRetryFailureForTesting(scenario)
+        for key in [
+            "initialInitializeFailed", "staged", "queued", "boundaryApplied",
+            "ranRecovery", "exactTerminal", "exactDrain", "nextOperationCanStage",
+            "nextOperationRetired",
+        ] {
+            XCTAssertTrue(try retryValue(key, in: result).boolValue, "\(key): \(result)", file: file, line: line)
+        }
+        XCTAssertEqual(
+            try retryValue("revoked", in: result).boolValue,
+            scenario == .revokedWhileQueued,
+            "\(result)", file: file, line: line
+        )
+        XCTAssertEqual(
+            try retryValue("rejected", in: result).boolValue,
+            scenario != .revokedWhileQueued,
+            "\(result)", file: file, line: line
+        )
+        for key in ["policyMatches", "playing", "sessionActive", "ownsSessionActivation", "inputBusEnabled"] {
+            XCTAssertFalse(try retryValue(key, in: result).boolValue, "\(key): \(result)", file: file, line: line)
+        }
+        return result
+    }
+
+    private func retryValue(_ key: String, in result: [String: NSNumber]) throws -> NSNumber {
+        try XCTUnwrap(result[key], "Missing native result: \(key)")
+    }
+
     func testRecoveryAuthorizationPublishesExactTerminalOutcomeAndGeneration() {
         let accepted = WebRTCIOSPlayoutRecoveryAuthorization()
         let rejected = WebRTCIOSPlayoutRecoveryAuthorization()
@@ -64,6 +1340,26 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
             }
         )
         XCTAssertEqual(counter.value, 0)
+    }
+
+    func testExactNativeAudioPolicyEffectsRejectMissingTransactionTag() {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+
+        XCTAssertTrue(
+            harness
+                .debugExactAudioPolicyEffectsRejectMissingTagForTesting()
+        )
+    }
+
+    func testInitializedMicrophoneCloseFailsClosedWithoutDelegate() {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+
+        XCTAssertTrue(
+            harness
+                .debugInitializedMicrophoneCloseFailsClosedWithoutDelegateForTesting()
+        )
     }
 
     func testMicrophoneRealtimeGateRevocationDrainsExactAdmission() {
@@ -712,7 +2008,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
             harness.debugExpectedCategoryObservationIsAbsorbedForTesting(
                 .outputOnlyExact
             ),
-            "The exact playback/default/empty notification must remain tied to its output-only transaction."
+            "The exact playback/default-mode/empty/longFormAudio notification must remain tied to its output-only transaction."
         )
     }
 
@@ -1290,8 +2586,91 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertEqual(accepted.requestCount, 2)
         XCTAssertEqual(accepted.authorizationRejectionCount, 1)
         XCTAssertEqual(accepted.rebuildCount, 1)
-        XCTAssertFalse(accepted.sessionActive)
+        XCTAssertTrue(accepted.sessionActive)
+        XCTAssertFalse(accepted.inputBusEnabled)
         XCTAssertFalse(accepted.remoteIOCreated)
+    }
+
+    func testRecoveryBeforeNativeInterruptionEndNeedsFreshAuthorizationAfterEnd() {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        harness.debugMarkHealthyPlayoutForTesting()
+        harness.debugMarkInterruptedFailClosedForTesting()
+        let baseline = harness.diagnostics
+        let configurationCount = harness.configurationOperationCount
+        XCTAssertEqual(baseline.failureCode, 17)
+        XCTAssertFalse(baseline.sessionActive)
+
+        // Inject an adverse native queue order directly. This characterizes
+        // fail-closed behavior, not production AVAudioSession notification order.
+        let earlyAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
+        harness.queueRecovery(authorization: earlyAuthorization)
+        harness.debugQueueInterruptionEndedForTesting()
+        XCTAssertEqual(harness.queuedOperationCount, 2)
+
+        XCTAssertTrue(harness.runNextQueuedOperation())
+        let rejected = harness.diagnostics
+        XCTAssertEqual(earlyAuthorization.terminalOutcome, .rejected)
+        XCTAssertEqual(earlyAuthorization.terminalGeneration, earlyAuthorization.generation)
+        XCTAssertEqual(rejected.failureCode, 17)
+        XCTAssertEqual(rejected.authorizationRejectionCount, baseline.authorizationRejectionCount + 1)
+        XCTAssertEqual(rejected.rebuildCount, baseline.rebuildCount)
+        XCTAssertEqual(harness.configurationOperationCount, configurationCount)
+        XCTAssertFalse(rejected.sessionActive)
+        XCTAssertFalse(rejected.inputBusEnabled)
+
+        XCTAssertTrue(harness.runNextQueuedOperation())
+        let ended = harness.diagnostics
+        XCTAssertEqual(ended.failureCode, 18)
+        XCTAssertTrue(ended.recoveryRequired)
+        XCTAssertFalse(ended.sessionActive)
+        XCTAssertFalse(ended.inputBusEnabled)
+        XCTAssertEqual(harness.queuedOperationCount, 0)
+        XCTAssertEqual(earlyAuthorization.terminalOutcome, .rejected)
+
+        let freshAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
+        harness.queueRecovery(authorization: freshAuthorization)
+        XCTAssertTrue(harness.runNextQueuedOperation())
+        let recovered = harness.diagnostics
+        XCTAssertTrue(freshAuthorization.hasAcceptedTerminalOutcome)
+        XCTAssertEqual(recovered.rebuildCount, baseline.rebuildCount + 1)
+        XCTAssertTrue(recovered.sessionActive)
+        XCTAssertFalse(recovered.inputBusEnabled)
+        XCTAssertEqual(recovered.failureCode, 0)
+    }
+
+    func testRecoveryStagedBeforeNativeInterruptionEndLosesExactTagBeforeExecution() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugRecoveryStagedBeforeInterruptionEndForTesting()
+        func value(_ key: String) throws -> NSNumber {
+            try XCTUnwrap(result[key], "Missing native result: \(key)")
+        }
+        for key in ["targetBound", "endedRan", "recoveryRan", "rejected",
+                    "terminalMatchesAuthorization", "noRebuild", "remainedClosed",
+                    "freshTargetBound", "freshRecoveryRan", "freshAccepted",
+                    "freshPolicyMatches", "freshSessionActive", "inputRemainedClosed"] {
+            XCTAssertTrue(try value(key).boolValue, key)
+        }
+        XCTAssertGreaterThan(try value("tagGeneration").uint64Value, 0)
+        XCTAssertEqual(try value("afterEndFailure").intValue, 18)
+        XCTAssertEqual(try value("rejectionCountDelta").intValue, 1)
+        XCTAssertGreaterThan(try value("freshTagGeneration").uint64Value,
+                             try value("tagGeneration").uint64Value)
+    }
+
+    func testSystemAudioEventFenceIsFIFOObservationalAndBoundToLiveDevice() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugSystemAudioEventFenceForTesting()
+        for key in ["fifoQueued", "endedBeforeCompletion", "completionOutsideLock", "fenceCompletedOnce",
+                    "fenceNoAudioSideEffects", "freshStagingAfterFenceSurvives", "pendingTagPreserved",
+                    "preservedTagStillUsable", "wrongDevice", "wrongRegistration", "missingDelegate",
+                    "uninitialized", "invalidRegistration", "queuedDeviceChange", "queuedRegistrationReplacement",
+                    "queuedRegistrationInvalidation", "queuedDelegateReplacement", "queuedTermination",
+                    "queuedReinitialization"] {
+            XCTAssertTrue(try XCTUnwrap(result[key], "Missing native result: \(key)").boolValue, key)
+        }
     }
 
     // MARK: - Connected hosted-call playout recovery
@@ -1619,7 +2998,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(healthy.categoryOptionsAreEmpty)
         XCTAssertFalse(healthy.categoryOptionsAreIPhoneMicrophoneRouting)
         XCTAssertFalse(healthy.categoryOptionsAreMixWithOthers)
-        XCTAssertTrue(healthy.routeSharingPolicyIsDefault)
+        XCTAssertFalse(healthy.routeSharingPolicyIsDefault)
         XCTAssertTrue(healthy.hasOutputRoute)
         XCTAssertFalse(healthy.hostedCallMode)
         assertLastRecordedAudioConfiguration(
@@ -2152,7 +3531,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(normal.categoryOptionsAreEmpty)
         XCTAssertFalse(normal.categoryOptionsAreIPhoneMicrophoneRouting)
         XCTAssertFalse(normal.categoryOptionsAreMixWithOthers)
-        XCTAssertTrue(normal.routeSharingPolicyIsDefault)
+        XCTAssertFalse(normal.routeSharingPolicyIsDefault)
         XCTAssertTrue(normal.hasOutputRoute)
         XCTAssertFalse(normal.hostedCallMode)
         XCTAssertFalse(normal.hostedCallAuthorizationValid)
@@ -2659,6 +4038,384 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         await viewer.close()
     }
 
+    func testPublicMicrophonePolicyRejectsUnboundCapabilitiesBeforeNativeEffect()
+        async throws
+    {
+        let viewer = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .viewer,
+                iceServers: []
+            )
+        )
+        let nativePolicyCallCount = LockedInteger()
+        await viewer.debugInstallIPhoneMicrophonePolicyApplier { _ in
+            nativePolicyCallCount.increment()
+            return true
+        }
+
+        let microphoneAuthorization = WebRTCIOSMicrophoneAuthorization()
+        do {
+            try await viewer.enableIPhoneMicrophone(
+                authorization: microphoneAuthorization
+            )
+            XCTFail("An unbound public microphone authorization must fail closed.")
+        } catch {
+            XCTAssertFalse(microphoneAuthorization.isValid)
+            XCTAssertNil(
+                microphoneAuthorization.stagedTransactionTagGeneration
+            )
+        }
+
+        let outputOnlyToken = WebRTCIOSOutputOnlyMicrophoneToken(
+            ownerEpoch: UUID(),
+            lifecycleGeneration: 1,
+            target: WebRTCIOSOutputOnlyMicrophoneTarget(
+                category: AVAudioSession.Category.playback.rawValue,
+                mode: AVAudioSession.Mode.default.rawValue
+            )
+        )
+        let outputOnlyApplied = await viewer.disableIPhoneMicrophone(
+            outputOnlyToken: outputOnlyToken
+        )
+
+        XCTAssertFalse(outputOnlyApplied)
+        XCTAssertEqual(outputOnlyToken.state, .revoked)
+        XCTAssertNil(outputOnlyToken.stagedTransactionTagGeneration)
+        XCTAssertEqual(nativePolicyCallCount.value, 0)
+        let closeResult = await viewer.close()
+        XCTAssertTrue(closeResult)
+    }
+
+    /// Only the viewer touches hardware. The second peer negotiates normally but its injected
+    /// device has no audio I/O; this proves native capture and sender RTP, not a Mac consumer.
+    func testPhysicalSoleViewerRemoteIOCapturesMicrophoneAcrossPublicAdmissionCycles() async throws {
+        executionTimeAllowance = 90
+        #if !DEBUG
+        throw XCTSkip("The no-hardware host fixture is DEBUG-only.")
+        #elseif targetEnvironment(simulator)
+        throw XCTSkip("Real RemoteIO microphone capture requires the authorized spare physical phone.")
+        #else
+        var result: [String: Any] = [
+            "processID": ProcessInfo.processInfo.processIdentifier,
+            "inertAppRoot": OpensteamerAppRootMode.isPhysicalUpdateValidationHost,
+            "bundleIdentifier": Bundle.main.bundleIdentifier ?? "<missing>",
+            "storedPCMBufferCount": 0, "macConsumptionProved": false,
+            "networkTraversalProved": false, "productionViewModelExercised": false,
+            "completedCycles": 0,
+        ]
+        defer {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                attachment.name = "physical-sole-viewer-remoteio-public-microphone-cycles"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else { XCTFail("Could not encode sole-viewer microphone evidence.") }
+        }
+        func require(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw PhysicalInputTapProbeError.requirement(message) }
+        }
+        try require(OpensteamerAppRootMode.isPhysicalUpdateValidationHost, "The actual app root must be inert.")
+        try require(Bundle.main.bundleIdentifier == "org.example.AudioStreamer.dev", "The distinct spare development app is required.")
+        try require(!Self.physicalMediaPlayerPolicyExperimentWasInvoked, "Select one experiment per fresh host process.")
+        Self.physicalMediaPlayerPolicyExperimentWasInvoked = true
+        let clock = ContinuousClock()
+        let activeDeadline = clock.now.advanced(by: .seconds(2))
+        while UIApplication.shared.applicationState != .active, clock.now < activeDeadline {
+            try await clock.sleep(until: min(activeDeadline, clock.now.advanced(by: .milliseconds(25))))
+        }
+        result["applicationStateRaw"] = UIApplication.shared.applicationState.rawValue
+        result["permissionRaw"] = AVAudioApplication.shared.recordPermission.rawValue
+        try require(UIApplication.shared.applicationState == .active, "The real test app did not become active within two seconds.")
+        try require(AVAudioApplication.shared.recordPermission == .granted, "Permission must already be granted; this test never requests it.")
+        let calls = CXCallObserver()
+        try require(calls.calls.allSatisfy(\.hasEnded), "A nonended call forbids microphone testing.")
+        let session = AVAudioSession.sharedInstance()
+        let initialCategory = session.category
+        let initialMode = session.mode
+        let initialOptions = session.categoryOptions
+        let initialPolicy = session.routeSharingPolicy
+        func tuple() -> [String: Any] {
+            ["category": session.category.rawValue, "mode": session.mode.rawValue,
+             "optionsRaw": session.categoryOptions.rawValue, "policyRaw": session.routeSharingPolicy.rawValue]
+        }
+        result["beforeRegistration"] = tuple()
+        try require(initialCategory == .soloAmbient && initialMode == .default
+            && initialOptions.isEmpty && initialPolicy == .default, "A supported untouched initial tuple is required.")
+        let quiescence = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = quiescence.debugTerminateForTesting() }
+        try require(quiescence.debugRealSessionIsQuiescentForTesting(), "Another native audio owner is present.")
+
+        let privacy = PhysicalMicrophoneAuthorizationFence()
+        calls.setDelegate(privacy, queue: .main)
+        let interruptions = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: session, queue: nil
+        ) { @Sendable notification in
+            if (notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt)
+                == AVAudioSession.InterruptionType.began.rawValue { privacy.close() }
+        }
+        let inactive = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: nil
+        ) { @Sendable _ in privacy.close() }
+        let playback = WebRTCAudioPlaybackSession()
+        let noHardware = PhysicalNoHardwareAudioDevice()
+        let forwardingFailures = LockedFailures()
+        var host: WebRTCPeer?
+        var viewer: WebRTCPeer?
+        var forwarders: [Task<Void, Never>] = []
+        var authorityJournal: PhysicalMicrophoneAuthorityJournal?
+        var authorityEvents: Task<Void, Never>?
+        var installedTarget: (MPRemoteCommand, Any)?
+        var manualGateOpened = false
+        var phase = "register actual media command"
+        let ownerEpoch = UUID()
+        func requirePrivacy() throws {
+            try require(privacy.isOpen && UIApplication.shared.applicationState == .active
+                && calls.calls.allSatisfy(\.hasEnded), "App, call, or interruption privacy boundary ended the test.")
+        }
+        func scalars(_ stats: WebRTCIPhoneMicrophoneSenderStatistics) -> [String: Any] {
+            let sender = stats.sender
+            return ["recordingGeneration": sender.recordingGeneration,
+                    "approvedRecordingGeneration": sender.approvedRecordingGeneration,
+                    "policyGeneration": sender.microphonePolicyGeneration,
+                    "renderSuccessCallbacks": sender.deliveryCallbackCount,
+                    "renderedFrames": sender.deliveredFrameCount,
+                    "realtimeAdmissions": sender.realtimeAdmissionCount,
+                    "packetsSent": stats.packetsSent, "bytesSent": stats.bytesSent,
+                    "sourceLinked": stats.sourceReportWasLinked,
+                    "sourceEnergy": stats.totalAudioEnergy.map { $0 as Any } ?? NSNull(),
+                    "sourceDuration": stats.totalSamplesDuration.map { $0 as Any } ?? NSNull(),
+                    "rawProcessingLive": sender.rawProcessingIsLive,
+                    "usesRemoteIO": sender.usesRemoteIO,
+                    "builtInInput": sender.captureRouteIsBuiltInMicrophone,
+                    "captureRouteProofGeneration": sender.captureRouteProofGeneration,
+                    "senderAdmitted": sender.senderIsAdmitted,
+                    "sharingDefault": sender.routeSharingPolicyIsDefault,
+                    "sharingLongForm": sender.routeSharingPolicyIsLongFormAudio,
+                    "ordinaryProfileMatches": sender.ordinaryRawMicrophonePolicyMatches]
+        }
+        do {
+            let play = MPRemoteCommandCenter.shared().playCommand
+            installedTarget = (play, play.addTarget { @Sendable _ in .commandFailed })
+            try await Task.sleep(for: .milliseconds(100))
+            result["afterRegistration100Milliseconds"] = tuple()
+            try requirePrivacy()
+            try require(quiescence.debugRealSessionIsQuiescentForTesting(), "Native ownership changed before constructing the viewer.")
+            try playback.activate()
+            manualGateOpened = true
+            let fixtureHost = try WebRTCPeer.makeNoHardwareHostForTesting(
+                configuration: .init(role: .host, iceServers: []), audioDevice: noHardware
+            )
+            host = fixtureHost
+            let physicalViewer = try WebRTCPeer(configuration: .init(role: .viewer, iceServers: []))
+            viewer = physicalViewer
+            let authority = try PhysicalMicrophoneAuthorityJournal(
+                binding: XCTUnwrap(physicalViewer.iOSAudioTransactionDeviceBinding), privacy: privacy
+            )
+            authorityJournal = authority
+            // Attach before negotiation: even an early output-only observation must be recorded
+            // and reduced, not silently discarded before the first microphone operation.
+            authorityEvents = Task {
+                for await event in physicalViewer.iOSAudioTransactionEvents {
+                    guard !Task.isCancelled else { return }
+                    authority.consume(event)
+                }
+            }
+            try require(fixtureHost.externalAudioCapturer == nil, "The fixture host must not expose an audio source capturer.")
+            forwarders.append(Task {
+                for await event in fixtureHost.events {
+                    guard !Task.isCancelled else { return }
+                    switch event {
+                    case .outboundSignal(let payload):
+                        do { try await physicalViewer.receive(payload) }
+                        catch { forwardingFailures.append(error) }
+                    case .remoteAudioTrack(let track): track.setEnabled(false)
+                    default: break
+                    }
+                }
+            })
+            forwarders.append(Task {
+                for await event in physicalViewer.events {
+                    guard !Task.isCancelled else { return }
+                    switch event {
+                    case .outboundSignal(let payload):
+                        do { try await fixtureHost.receive(payload) }
+                        catch { forwardingFailures.append(error) }
+                    case .remoteAudioTrack(let track):
+                        track.setEnabled(privacy.isOpen && track.logicalLane == .systemAudio)
+                    default: break
+                    }
+                }
+            })
+            phase = "normal full peer negotiation and output startup"
+            try await fixtureHost.start()
+            let readyDeadline = clock.now.advanced(by: .seconds(8))
+            var outputReady = false
+            while clock.now < readyDeadline {
+                try requirePrivacy()
+                if let state = await physicalViewer.iPhoneMicrophoneSenderState(),
+                   let output = await physicalViewer.iOSPlayoutDiagnostics(),
+                   state.transportIsHealthy, state.senderOwnsMID, state.senderOwnsLocalTrack,
+                   output.playing, output.remoteIOCreated, output.playoutCallbackCount > 0,
+                   !output.inputBusEnabled, output.routeSharingPolicyIsLongFormAudio,
+                   !output.routeSharingPolicyIsDefault, output.failureCode == 0 {
+                    outputReady = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            try require(outputReady, "Normal negotiated viewer output did not start; no host audio or admission bypass is permitted.")
+            let deviceBinding = physicalViewer.iOSAudioTransactionDeviceBinding
+            var previousRecordingGeneration: UInt64 = 0
+            func readStatistics() async throws -> WebRTCIPhoneMicrophoneSenderStatistics {
+                let deadline = clock.now.advanced(by: .seconds(3))
+                repeat {
+                    try requirePrivacy()
+                    if let stats = await physicalViewer.iPhoneMicrophoneSenderStatistics() { return stats }
+                    try await Task.sleep(for: .milliseconds(50))
+                } while clock.now < deadline
+                throw PhysicalInputTapProbeError.requirement("Exact production microphone sender statistics did not become available.")
+            }
+            for cycle in 1...3 {
+                phase = "public microphone admission cycle \(cycle)"
+                try requirePrivacy()
+                let microphoneOperation = try authority.arm(inputRequired: true)
+                let authorization = WebRTCIOSMicrophoneAuthorization(transaction: microphoneOperation.nativeContext)
+                try require(privacy.install(authorization), "Privacy changed before microphone admission.")
+                try await physicalViewer.enableIPhoneMicrophone(authorization: authorization)
+                try requirePrivacy()
+                var previous = try await readStatistics()
+                try require(previous.sender.recordingGeneration > previousRecordingGeneration,
+                            "Re-admission must own a fresh native recording generation.")
+                previousRecordingGeneration = previous.sender.recordingGeneration
+                result["cycle\(cycle)Baseline"] = scalars(previous)
+                for window in 1...2 {
+                    try await Task.sleep(for: .milliseconds(500))
+                    let current = try await readStatistics()
+                    result["cycle\(cycle)Window\(window)"] = scalars(current)
+                    let old = previous.sender
+                    let new = current.sender
+                    try require(new.recordingGeneration == old.recordingGeneration
+                        && new.approvedRecordingGeneration == new.recordingGeneration
+                        && new.microphonePolicyGeneration == old.microphonePolicyGeneration
+                        && new.rawProcessingIsLive && new.usesRemoteIO && new.captureRouteIsBuiltInMicrophone
+                        && new.senderIsAdmitted && new.authorizationIsCurrent && new.authorizationIsValid
+                        && new.ordinaryRawMicrophonePolicyMatches
+                        && !new.routeSharingPolicyIsDefault && new.routeSharingPolicyIsLongFormAudio,
+                        "The exact authorized raw microphone/effective-policy1 proof changed.")
+                    try require(new.deliveryCallbackCount > old.deliveryCallbackCount
+                        && new.deliveredFrameCount > old.deliveredFrameCount
+                        && current.packetsSent > previous.packetsSent && current.bytesSent > previous.bytesSent
+                        && current.sourceReportWasLinked,
+                        "Real AudioUnitRender-success counters and the exact sender's RTP must advance together.")
+                    let oldEnergy = try XCTUnwrap(previous.totalAudioEnergy)
+                    let energy = try XCTUnwrap(current.totalAudioEnergy)
+                    let oldDuration = try XCTUnwrap(previous.totalSamplesDuration)
+                    let duration = try XCTUnwrap(current.totalSamplesDuration)
+                    try require(oldEnergy.isFinite && energy.isFinite && energy > oldEnergy
+                        && oldDuration.isFinite && duration.isFinite && duration > oldDuration,
+                        "Linked raw microphone source energy and duration must advance; clocks alone are insufficient.")
+                    previous = current
+                }
+                try await authority.retire(
+                    microphoneOperation, tagGeneration: XCTUnwrap(authorization.stagedTransactionTagGeneration),
+                    peer: physicalViewer
+                )
+                phase = "public output-only disable cycle \(cycle)"
+                let outputOperation = try authority.arm(inputRequired: false)
+                let context = outputOperation.nativeContext
+                let token = WebRTCIOSOutputOnlyMicrophoneToken(
+                    operationID: context.operationID, ownerEpoch: ownerEpoch,
+                    lifecycleGeneration: UInt64(cycle),
+                    target: .init(category: AVAudioSession.Category.playback.rawValue,
+                                  mode: AVAudioSession.Mode.default.rawValue), transaction: context
+                )
+                let disabled = await physicalViewer.disableIPhoneMicrophone(
+                    authorization: authorization, outputOnlyToken: token
+                )
+                result["cycle\(cycle)DisableSucceeded"] = disabled
+                result["cycle\(cycle)DisableTokenState"] = token.state.rawValue
+                try require(disabled && token.state == .succeeded && !authorization.isValid,
+                            "The exact one-shot output-only operation did not finish.")
+                try await Task.sleep(for: .milliseconds(100))
+                let beforeDisabledState = await physicalViewer.iPhoneMicrophoneSenderState()
+                let stopped = try XCTUnwrap(beforeDisabledState)
+                try await Task.sleep(for: .milliseconds(200))
+                let afterDisabledState = await physicalViewer.iPhoneMicrophoneSenderState()
+                let stillStopped = try XCTUnwrap(afterDisabledState)
+                try require(!stillStopped.inputBusEnabled && !stillStopped.senderIsAdmitted
+                    && !stillStopped.nativeAuthorizationGateIsOpen
+                    && stillStopped.routeSharingPolicyIsLongFormAudio && !stillStopped.routeSharingPolicyIsDefault
+                    && stopped.deliveryCallbackCount == stillStopped.deliveryCallbackCount
+                    && stopped.deliveredFrameCount == stillStopped.deliveredFrameCount,
+                    "Microphone delivery advanced after output-only disable.")
+                try require(physicalViewer.iOSAudioTransactionDeviceBinding == deviceBinding,
+                            "The test must reuse the same production native device.")
+                result["cycle\(cycle)DisabledRenderCallbacks"] = stillStopped.deliveryCallbackCount
+                result["cycle\(cycle)DisabledRenderedFrames"] = stillStopped.deliveredFrameCount
+                try await authority.retire(
+                    outputOperation, tagGeneration: XCTUnwrap(token.stagedTransactionTagGeneration),
+                    peer: physicalViewer
+                )
+                result["completedCycles"] = cycle
+            }
+            try require(forwardingFailures.values.isEmpty, "Peer signaling forwarding failed.")
+        } catch {
+            result["failurePhase"] = phase
+            result["failureErrorCode"] = (error as NSError).code
+            result["failureErrorDomain"] = (error as NSError).domain
+            XCTFail("Sole-viewer microphone proof failed during \(phase): \(error)")
+        }
+
+        privacy.close()
+        for task in forwarders { task.cancel() }
+        for task in forwarders { await task.value }
+        let viewerClosed = await viewer?.close() ?? true
+        let hostClosed = await host?.close() ?? true
+        if let authorityEvents { await authorityEvents.value }
+        authorityEvents = nil
+        forwarders.removeAll()
+        viewer = nil
+        host = nil
+        result["viewerClosed"] = viewerClosed
+        result["hostClosed"] = hostClosed
+        result["realCategoryReceiptAuthority"] = authorityJournal?.scalars
+        if manualGateOpened { playback.deactivate() }
+        result["manualGateOpenCount"] = manualGateOpened ? 1 : 0
+        result["manualGateCloseCount"] = manualGateOpened ? 1 : 0
+        calls.setDelegate(nil, queue: nil)
+        NotificationCenter.default.removeObserver(interruptions)
+        NotificationCenter.default.removeObserver(inactive)
+        if let installedTarget { installedTarget.0.removeTarget(installedTarget.1) }
+        result["mediaCommandRemovalCount"] = installedTarget == nil ? 0 : 1
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch { result["removalWaitCancelled"] = true }
+        let isQuiescent = quiescence.debugRealSessionIsQuiescentForTesting()
+        result["nativeQuiescentAfterClose"] = isQuiescent
+        result["noHardwareHost"] = noHardware.snapshot.scalars
+        if viewerClosed && hostClosed && isQuiescent {
+            result["capturedInitialRestoreAttemptCount"] = 1
+            do {
+                try session.setCategory(initialCategory, mode: initialMode,
+                                        policy: initialPolicy, options: initialOptions)
+                try await Task.sleep(for: .milliseconds(100))
+                result["afterCapturedInitialRestore"] = tuple()
+                XCTAssertEqual(session.category, initialCategory)
+                XCTAssertEqual(session.mode, initialMode)
+                XCTAssertEqual(session.categoryOptions, initialOptions)
+                XCTAssertEqual(session.routeSharingPolicy, initialPolicy)
+            } catch { XCTFail("The single owned-baseline cleanup failed: \(error)") }
+        } else { XCTFail("Native teardown did not prove quiescence; no cleanup setter is permitted.") }
+        XCTAssertEqual(result["completedCycles"] as? Int, 3)
+        XCTAssertEqual(noHardware.snapshot.initializations, 1)
+        XCTAssertEqual(noHardware.snapshot.terminations, 1)
+        XCTAssertFalse(noHardware.snapshot.delegateBound)
+        XCTAssertFalse(noHardware.snapshot.wrongWorker)
+        XCTAssertEqual(authorityJournal?.failureCount, 0)
+        XCTAssertEqual(authorityJournal?.garbageCollectionCount, 6)
+        XCTAssertTrue(authorityJournal?.deviceRetired == true)
+        #endif
+    }
+
     /// Runtime—not a direct protocol invocation—proof that a real peer connection initializes
     /// and clocks the injected output-only RemoteIO device on physical iOS hardware.
     func testPeerUsesStereoRemoteIOAndReceivesNativePlayoutCallbacks() async throws {
@@ -2758,11 +4515,47 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
 
         // A normal app-lifecycle recovery signal must be idempotent while this exact device owns
         // healthy playout. In particular, it must not tear down RemoteIO and produce an audible gap.
-        let healthyRecoveryAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
-        await viewer.requestIOSPlayoutRecovery(
-            authorization: healthyRecoveryAuthorization
+        let healthyRecoveryTransaction = WebRTCIOSAudioTransactionContext(
+            operationID: try XCTUnwrap(
+                UUID(uuidString: "00112233-4455-6677-8899-AABBCCDDEEFF")
+            ),
+            authorityEpoch: 1,
+            operationRevision: 1
         )
+        let healthyRecoveryAuthorization =
+            WebRTCIOSPlayoutRecoveryAuthorization(
+                transaction: healthyRecoveryTransaction
+            )
+        XCTAssertTrue(
+            viewer.stageIOSPlayoutRecoveryTransaction(
+                authorization: healthyRecoveryAuthorization,
+                inputRequired: false
+            )
+        )
+        XCTAssertNotNil(
+            healthyRecoveryAuthorization.stagedTransactionTagGeneration
+        )
+        let healthyRecoveryWasRequested =
+            await viewer.requestIOSPlayoutRecovery(
+                authorization: healthyRecoveryAuthorization
+            )
+        XCTAssertTrue(healthyRecoveryWasRequested)
         try await Task.sleep(for: .milliseconds(50))
+        let healthyRecoveryReceipt = try XCTUnwrap(
+            healthyRecoveryAuthorization.terminalReceipt
+        )
+        XCTAssertEqual(
+            healthyRecoveryReceipt.transaction,
+            healthyRecoveryTransaction
+        )
+        XCTAssertEqual(healthyRecoveryReceipt.outcome, .accepted)
+        XCTAssertTrue(
+            healthyRecoveryReceipt.policyMatchesRequestedTarget
+        )
+        XCTAssertEqual(
+            healthyRecoveryReceipt.authorizationGeneration,
+            healthyRecoveryReceipt.terminalGeneration
+        )
         let healthyRecoveryDiagnostics = await viewer.iOSPlayoutDiagnostics()
         let afterHealthyRecoveryRequest = try XCTUnwrap(healthyRecoveryDiagnostics)
         XCTAssertTrue(afterHealthyRecoveryRequest.playing)
@@ -2801,10 +4594,31 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertEqual(failedClosed.failureCode, 19)
         XCTAssertNotNil(failedClosed.failureMessage)
 
-        let routeRecoveryAuthorization = WebRTCIOSPlayoutRecoveryAuthorization()
-        await viewer.requestIOSPlayoutRecovery(
-            authorization: routeRecoveryAuthorization
+        let routeRecoveryTransaction = WebRTCIOSAudioTransactionContext(
+            operationID: try XCTUnwrap(
+                UUID(uuidString: "10213243-5465-7687-98A9-BACBDCEDFE0F")
+            ),
+            authorityEpoch: 1,
+            operationRevision: 2
         )
+        let routeRecoveryAuthorization =
+            WebRTCIOSPlayoutRecoveryAuthorization(
+                transaction: routeRecoveryTransaction
+            )
+        XCTAssertTrue(
+            viewer.stageIOSPlayoutRecoveryTransaction(
+                authorization: routeRecoveryAuthorization,
+                inputRequired: false
+            )
+        )
+        XCTAssertNotNil(
+            routeRecoveryAuthorization.stagedTransactionTagGeneration
+        )
+        let routeRecoveryWasRequested =
+            await viewer.requestIOSPlayoutRecovery(
+                authorization: routeRecoveryAuthorization
+            )
+        XCTAssertTrue(routeRecoveryWasRequested)
         var recovered = await viewer.iOSPlayoutDiagnostics()
         for _ in 0..<500 where recovered?.playing != true {
             try await Task.sleep(for: .milliseconds(10))
@@ -2818,6 +4632,19 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         XCTAssertFalse(recoveredValue.explicitResumeRequired)
         XCTAssertEqual(recoveredValue.failureCode, 0)
         XCTAssertNil(recoveredValue.failureMessage)
+        let routeRecoveryReceipt = try XCTUnwrap(
+            routeRecoveryAuthorization.terminalReceipt
+        )
+        XCTAssertEqual(
+            routeRecoveryReceipt.transaction,
+            routeRecoveryTransaction
+        )
+        XCTAssertEqual(routeRecoveryReceipt.outcome, .accepted)
+        XCTAssertTrue(routeRecoveryReceipt.policyMatchesRequestedTarget)
+        XCTAssertEqual(
+            routeRecoveryReceipt.authorizationGeneration,
+            routeRecoveryReceipt.terminalGeneration
+        )
 
         await host.close()
         await viewer.close()
@@ -2950,7 +4777,7 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
         )
         XCTAssertEqual(
             harness.lastConfiguredRouteSharingPolicy,
-            Int(AVAudioSession.RouteSharingPolicy.default.rawValue),
+            Int((options == .mixWithOthers ? AVAudioSession.RouteSharingPolicy.default : .longFormAudio).rawValue),
             file: file,
             line: line
         )
@@ -3030,6 +4857,124 @@ final class WebRTCAudioPlaybackSessionTests: XCTestCase {
 
 // MARK: - Thread-safe test probes
 
+/// One-second physical characterization retains only scalars, never tap buffers or PCM copies.
+private final class PhysicalInputTapJournal: @unchecked Sendable {
+    struct Snapshot: Sendable {
+        var callbacks: UInt64 = 0
+        var frames: UInt64 = 0
+        var finiteSamples: UInt64 = 0
+        var nonzeroSamples: UInt64 = 0
+        var nonfiniteSamples: UInt64 = 0
+        var formatErrors: UInt64 = 0
+        var timestampErrors: UInt64 = 0
+        var energy: Double = 0
+        var peak: Double = 0
+        var firstSampleTime: Int64?
+        var lastSampleTime: Int64?
+        var privacyBoundaryObserved = false
+
+        var scalars: [String: Any] {
+            [
+                "callbacks": callbacks, "frames": frames,
+                "finiteSamples": finiteSamples, "nonzeroSamples": nonzeroSamples,
+                "nonfiniteSamples": nonfiniteSamples, "formatErrors": formatErrors,
+                "timestampErrors": timestampErrors, "energy": energy, "peak": peak,
+                "firstSampleTime": firstSampleTime.map { $0 as Any } ?? NSNull(),
+                "lastSampleTime": lastSampleTime.map { $0 as Any } ?? NSNull(),
+                "privacyBoundaryObserved": privacyBoundaryObserved,
+            ]
+        }
+
+        func advanced(since previous: Snapshot) -> Bool {
+            callbacks > previous.callbacks && frames > previous.frames
+                && finiteSamples > previous.finiteSamples && nonzeroSamples > previous.nonzeroSamples
+                && energy.isFinite && energy > previous.energy && peak.isFinite && peak > 0
+                && nonfiniteSamples == 0 && formatErrors == 0 && timestampErrors == 0
+                && !privacyBoundaryObserved
+                && lastSampleTime.map { last in
+                    previous.lastSampleTime.map { last > $0 }
+                        ?? firstSampleTime.map { last > $0 } ?? false
+                } == true
+        }
+    }
+
+    private let lock = NSLock()
+    private var value = Snapshot()
+    private let sampleRate: Double
+    private let channels: AVAudioChannelCount
+
+    init(sampleRate: Double, channels: AVAudioChannelCount) {
+        self.sampleRate = sampleRate
+        self.channels = channels
+    }
+
+    var snapshot: Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func closeForPrivacyBoundary() {
+        lock.lock()
+        value.privacyBoundaryObserved = true
+        lock.unlock()
+    }
+
+    func observe(_ buffer: AVAudioPCMBuffer, when: AVAudioTime) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !value.privacyBoundaryObserved else { return }
+        value.callbacks += 1
+        value.frames += UInt64(buffer.frameLength)
+        guard buffer.format.commonFormat == .pcmFormatFloat32,
+              buffer.format.sampleRate == sampleRate,
+              buffer.format.channelCount == channels,
+              let samples = buffer.floatChannelData else {
+            value.formatErrors += 1
+            return
+        }
+        if when.isSampleTimeValid {
+            if let previous = value.lastSampleTime, when.sampleTime <= previous {
+                value.timestampErrors += 1
+            }
+            if value.firstSampleTime == nil { value.firstSampleTime = when.sampleTime }
+            value.lastSampleTime = when.sampleTime
+        } else {
+            value.timestampErrors += 1
+        }
+        for frame in 0..<Int(buffer.frameLength) {
+            for channel in 0..<Int(channels) {
+                let sample = Double(buffer.format.isInterleaved
+                    ? samples[0][frame * Int(channels) + channel]
+                    : samples[channel][frame])
+                guard sample.isFinite else {
+                    value.nonfiniteSamples += 1
+                    continue
+                }
+                value.finiteSamples += 1
+                if sample != 0 { value.nonzeroSamples += 1 }
+                value.energy += sample * sample
+                value.peak = max(value.peak, abs(sample))
+            }
+        }
+    }
+}
+
+/// Only aggregate ended/nonended status affects the capture gate; no call identity is retained.
+private final class PhysicalInputTapCallFence: NSObject, CXCallObserverDelegate, @unchecked Sendable {
+    let journal: PhysicalInputTapJournal
+
+    init(journal: PhysicalInputTapJournal) { self.journal = journal }
+
+    func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        if !call.hasEnded { journal.closeForPrivacyBoundary() }
+    }
+}
+
+private enum PhysicalInputTapProbeError: Error {
+    case requirement(String)
+}
+
 /// One-shot claim primitive used to assert native callback serialization under contention.
 private final class LockedOnce: @unchecked Sendable {
     private let lock = NSLock()
@@ -3041,6 +4986,455 @@ private final class LockedOnce: @unchecked Sendable {
             wasClaimed = true
             return true
         }
+    }
+}
+
+/// Real reducer integration for the physical fixture, without claiming the app's full lifecycle.
+/// Actual measurements stay independent: no synthetic native ack or accepted proof is supplied.
+@MainActor
+private final class PhysicalMicrophoneAuthorityJournal {
+    private let authority = AudioTransactionAuthority()
+    private let privacy: PhysicalMicrophoneAuthorizationFence
+    private var currentTarget: AudioTransactionTarget?
+    private var observations: [[String: Any]] = []
+    private(set) var failureCount = 0
+    private var unownedFailedClosedCount = 0
+    private(set) var garbageCollectionCount = 0
+    private(set) var deviceRetired = false
+    private var retiredOperation: AudioTransactionOperationReceipt?
+
+    init(binding: WebRTCIOSAudioTransactionDeviceBinding, privacy: PhysicalMicrophoneAuthorizationFence) throws {
+        self.privacy = privacy
+        let snapshot = try XCTUnwrap(authority.snapshot)
+        guard case .deviceBound = authority.bindDevice(binding, expectedReducerRevision: snapshot.reducerRevision) else {
+            throw PhysicalInputTapProbeError.requirement("The real Rust authority did not bind the viewer device.")
+        }
+    }
+
+    var scalars: [String: Any] {
+        ["observationCount": observations.count, "observations": observations,
+         "failureCount": failureCount, "garbageCollectionCount": garbageCollectionCount,
+         "unownedFailedClosedCount": unownedFailedClosedCount,
+         "deviceRetired": deviceRetired, "syntheticAcknowledgementCount": 0,
+         "syntheticAcceptedProofCount": 0]
+    }
+
+    func arm(inputRequired: Bool) throws -> AudioTransactionOperationReceipt {
+        guard failureCount == 0, privacy.isOpen else {
+            throw PhysicalInputTapProbeError.requirement("A prior real category receipt or privacy boundary failed closed.")
+        }
+        let snapshot = try XCTUnwrap(authority.snapshot)
+        let target = AudioTransactionTarget(
+            category: inputRequired ? AVAudioSession.Category.playAndRecord.rawValue : AVAudioSession.Category.playback.rawValue,
+            mode: AVAudioSession.Mode.default.rawValue,
+            categoryOptionsRawValue: inputRequired ? 40 : 0,
+            routeSharingPolicyRawValue: inputRequired ? 0 : 1, inputRequired: inputRequired
+        )
+        guard snapshot.currentOperation == nil, snapshot.tombstoneCount == 0,
+              case let .armed(operation, _, _) = authority.arm(
+                operationID: UUID(), target: target, expectedReducerRevision: snapshot.reducerRevision,
+                observationHead: snapshot.lastObservationSequence
+              ) else {
+            throw PhysicalInputTapProbeError.requirement("The real Rust authority refused the next physical audio transaction.")
+        }
+        currentTarget = target
+        return operation
+    }
+
+    func consume(_ event: WebRTCIOSAudioTransactionEvent) {
+        let ownedOperationBefore = authority.snapshot?.currentOperation
+        let decision: AudioTransactionDecision
+        switch event {
+        case .observation(let receipt):
+            let before = authority.snapshot
+            decision = authority.observe(receipt)
+            var row: [String: Any] = [
+                "sequence": receipt.notificationSequence, "requestedPolicy": receipt.expectedRouteSharingPolicyRawValue,
+                "observedPolicy": receipt.observedRouteSharingPolicyRawValue, "inputRequired": receipt.inputRequired,
+                "profileMatches": receipt.policyTupleIsExact, "transactionEvidenceExact": receipt.transactionEvidenceIsExact,
+                "hadCurrentOperation": before?.currentOperation != nil,
+                "decision": Self.kind(decision), "disposition": String(describing: receipt.disposition),
+            ]
+            if case .failedClosed = decision {
+                row["failureCode"] = AudioTransactionAuthority.categoryObservationFailureCode(
+                    receipt: receipt, snapshot: before, target: currentTarget
+                )
+            }
+            guard observations.count < 128 else { failClosed(); return }
+            observations.append(row)
+        case .drain(let receipt): decision = authority.collectRetired(receipt)
+        case .deviceTeardown(let receipt):
+            guard let snapshot = authority.snapshot else { failClosed(); return }
+            decision = authority.retireDevice(receipt, expectedReducerRevision: snapshot.reducerRevision)
+        }
+        switch decision {
+        case .failedClosed(let operation):
+            // Like the production controller, there is no current transition to fail at
+            // untouched startup or after completed retirement. Retain these real receipts
+            // without granting authority; any failure of an owned operation still revokes.
+            if ownedOperationBefore != nil || operation != nil {
+                failClosed()
+            } else {
+                unownedFailedClosedCount += 1
+            }
+        case .rejected, .runtimeFailure: failClosed()
+        case .garbageCollected(_, let operation):
+            garbageCollectionCount += 1
+            if retiredOperation == operation { retiredOperation = nil; currentTarget = nil }
+        case .deviceRetired(let snapshot, _):
+            deviceRetired = snapshot.currentOperation == nil && snapshot.tombstoneCount == 0
+                && snapshot.deviceInstanceGeneration == 0 && snapshot.observationRegistrationGeneration == 0
+        default: break
+        }
+    }
+
+    func retire(_ operation: AudioTransactionOperationReceipt, tagGeneration: UInt64, peer: WebRTCPeer) async throws {
+        let snapshot = try XCTUnwrap(authority.snapshot)
+        guard failureCount == 0, snapshot.currentOperation == operation, tagGeneration != 0,
+              case .boundaryApplied = authority.applyBoundary(
+                expectedReducerRevision: snapshot.reducerRevision, observationHead: snapshot.lastObservationSequence
+              ) else {
+            throw PhysicalInputTapProbeError.requirement("The real audio operation could not enter its retirement boundary.")
+        }
+        retiredOperation = operation
+        guard peer.requestIOSAudioCategoryDrain(transaction: operation.nativeContext, tagGeneration: tagGeneration) else {
+            throw PhysicalInputTapProbeError.requirement("The exact native audio tag did not accept its drain request.")
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while retiredOperation != nil, failureCount == 0, clock.now < deadline {
+            try await clock.sleep(until: min(deadline, clock.now.advanced(by: .milliseconds(25))))
+        }
+        guard failureCount == 0, retiredOperation == nil, authority.snapshot?.tombstoneCount == 0 else {
+            throw PhysicalInputTapProbeError.requirement("The real native drain did not garbage-collect its exact Rust tombstone.")
+        }
+    }
+
+    private func failClosed() { failureCount += 1; privacy.close() }
+
+    private static func kind(_ decision: AudioTransactionDecision) -> String {
+        switch decision {
+        case .observationAccepted: "observationAccepted"
+        case .failedClosed: "failedClosed"
+        case .ignored: "ignored"
+        case .rejected: "rejected"
+        case .runtimeFailure: "runtimeFailure"
+        default: "other"
+        }
+    }
+}
+
+/// The test's current microphone carrier is revoked at the first call, interruption, or inactive
+/// boundary. No identity/handle is retained, and an ended event never reopens this test lifetime.
+private final class PhysicalMicrophoneAuthorizationFence: NSObject, CXCallObserverDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = true
+    private var authorization: WebRTCIOSMicrophoneAuthorization?
+
+    var isOpen: Bool { lock.withLock { open } }
+
+    func install(_ value: WebRTCIOSMicrophoneAuthorization) -> Bool {
+        let accepted = lock.withLock {
+            guard open else { return false }
+            authorization = value
+            return true
+        }
+        if !accepted { value.revoke() }
+        return accepted
+    }
+
+    func close() {
+        let retired = lock.withLock {
+            open = false
+            let value = authorization
+            authorization = nil
+            return value
+        }
+        retired?.revoke()
+    }
+
+    func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        if !call.hasEnded { close() }
+    }
+}
+
+/// Negotiation-only fixture device. These flags describe ADM requests, never hardware state.
+/// There is no session, engine, AudioUnit, timer, renderer, input producer, PCM or audio callback.
+private final class PhysicalNoHardwareAudioDevice: NSObject, LKRTCAudioDevice, Sendable {
+    struct Snapshot: Sendable {
+        var initialized = false
+        var playoutInitialized = false
+        var playing = false
+        var delegateBound = false
+        var initializations = 0
+        var terminations = 0
+        var playoutStarts = 0
+        var recordingInitializations = 0
+        var recordingStarts = 0
+        var wrongWorker = false
+        var scalars: [String: Any] {
+            ["initialized": initialized, "playoutInitialized": playoutInitialized,
+             "playing": playing, "delegateBound": delegateBound,
+             "initializations": initializations, "terminations": terminations,
+             "playoutStarts": playoutStarts, "recordingInitializations": recordingInitializations,
+             "recordingStarts": recordingStarts, "wrongWorker": wrongWorker,
+             "hardwareAPICalls": 0, "getPlayoutDataCalls": 0, "deliverRecordedDataCalls": 0]
+        }
+    }
+    private struct State {
+        var delegate: (any LKRTCAudioDeviceDelegate)?
+        var snapshot = Snapshot()
+        var worker: mach_port_t?
+        mutating func checkWorker() {
+            snapshot.wrongWorker = snapshot.wrongWorker
+                || worker != pthread_mach_thread_np(pthread_self())
+        }
+    }
+    private let state = OSAllocatedUnfairLock(uncheckedState: State())
+    var snapshot: Snapshot { state.withLock { $0.snapshot } }
+    var deviceInputSampleRate: Double { 48_000 }
+    var inputIOBufferDuration: TimeInterval { 0.01 }
+    var inputNumberOfChannels: Int { 1 }
+    var inputLatency: TimeInterval { 0 }
+    var deviceOutputSampleRate: Double { 48_000 }
+    var outputIOBufferDuration: TimeInterval { 0.01 }
+    var outputNumberOfChannels: Int { 2 }
+    var outputLatency: TimeInterval { 0 }
+    var isInitialized: Bool { snapshot.initialized }
+    var isPlayoutInitialized: Bool { snapshot.playoutInitialized }
+    var isPlaying: Bool { snapshot.playing }
+    var isRecordingInitialized: Bool { false }
+    var isRecording: Bool { false }
+
+    func initialize(with delegate: any LKRTCAudioDeviceDelegate) -> Bool {
+        state.withLockUnchecked {
+            $0.worker = pthread_mach_thread_np(pthread_self())
+            $0.delegate = delegate
+            $0.snapshot.delegateBound = true
+            $0.snapshot.initializations += 1
+            $0.snapshot.initialized = true
+        }
+        return true
+    }
+
+    func terminateDevice() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.delegate = nil
+            $0.snapshot.terminations += 1
+            $0.snapshot.delegateBound = false
+            $0.snapshot.initialized = false
+            $0.snapshot.playoutInitialized = false
+            $0.snapshot.playing = false
+        }
+        return true
+    }
+
+    func initializePlayout() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.playoutInitialized = true }
+        return true
+    }
+
+    func startPlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playoutStarts += 1
+            $0.snapshot.playing = $0.snapshot.playoutInitialized
+            return $0.snapshot.playing
+        }
+    }
+
+    func stopPlayout() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.playing = false }
+        return true
+    }
+
+    func initializeRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingInitializations += 1 }
+        return false
+    }
+
+    func startRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingStarts += 1 }
+        return false
+    }
+
+    func stopRecording() -> Bool {
+        state.withLock { $0.checkWorker() }
+        return true
+    }
+}
+
+// Only this test device is fake. Its delegate, ADM, audio buffer and transport come from the
+// packaged dynamic framework. No method creates an audio session, AudioUnit, track or socket.
+private final class DynamicFrameworkRetryDevice: NSObject, LKRTCAudioDevice, Sendable {
+    struct Snapshot: Sendable {
+        var initialized = false
+        var playoutInitialized = false
+        var playing = false
+        var delegateBound = false
+        var initializations = 0
+        var terminations = 0
+        var playoutInitializations = 0
+        var playoutStarts = 0
+        var recordingInitializations = 0
+        var recordingStarts = 0
+        var recordingStops = 0
+        var wrongWorker = false
+    }
+
+    struct PCMObservation: Sendable {
+        let status: OSStatus
+        let flags: AudioUnitRenderActionFlags
+        let allZero: Bool
+    }
+
+    struct Proof: Sendable {
+        var supportsRetry = false
+        var imagePath: String?
+        var accepted: [Bool] = []
+        var snapshots: [Snapshot] = []
+        var inactivePCM: PCMObservation?
+        var activePCM: PCMObservation?
+    }
+
+    private struct State {
+        var delegate: (any LKRTCAudioDeviceDelegate)?
+        var snapshot = Snapshot()
+        var worker: mach_port_t?
+
+        mutating func checkWorker() {
+            snapshot.wrongWorker = snapshot.wrongWorker
+                || worker != pthread_mach_thread_np(pthread_self())
+        }
+    }
+
+    // Every mutable value is lock-owned. A copied delegate is used only to dispatch onto its
+    // worker; no lock is held while framework code can reenter this device.
+    private let state = OSAllocatedUnfairLock(uncheckedState: State())
+    var snapshot: Snapshot { state.withLock { $0.snapshot } }
+    var deviceInputSampleRate: Double { 48_000 }
+    var inputIOBufferDuration: TimeInterval { 0.01 }
+    var inputNumberOfChannels: Int { 1 }
+    var inputLatency: TimeInterval { 0 }
+    var deviceOutputSampleRate: Double { 48_000 }
+    var outputIOBufferDuration: TimeInterval { 0.01 }
+    var outputNumberOfChannels: Int { 2 }
+    var outputLatency: TimeInterval { 0 }
+    var isInitialized: Bool { snapshot.initialized }
+    var isPlayoutInitialized: Bool { snapshot.playoutInitialized }
+    var isPlaying: Bool { snapshot.playing }
+    var isRecordingInitialized: Bool { false }
+    var isRecording: Bool { false }
+
+    func initialize(with delegate: any LKRTCAudioDeviceDelegate) -> Bool {
+        state.withLockUnchecked {
+            $0.worker = pthread_mach_thread_np(pthread_self())
+            $0.delegate = delegate
+            $0.snapshot.delegateBound = true
+            $0.snapshot.initializations += 1
+            $0.snapshot.initialized = true
+        }
+        return true
+    }
+
+    func terminateDevice() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.delegate = nil
+            $0.snapshot.delegateBound = false
+            $0.snapshot.terminations += 1
+            $0.snapshot.initialized = false
+            $0.snapshot.playoutInitialized = false
+            $0.snapshot.playing = false
+        }
+        return true
+    }
+
+    func initializePlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playoutInitializations += 1
+            $0.snapshot.playoutInitialized = $0.snapshot.playoutInitializations > 1
+            return $0.snapshot.playoutInitialized
+        }
+    }
+
+    func startPlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playoutStarts += 1
+            $0.snapshot.playing = $0.snapshot.playoutInitialized
+            return $0.snapshot.playing
+        }
+    }
+
+    func stopPlayout() -> Bool {
+        state.withLock {
+            $0.checkWorker()
+            $0.snapshot.playing = false
+        }
+        return true
+    }
+
+    func initializeRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingInitializations += 1 }
+        return false
+    }
+
+    func startRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingStarts += 1 }
+        return false
+    }
+
+    func stopRecording() -> Bool {
+        state.withLock { $0.checkWorker(); $0.snapshot.recordingStops += 1 }
+        return true
+    }
+
+    func exerciseRetry() -> Proof? {
+        guard let delegate = state.withLockUnchecked({ $0.delegate }) else { return nil }
+        let result = OSAllocatedUnfairLock(initialState: Proof?.none)
+        delegate.dispatchSync { [self] in
+            guard let current = state.withLockUnchecked({ $0.delegate }) else { return }
+            var proof = Proof()
+            let selector = NSSelectorFromString("retryPlayoutForAudioDevice:")
+            proof.supportsRetry = current.responds(to: selector)
+            guard proof.supportsRetry,
+                  let implementation = class_getMethodImplementation(object_getClass(current), selector)
+            else {
+                let incomplete = proof
+                result.withLock { $0 = incomplete }
+                return
+            }
+            var image = Dl_info()
+            let address = unsafeBitCast(implementation, to: UnsafeRawPointer.self)
+            if dladdr(address, &image) != 0, let path = image.dli_fname {
+                proof.imagePath = String(cString: path)
+            }
+            for attempt in 0..<3 {
+                proof.accepted.append(current.retryPlayout?(for: self) ?? false)
+                proof.snapshots.append(snapshot)
+                if attempt == 0 { proof.inactivePCM = Self.readPCM(current) }
+                if attempt == 1 { proof.activePCM = Self.readPCM(current) }
+            }
+            let completed = proof
+            result.withLock { $0 = completed }
+        }
+        return result.withLock { $0 }
+    }
+
+    private static func readPCM(_ delegate: any LKRTCAudioDeviceDelegate) -> PCMObservation {
+        var samples = [Int16](repeating: 123, count: 480 * 2)
+        var flags: AudioUnitRenderActionFlags = []
+        var timestamp = AudioTimeStamp()
+        let status = samples.withUnsafeMutableBytes { bytes in
+            var data = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
+                mNumberChannels: 2, mDataByteSize: UInt32(bytes.count), mData: bytes.baseAddress
+            ))
+            return delegate.getPlayoutData(&flags, &timestamp, 0, 480, &data)
+        }
+        return PCMObservation(status: status, flags: flags, allZero: samples.allSatisfy { $0 == 0 })
     }
 }
 

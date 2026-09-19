@@ -1,7 +1,9 @@
 import ApplicationServices
+import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
+import Streaming
 
 /// A display-relative point received from a remote viewer.
 ///
@@ -38,6 +40,12 @@ public struct MacRemoteInputVideoSize: Equatable, Sendable {
     var isValid: Bool {
         (2 ... 32_768).contains(width) && (2 ... 32_768).contains(height)
     }
+
+    func hasExactlySameAspectRatio(as other: MacRemoteInputVideoSize) -> Bool {
+        guard isValid, other.isValid else { return false }
+        return Int64(width) * Int64(other.height)
+            == Int64(other.width) * Int64(height)
+    }
 }
 
 /// Snapshot of the macOS grants needed to synthesize and target remote input.
@@ -57,9 +65,88 @@ public struct MacRemoteInputPermissionStatus: Equatable, Sendable {
     }
 }
 
+/// Opaque identity for one screen-sharing service competing for global Mac input authority.
+///
+/// Multiple viewers may remain connected, but only the service whose token armed the current
+/// session may update its coordinate transform or revoke it. The token never crosses the wire.
+public struct MacRemoteInputOwnerToken: Hashable, Sendable {
+    private let value: UUID
+
+    public init() {
+        value = UUID()
+    }
+}
+
+/// Process-local ordering lease reserved when a viewer's ordinary Show is received.
+///
+/// The controller, not either service actor, owns the monotonic order. The highest claim that has
+/// successfully armed wins; a failed newer Show cannot displace a working viewer, while an older
+/// completion or automatic resume cannot retake authority after a newer Show succeeds.
+public struct MacRemoteInputOwnershipClaim: Equatable, Sendable {
+    fileprivate let ownerToken: MacRemoteInputOwnerToken
+    fileprivate let generation: UInt64
+    fileprivate let epoch: UInt64
+    fileprivate let permissionsWereAuthorizedAtReservation: Bool
+}
+
 /// Outcome of binding remote input to a specific screen-sharing session.
 public enum MacRemoteInputArmResult: Equatable, Sendable {
     case armed
+    case superseded
+    case disabled
+    case permissionRequired(MacRemoteInputPermissionStatus)
+    case displayUnavailable
+}
+
+/// A validated but not-yet-published remote-input session.
+///
+/// Preparing does not disturb the viewer that currently controls the Mac. The screen service
+/// carries this opaque value into the synchronous Active-acknowledgement transaction, where the
+/// controller either commits it or downgrades that acknowledgement to view-only.
+public final class MacRemoteInputPreparedActivation: @unchecked Sendable {
+    fileprivate let controllerID: UUID
+    fileprivate let displayID: UInt32
+    fileprivate let screenRequestID: UInt64
+    fileprivate let inputSessionID: UUID
+    fileprivate let ownerToken: MacRemoteInputOwnerToken
+    fileprivate let ownershipClaim: MacRemoteInputOwnershipClaim
+    fileprivate let initialFrameGeometry: ScreenVideoFrameGeometry?
+    fileprivate let authoritativeDisplayBounds: CGRect?
+    fileprivate let supportsFocusedWindowResizeScaleRebinding: Bool
+    fileprivate let revokeAuthorization: @Sendable () -> Void
+    /// Accessed only while the owning controller's lock is held.
+    fileprivate var isConsumed = false
+
+    fileprivate init(
+        controllerID: UUID,
+        displayID: UInt32,
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        ownerToken: MacRemoteInputOwnerToken,
+        ownershipClaim: MacRemoteInputOwnershipClaim,
+        initialFrameGeometry: ScreenVideoFrameGeometry?,
+        authoritativeDisplayBounds: CGRect?,
+        supportsFocusedWindowResizeScaleRebinding: Bool,
+        revokeAuthorization: @escaping @Sendable () -> Void
+    ) {
+        self.controllerID = controllerID
+        self.displayID = displayID
+        self.screenRequestID = screenRequestID
+        self.inputSessionID = inputSessionID
+        self.ownerToken = ownerToken
+        self.ownershipClaim = ownershipClaim
+        self.initialFrameGeometry = initialFrameGeometry
+        self.authoritativeDisplayBounds = authoritativeDisplayBounds
+        self.supportsFocusedWindowResizeScaleRebinding =
+            supportsFocusedWindowResizeScaleRebinding
+        self.revokeAuthorization = revokeAuthorization
+    }
+}
+
+/// Outcome of validating an input session without displacing the current controller.
+public enum MacRemoteInputPrepareResult: Sendable {
+    case prepared(MacRemoteInputPreparedActivation)
+    case superseded
     case disabled
     case permissionRequired(MacRemoteInputPermissionStatus)
     case displayUnavailable
@@ -91,6 +178,9 @@ public enum MacRemoteInputRejection: Equatable, Sendable {
     case focusChanged
     case primaryButtonInUse
     case injectionFailed
+    case windowUnavailable
+    case windowResizeFailed
+    case windowResizeUncertain
 }
 
 /// Result of one authorized remote input request.
@@ -157,6 +247,70 @@ public struct MacRemoteInputDiagnosedResult: Equatable, Sendable {
     }
 }
 
+/// Opaque focused-window authority and its rectangle in the exact encoded video frame.
+public struct MacRemoteWindowResizeTarget: Equatable, Sendable {
+    public let generation: UUID
+    public let normalizedFrame: CGRect
+    public let unclippedNormalizedFrame: CGRect?
+
+    public init(
+        generation: UUID,
+        normalizedFrame: CGRect,
+        unclippedNormalizedFrame: CGRect? = nil
+    ) {
+        self.generation = generation
+        self.normalizedFrame = normalizedFrame
+        self.unclippedNormalizedFrame = unclippedNormalizedFrame
+    }
+}
+
+/// Semantic operation that produced a current focused-window target.
+public enum MacRemoteWindowResizeFeedbackKind: Equatable, Sendable {
+    case targetAcquired
+    case windowSelected
+    case resizeCommitted
+    case moveCommitted
+}
+
+/// Content-free target feedback produced by a focused-window operation.
+public struct MacRemoteWindowResizeFeedback: Equatable, Sendable {
+    public let kind: MacRemoteWindowResizeFeedbackKind
+    public let target: MacRemoteWindowResizeTarget
+    /// Present only for a successful commit, identifying the one-shot target that was consumed.
+    public let committedTargetGeneration: UUID?
+
+    public init(
+        kind: MacRemoteWindowResizeFeedbackKind,
+        target: MacRemoteWindowResizeTarget,
+        committedTargetGeneration: UUID? = nil
+    ) {
+        self.kind = kind
+        self.target = target
+        self.committedTargetGeneration = committedTargetGeneration
+    }
+}
+
+/// Focused-window result with optional target and format-fence evidence.
+public struct MacRemoteWindowResizeDiagnosedResult: Equatable, Sendable {
+    public let result: MacRemoteInputResult
+    public let windowResizeFeedback: MacRemoteWindowResizeFeedback?
+    /// Exact post-operation focus proof used even when the resize itself was rejected.
+    public let verifiedFocus: MacRemoteInputFocus?
+    public let screenFormatDiagnostic: MacRemoteInputScreenFormatDiagnostic?
+
+    public init(
+        result: MacRemoteInputResult,
+        windowResizeFeedback: MacRemoteWindowResizeFeedback? = nil,
+        verifiedFocus: MacRemoteInputFocus? = nil,
+        screenFormatDiagnostic: MacRemoteInputScreenFormatDiagnostic? = nil
+    ) {
+        self.result = result
+        self.windowResizeFeedback = windowResizeFeedback
+        self.verifiedFocus = verifiedFocus
+        self.screenFormatDiagnostic = screenFormatDiagnostic
+    }
+}
+
 /// Serializes and authorizes remote input for one active screen-sharing session.
 ///
 /// The controller is disabled unless the host explicitly opts in. Each action must
@@ -171,24 +325,42 @@ public final class MacRemoteInputController: @unchecked Sendable {
     private static let maximumEditableAncestorDepth = 12
     private static let minimumFrameGeometryStability: TimeInterval = 0.750
     private static let maximumScrollDeltaMagnitude: Int32 = 4_096
+    private static let maximumWindowAncestorDepth = 24
+    private static let maximumWindowResizeGenerationsPerSession = 65_536
+    private static let zeroUUID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
+    private static let legacyOwnerToken = MacRemoteInputOwnerToken()
 
     private let allowRemoteControl: Bool
     private let system: any MacRemoteInputSystem
     private let clock: any MacRemoteInputClock
+    private let makeWindowResizeGeneration: @Sendable () -> UUID
     private let lock = NSLock()
+    private let ownershipControllerID = UUID()
 
     private var isPermanentlyInvalidated = false
+    private var nextOwnershipClaimGeneration: UInt64 = 0
+    private var ownershipClaimEpoch: UInt64 = 0
+    private var highestSuccessfullyArmedClaimGeneration: UInt64 = 0
+    /// Authorization revocations discovered while the controller lock is held. `withLock`
+    /// drains these only after unlocking so TCC loss cannot invert the controller and WebRTC
+    /// input-authorization locks.
+    private var authorizationRevocationsAfterUnlock: [@Sendable () -> Void] = []
     private var activeSession: ActiveSession?
     private var screenVideoFrameGeometry: ScreenVideoFrameGeometry?
     private var candidateScreenVideoFrameGeometry: ScreenVideoFrameGeometry?
     private var candidateScreenVideoFrameGeometrySince: TimeInterval?
     private var authorizedFocus: AuthorizedFocus?
+    private var authorizedWindowResizeTarget: AuthorizedWindowResizeTarget?
+    private var issuedWindowResizeGenerations: Set<UUID> = []
     private var nextFocusGeneration: UInt64 = 0
 
     private var tapBucket: TokenBucket
     private var scrollBucket: TokenBucket
     private var keyBucket: TokenBucket
     private var textBucket: TokenBucket
+    private var windowResizeBucket: TokenBucket
     private var scrollDeltaConversionState: ScrollDeltaConversionState?
 
     /// Creates a controller backed by macOS Accessibility and Core Graphics APIs.
@@ -197,27 +369,32 @@ public final class MacRemoteInputController: @unchecked Sendable {
         self.allowRemoteControl = allowRemoteControl
         self.system = CoreGraphicsMacRemoteInputSystem()
         self.clock = clock
+        self.makeWindowResizeGeneration = { UUID() }
         let now = clock.now()
         self.tapBucket = TokenBucket(capacity: 12, refillPerSecond: 8, now: now)
         self.scrollBucket = TokenBucket(capacity: 8, refillPerSecond: 60, now: now)
         self.keyBucket = TokenBucket(capacity: 40, refillPerSecond: 25, now: now)
         self.textBucket = TokenBucket(capacity: 4_096, refillPerSecond: 2_048, now: now)
+        self.windowResizeBucket = TokenBucket(capacity: 8, refillPerSecond: 4, now: now)
     }
 
     /// Test-only dependency initializer for deterministic clocks and system behavior.
     init(
         allowRemoteControl: Bool,
         system: any MacRemoteInputSystem,
-        clock: any MacRemoteInputClock
+        clock: any MacRemoteInputClock,
+        makeWindowResizeGeneration: @escaping @Sendable () -> UUID = { UUID() }
     ) {
         self.allowRemoteControl = allowRemoteControl
         self.system = system
         self.clock = clock
+        self.makeWindowResizeGeneration = makeWindowResizeGeneration
         let now = clock.now()
         self.tapBucket = TokenBucket(capacity: 12, refillPerSecond: 8, now: now)
         self.scrollBucket = TokenBucket(capacity: 8, refillPerSecond: 60, now: now)
         self.keyBucket = TokenBucket(capacity: 40, refillPerSecond: 25, now: now)
         self.textBucket = TokenBucket(capacity: 4_096, refillPerSecond: 2_048, now: now)
+        self.windowResizeBucket = TokenBucket(capacity: 8, refillPerSecond: 4, now: now)
     }
 
     /// Checks the only two TCC grants used by remote input. This never checks or
@@ -228,20 +405,308 @@ public final class MacRemoteInputController: @unchecked Sendable {
         }
     }
 
+    /// Reserves global successful-Show ordering before either service crosses an async boundary.
+    public func reserveOwnershipClaim(
+        for ownerToken: MacRemoteInputOwnerToken
+    ) -> MacRemoteInputOwnershipClaim {
+        var incumbentAuthorizationRevocation: (@Sendable () -> Void)?
+        let claim = withLock {
+            let permissionsAreAuthorized = system
+                .permissionStatus(promptIfNeeded: false)
+                .isAuthorized
+            if !permissionsAreAuthorized {
+                invalidateOwnershipClaimsLocked()
+                incumbentAuthorizationRevocation = activeSession?.revokeAuthorization
+                clearScreenVideoFrameGeometry()
+                revokeState()
+            }
+            return reserveOwnershipClaimLocked(
+                for: ownerToken,
+                permissionsWereAuthorizedAtReservation: permissionsAreAuthorized
+            )
+        }
+        incumbentAuthorizationRevocation?()
+        return claim
+    }
+
+    private func reserveOwnershipClaimLocked(
+        for ownerToken: MacRemoteInputOwnerToken,
+        permissionsWereAuthorizedAtReservation: Bool = true
+    ) -> MacRemoteInputOwnershipClaim {
+        nextOwnershipClaimGeneration &+= 1
+        if nextOwnershipClaimGeneration == 0 {
+            nextOwnershipClaimGeneration = 1
+        }
+        let claim = MacRemoteInputOwnershipClaim(
+            ownerToken: ownerToken,
+            generation: nextOwnershipClaimGeneration,
+            epoch: ownershipClaimEpoch,
+            permissionsWereAuthorizedAtReservation:
+                permissionsWereAuthorizedAtReservation
+        )
+        return claim
+    }
+
+    private func invalidateOwnershipClaimsLocked() {
+        ownershipClaimEpoch &+= 1
+        if ownershipClaimEpoch == 0 {
+            ownershipClaimEpoch = 1
+        }
+        highestSuccessfullyArmedClaimGeneration = 0
+    }
+
+    /// Validates a prospective input owner without revoking the last successfully activated one.
+    ///
+    /// The returned activation is deliberately provisional. Call
+    /// `withPreparedActivationCommit(_:operation:)` around the exact Active acknowledgement send.
+    /// Only a successful send publishes the new owner and advances global Show ordering.
+    public func prepareArm(
+        displayID: UInt32,
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        ownerToken: MacRemoteInputOwnerToken,
+        ownershipClaim: MacRemoteInputOwnershipClaim,
+        initialFrameGeometry: ScreenVideoFrameGeometry? = nil,
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false,
+        revokeAuthorization: @escaping @Sendable () -> Void
+    ) -> MacRemoteInputPrepareResult {
+        var incumbentAuthorizationRevocation: (@Sendable () -> Void)?
+        let result: MacRemoteInputPrepareResult = withLock {
+            guard !isPermanentlyInvalidated, allowRemoteControl else {
+                return .disabled
+            }
+            guard ownershipClaim.ownerToken == ownerToken,
+                  ownershipClaim.epoch == ownershipClaimEpoch,
+                  ownershipClaim.permissionsWereAuthorizedAtReservation,
+                  ownershipClaim.generation
+                    >= highestSuccessfullyArmedClaimGeneration else {
+                return .superseded
+            }
+            let permissions = system.permissionStatus(promptIfNeeded: false)
+            guard permissions.isAuthorized else {
+                // TCC applies process-wide. Once either grant is lost, no prior viewer may
+                // silently regain control if the user restores it later.
+                incumbentAuthorizationRevocation = activeSession?.revokeAuthorization
+                invalidateOwnershipClaimsLocked()
+                clearScreenVideoFrameGeometry()
+                revokeState()
+                return .permissionRequired(permissions)
+            }
+            guard validDisplayBounds(for: displayID) != nil else {
+                return .displayUnavailable
+            }
+            let validatedAuthoritativeBounds: CGRect?
+            if let authoritativeDisplayBounds {
+                guard let bounds = Self.validatedDisplayBounds(authoritativeDisplayBounds) else {
+                    return .displayUnavailable
+                }
+                validatedAuthoritativeBounds = bounds
+            } else {
+                validatedAuthoritativeBounds = nil
+            }
+            return .prepared(
+                MacRemoteInputPreparedActivation(
+                    controllerID: ownershipControllerID,
+                    displayID: displayID,
+                    screenRequestID: screenRequestID,
+                    inputSessionID: inputSessionID,
+                    ownerToken: ownerToken,
+                    ownershipClaim: ownershipClaim,
+                    initialFrameGeometry: initialFrameGeometry,
+                    authoritativeDisplayBounds: validatedAuthoritativeBounds,
+                    supportsFocusedWindowResizeScaleRebinding:
+                        supportsFocusedWindowResizeScaleRebinding,
+                    revokeAuthorization: revokeAuthorization
+                )
+            )
+        }
+        incumbentAuthorizationRevocation?()
+        return result
+    }
+
+    /// Serializes the final Active acknowledgement with global input ownership publication.
+    ///
+    /// `operation(true)` must synchronously send an Active acknowledgement carrying the prepared
+    /// capability. If a newer viewer already committed, or control became unavailable after
+    /// preparation, `operation(false)` instead sends the same Active acknowledgement view-only.
+    /// A throwing send leaves the incumbent owner and successful-Show generation unchanged.
+    public func withPreparedActivationCommit(
+        _ activation: MacRemoteInputPreparedActivation,
+        operation: (_ grantsInput: Bool) throws -> Void
+    ) throws -> Bool {
+        guard activation.controllerID == ownershipControllerID else {
+            // Do not touch another controller's one-shot state under this controller's lock.
+            try operation(false)
+            return false
+        }
+        var displacedAuthorizationRevocation: (@Sendable () -> Void)?
+        var shouldRevokeCandidate = false
+
+        lock.lock()
+        let permissionsAreCurrent = system.permissionStatus(promptIfNeeded: false).isAuthorized
+        if !permissionsAreCurrent {
+            displacedAuthorizationRevocation = activeSession?.revokeAuthorization
+            invalidateOwnershipClaimsLocked()
+            clearScreenVideoFrameGeometry()
+            revokeState()
+        }
+        let canCommit = !activation.isConsumed
+            && !isPermanentlyInvalidated
+            && allowRemoteControl
+            && activation.ownershipClaim.ownerToken == activation.ownerToken
+            && activation.ownershipClaim.epoch == ownershipClaimEpoch
+            && activation.ownershipClaim.permissionsWereAuthorizedAtReservation
+            && activation.ownershipClaim.generation
+                >= highestSuccessfullyArmedClaimGeneration
+            && permissionsAreCurrent
+            && validDisplayBounds(for: activation.displayID) != nil
+
+        // Every prepared value is one-shot, including a view-only downgrade or failed send.
+        activation.isConsumed = true
+        do {
+            try operation(canCommit)
+            if canCommit {
+                displacedAuthorizationRevocation = activeSession?.revokeAuthorization
+                clearScreenVideoFrameGeometry()
+                revokeState()
+                activeSession = ActiveSession(
+                    displayID: activation.displayID,
+                    screenRequestID: activation.screenRequestID,
+                    inputSessionID: activation.inputSessionID,
+                    ownerToken: activation.ownerToken,
+                    ownershipClaimGeneration: activation.ownershipClaim.generation,
+                    authoritativeDisplayBounds: activation.authoritativeDisplayBounds,
+                    supportsFocusedWindowResizeScaleRebinding:
+                        activation.supportsFocusedWindowResizeScaleRebinding,
+                    revokeAuthorization: activation.revokeAuthorization
+                )
+                highestSuccessfullyArmedClaimGeneration =
+                    activation.ownershipClaim.generation
+                if let initialFrameGeometry = activation.initialFrameGeometry {
+                    updateScreenVideoFrameGeometryLocked(initialFrameGeometry)
+                }
+                resetRateLimits(now: clock.now())
+            } else {
+                shouldRevokeCandidate = true
+            }
+            lock.unlock()
+        } catch {
+            shouldRevokeCandidate = true
+            lock.unlock()
+            activation.revokeAuthorization()
+            displacedAuthorizationRevocation?()
+            throw error
+        }
+
+        // Never acquire an input-authorization lock while holding the controller lock. An input
+        // already admitted by the displaced viewer will acquire the controller next and observe
+        // the newly committed session before it can inject anything.
+        if shouldRevokeCandidate {
+            activation.revokeAuthorization()
+        }
+        displacedAuthorizationRevocation?()
+        return canCommit
+    }
+
+    /// Whether this exact prepared generation is the controller's current committed owner.
+    public func isCommitted(_ activation: MacRemoteInputPreparedActivation) -> Bool {
+        withLock {
+            guard activation.controllerID == ownershipControllerID,
+                  let activeSession else {
+                return false
+            }
+            return activeSession.ownerToken == activation.ownerToken
+                && activeSession.ownershipClaimGeneration
+                    == activation.ownershipClaim.generation
+                && activeSession.screenRequestID == activation.screenRequestID
+                && activeSession.inputSessionID == activation.inputSessionID
+        }
+    }
+
+    /// Arms only if no newer ordinary Show has already activated global ownership.
+    @discardableResult
+    public func arm(
+        displayID: UInt32,
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        ownerToken: MacRemoteInputOwnerToken,
+        ownershipClaim: MacRemoteInputOwnershipClaim,
+        initialFrameGeometry: ScreenVideoFrameGeometry? = nil,
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false
+    ) -> MacRemoteInputArmResult {
+        withLock {
+            return armLocked(
+                displayID: displayID,
+                screenRequestID: screenRequestID,
+                inputSessionID: inputSessionID,
+                ownerToken: ownerToken,
+                ownershipClaim: ownershipClaim,
+                initialFrameGeometry: initialFrameGeometry,
+                authoritativeDisplayBounds: authoritativeDisplayBounds,
+                supportsFocusedWindowResizeScaleRebinding:
+                    supportsFocusedWindowResizeScaleRebinding,
+                clearsFrameGeometry: true
+            )
+        }
+    }
+
     /// Replaces any previous authorization and arms one exact active screen share.
     @discardableResult
     public func arm(
         displayID: UInt32,
         screenRequestID: UInt64,
         inputSessionID: UUID,
-        authoritativeDisplayBounds: CGRect? = nil
+        ownerToken: MacRemoteInputOwnerToken,
+        initialFrameGeometry: ScreenVideoFrameGeometry? = nil,
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false
     ) -> MacRemoteInputArmResult {
         withLock {
-            armLocked(
+            let ownershipClaim = reserveOwnershipClaimLocked(
+                for: ownerToken
+            )
+            return armLocked(
                 displayID: displayID,
                 screenRequestID: screenRequestID,
                 inputSessionID: inputSessionID,
-                authoritativeDisplayBounds: authoritativeDisplayBounds
+                ownerToken: ownerToken,
+                ownershipClaim: ownershipClaim,
+                initialFrameGeometry: initialFrameGeometry,
+                authoritativeDisplayBounds: authoritativeDisplayBounds,
+                supportsFocusedWindowResizeScaleRebinding:
+                    supportsFocusedWindowResizeScaleRebinding,
+                clearsFrameGeometry: true
+            )
+        }
+    }
+
+    /// Source-compatible single-owner entry point retained for CaptureCore's focused unit tests.
+    /// Production screen services must use the owner-scoped public overload above.
+    @discardableResult
+    public func arm(
+        displayID: UInt32,
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        authoritativeDisplayBounds: CGRect? = nil,
+        supportsFocusedWindowResizeScaleRebinding: Bool = false
+    ) -> MacRemoteInputArmResult {
+        withLock {
+            let ownershipClaim = reserveOwnershipClaimLocked(
+                for: Self.legacyOwnerToken
+            )
+            return armLocked(
+                displayID: displayID,
+                screenRequestID: screenRequestID,
+                inputSessionID: inputSessionID,
+                ownerToken: Self.legacyOwnerToken,
+                ownershipClaim: ownershipClaim,
+                initialFrameGeometry: nil,
+                authoritativeDisplayBounds: authoritativeDisplayBounds,
+                supportsFocusedWindowResizeScaleRebinding:
+                    supportsFocusedWindowResizeScaleRebinding,
+                clearsFrameGeometry: false
             )
         }
     }
@@ -251,20 +716,33 @@ public final class MacRemoteInputController: @unchecked Sendable {
         displayID: UInt32,
         screenRequestID: UInt64,
         inputSessionID: UUID,
-        authoritativeDisplayBounds: CGRect?
+        ownerToken: MacRemoteInputOwnerToken,
+        ownershipClaim: MacRemoteInputOwnershipClaim,
+        initialFrameGeometry: ScreenVideoFrameGeometry?,
+        authoritativeDisplayBounds: CGRect?,
+        supportsFocusedWindowResizeScaleRebinding: Bool,
+        clearsFrameGeometry: Bool
     ) -> MacRemoteInputArmResult {
         guard !isPermanentlyInvalidated else {
             return .disabled
         }
 
-        revokeState()
-
         guard allowRemoteControl else {
             return .disabled
         }
 
+        guard ownershipClaim.ownerToken == ownerToken,
+              ownershipClaim.epoch == ownershipClaimEpoch,
+              ownershipClaim.permissionsWereAuthorizedAtReservation,
+              ownershipClaim.generation
+                >= highestSuccessfullyArmedClaimGeneration else {
+            return .superseded
+        }
+
         let permissions = system.permissionStatus(promptIfNeeded: false)
         guard permissions.isAuthorized else {
+            // TCC loss invalidates every viewer equally, so no incumbent authority remains valid.
+            revokeForPermissionLossLocked()
             return .permissionRequired(permissions)
         }
 
@@ -281,19 +759,45 @@ public final class MacRemoteInputController: @unchecked Sendable {
             validatedAuthoritativeBounds = nil
         }
 
+        // Only a fully validated successor may replace the incumbent. Display/configuration
+        // failures from a second viewer therefore cannot knock a working first viewer offline.
+        if clearsFrameGeometry {
+            clearScreenVideoFrameGeometry()
+        }
+        revokeState()
         activeSession = ActiveSession(
             displayID: displayID,
             screenRequestID: screenRequestID,
             inputSessionID: inputSessionID,
-            authoritativeDisplayBounds: validatedAuthoritativeBounds
+            ownerToken: ownerToken,
+            ownershipClaimGeneration: ownershipClaim.generation,
+            authoritativeDisplayBounds: validatedAuthoritativeBounds,
+            supportsFocusedWindowResizeScaleRebinding:
+                supportsFocusedWindowResizeScaleRebinding,
+            revokeAuthorization: nil
         )
+        highestSuccessfullyArmedClaimGeneration = ownershipClaim.generation
+        if let initialFrameGeometry {
+            updateScreenVideoFrameGeometryLocked(initialFrameGeometry)
+        }
         resetRateLimits(now: clock.now())
         return .armed
     }
 
-    /// Immediately revokes the active input session and any focused-element grant.
+    /// Revokes input only when the caller still owns the active session.
+    ///
+    /// A delayed Hide, disconnect, or capture-stop callback from an older viewer is a no-op.
+    public func revoke(ifOwnedBy ownerToken: MacRemoteInputOwnerToken) {
+        withLock {
+            guard activeSession?.ownerToken == ownerToken else { return }
+            revokeState()
+        }
+    }
+
+    /// Source-compatible single-owner entry point. It cannot revoke an owner-scoped session.
     public func revoke() {
         withLock {
+            guard activeSession?.ownerToken == Self.legacyOwnerToken else { return }
             revokeState()
         }
     }
@@ -303,10 +807,12 @@ public final class MacRemoteInputController: @unchecked Sendable {
     /// remained stable, while the same authenticated Show/input capability stays valid.
     public func updateAuthoritativeDisplayBounds(
         _ bounds: CGRect?,
-        for displayID: UInt32
+        for displayID: UInt32,
+        ownerToken: MacRemoteInputOwnerToken
     ) {
         withLock {
             guard var session = activeSession,
+                  session.ownerToken == ownerToken,
                   session.displayID == displayID else {
                 return
             }
@@ -327,35 +833,74 @@ public final class MacRemoteInputController: @unchecked Sendable {
             session.authoritativeDisplayBounds = validatedBounds
             activeSession = session
             authorizedFocus = nil
+            authorizedWindowResizeTarget = nil
             clearScreenVideoFrameGeometry()
         }
+    }
+
+    /// Source-compatible single-owner entry point retained for CaptureCore's focused unit tests.
+    public func updateAuthoritativeDisplayBounds(
+        _ bounds: CGRect?,
+        for displayID: UInt32
+    ) {
+        updateAuthoritativeDisplayBounds(
+            bounds,
+            for: displayID,
+            ownerToken: Self.legacyOwnerToken
+        )
     }
 
     /// Observes the geometry of a complete frame that has entered WebRTC.
     ///
     /// A new transform closes input for a bounded propagation interval. Passing nil closes the
     /// gate while capture is stopped or geometry cannot be proven.
+    public func updateScreenVideoFrameGeometry(
+        _ geometry: ScreenVideoFrameGeometry?,
+        ownerToken: MacRemoteInputOwnerToken
+    ) {
+        withLock {
+            guard activeSession?.ownerToken == ownerToken else { return }
+            updateScreenVideoFrameGeometryLocked(geometry)
+        }
+    }
+
+    /// Source-compatible single-owner entry point retained for CaptureCore's focused unit tests.
     public func updateScreenVideoFrameGeometry(_ geometry: ScreenVideoFrameGeometry?) {
         withLock {
-            guard let geometry else {
-                clearScreenVideoFrameGeometry()
+            guard activeSession?.ownerToken == Self.legacyOwnerToken
+                    || activeSession == nil else {
                 return
             }
+            updateScreenVideoFrameGeometryLocked(geometry)
+        }
+    }
 
-            let now = clock.now()
-            guard let candidateScreenVideoFrameGeometry,
-                  candidateScreenVideoFrameGeometry.hasSameInputTransform(as: geometry),
-                  let candidateScreenVideoFrameGeometrySince else {
-                screenVideoFrameGeometry = nil
-                candidateScreenVideoFrameGeometry = geometry
-                self.candidateScreenVideoFrameGeometrySince = now
-                return
-            }
+    private func updateScreenVideoFrameGeometryLocked(
+        _ geometry: ScreenVideoFrameGeometry?
+    ) {
+        guard let geometry else {
+            clearScreenVideoFrameGeometry()
+            return
+        }
 
-            if now - candidateScreenVideoFrameGeometrySince
-                >= Self.minimumFrameGeometryStability {
-                screenVideoFrameGeometry = geometry
-            }
+        if let target = authorizedWindowResizeTarget,
+           !target.frameGeometry.hasSameInputTransform(as: geometry) {
+            authorizedWindowResizeTarget = nil
+        }
+
+        let now = clock.now()
+        guard let candidateScreenVideoFrameGeometry,
+              candidateScreenVideoFrameGeometry.hasSameInputTransform(as: geometry),
+              let candidateScreenVideoFrameGeometrySince else {
+            screenVideoFrameGeometry = nil
+            candidateScreenVideoFrameGeometry = geometry
+            self.candidateScreenVideoFrameGeometrySince = now
+            return
+        }
+
+        if now - candidateScreenVideoFrameGeometrySince
+            >= Self.minimumFrameGeometryStability {
+            screenVideoFrameGeometry = geometry
         }
     }
 
@@ -449,7 +994,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
             return .rejected(.invalidPoint)
         }
         guard hasCurrentPermissions() else {
-            revokeState()
+            revokeForPermissionLossLocked()
             return .rejected(.permissionRequired)
         }
         guard let liveDisplayBounds = validDisplayBounds(for: session.displayID) else {
@@ -530,10 +1075,11 @@ public final class MacRemoteInputController: @unchecked Sendable {
         }
         let focus = AuthorizedFocus(
             element: focusedEditable.element,
-            generation: nextFocusGeneration
+            generation: nextFocusGeneration,
+            secure: focusedEditable.secure
         )
         authorizedFocus = focus
-        return .accepted(.editable(generation: focus.generation, secure: false))
+        return .accepted(.editable(generation: focus.generation, secure: focus.secure))
     }
 
     /// Performs one complete primary-button drag for the exact active screen share.
@@ -620,7 +1166,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
             return .rejected(.invalidPoint)
         }
         guard hasCurrentPermissions() else {
-            revokeState()
+            revokeForPermissionLossLocked()
             return .rejected(.permissionRequired)
         }
         guard let liveDisplayBounds = validDisplayBounds(for: session.displayID) else {
@@ -710,10 +1256,11 @@ public final class MacRemoteInputController: @unchecked Sendable {
         }
         let focus = AuthorizedFocus(
             element: focusedEditable.element,
-            generation: nextFocusGeneration
+            generation: nextFocusGeneration,
+            secure: focusedEditable.secure
         )
         authorizedFocus = focus
-        return .accepted(.editable(generation: focus.generation, secure: false))
+        return .accepted(.editable(generation: focus.generation, secure: focus.secure))
     }
 
     /// Posts one stateless pixel scroll at the initial remote touch anchor.
@@ -804,7 +1351,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
             return .rejected(.invalidPoint)
         }
         guard hasCurrentPermissions() else {
-            revokeState()
+            revokeForPermissionLossLocked()
             return .rejected(.permissionRequired)
         }
         guard let liveDisplayBounds = validDisplayBounds(for: session.displayID) else {
@@ -991,6 +1538,1056 @@ public final class MacRemoteInputController: @unchecked Sendable {
         return value.rounded(.towardZero)
     }
 
+    // MARK: - Focused-window resize
+
+    /// Acquires the exact currently focused standard window without changing system focus.
+    public func requestFocusedWindowResizeTarget(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        requestFocusedWindowTarget(
+            screenRequestID: screenRequestID, inputSessionID: inputSessionID,
+            viewerVideoSize: viewerVideoSize, operation: .resize
+        )
+    }
+
+    public func requestFocusedWindowMoveTarget(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        requestFocusedWindowTarget(
+            screenRequestID: screenRequestID, inputSessionID: inputSessionID,
+            viewerVideoSize: viewerVideoSize, operation: .move
+        )
+    }
+
+    private func requestFocusedWindowTarget(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        viewerVideoSize: MacRemoteInputVideoSize?,
+        operation: MacRemoteWindowOperation
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        withLock {
+            // A semantic reacquisition supersedes any previously issued resize authority.
+            authorizedWindowResizeTarget = nil
+            let resolution = windowResizeContextLocked(
+                screenRequestID: screenRequestID,
+                inputSessionID: inputSessionID,
+                viewerVideoSize: viewerVideoSize,
+                operation: operation,
+                allowsRecoverableOffscreenMove: operation == .move
+            )
+            guard case .available(let context) = resolution else {
+                return diagnosedWindowResizeRejection(resolution)
+            }
+            let preservedFocus = currentlyAuthorizedFocusIfValid()
+            guard windowResizeBucket.consume(1, at: clock.now()) else {
+                return .init(
+                    result: .rejected(.rateLimited),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+
+            guard let window = system.focusedWindow() else {
+                authorizedWindowResizeTarget = nil
+                return .init(
+                    result: .rejected(.windowUnavailable),
+                    verifiedFocus: focusResult(preserving: preservedFocus),
+                    screenFormatDiagnostic: nil
+                )
+            }
+            return installWindowResizeTarget(
+                for: window,
+                kind: .targetAcquired,
+                context: context,
+                preservedFocus: preservedFocus
+            )
+        }
+    }
+
+    /// Selects only the top-level standard window at a video point, without clicking its controls.
+    public func selectWindowForResize(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        normalizedPoint: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        selectWindow(
+            screenRequestID: screenRequestID, inputSessionID: inputSessionID,
+            normalizedPoint: normalizedPoint, viewerVideoSize: viewerVideoSize, operation: .resize
+        )
+    }
+
+    public func selectWindowForMove(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        normalizedPoint: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        selectWindow(
+            screenRequestID: screenRequestID, inputSessionID: inputSessionID,
+            normalizedPoint: normalizedPoint, viewerVideoSize: viewerVideoSize, operation: .move
+        )
+    }
+
+    private func selectWindow(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        normalizedPoint: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?,
+        operation: MacRemoteWindowOperation
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        withLock {
+            // A selection attempt always retires the old target, including malformed taps.
+            authorizedWindowResizeTarget = nil
+            guard normalizedPoint.isValid else {
+                return .init(result: .rejected(.invalidPoint))
+            }
+            let resolution = windowResizeContextLocked(
+                screenRequestID: screenRequestID,
+                inputSessionID: inputSessionID,
+                viewerVideoSize: viewerVideoSize,
+                operation: operation,
+                allowsRecoverableOffscreenMove: operation == .move
+            )
+            guard case .available(let context) = resolution else {
+                return diagnosedWindowResizeRejection(resolution)
+            }
+            guard let contentPoint = mappedContentPoint(
+                normalizedPoint,
+                frameGeometry: context.frameGeometry,
+                clampToContent: false
+            ) else {
+                return .init(result: .rejected(.invalidPoint))
+            }
+            let preservedFocus = currentlyAuthorizedFocusIfValid()
+            guard windowResizeBucket.consume(1, at: clock.now()) else {
+                return .init(
+                    result: .rejected(.rateLimited),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+
+            let globalPoint = MacRemoteInputCoordinateMapper.globalPoint(
+                contentPoint,
+                in: context.displayBounds
+            )
+            guard let hitElement = system.element(at: globalPoint),
+                  let window = windowAncestor(from: hitElement),
+                  validatedResizableWindowFrame(
+                      window, in: context.displayBounds, operation: operation,
+                      allowsRecoverableOffscreenMove: context.allowsRecoverableOffscreenMove
+                  ) != nil,
+                  system.focusWindow(window),
+                  waitForFocusedWindow(matching: window) else {
+                return .init(
+                    result: .rejected(.windowUnavailable),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+            return installWindowResizeTarget(
+                for: window,
+                kind: .windowSelected,
+                context: context,
+                preservedFocus: preservedFocus
+            )
+        }
+    }
+
+    /// Applies one bounded AX size/position transaction to the exact bound target generation.
+    public func commitFocusedWindowResize(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        targetGeneration: UUID,
+        start: MacRemoteNormalizedPoint,
+        end: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        commitFocusedWindow(
+            screenRequestID: screenRequestID, inputSessionID: inputSessionID,
+            targetGeneration: targetGeneration, start: start, end: end,
+            viewerVideoSize: viewerVideoSize, operation: .resize
+        )
+    }
+
+    public func commitFocusedWindowMove(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        targetGeneration: UUID,
+        start: MacRemoteNormalizedPoint,
+        end: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?,
+        allowsRecoverableOffscreen: Bool = false
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        commitFocusedWindow(
+            screenRequestID: screenRequestID, inputSessionID: inputSessionID,
+            targetGeneration: targetGeneration, start: start, end: end,
+            viewerVideoSize: viewerVideoSize, operation: .move,
+            allowsRecoverableOffscreenMove: allowsRecoverableOffscreen
+        )
+    }
+
+    private func commitFocusedWindow(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        targetGeneration: UUID,
+        start: MacRemoteNormalizedPoint,
+        end: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?,
+        operation: MacRemoteWindowOperation,
+        allowsRecoverableOffscreenMove: Bool = false
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        withLock {
+            guard targetGeneration != Self.zeroUUID,
+                  start.isValid, end.isValid else {
+                authorizedWindowResizeTarget = nil
+                return .init(result: .rejected(.invalidPoint))
+            }
+            let resolution = windowResizeContextLocked(
+                screenRequestID: screenRequestID,
+                inputSessionID: inputSessionID,
+                viewerVideoSize: viewerVideoSize,
+                operation: operation,
+                allowsRecoverableOffscreenMove: allowsRecoverableOffscreenMove
+            )
+            guard case .available(let context) = resolution else {
+                authorizedWindowResizeTarget = nil
+                return diagnosedWindowResizeRejection(resolution)
+            }
+            guard let target = authorizedWindowResizeTarget,
+                  target.operation == operation,
+                  target.generation == targetGeneration,
+                  target.screenRequestID == screenRequestID,
+                  target.inputSessionID == inputSessionID,
+                  target.hasCompatibleCoordinateBinding(with: context),
+                  MacRemoteWindowResizeGeometry.approximatelyEqual(
+                      target.displayBounds,
+                      context.displayBounds
+                  ),
+                  let focusedWindow = system.focusedWindow(),
+                  system.elementsEqual(focusedWindow, target.element),
+                  let currentFrame = validatedResizableWindowFrame(
+                      target.element,
+                      in: context.displayBounds,
+                      operation: operation,
+                      allowsRecoverableOffscreenMove: context.allowsRecoverableOffscreenMove
+                  ),
+                  MacRemoteWindowResizeGeometry.approximatelyEqual(
+                      currentFrame,
+                      target.originalFrame
+                  ),
+                  let contentStart = mappedContentPoint(
+                      start,
+                      frameGeometry: context.frameGeometry,
+                      clampToContent: false
+                  ),
+                  let contentEnd = mappedContentPoint(
+                      end,
+                      frameGeometry: context.frameGeometry,
+                      clampToContent: true
+                  ) else {
+                authorizedWindowResizeTarget = nil
+                let preservedFocus = currentlyAuthorizedFocusIfValid()
+                return .init(
+                    result: .rejected(.windowUnavailable),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+
+            let preservedFocus = currentlyAuthorizedFocusIfValid()
+
+            let globalStart = MacRemoteInputCoordinateMapper.globalPoint(
+                contentStart,
+                in: context.displayBounds
+            )
+            let globalEnd = MacRemoteInputCoordinateMapper.globalPoint(
+                contentEnd,
+                in: context.displayBounds
+            )
+            let resizeProposal = operation == .resize ? MacRemoteWindowResizeGeometry.proposedFrame(
+                original: target.originalFrame,
+                start: globalStart,
+                end: globalEnd,
+                displayBounds: context.displayBounds
+            ) : nil
+            let moveProposal = operation == .move ? FocusedWindowMoveGeometry.proposedFrame(
+                original: target.originalFrame, start: globalStart, end: globalEnd,
+                displayBounds: context.displayBounds,
+                allowsRecoverableOffscreen: context.allowsRecoverableOffscreenMove
+            ) : nil
+            guard let proposedFrame = resizeProposal?.frame ?? moveProposal else {
+                authorizedWindowResizeTarget = nil
+                return .init(
+                    result: .rejected(.invalidPoint),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+            guard windowResizeBucket.consume(1, at: clock.now()) else {
+                authorizedWindowResizeTarget = nil
+                return .init(
+                    result: .rejected(.rateLimited),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+            guard !system.isPhysicalPrimaryButtonPressed() else {
+                authorizedWindowResizeTarget = nil
+                return .init(
+                    result: .rejected(.primaryButtonInUse),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+            guard let successorGeneration = freshWindowResizeGeneration(
+                excluding: target.generation
+            ) else {
+                revokeState()
+                return .init(
+                    result: .rejected(.staleSession)
+                )
+            }
+
+            // The AX/TCC/display world is not serialized by this controller's lock. Re-resolve
+            // every external and controller-owned authorization fact after all proposal, rate-limit,
+            // physical-button, and successor-generation work, immediately before the first AX
+            // write. A focus, frame, permission, display, capture transform, viewer shape, session,
+            // or one-shot target drift therefore retires the target without any system mutation.
+            let finalResolution = windowResizeContextLocked(
+                screenRequestID: screenRequestID,
+                inputSessionID: inputSessionID,
+                viewerVideoSize: viewerVideoSize,
+                operation: operation,
+                allowsRecoverableOffscreenMove: allowsRecoverableOffscreenMove
+            )
+            guard case .available(let finalContext) = finalResolution else {
+                authorizedWindowResizeTarget = nil
+                return diagnosedWindowResizeRejection(finalResolution)
+            }
+            guard let finalTarget = authorizedWindowResizeTarget,
+                  finalTarget.operation == operation,
+                  finalTarget.generation == targetGeneration,
+                  finalTarget.generation == target.generation,
+                  finalTarget.screenRequestID == screenRequestID,
+                  finalTarget.inputSessionID == inputSessionID,
+                  finalTarget.hasCompatibleCoordinateBinding(with: finalContext),
+                  finalTarget.viewerVideoSize == target.viewerVideoSize,
+                  finalTarget.frameGeometry.hasSameInputTransform(
+                      as: target.frameGeometry
+                  ),
+                  MacRemoteWindowResizeGeometry.approximatelyEqual(
+                      finalTarget.displayBounds,
+                      finalContext.displayBounds
+                  ),
+                  MacRemoteWindowResizeGeometry.approximatelyEqual(
+                      finalTarget.displayBounds,
+                      target.displayBounds
+                  ),
+                  let finalFocusedWindow = system.focusedWindow(),
+                  system.elementsEqual(finalFocusedWindow, finalTarget.element),
+                  system.elementsEqual(finalTarget.element, target.element),
+                  let finalFrame = validatedResizableWindowFrame(
+                      finalTarget.element,
+                      in: finalContext.displayBounds,
+                      operation: operation,
+                      allowsRecoverableOffscreenMove:
+                          finalContext.allowsRecoverableOffscreenMove
+                  ),
+                  MacRemoteWindowResizeGeometry.approximatelyEqual(
+                      finalFrame,
+                      finalTarget.originalFrame
+                  ),
+                  MacRemoteWindowResizeGeometry.approximatelyEqual(
+                      finalFrame,
+                      target.originalFrame
+                  ) else {
+                authorizedWindowResizeTarget = nil
+                return .init(
+                    result: .rejected(.windowUnavailable),
+                    verifiedFocus: focusResult(preserving: preservedFocus)
+                )
+            }
+
+            authorizedWindowResizeTarget = nil
+            let transaction: WindowResizeTransactionResult
+            if let resizeProposal {
+                transaction = performWindowResizeTransaction(
+                    window: finalTarget.element,
+                    originalFrame: finalTarget.originalFrame,
+                    proposedFrame: proposedFrame,
+                    corner: resizeProposal.corner,
+                    context: finalContext
+                )
+            } else {
+                transaction = performWindowMoveTransaction(
+                window: finalTarget.element,
+                originalFrame: finalTarget.originalFrame,
+                proposedFrame: proposedFrame,
+                context: finalContext
+                )
+            }
+            switch transaction {
+            case .committed(let finalFrame):
+                guard windowResizeTransactionIsAuthorized(
+                    window: finalTarget.element,
+                    expectedFrame: finalFrame,
+                    context: finalContext,
+                    expectedFocus: finalTarget.element
+                ),
+                      let normalizedFrames = normalizedWindowTargetFrames(
+                          for: finalFrame,
+                          context: finalContext
+                      ) else {
+                    return rejectCommittedResizeAfterRollback(
+                        window: finalTarget.element,
+                        originalFrame: finalTarget.originalFrame,
+                        ownedFrame: finalFrame,
+                        context: finalContext,
+                        preservedFocus: preservedFocus
+                    )
+                }
+                return installCommittedWindowResizeTarget(
+                    window: finalTarget.element,
+                    generation: successorGeneration,
+                    consumedGeneration: finalTarget.generation,
+                    finalFrame: finalFrame,
+                    normalizedFrame: normalizedFrames.visible,
+                    unclippedNormalizedFrame: normalizedFrames.unclipped,
+                    context: finalContext,
+                    preservedFocus: preservedFocus
+                )
+
+            case .failedWithProvenRollback:
+                return .init(
+                    result: .rejected(.windowResizeFailed),
+                    verifiedFocus: focusResult(preserving: preservedFocus),
+                    screenFormatDiagnostic: nil
+                )
+
+            case .restorationUncertain:
+                authorizedFocus = nil
+                return .init(
+                    result: .rejected(.windowResizeUncertain),
+                    screenFormatDiagnostic: nil
+                )
+            }
+        }
+    }
+
+    private func windowResizeContextLocked(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        viewerVideoSize: MacRemoteInputVideoSize?,
+        operation: MacRemoteWindowOperation = .resize,
+        allowsRecoverableOffscreenMove: Bool = false
+    ) -> MacRemoteWindowResizeContextResolution {
+        guard !isPermanentlyInvalidated, allowRemoteControl else {
+            return .rejected(.disabled, diagnostic: nil)
+        }
+        guard let session = matchingSession(
+            screenRequestID: screenRequestID,
+            inputSessionID: inputSessionID
+        ) else {
+            return .rejected(.staleSession, diagnostic: nil)
+        }
+        guard let viewerVideoSize else {
+            return .rejected(
+                .screenFormatChanging,
+                diagnostic: makeScreenFormatDiagnostic(
+                    reason: .viewerSizeMissing,
+                    viewerVideoSize: nil,
+                    frameGeometry: screenVideoFrameGeometry
+                        ?? candidateScreenVideoFrameGeometry,
+                    viewerAspectRelativeDifference: nil
+                )
+            )
+        }
+        guard viewerVideoSize.isValid else {
+            return .rejected(.invalidPoint, diagnostic: nil)
+        }
+        guard hasCurrentPermissions() else {
+            revokeForPermissionLossLocked()
+            return .rejected(.permissionRequired, diagnostic: nil)
+        }
+        guard let liveDisplayBounds = validDisplayBounds(for: session.displayID) else {
+            revokeState()
+            return .rejected(.displayUnavailable, diagnostic: nil)
+        }
+        let displayBounds = session.authoritativeDisplayBounds ?? liveDisplayBounds
+        let frameGeometry: ScreenVideoFrameGeometry
+        switch currentScreenVideoFrameGeometryResolution(compatibleWith: displayBounds) {
+        case .unavailable:
+            return .rejected(
+                .screenFormatChanging,
+                diagnostic: makeScreenFormatDiagnostic(
+                    reason: .frameGeometryUnavailableOrUnstable,
+                    viewerVideoSize: viewerVideoSize,
+                    frameGeometry: candidateScreenVideoFrameGeometry,
+                    viewerAspectRelativeDifference: nil
+                )
+            )
+        case .displayIncompatible(let geometry):
+            return .rejected(
+                .screenFormatChanging,
+                diagnostic: makeScreenFormatDiagnostic(
+                    reason: .displayGeometryIncompatible,
+                    viewerVideoSize: viewerVideoSize,
+                    frameGeometry: geometry,
+                    viewerAspectRelativeDifference: nil
+                )
+            )
+        case .available(let geometry):
+            frameGeometry = geometry
+        }
+        let comparison = Self.viewerVideoAspectComparison(
+            viewerVideoSize,
+            frameGeometry: frameGeometry
+        )
+        guard comparison.matches else {
+            return .rejected(
+                .screenFormatChanging,
+                diagnostic: makeScreenFormatDiagnostic(
+                    reason: .viewerAspectMismatch,
+                    viewerVideoSize: viewerVideoSize,
+                    frameGeometry: frameGeometry,
+                    viewerAspectRelativeDifference: comparison.relativeDifference
+                )
+            )
+        }
+        return .available(
+            MacRemoteWindowResizeContext(
+                operation: operation,
+                session: session,
+                displayBounds: displayBounds,
+                frameGeometry: frameGeometry,
+                viewerVideoSize: viewerVideoSize,
+                allowsRecoverableOffscreenMove:
+                    operation == .move && allowsRecoverableOffscreenMove
+            )
+        )
+    }
+
+    private func diagnosedWindowResizeRejection(
+        _ resolution: MacRemoteWindowResizeContextResolution
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        switch resolution {
+        case .available:
+            return .init(result: .rejected(.windowUnavailable))
+        case .rejected(let rejection, let diagnostic):
+            let verifiedFocus: MacRemoteInputFocus?
+            if rejection == .screenFormatChanging {
+                verifiedFocus = focusResult(
+                    preserving: currentlyAuthorizedFocusIfValid()
+                )
+            } else {
+                verifiedFocus = nil
+            }
+            return .init(
+                result: .rejected(rejection),
+                verifiedFocus: verifiedFocus,
+                screenFormatDiagnostic: diagnostic
+            )
+        }
+    }
+
+    private func normalizedWindowTargetFrames(
+        for frame: CGRect,
+        context: MacRemoteWindowResizeContext
+    ) -> (visible: CGRect, unclipped: CGRect?)? {
+        switch context.operation {
+        case .resize:
+            guard let visible = context.frameGeometry.frameNormalizedRect(
+                forGlobalRect: frame,
+                in: context.displayBounds
+            ) else { return nil }
+            return (visible, nil)
+        case .move:
+            guard let visible = context.frameGeometry.frameNormalizedVisibleIntersection(
+                forGlobalRect: frame,
+                in: context.displayBounds
+            ), let unclipped = context.frameGeometry.frameUnclippedNormalizedRect(
+                forGlobalRect: frame,
+                in: context.displayBounds
+            ) else { return nil }
+            return (visible, unclipped)
+        }
+    }
+
+    private func installWindowResizeTarget(
+        for window: MacRemoteAccessibilityElement,
+        kind: MacRemoteWindowResizeFeedbackKind,
+        context: MacRemoteWindowResizeContext,
+        preservedFocus: AuthorizedFocus?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        guard let focusedWindow = system.focusedWindow(),
+              system.elementsEqual(focusedWindow, window),
+              let frame = validatedResizableWindowFrame(
+                  window,
+                  in: context.displayBounds,
+                  operation: context.operation,
+                  allowsRecoverableOffscreenMove: context.allowsRecoverableOffscreenMove
+              ),
+              let normalizedFrames = normalizedWindowTargetFrames(
+                  for: frame,
+                  context: context
+              ) else {
+            authorizedWindowResizeTarget = nil
+            return .init(
+                result: .rejected(.windowUnavailable),
+                verifiedFocus: focusResult(preserving: preservedFocus),
+                screenFormatDiagnostic: nil
+            )
+        }
+        guard let generation = freshWindowResizeGeneration(excluding: nil) else {
+            revokeState()
+            return .init(result: .rejected(.staleSession))
+        }
+
+        authorizedWindowResizeTarget = AuthorizedWindowResizeTarget(
+            operation: context.operation,
+            element: window,
+            generation: generation,
+            originalFrame: frame,
+            displayBounds: context.displayBounds,
+            frameGeometry: context.frameGeometry,
+            viewerVideoSize: context.viewerVideoSize,
+            screenRequestID: context.session.screenRequestID,
+            inputSessionID: context.session.inputSessionID
+        )
+        return MacRemoteWindowResizeDiagnosedResult(
+            result: .accepted(focusResult(preserving: preservedFocus)),
+            windowResizeFeedback: MacRemoteWindowResizeFeedback(
+                kind: kind,
+                target: MacRemoteWindowResizeTarget(
+                    generation: generation,
+                    normalizedFrame: normalizedFrames.visible,
+                    unclippedNormalizedFrame: normalizedFrames.unclipped
+                )
+            ),
+            verifiedFocus: nil
+        )
+    }
+
+    /// Publishes only the already-read, validated AX truth from the successful transaction.
+    private func installCommittedWindowResizeTarget(
+        window: MacRemoteAccessibilityElement,
+        generation: UUID,
+        consumedGeneration: UUID,
+        finalFrame: CGRect,
+        normalizedFrame: CGRect,
+        unclippedNormalizedFrame: CGRect?,
+        context: MacRemoteWindowResizeContext,
+        preservedFocus: AuthorizedFocus?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        authorizedWindowResizeTarget = AuthorizedWindowResizeTarget(
+            operation: context.operation,
+            element: window,
+            generation: generation,
+            originalFrame: finalFrame,
+            displayBounds: context.displayBounds,
+            frameGeometry: context.frameGeometry,
+            viewerVideoSize: context.viewerVideoSize,
+            screenRequestID: context.session.screenRequestID,
+            inputSessionID: context.session.inputSessionID
+        )
+        return MacRemoteWindowResizeDiagnosedResult(
+            result: .accepted(focusResult(preserving: preservedFocus)),
+            windowResizeFeedback: MacRemoteWindowResizeFeedback(
+                kind: context.operation == .move ? .moveCommitted : .resizeCommitted,
+                target: MacRemoteWindowResizeTarget(
+                    generation: generation,
+                    normalizedFrame: normalizedFrame,
+                    unclippedNormalizedFrame: unclippedNormalizedFrame
+                ),
+                committedTargetGeneration: consumedGeneration
+            )
+        )
+    }
+
+    /// A resize is not rejected after mutation unless the original frame is restored or the
+    /// outcome is escalated to terminal uncertainty.
+    private func rejectCommittedResizeAfterRollback(
+        window: MacRemoteAccessibilityElement,
+        originalFrame: CGRect,
+        ownedFrame: CGRect,
+        context: MacRemoteWindowResizeContext,
+        preservedFocus: AuthorizedFocus?
+    ) -> MacRemoteWindowResizeDiagnosedResult {
+        authorizedWindowResizeTarget = nil
+        if rollbackWindowFrame(
+            window, to: originalFrame, ownedFrame: ownedFrame, context: context
+        ) {
+            return .init(
+                result: .rejected(.windowResizeFailed),
+                verifiedFocus: focusResult(preserving: preservedFocus)
+            )
+        }
+        authorizedFocus = nil
+        return .init(result: .rejected(.windowResizeUncertain))
+    }
+
+    /// Bounds a broken generator and never reissues authority within one input session.
+    private func freshWindowResizeGeneration(excluding consumed: UUID?) -> UUID? {
+        guard issuedWindowResizeGenerations.count
+                < Self.maximumWindowResizeGenerationsPerSession else {
+            return nil
+        }
+        for _ in 0..<16 {
+            let candidate = makeWindowResizeGeneration()
+            if candidate != Self.zeroUUID,
+               candidate != consumed,
+               issuedWindowResizeGenerations.insert(candidate).inserted {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func validatedResizableWindowFrame(
+        _ window: MacRemoteAccessibilityElement,
+        in displayBounds: CGRect,
+        operation: MacRemoteWindowOperation = .resize,
+        allowsRecoverableOffscreenMove: Bool = false
+    ) -> CGRect? {
+        guard let frame = system.windowFrame(window),
+              isResizableWindow(
+                  window,
+                  with: frame,
+                  in: displayBounds,
+                  operation: operation,
+                  allowsRecoverableOffscreenMove: allowsRecoverableOffscreenMove
+              ) else {
+            return nil
+        }
+        return frame
+    }
+
+    /// Validates one exact AX readback so a second frame read cannot race the transaction proof.
+    private func isResizableWindow(
+        _ window: MacRemoteAccessibilityElement,
+        with frame: CGRect,
+        in displayBounds: CGRect,
+        operation: MacRemoteWindowOperation = .resize,
+        allowsRecoverableOffscreenMove: Bool = false
+    ) -> Bool {
+        let positionIsAllowed = operation == .move && allowsRecoverableOffscreenMove
+            ? FocusedWindowMoveGeometry.isRecoverable(frame, in: displayBounds)
+            : MacRemoteWindowResizeGeometry.contains(frame, in: displayBounds, tolerance: 0.5)
+        return system.role(of: window) == "AXWindow"
+            && system.subrole(of: window) == "AXStandardWindow"
+            && system.windowEnabledState(window).permitsStandardWindowInteraction
+            && system.isWindowMinimized(window) == false
+            && system.isWindowFullScreen(window) == false
+            && system.isWindowModal(window) == false
+            && system.isWindowPositionSettable(window)
+            && (operation == .move || system.isWindowSizeSettable(window))
+            && positionIsAllowed
+            && !Self.isFullscreenLike(frame, in: displayBounds)
+    }
+
+    private static func isFullscreenLike(_ frame: CGRect, in displayBounds: CGRect) -> Bool {
+        let tolerance: CGFloat = 2
+        return abs(frame.minX - displayBounds.minX) <= tolerance
+            && abs(frame.minY - displayBounds.minY) <= tolerance
+            && abs(frame.maxX - displayBounds.maxX) <= tolerance
+            && abs(frame.maxY - displayBounds.maxY) <= tolerance
+    }
+
+    private func windowAncestor(
+        from hitElement: MacRemoteAccessibilityElement
+    ) -> MacRemoteAccessibilityElement? {
+        var current: MacRemoteAccessibilityElement? = hitElement
+        var visited: [MacRemoteAccessibilityElement] = []
+        for _ in 0..<Self.maximumWindowAncestorDepth {
+            guard let element = current else { break }
+            if visited.contains(where: { system.elementsEqual($0, element) }) {
+                break
+            }
+            visited.append(element)
+            if system.role(of: element) == "AXWindow" {
+                return element
+            }
+            current = system.parent(of: element)
+        }
+        return nil
+    }
+
+    private func waitForFocusedWindow(
+        matching expected: MacRemoteAccessibilityElement
+    ) -> Bool {
+        let deadline = clock.now() + Self.maximumFocusWait
+        for attempt in 0...10 {
+            if let focused = system.focusedWindow(), system.elementsEqual(focused, expected) {
+                return true
+            }
+            let now = clock.now()
+            guard attempt < 10, now < deadline else { break }
+            clock.sleep(for: min(Self.focusPollInterval, deadline - now))
+        }
+        return false
+    }
+
+    private func currentlyAuthorizedFocusIfValid() -> AuthorizedFocus? {
+        guard let authorizedFocus else { return nil }
+        guard verifyFocusedElement(authorizedFocus) else {
+            self.authorizedFocus = nil
+            return nil
+        }
+        return authorizedFocus
+    }
+
+    private func focusResult(preserving focus: AuthorizedFocus?) -> MacRemoteInputFocus {
+        guard let focus, verifyFocusedElement(focus) else {
+            if let focus, authorizedFocus?.generation == focus.generation {
+                authorizedFocus = nil
+            }
+            return .none
+        }
+        authorizedFocus = focus
+        return .editable(generation: focus.generation, secure: focus.secure)
+    }
+
+    private enum WindowResizeTransactionResult {
+        case committed(CGRect)
+        case failedWithProvenRollback
+        case restorationUncertain
+    }
+
+    private func performWindowMoveTransaction(
+        window: MacRemoteAccessibilityElement,
+        originalFrame: CGRect,
+        proposedFrame: CGRect,
+        context: MacRemoteWindowResizeContext
+    ) -> WindowResizeTransactionResult {
+        guard !MacRemoteWindowResizeGeometry.approximatelyEqual(
+            originalFrame.origin, proposedFrame.origin
+        ) else { return .committed(originalFrame) }
+        var ownedFrame: CGRect? = originalFrame
+        if writeWindowFrame(
+            window, position: proposedFrame.origin, ownedFrame: &ownedFrame,
+            context: context, expectedFocus: window
+        ), let actual = ownedFrame,
+           actual.size == originalFrame.size,
+           MacRemoteWindowResizeGeometry.followsRequestedMove(
+               actual,
+               from: originalFrame,
+               toward: proposedFrame
+           ), context.allowsRecoverableOffscreenMove
+                ? FocusedWindowMoveGeometry.isRecoverable(
+                    actual,
+                    in: context.displayBounds
+                )
+                : MacRemoteWindowResizeGeometry.contains(
+                    actual,
+                    in: context.displayBounds,
+                    tolerance: 0.5
+                ) {
+            return .committed(actual)
+        }
+        return rollbackWindowFrame(
+            window, to: originalFrame, ownedFrame: ownedFrame, context: context
+        ) ? .failedWithProvenRollback : .restorationUncertain
+    }
+
+    private func performWindowResizeTransaction(
+        window: MacRemoteAccessibilityElement,
+        originalFrame: CGRect,
+        proposedFrame: CGRect,
+        corner: MacRemoteWindowResizeCorner,
+        context: MacRemoteWindowResizeContext
+    ) -> WindowResizeTransactionResult {
+        var ownedFrame: CGRect? = originalFrame
+        if moveWindowFrame(
+            window, toward: proposedFrame, ownedFrame: &ownedFrame, context: context,
+            expectedFocus: window, anchor: (originalFrame, corner)
+        ), let finalFrame = ownedFrame,
+           MacRemoteWindowResizeGeometry.preservesOppositeCorner(
+               finalFrame, from: originalFrame, corner: corner
+           ), MacRemoteWindowResizeGeometry.followsRequestedResize(
+               finalFrame, from: originalFrame, toward: proposedFrame
+           ) {
+            return .committed(finalFrame)
+        }
+        return rollbackWindowFrame(
+            window, to: originalFrame, ownedFrame: ownedFrame, context: context
+        ) ? .failedWithProvenRollback : .restorationUncertain
+    }
+
+    /// Four bounded phases, with no polling under the input/dispatch authorization locks.
+    /// Shrinking first makes room for an inward move; prepositioning before growth avoids an
+    /// application's position-dependent size clamp. The final origin uses actual AX size.
+    /// Proof is limited to immediate AX readback: missing/invalid readback is uncertainty and
+    /// never replayed. An unchanged read cannot detect an outstanding asynchronous setter;
+    /// delayed AX convergence requires separate investigation, not waits under these locks.
+    private func moveWindowFrame(
+        _ window: MacRemoteAccessibilityElement,
+        toward goal: CGRect,
+        ownedFrame: inout CGRect?,
+        context: MacRemoteWindowResizeContext,
+        expectedFocus: MacRemoteAccessibilityElement?,
+        anchor: (CGRect, MacRemoteWindowResizeCorner)?
+    ) -> Bool {
+        guard let initial = ownedFrame else { return false }
+        let smaller = CGSize(
+            width: min(initial.width, goal.width), height: min(initial.height, goal.height)
+        )
+        if smaller != initial.size,
+           !writeWindowFrame(
+               window, size: smaller, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        guard let current = ownedFrame,
+              let stagingOrigin = MacRemoteWindowResizeGeometry.safeStagingOrigin(
+                  toward: goal, current: current, in: context.displayBounds
+              ) else { return false }
+        if !MacRemoteWindowResizeGeometry.approximatelyEqual(current.origin, stagingOrigin),
+           !writeWindowFrame(
+               window, position: stagingOrigin, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        if ownedFrame?.size != goal.size,
+           !writeWindowFrame(
+               window, size: goal.size, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        guard let sized = ownedFrame else { return false }
+        let finalOrigin: CGPoint
+        if let (original, corner) = anchor {
+            guard let origin = MacRemoteWindowResizeGeometry.anchoredOrigin(
+                for: sized.size, original: original, corner: corner
+            ) else { return false }
+            finalOrigin = origin
+        } else {
+            finalOrigin = goal.origin
+        }
+        guard MacRemoteWindowResizeGeometry.contains(
+            CGRect(origin: finalOrigin, size: sized.size),
+            in: context.displayBounds, tolerance: 0.5
+        ) else { return false }
+        if !MacRemoteWindowResizeGeometry.approximatelyEqual(sized.origin, finalOrigin),
+           !writeWindowFrame(
+               window, position: finalOrigin, ownedFrame: &ownedFrame,
+               context: context, expectedFocus: expectedFocus
+           ) { return false }
+        return true
+    }
+
+    /// Rechecks live authorization and the last owned frame immediately before every AX write.
+    /// A setter may return failure after a partial change: only a bounded readback that changed
+    /// its intended component can be retained for conditional cleanup.
+    private func writeWindowFrame(
+        _ window: MacRemoteAccessibilityElement,
+        size: CGSize? = nil,
+        position: CGPoint? = nil,
+        ownedFrame: inout CGRect?,
+        context: MacRemoteWindowResizeContext,
+        expectedFocus: MacRemoteAccessibilityElement?
+    ) -> Bool {
+        guard let before = ownedFrame,
+              windowResizeTransactionIsAuthorized(
+                  window: window, expectedFrame: before, context: context,
+                  expectedFocus: expectedFocus
+              ) else { return false }
+        let succeeded: Bool
+        if let size {
+            succeeded = system.setWindowSize(size, for: window)
+        } else if let position {
+            succeeded = system.setWindowPosition(position, for: window)
+        } else { return false }
+        guard let actual = system.windowFrame(window),
+              isResizableWindow(
+                  window, with: actual, in: context.displayBounds, operation: context.operation,
+                  allowsRecoverableOffscreenMove: context.allowsRecoverableOffscreenMove
+              ),
+              size != nil
+                ? MacRemoteWindowResizeGeometry.approximatelyEqual(actual.origin, before.origin)
+                : actual.size == before.size else {
+            ownedFrame = nil
+            return false
+        }
+        ownedFrame = actual
+        return succeeded
+    }
+
+    private func windowResizeTransactionIsAuthorized(
+        window: MacRemoteAccessibilityElement,
+        expectedFrame: CGRect,
+        context: MacRemoteWindowResizeContext,
+        expectedFocus: MacRemoteAccessibilityElement?
+    ) -> Bool {
+        let resolution = windowResizeContextLocked(
+            screenRequestID: context.session.screenRequestID,
+            inputSessionID: context.session.inputSessionID,
+            viewerVideoSize: context.viewerVideoSize,
+            operation: context.operation,
+            allowsRecoverableOffscreenMove: context.allowsRecoverableOffscreenMove
+        )
+        guard case .available(let current) = resolution,
+              current.frameGeometry.hasSameInputTransform(as: context.frameGeometry),
+              current.viewerVideoSize == context.viewerVideoSize,
+              MacRemoteWindowResizeGeometry.approximatelyEqual(
+                  current.displayBounds, context.displayBounds
+              ), !system.isPhysicalPrimaryButtonPressed() else { return false }
+        let focus = system.focusedWindow()
+        switch (focus, expectedFocus) {
+        case (nil, nil): break
+        case (let actual?, let expected?) where system.elementsEqual(actual, expected): break
+        default: return false
+        }
+        guard let actual = validatedResizableWindowFrame(
+            window, in: context.displayBounds, operation: context.operation,
+            allowsRecoverableOffscreenMove: context.allowsRecoverableOffscreenMove
+        )
+        else { return false }
+        return MacRemoteWindowResizeGeometry.approximatelyEqual(actual, expectedFrame)
+    }
+
+    private func rollbackWindowFrame(
+        _ window: MacRemoteAccessibilityElement,
+        to originalFrame: CGRect,
+        ownedFrame: CGRect?,
+        context: MacRemoteWindowResizeContext
+    ) -> Bool {
+        var frame = ownedFrame
+        // Cleanup never focuses a window. If focus changed, restore only the exact previously
+        // owned window while the newly observed focus remains stable throughout cleanup.
+        let cleanupFocus = system.focusedWindow()
+        if context.operation == .move {
+            guard let expected = frame,
+                  windowResizeTransactionIsAuthorized(
+                      window: window,
+                      expectedFrame: expected,
+                      context: context,
+                      expectedFocus: cleanupFocus
+                  ), writeWindowFrame(
+                      window,
+                      position: originalFrame.origin,
+                      ownedFrame: &frame,
+                      context: context,
+                      expectedFocus: cleanupFocus
+                  ), let restored = frame,
+                  windowResizeTransactionIsAuthorized(
+                      window: window,
+                      expectedFrame: restored,
+                      context: context,
+                      expectedFocus: cleanupFocus
+                  ) else { return false }
+            return MacRemoteWindowResizeGeometry.approximatelyEqual(restored, originalFrame)
+        }
+        guard let expected = frame,
+              windowResizeTransactionIsAuthorized(
+                  window: window, expectedFrame: expected, context: context,
+                  expectedFocus: cleanupFocus
+              ), moveWindowFrame(
+                  window, toward: originalFrame, ownedFrame: &frame, context: context,
+                  expectedFocus: cleanupFocus, anchor: nil
+              ), let restored = frame,
+              windowResizeTransactionIsAuthorized(
+                  window: window, expectedFrame: restored, context: context,
+                  expectedFocus: cleanupFocus
+              ) else { return false }
+        return MacRemoteWindowResizeGeometry.approximatelyEqual(restored, originalFrame)
+    }
+
     // MARK: - Keyboard actions
 
     /// Inserts bounded Unicode text into the exact focus generation granted by a tap.
@@ -1039,7 +2636,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
         guard system.postUnicodeText(text) else {
             return rejectKeyboardAction(.injectionFailed)
         }
-        return .accepted(.editable(generation: focus.generation, secure: false))
+        return .accepted(.editable(generation: focus.generation, secure: focus.secure))
     }
 
     /// Posts one allowed key into the exact focus generation granted by a tap.
@@ -1084,7 +2681,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
         guard system.postKey(key) else {
             return rejectKeyboardAction(.injectionFailed)
         }
-        return .accepted(.editable(generation: focus.generation, secure: false))
+        return .accepted(.editable(generation: focus.generation, secure: focus.secure))
     }
 
     /// Validates protocol text limits and rejects control/function-key scalars.
@@ -1125,7 +2722,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
             return (nil, .staleSession)
         }
         guard hasCurrentPermissions() else {
-            revokeState()
+            revokeForPermissionLossLocked()
             return (nil, .permissionRequired)
         }
         guard let focus = authorizedFocus, focus.generation == focusGeneration else {
@@ -1260,6 +2857,7 @@ public final class MacRemoteInputController: @unchecked Sendable {
         candidateScreenVideoFrameGeometry = nil
         candidateScreenVideoFrameGeometrySince = nil
         scrollDeltaConversionState = nil
+        authorizedWindowResizeTarget = nil
     }
 
     private func hasCurrentPermissions() -> Bool {
@@ -1298,23 +2896,23 @@ public final class MacRemoteInputController: @unchecked Sendable {
             }
             visited.append(element)
 
-            // A secure field is a hard traversal boundary. Returning nil here, rather than
-            // merely treating the field itself as non-editable, prevents a secure descendant
-            // from falling through to an otherwise editable container above it.
-            if system.subrole(of: element) == "AXSecureTextField" {
-                return nil
-            }
-
-            if let editable = editableElement(exactly: element) {
+            let secure = system.subrole(of: element) == "AXSecureTextField"
+            if let editable = editableElement(exactly: element, secure: secure) {
                 return editable
             }
+            // A malformed or disabled secure field remains a hard traversal boundary. It must
+            // never fall through to an editable container above it.
+            if secure { return nil }
             current = system.parent(of: element)
         }
         return nil
     }
 
     /// Applies the role, enabled-state, and writable-value editability policy.
-    private func editableElement(exactly element: MacRemoteAccessibilityElement) -> EditableElement? {
+    private func editableElement(
+        exactly element: MacRemoteAccessibilityElement,
+        secure: Bool
+    ) -> EditableElement? {
         // Some first-party controls (including TextEdit's AXTextArea) omit AXEnabled even though
         // AXValue is settable. Only an explicit false is a disabled-control signal; editability
         // still requires an approved role + settable value, or AXEditable == true below.
@@ -1322,12 +2920,21 @@ public final class MacRemoteInputController: @unchecked Sendable {
             return nil
         }
 
+        if secure {
+            // Secure controls may intentionally deny AXValue reads/writes even though they accept
+            // real keyboard events. Authorize only the exact secure text field (or an element that
+            // explicitly advertises editability), never an ancestor fallback.
+            let roleIsSecureTextField = system.role(of: element) == "AXTextField"
+            guard roleIsSecureTextField || system.isEditable(element) == true else { return nil }
+            return EditableElement(element: element, secure: true)
+        }
+
         let roleIsEditable = system.role(of: element)
             .map(Self.editableRoles.contains) == true
             && system.isValueSettable(element)
         guard roleIsEditable || system.isEditable(element) == true else { return nil }
 
-        return EditableElement(element: element)
+        return EditableElement(element: element, secure: secure)
     }
 
     /// Gives AppKit a bounded 50 ms window to move focus after pointer injection.
@@ -1357,7 +2964,8 @@ public final class MacRemoteInputController: @unchecked Sendable {
     private func verifyFocusedElement(_ focus: AuthorizedFocus) -> Bool {
         guard let currentlyFocused = system.focusedElement(),
               let editable = editableAncestor(from: currentlyFocused),
-              system.elementsEqual(editable.element, focus.element) else {
+              system.elementsEqual(editable.element, focus.element),
+              editable.secure == focus.secure else {
             return false
         }
         return true
@@ -1368,12 +2976,27 @@ public final class MacRemoteInputController: @unchecked Sendable {
         scrollBucket.reset(at: now)
         keyBucket.reset(at: now)
         textBucket.reset(at: now)
+        windowResizeBucket.reset(at: now)
+    }
+
+    /// Invalidates every pre-loss ownership claim and queues the incumbent wire capability for
+    /// revocation. Callers are inside `withLock`; the callback is deliberately invoked only after
+    /// that helper releases the controller lock.
+    private func revokeForPermissionLossLocked() {
+        if let revokeAuthorization = activeSession?.revokeAuthorization {
+            authorizationRevocationsAfterUnlock.append(revokeAuthorization)
+        }
+        invalidateOwnershipClaimsLocked()
+        clearScreenVideoFrameGeometry()
+        revokeState()
     }
 
     /// Clears all authority and refills buckets for the next explicitly armed session.
     private func revokeState() {
         activeSession = nil
         authorizedFocus = nil
+        authorizedWindowResizeTarget = nil
+        issuedWindowResizeGenerations.removeAll(keepingCapacity: false)
         nextFocusGeneration = 0
         scrollDeltaConversionState = nil
         resetRateLimits(now: clock.now())
@@ -1382,7 +3005,12 @@ public final class MacRemoteInputController: @unchecked Sendable {
     /// Serializes a complete authorization-and-post transaction.
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            let revocations = authorizationRevocationsAfterUnlock
+            authorizationRevocationsAfterUnlock.removeAll(keepingCapacity: false)
+            lock.unlock()
+            revocations.forEach { $0() }
+        }
         return try body()
     }
 
@@ -1398,7 +3026,11 @@ private struct ActiveSession: Sendable {
     let displayID: UInt32
     let screenRequestID: UInt64
     let inputSessionID: UUID
+    let ownerToken: MacRemoteInputOwnerToken
+    let ownershipClaimGeneration: UInt64
     var authoritativeDisplayBounds: CGRect?
+    let supportsFocusedWindowResizeScaleRebinding: Bool
+    let revokeAuthorization: (@Sendable () -> Void)?
 }
 
 /// Stable conversion identity for fractional logical scroll carry.
@@ -1441,11 +3073,247 @@ private struct PreparedLogicalScrollDelta: Sendable {
 private struct AuthorizedFocus: Sendable {
     let element: MacRemoteAccessibilityElement
     let generation: UInt64
+    let secure: Bool
+}
+
+/// Exact AX and geometry identity authorized by the most recent target acquisition.
+private enum MacRemoteWindowOperation: Sendable {
+    case resize
+    case move
+}
+
+private struct AuthorizedWindowResizeTarget: Sendable {
+    let operation: MacRemoteWindowOperation
+    let element: MacRemoteAccessibilityElement
+    let generation: UUID
+    let originalFrame: CGRect
+    let displayBounds: CGRect
+    let frameGeometry: ScreenVideoFrameGeometry
+    let viewerVideoSize: MacRemoteInputVideoSize
+    let screenRequestID: UInt64
+    let inputSessionID: UUID
+
+    func hasCompatibleCoordinateBinding(with context: MacRemoteWindowResizeContext) -> Bool {
+        switch operation {
+        case .resize:
+            (
+                viewerVideoSize == context.viewerVideoSize
+                    || (
+                        context.session.supportsFocusedWindowResizeScaleRebinding
+                            && viewerVideoSize.hasExactlySameAspectRatio(
+                                as: context.viewerVideoSize
+                            )
+                    )
+            )
+                && frameGeometry.hasSameInputTransform(as: context.frameGeometry)
+        case .move:
+            viewerVideoSize.hasExactlySameAspectRatio(as: context.viewerVideoSize)
+                && frameGeometry.hasSameInputTransform(as: context.frameGeometry)
+        }
+    }
+}
+
+private struct MacRemoteWindowResizeContext: Sendable {
+    let operation: MacRemoteWindowOperation
+    let session: ActiveSession
+    let displayBounds: CGRect
+    let frameGeometry: ScreenVideoFrameGeometry
+    let viewerVideoSize: MacRemoteInputVideoSize
+    let allowsRecoverableOffscreenMove: Bool
+}
+
+private enum MacRemoteWindowResizeContextResolution {
+    case available(MacRemoteWindowResizeContext)
+    case rejected(
+        MacRemoteInputRejection,
+        diagnostic: MacRemoteInputScreenFormatDiagnostic?
+    )
+}
+
+typealias MacRemoteWindowResizeCorner = FocusedWindowResizeCorner
+
+/// Pure opposite-corner resize calculations shared by the AX transaction and deterministic tests.
+enum MacRemoteWindowResizeGeometry {
+    static func proposedFrame(
+        original: CGRect,
+        start: CGPoint,
+        end: CGPoint,
+        displayBounds: CGRect
+    ) -> (corner: MacRemoteWindowResizeCorner, frame: CGRect)? {
+        guard let minimumSize = FocusedWindowResizeGeometry.minimumRetainedSize(
+            for: original
+        ) else { return nil }
+        guard let proposal = FocusedWindowResizeGeometry.proposedFrame(
+            original: original,
+            start: start,
+            end: end,
+            bounds: displayBounds,
+            minimumSize: minimumSize
+        ) else { return nil }
+        return (proposal.corner, proposal.frame)
+    }
+
+    static func safeStagingOrigin(
+        toward goal: CGRect,
+        current: CGRect,
+        in bounds: CGRect
+    ) -> CGPoint? {
+        let width = max(current.width, goal.width)
+        let height = max(current.height, goal.height)
+        guard isFinitePositiveRect(goal), isFinitePositiveRect(current),
+              width <= bounds.width, height <= bounds.height else { return nil }
+        return CGPoint(
+            x: min(max(goal.minX, bounds.minX), bounds.maxX - width),
+            y: min(max(goal.minY, bounds.minY), bounds.maxY - height)
+        )
+    }
+
+    /// Application minimum/maximum sizes may limit progress, but cannot turn a requested
+    /// growth into a shrink, change an untouched axis, or commit a constrained no-op.
+    static func followsRequestedResize(
+        _ actual: CGRect,
+        from original: CGRect,
+        toward proposed: CGRect
+    ) -> Bool {
+        func follows(_ value: CGFloat, _ initial: CGFloat, _ requested: CGFloat) -> Bool {
+            let delta = requested - initial
+            if abs(delta) <= 0.5 { return abs(value - initial) <= 0.5 }
+            return delta > 0 ? value >= initial - 0.5 : value <= initial + 0.5
+        }
+        return !approximatelyEqual(actual, original)
+            && follows(actual.width, original.width, proposed.width)
+            && follows(actual.height, original.height, proposed.height)
+    }
+
+    /// Accepts exact or application-constrained position readback only when every axis stays on
+    /// the closed segment from the original origin to the requested origin. At least one changed
+    /// axis must make progress, while an untouched axis may not drift.
+    static func followsRequestedMove(
+        _ actual: CGRect,
+        from original: CGRect,
+        toward proposed: CGRect,
+        tolerance: CGFloat = 0.5
+    ) -> Bool {
+        guard actual.size == original.size,
+              isFinitePositiveRect(actual),
+              isFinitePositiveRect(original),
+              isFinitePositiveRect(proposed) else { return false }
+
+        func follows(_ value: CGFloat, from initial: CGFloat, toward requested: CGFloat) -> Bool {
+            let requestedDelta = requested - initial
+            let actualDelta = value - initial
+            if abs(requestedDelta) <= tolerance {
+                return abs(actualDelta) <= tolerance
+            }
+            if requestedDelta > 0 {
+                return actualDelta >= -tolerance
+                    && actualDelta <= requestedDelta + tolerance
+            }
+            return actualDelta <= tolerance
+                && actualDelta >= requestedDelta - tolerance
+        }
+
+        return !approximatelyEqual(actual.origin, original.origin, tolerance: tolerance)
+            && follows(actual.minX, from: original.minX, toward: proposed.minX)
+            && follows(actual.minY, from: original.minY, toward: proposed.minY)
+    }
+
+    static func anchoredOrigin(
+        for actualSize: CGSize,
+        original: CGRect,
+        corner: MacRemoteWindowResizeCorner
+    ) -> CGPoint? {
+        guard actualSize.width.isFinite, actualSize.height.isFinite,
+              actualSize.width > 0, actualSize.height > 0 else {
+            return nil
+        }
+        let x: CGFloat = switch corner {
+        case .topLeft, .bottomLeft:
+            original.maxX - actualSize.width
+        case .topRight, .bottomRight:
+            original.minX
+        }
+        let y: CGFloat = switch corner {
+        case .topLeft, .topRight:
+            original.maxY - actualSize.height
+        case .bottomLeft, .bottomRight:
+            original.minY
+        }
+        guard x.isFinite, y.isFinite else { return nil }
+        return CGPoint(x: x, y: y)
+    }
+
+    static func preservesOppositeCorner(
+        _ frame: CGRect,
+        from original: CGRect,
+        corner: MacRemoteWindowResizeCorner,
+        tolerance: CGFloat = 1
+    ) -> Bool {
+        switch corner {
+        case .topLeft:
+            abs(frame.maxX - original.maxX) <= tolerance
+                && abs(frame.maxY - original.maxY) <= tolerance
+        case .topRight:
+            abs(frame.minX - original.minX) <= tolerance
+                && abs(frame.maxY - original.maxY) <= tolerance
+        case .bottomLeft:
+            abs(frame.maxX - original.maxX) <= tolerance
+                && abs(frame.minY - original.minY) <= tolerance
+        case .bottomRight:
+            abs(frame.minX - original.minX) <= tolerance
+                && abs(frame.minY - original.minY) <= tolerance
+        }
+    }
+
+    static func approximatelyEqual(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat = 0.5) -> Bool {
+        abs(lhs.minX - rhs.minX) <= tolerance
+            && abs(lhs.minY - rhs.minY) <= tolerance
+            && abs(lhs.width - rhs.width) <= tolerance
+            && abs(lhs.height - rhs.height) <= tolerance
+    }
+
+    static func approximatelyEqual(
+        _ lhs: CGPoint,
+        _ rhs: CGPoint,
+        tolerance: CGFloat = 0.5
+    ) -> Bool {
+        abs(lhs.x - rhs.x) <= tolerance && abs(lhs.y - rhs.y) <= tolerance
+    }
+
+    static func isFinitePositiveRect(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite
+            && rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.width.isFinite && rect.height.isFinite
+            && rect.width > 0 && rect.height > 0
+    }
+
+    static func contains(
+        _ rect: CGRect,
+        in bounds: CGRect,
+        tolerance: CGFloat
+    ) -> Bool {
+        rect.minX >= bounds.minX - tolerance
+            && rect.minY >= bounds.minY - tolerance
+            && rect.maxX <= bounds.maxX + tolerance
+            && rect.maxY <= bounds.maxY + tolerance
+    }
+
+    private static func contains(
+        _ point: CGPoint,
+        in frame: CGRect,
+        tolerance: CGFloat
+    ) -> Bool {
+        point.x >= frame.minX - tolerance
+            && point.x <= frame.maxX + tolerance
+            && point.y >= frame.minY - tolerance
+            && point.y <= frame.maxY + tolerance
+    }
 }
 
 /// Validated accessibility element that may receive keyboard input.
 private struct EditableElement {
     let element: MacRemoteAccessibilityElement
+    let secure: Bool
 }
 
 /// Maps iPhone-relative coordinates into the selected Core Graphics display bounds.
@@ -1534,6 +3402,29 @@ final class MacRemoteAccessibilityElement: @unchecked Sendable {
     }
 }
 
+/// AXEnabled is optional for windows; an unsupported attribute is distinct from a failed read.
+enum MacRemoteWindowEnabledState: Equatable, Sendable {
+    case enabled
+    case disabled
+    case unsupported
+    case unavailable
+
+    init(error: AXError, value: CFTypeRef?) {
+        if error == .attributeUnsupported {
+            self = .unsupported
+        } else if error == .success, let value,
+                  CFGetTypeID(value) == CFBooleanGetTypeID() {
+            self = CFBooleanGetValue((value as! CFBoolean)) ? .enabled : .disabled
+        } else {
+            self = .unavailable
+        }
+    }
+
+    var permitsStandardWindowInteraction: Bool {
+        self == .enabled || self == .unsupported
+    }
+}
+
 /// Narrow system boundary for permission, AX inspection, and synthetic event posting.
 protocol MacRemoteInputSystem: Sendable {
     func permissionStatus(promptIfNeeded: Bool) -> MacRemoteInputPermissionStatus
@@ -1545,9 +3436,20 @@ protocol MacRemoteInputSystem: Sendable {
     func role(of element: MacRemoteAccessibilityElement) -> String?
     func subrole(of element: MacRemoteAccessibilityElement) -> String?
     func isEnabled(_ element: MacRemoteAccessibilityElement) -> Bool?
+    func windowEnabledState(_ window: MacRemoteAccessibilityElement) -> MacRemoteWindowEnabledState
     func isEditable(_ element: MacRemoteAccessibilityElement) -> Bool?
     func isValueSettable(_ element: MacRemoteAccessibilityElement) -> Bool
     func focusedElement() -> MacRemoteAccessibilityElement?
+    func focusedWindow() -> MacRemoteAccessibilityElement?
+    func isWindowPositionSettable(_ window: MacRemoteAccessibilityElement) -> Bool
+    func isWindowSizeSettable(_ window: MacRemoteAccessibilityElement) -> Bool
+    func windowFrame(_ window: MacRemoteAccessibilityElement) -> CGRect?
+    func isWindowMinimized(_ window: MacRemoteAccessibilityElement) -> Bool?
+    func isWindowFullScreen(_ window: MacRemoteAccessibilityElement) -> Bool?
+    func isWindowModal(_ window: MacRemoteAccessibilityElement) -> Bool?
+    func focusWindow(_ window: MacRemoteAccessibilityElement) -> Bool
+    func setWindowSize(_ size: CGSize, for window: MacRemoteAccessibilityElement) -> Bool
+    func setWindowPosition(_ position: CGPoint, for window: MacRemoteAccessibilityElement) -> Bool
     func elementsEqual(
         _ lhs: MacRemoteAccessibilityElement,
         _ rhs: MacRemoteAccessibilityElement
@@ -1624,6 +3526,14 @@ private struct CoreGraphicsMacRemoteInputSystem: MacRemoteInputSystem {
         (copyAttribute(kAXEnabledAttribute as CFString, from: element) as? NSNumber)?.boolValue
     }
 
+    func windowEnabledState(_ window: MacRemoteAccessibilityElement) -> MacRemoteWindowEnabledState {
+        let axWindow = window.rawValue as! AXUIElement
+        AXUIElementSetMessagingTimeout(axWindow, 0.2)
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(axWindow, kAXEnabledAttribute as CFString, &value)
+        return MacRemoteWindowEnabledState(error: error, value: value)
+    }
+
     func isEditable(_ element: MacRemoteAccessibilityElement) -> Bool? {
         (copyAttribute(kAXIsEditableAttribute as CFString, from: element) as? NSNumber)?.boolValue
     }
@@ -1644,6 +3554,107 @@ private struct CoreGraphicsMacRemoteInputSystem: MacRemoteInputSystem {
     func focusedElement() -> MacRemoteAccessibilityElement? {
         let systemWide = MacRemoteAccessibilityElement(rawValue: AXUIElementCreateSystemWide())
         return copyElementAttribute(kAXFocusedUIElementAttribute as CFString, from: systemWide)
+    }
+
+    func focusedWindow() -> MacRemoteAccessibilityElement? {
+        let systemWide = MacRemoteAccessibilityElement(rawValue: AXUIElementCreateSystemWide())
+        guard let application = copyElementAttribute(
+            kAXFocusedApplicationAttribute as CFString,
+            from: systemWide
+        ) else {
+            return nil
+        }
+        return copyElementAttribute(kAXFocusedWindowAttribute as CFString, from: application)
+    }
+
+    func isWindowPositionSettable(_ window: MacRemoteAccessibilityElement) -> Bool {
+        isAttributeSettable(kAXPositionAttribute as CFString, on: window)
+    }
+
+    func isWindowSizeSettable(_ window: MacRemoteAccessibilityElement) -> Bool {
+        isAttributeSettable(kAXSizeAttribute as CFString, on: window)
+    }
+
+    func windowFrame(_ window: MacRemoteAccessibilityElement) -> CGRect? {
+        guard let position = copyPointAttribute(kAXPositionAttribute as CFString, from: window),
+              let size = copySizeAttribute(kAXSizeAttribute as CFString, from: window),
+              size.width > 0, size.height > 0 else {
+            return nil
+        }
+        let frame = CGRect(origin: position, size: size)
+        return MacRemoteWindowResizeGeometry.isFinitePositiveRect(frame) ? frame : nil
+    }
+
+    func isWindowMinimized(_ window: MacRemoteAccessibilityElement) -> Bool? {
+        copyBooleanAttribute(kAXMinimizedAttribute as CFString, from: window)
+    }
+
+    func isWindowFullScreen(_ window: MacRemoteAccessibilityElement) -> Bool? {
+        // `AXFullScreen` is public AX API but is not exported as a Swift SDK constant.
+        copyBooleanAttribute("AXFullScreen" as CFString, from: window)
+    }
+
+    func isWindowModal(_ window: MacRemoteAccessibilityElement) -> Bool? {
+        copyBooleanAttribute(kAXModalAttribute as CFString, from: window)
+    }
+
+    func focusWindow(_ window: MacRemoteAccessibilityElement) -> Bool {
+        let axWindow = window.rawValue as! AXUIElement
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(axWindow, &pid) == .success,
+              let application = NSRunningApplication(processIdentifier: pid),
+              application.activate(options: []) else {
+            return false
+        }
+        guard AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString) == .success else {
+            return false
+        }
+        if isAttributeSettable(kAXMainAttribute as CFString, on: window) {
+            guard AXUIElementSetAttributeValue(
+                axWindow,
+                kAXMainAttribute as CFString,
+                kCFBooleanTrue
+            ) == .success else {
+                return false
+            }
+        }
+        if isAttributeSettable(kAXFocusedAttribute as CFString, on: window) {
+            guard AXUIElementSetAttributeValue(
+                axWindow,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            ) == .success else {
+                return false
+            }
+        }
+        return true
+    }
+
+    func setWindowSize(_ size: CGSize, for window: MacRemoteAccessibilityElement) -> Bool {
+        var size = size
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0,
+              let value = AXValueCreate(.cgSize, &size) else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(
+            window.rawValue as! AXUIElement,
+            kAXSizeAttribute as CFString,
+            value
+        ) == .success
+    }
+
+    func setWindowPosition(_ position: CGPoint, for window: MacRemoteAccessibilityElement) -> Bool {
+        var position = position
+        guard position.x.isFinite, position.y.isFinite,
+              let value = AXValueCreate(.cgPoint, &position) else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(
+            window.rawValue as! AXUIElement,
+            kAXPositionAttribute as CFString,
+            value
+        ) == .success
     }
 
     func elementsEqual(
@@ -1815,6 +3826,64 @@ private struct CoreGraphicsMacRemoteInputSystem: MacRemoteInputSystem {
             return nil
         }
         return MacRemoteAccessibilityElement(rawValue: value as AnyObject)
+    }
+
+    private func isAttributeSettable(
+        _ attribute: CFString,
+        on element: MacRemoteAccessibilityElement
+    ) -> Bool {
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            element.rawValue as! AXUIElement,
+            attribute,
+            &settable
+        ) == .success else {
+            return false
+        }
+        return settable.boolValue
+    }
+
+    private func copyBooleanAttribute(
+        _ attribute: CFString,
+        from element: MacRemoteAccessibilityElement
+    ) -> Bool? {
+        (copyAttribute(attribute, from: element) as? NSNumber)?.boolValue
+    }
+
+    private func copyPointAttribute(
+        _ attribute: CFString,
+        from element: MacRemoteAccessibilityElement
+    ) -> CGPoint? {
+        guard let value = copyAttribute(attribute, from: element),
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+        let axValue = value as! AXValue
+        guard AXValueGetType(axValue) == .cgPoint else { return nil }
+        var point = CGPoint.zero
+        guard AXValueGetValue(axValue, .cgPoint, &point),
+              point.x.isFinite, point.y.isFinite else {
+            return nil
+        }
+        return point
+    }
+
+    private func copySizeAttribute(
+        _ attribute: CFString,
+        from element: MacRemoteAccessibilityElement
+    ) -> CGSize? {
+        guard let value = copyAttribute(attribute, from: element),
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+        let axValue = value as! AXValue
+        guard AXValueGetType(axValue) == .cgSize else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(axValue, .cgSize, &size),
+              size.width.isFinite, size.height.isFinite else {
+            return nil
+        }
+        return size
     }
 
     /// Reads one AX attribute with a bounded messaging timeout to avoid host stalls.

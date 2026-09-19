@@ -5,6 +5,191 @@ import Foundation
 import RemoteSessionCore
 import WebRTCTransport
 
+struct WorldwideRemoteMediaPublicationMachine: Sendable, Equatable {
+    struct Attempt: Sendable, Equatable {
+        struct ID: Sendable, Equatable {
+            fileprivate let peerEpoch: UInt64
+            fileprivate let ordinal: UInt64
+        }
+
+        let id: ID
+        let desiredVersion: UInt64
+        let update: WebRTCRemoteMediaStateUpdate
+    }
+
+    enum Completion: Sendable, Equatable {
+        case ignored
+        case finished
+        case publishNewest
+        case retryLatest
+    }
+
+    private(set) var peerEpoch: UInt64 = 0
+    private(set) var nextAttemptOrdinal: UInt64 = 0
+    private(set) var desiredControllerRevision: UInt64?
+    private(set) var desiredItem: WebRTCRemoteMediaItem?
+    private(set) var desiredVersion: UInt64 = 0
+    private(set) var publishedVersion: UInt64 = 0
+    private(set) var lastSuccessfullySent: WebRTCRemoteMediaStateUpdate?
+    private(set) var remoteMediaIsAvailable = false
+    private(set) var inFlight: Attempt?
+
+    var hasPendingPublication: Bool {
+        desiredControllerRevision != nil && desiredVersion != publishedVersion
+    }
+
+    mutating func applyControllerUpdate(_ update: WebRTCRemoteMediaStateUpdate) {
+        guard update.isValid,
+              update.revision > (desiredControllerRevision ?? 0) else { return }
+        desiredControllerRevision = update.revision
+        desiredItem = update.item
+        advanceDesiredVersion()
+    }
+
+    mutating func requestRefresh() {
+        guard desiredControllerRevision != nil else { return }
+        advanceDesiredVersion()
+    }
+
+    mutating func setRemoteMediaAvailable(_ isAvailable: Bool) {
+        guard remoteMediaIsAvailable != isAvailable else { return }
+        if !isAvailable,
+           desiredControllerRevision != nil,
+           (inFlight != nil || !hasPendingPublication) {
+            // A same-peer authorization renegotiation must republish the last desired value but
+            // must not reset the monotonically increasing wire revision.
+            advanceDesiredVersion()
+        }
+        remoteMediaIsAvailable = isAvailable
+    }
+
+    mutating func beginIfPossible(transportIsReady: Bool) -> Attempt? {
+        guard transportIsReady,
+              remoteMediaIsAvailable,
+              inFlight == nil,
+              hasPendingPublication else { return nil }
+        guard let wireRevision = Self.nextWireRevision(
+            after: lastSuccessfullySent?.revision
+        ) else {
+            // The viewer's recovery floor saturates at max; wrapping to one on the same peer
+            // would be rejected. Only a fresh peer authorization may reset the wire sequence.
+            return nil
+        }
+        nextAttemptOrdinal &+= 1
+        if nextAttemptOrdinal == 0 { nextAttemptOrdinal = 1 }
+        let attempt = Attempt(
+            id: Attempt.ID(
+                peerEpoch: peerEpoch,
+                ordinal: nextAttemptOrdinal
+            ),
+            desiredVersion: desiredVersion,
+            update: WebRTCRemoteMediaStateUpdate(
+                revision: wireRevision,
+                item: desiredItem
+            )
+        )
+        inFlight = attempt
+        return attempt
+    }
+
+    static func nextWireRevision(after revision: UInt64?) -> UInt64? {
+        let revision = revision ?? 0
+        guard revision < UInt64.max else { return nil }
+        return revision + 1
+    }
+
+    mutating func complete(
+        _ attempt: Attempt,
+        succeeded: Bool
+    ) -> Completion {
+        guard inFlight?.id == attempt.id,
+              attempt.id.peerEpoch == peerEpoch else { return .ignored }
+        inFlight = nil
+        if succeeded {
+            lastSuccessfullySent = attempt.update
+            publishedVersion = attempt.desiredVersion
+        }
+        if desiredVersion != attempt.desiredVersion {
+            return .publishNewest
+        }
+        return succeeded ? .finished : .retryLatest
+    }
+
+    mutating func startNewPeer() {
+        peerEpoch &+= 1
+        nextAttemptOrdinal = 0
+        publishedVersion = 0
+        lastSuccessfullySent = nil
+        remoteMediaIsAvailable = false
+        inFlight = nil
+    }
+
+    mutating func stop() {
+        startNewPeer()
+        desiredControllerRevision = nil
+        desiredItem = nil
+        desiredVersion = 0
+        publishedVersion = 0
+    }
+
+    private mutating func advanceDesiredVersion() {
+        desiredVersion &+= 1
+        if desiredVersion == 0 { desiredVersion = 1 }
+    }
+}
+
+struct WorldwideRemoteMediaPublicationRetryGate: Sendable, Equatable {
+    struct Token: Sendable, Equatable {
+        fileprivate let epoch: UInt64
+    }
+
+    private(set) var epoch: UInt64 = 0
+    private(set) var isScheduled = false
+
+    mutating func schedule() -> Token? {
+        guard !isScheduled else { return nil }
+        isScheduled = true
+        return Token(epoch: epoch)
+    }
+
+    mutating func consume(_ token: Token) -> Bool {
+        guard isScheduled, token.epoch == epoch else { return false }
+        isScheduled = false
+        return true
+    }
+
+    mutating func cancel() {
+        epoch &+= 1
+        isScheduled = false
+    }
+}
+
+struct WorldwideRemoteMediaCommandQueueCapacity: Sendable, Equatable {
+    static let maximumCount = 16
+    private(set) var count = 0
+    private(set) var generation: UInt64 = 0
+
+    mutating func reserve() -> UInt64? {
+        guard count < Self.maximumCount else { return nil }
+        count += 1
+        return generation
+    }
+
+    mutating func finish(generation candidate: UInt64) {
+        guard candidate == generation else { return }
+        if count > 0 { count -= 1 }
+    }
+
+    func admits(generation candidate: UInt64) -> Bool {
+        candidate == generation
+    }
+
+    mutating func reset() {
+        generation &+= 1
+        count = 0
+    }
+}
+
 enum WorldwideRemoteInputFormatOrigin: Equatable, Sendable {
     case captureGateUnavailable(WorldwideScreenCaptureGateDiagnostic?)
     case controller(MacRemoteInputScreenFormatDiagnostic)
@@ -30,18 +215,29 @@ struct WorldwideScreenCaptureGateDiagnostic: Equatable, Sendable {
 
 struct WorldwideRemoteInputInjectionOutcome: Equatable, Sendable {
     let result: MacRemoteInputResult
+    let windowResizeFeedback: MacRemoteWindowResizeFeedback?
+    let isWindowMove: Bool
+    let verifiedFocus: MacRemoteInputFocus?
     let formatOrigin: WorldwideRemoteInputFormatOrigin?
 
     init(
         _ result: MacRemoteInputResult,
+        windowResizeFeedback: MacRemoteWindowResizeFeedback? = nil,
+        verifiedFocus: MacRemoteInputFocus? = nil,
         formatOrigin: WorldwideRemoteInputFormatOrigin? = nil
     ) {
         self.result = result
+        self.windowResizeFeedback = windowResizeFeedback
+        self.isWindowMove = false
+        self.verifiedFocus = verifiedFocus
         self.formatOrigin = formatOrigin
     }
 
     init(_ diagnosedResult: MacRemoteInputDiagnosedResult) {
         result = diagnosedResult.result
+        windowResizeFeedback = nil
+        isWindowMove = false
+        verifiedFocus = nil
         if let diagnostic = diagnosedResult.screenFormatDiagnostic {
             formatOrigin = .controller(diagnostic)
         } else if case .rejected(.screenFormatChanging) = diagnosedResult.result {
@@ -49,6 +245,147 @@ struct WorldwideRemoteInputInjectionOutcome: Equatable, Sendable {
         } else {
             formatOrigin = nil
         }
+    }
+
+    init(_ diagnosedResult: MacRemoteWindowResizeDiagnosedResult, isWindowMove: Bool = false) {
+        result = diagnosedResult.result
+        windowResizeFeedback = diagnosedResult.windowResizeFeedback
+        self.isWindowMove = isWindowMove
+        verifiedFocus = diagnosedResult.verifiedFocus
+        if let diagnostic = diagnosedResult.screenFormatDiagnostic {
+            formatOrigin = .controller(diagnostic)
+        } else if case .rejected(.screenFormatChanging) = diagnosedResult.result {
+            formatOrigin = .controllerUnknown
+        } else {
+            formatOrigin = nil
+        }
+    }
+}
+
+protocol WorldwideFocusedWindowResizeDispatching: Sendable {
+    func requestFocusedWindowResizeTarget(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult
+
+    func selectWindowForResize(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        normalizedPoint: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult
+
+    func commitFocusedWindowResize(
+        screenRequestID: UInt64,
+        inputSessionID: UUID,
+        targetGeneration: UUID,
+        start: MacRemoteNormalizedPoint,
+        end: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult
+}
+
+extension MacRemoteInputController: WorldwideFocusedWindowResizeDispatching {}
+
+enum WorldwideFocusedWindowResizeDispatcher {
+    static func dispatch(
+        _ request: WebRTCInputRequest,
+        to controller: any WorldwideFocusedWindowResizeDispatching
+    ) -> WorldwideRemoteInputInjectionOutcome? {
+        let viewerVideoSize = request.viewerVideoSize.map {
+            MacRemoteInputVideoSize(width: $0.width, height: $0.height)
+        }
+        switch request.action {
+        case .requestFocusedWindowResizeTarget:
+            return WorldwideRemoteInputInjectionOutcome(
+                controller.requestFocusedWindowResizeTarget(
+                    screenRequestID: request.screenRequestID,
+                    inputSessionID: request.inputSessionID,
+                    viewerVideoSize: viewerVideoSize
+                )
+            )
+
+        case .selectWindowForResize(let point):
+            return WorldwideRemoteInputInjectionOutcome(
+                controller.selectWindowForResize(
+                    screenRequestID: request.screenRequestID,
+                    inputSessionID: request.inputSessionID,
+                    normalizedPoint: .init(x: point.x, y: point.y),
+                    viewerVideoSize: viewerVideoSize
+                )
+            )
+
+        case .commitFocusedWindowResize(let targetGeneration, let start, let end):
+            return WorldwideRemoteInputInjectionOutcome(
+                controller.commitFocusedWindowResize(
+                    screenRequestID: request.screenRequestID,
+                    inputSessionID: request.inputSessionID,
+                    targetGeneration: targetGeneration,
+                    start: .init(x: start.x, y: start.y),
+                    end: .init(x: end.x, y: end.y),
+                    viewerVideoSize: viewerVideoSize
+                )
+            )
+
+        default:
+            return nil
+        }
+    }
+}
+
+protocol WorldwideFocusedWindowMoveDispatching: Sendable {
+    func requestFocusedWindowMoveTarget(
+        screenRequestID: UInt64, inputSessionID: UUID, viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult
+    func selectWindowForMove(
+        screenRequestID: UInt64, inputSessionID: UUID, normalizedPoint: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?
+    ) -> MacRemoteWindowResizeDiagnosedResult
+    func commitFocusedWindowMove(
+        screenRequestID: UInt64, inputSessionID: UUID, targetGeneration: UUID,
+        start: MacRemoteNormalizedPoint, end: MacRemoteNormalizedPoint,
+        viewerVideoSize: MacRemoteInputVideoSize?,
+        allowsRecoverableOffscreen: Bool
+    ) -> MacRemoteWindowResizeDiagnosedResult
+}
+
+extension MacRemoteInputController: WorldwideFocusedWindowMoveDispatching {}
+
+enum WorldwideFocusedWindowMoveDispatcher {
+    static func dispatch(
+        _ request: WebRTCInputRequest,
+        to controller: any WorldwideFocusedWindowMoveDispatching
+    ) -> WorldwideRemoteInputInjectionOutcome? {
+        let size = request.viewerVideoSize.map { MacRemoteInputVideoSize(width: $0.width, height: $0.height) }
+        let result: MacRemoteWindowResizeDiagnosedResult
+        switch request.action {
+        case .requestFocusedWindowMoveTarget:
+            result = controller.requestFocusedWindowMoveTarget(
+                screenRequestID: request.screenRequestID, inputSessionID: request.inputSessionID,
+                viewerVideoSize: size
+            )
+        case .selectWindowForMove(let point):
+            result = controller.selectWindowForMove(
+                screenRequestID: request.screenRequestID, inputSessionID: request.inputSessionID,
+                normalizedPoint: .init(x: point.x, y: point.y), viewerVideoSize: size
+            )
+        case .commitFocusedWindowMove(
+            let generation,
+            let start,
+            let end,
+            let allowsRecoverableOffscreen
+        ):
+            result = controller.commitFocusedWindowMove(
+                screenRequestID: request.screenRequestID, inputSessionID: request.inputSessionID,
+                targetGeneration: generation, start: .init(x: start.x, y: start.y),
+                end: .init(x: end.x, y: end.y), viewerVideoSize: size,
+                allowsRecoverableOffscreen: allowsRecoverableOffscreen
+            )
+        default:
+            return nil
+        }
+        return WorldwideRemoteInputInjectionOutcome(result, isWindowMove: true)
     }
 }
 
@@ -65,13 +402,14 @@ final class WorldwideScreenAutomaticResumeCommitLatch: @unchecked Sendable {
     private let lock = NSLock()
     private var state = State.pending
 
-    func commit(_ operation: () throws -> Void) throws {
+    func commit<Result>(_ operation: () throws -> Result) throws -> Result {
         try lock.withLock {
             guard case .pending = state else {
                 throw WorldwideScreenServiceError.transportUnavailable
             }
-            try operation()
+            let result = try operation()
             state = .committed
+            return result
         }
     }
 
@@ -91,14 +429,53 @@ final class WorldwideScreenAutomaticResumeCommitLatch: @unchecked Sendable {
     }
 }
 
+/// Rejects statistics whose native request began before the latest encoder-resume boundary.
+/// Ordinary WebRTC events are buffered, so callback time and event-delivery order cannot prove
+/// which encoder epoch produced a report.
+struct WorldwideScreenVideoAdaptationFreshnessFence: Equatable, Sendable {
+    private(set) var minimumCollectionSequence: UInt64?
+
+    mutating func beginPostResumeEpoch(
+        minimumCollectionSequence: UInt64
+    ) {
+        self.minimumCollectionSequence = self.minimumCollectionSequence.map {
+            max($0, minimumCollectionSequence)
+        } ?? minimumCollectionSequence
+    }
+
+    mutating func reset() {
+        minimumCollectionSequence = nil
+    }
+
+    func admits(_ snapshot: WebRTCStatisticsSnapshot) -> Bool {
+        guard let minimumCollectionSequence else { return true }
+        guard let collectionSequence = snapshot.collectionSequence else {
+            return false
+        }
+        return collectionSequence >= minimumCollectionSequence
+    }
+}
+
 /// Owns one consume-once rendezvous and its Mac-side WebRTC screen session.
 ///
 /// The invitation authenticates and encrypts signaling. Reachability still comes from
 /// ICE/STUN and, when a direct candidate pair is impossible, the configured TURN service.
 actor WorldwideScreenService {
+    private enum ScreenVideoAdaptationEvidenceLane: Equatable {
+        case fastSender
+        case ordinaryFallback
+    }
+
     private static let maximumDisplayModeStartupRetries = 3
     private static let maximumForwardingStartupProofPolls = 40
     private static let forwardingStartupProofPollInterval = Duration.milliseconds(25)
+    static let screenVideoAdaptationStatisticsInterval = Duration.milliseconds(
+        WorldwideScreenVideoAdaptationPolicy.sampleIntervalMilliseconds
+    )
+    static let screenVideoAdaptationStatisticsTimeout = Duration.milliseconds(400)
+    static let screenVideoAdaptationFallbackStatisticsInterval =
+        Duration.seconds(1)
+    static let screenVideoAdaptationMaximumEvidenceGap = Duration.seconds(2)
     private static let automaticScreenMediaResumeTimeout = Duration.seconds(12)
     private static let screenClientDiagnosticsStaleInterval: TimeInterval = 5
     private static let maximumSharedClockEpochQuiescencePolls = 20
@@ -446,9 +823,12 @@ actor WorldwideScreenService {
     private let maximumWidth: Int
     private let framesPerSecond: Int
     private let maximumVideoBitrate: Int
+    private let featureProfile: WorldwideScreenServiceFeatureProfile
     private var screenVideoAdaptationPolicy:
         WorldwideScreenVideoAdaptationPolicy
     private let remoteInputController: MacRemoteInputController
+    private let remoteInputOwnerToken = MacRemoteInputOwnerToken()
+    private let remoteMediaController: any MacRemoteMediaControlling
     private weak var captureLifetime: CaptureServiceLifetime?
     private let captureLifetimeIsRequired: Bool
     private let iPhoneMicrophoneForwardingPolicy:
@@ -475,7 +855,27 @@ actor WorldwideScreenService {
     private var signalingTask: Task<Void, Never>?
     private var peerEventTask: Task<Void, Never>?
     private var screenClientDiagnosticsEventTask: Task<Void, Never>?
+    private var audioClientDiagnosticsEventTask: Task<Void, Never>?
+    private var audioClientDiagnosticsFreshnessTask: Task<Void, Never>?
+    private var audioClientDiagnostics = WorldwideAudioClientDiagnosticsSink(
+        hostPID: ProcessInfo.processInfo.processIdentifier
+    )
+    private let audioClientDiagnosticsReportWriter:
+        WorldwideAudioClientDiagnosticsReportWriter?
+    private var screenVideoAdaptationTask: Task<Void, Never>?
+    private var screenVideoAdaptationFastStatisticsAreAvailable = false
+    private var screenVideoAdaptationPolicyRevision: UInt64 = 0
+    private var screenVideoAdaptationEvidenceLane:
+        ScreenVideoAdaptationEvidenceLane?
+    private var screenVideoAdaptationLastEvidenceTime:
+        ContinuousClock.Instant?
+    private var screenVideoAdaptationFreshnessFence =
+        WorldwideScreenVideoAdaptationFreshnessFence()
     private var keyFrameControlTask: Task<Void, Never>?
+    private var remoteMediaCommandTask: Task<Void, Never>?
+    private let remoteMediaTraceSession = UUID()
+    private var remoteMediaCommandCapacity =
+        WorldwideRemoteMediaCommandQueueCapacity()
     private var peer: WebRTCPeer?
     private var recoveryCoordinator: ICERecoveryCoordinator?
     private var peerGeneration: UInt64 = 0
@@ -483,6 +883,15 @@ actor WorldwideScreenService {
     private var peerIsConnected = false
     private var iceIsConnected = false
     private var controlChannelIsOpen = false
+    private var latestRemoteMediaControllerRevision: UInt64 = 0
+    private var latestRemoteMediaItem: WebRTCRemoteMediaItem?
+    private var remoteMediaPublication =
+        WorldwideRemoteMediaPublicationMachine()
+    private var remoteMediaPublicationRetryGate =
+        WorldwideRemoteMediaPublicationRetryGate()
+    private var remoteMediaPublicationRetryTask: Task<Void, Never>?
+    private var pendingRemoteMediaStateRefresh:
+        WebRTCReceivedRemoteMediaStateRefreshRequest?
     private var isRecovering = false
     private var recoveryProofRequired = false
     private var recoveryProofEpoch: UInt64 = 0
@@ -506,6 +915,7 @@ actor WorldwideScreenService {
         let attemptID: UUID
         let finalAcknowledgementCommit:
             WorldwideScreenAutomaticResumeCommitLatch
+        let inputOwnershipClaim: MacRemoteInputOwnershipClaim?
         var probeAuthorization: WebRTCControlAuthorization?
         var forwardingAuthorization: WebRTCControlAuthorization?
         var boundary: WorldwideScreenSampleSink.ResumeMarkerBoundary?
@@ -514,6 +924,8 @@ actor WorldwideScreenService {
     }
     private var automaticScreenMediaResumeContext:
         AutomaticScreenMediaResumeContext?
+    private var latestShowInputOwnershipClaim:
+        MacRemoteInputOwnershipClaim?
     private var automaticScreenMediaResumeTimeoutTask: Task<Void, Never>?
     /// Invalidates a timeout that has already awakened but has not yet re-entered this actor.
     /// Task cancellation alone cannot fence that queued call across actor reentrancy.
@@ -710,7 +1122,10 @@ actor WorldwideScreenService {
         maximumWidth: Int,
         framesPerSecond: Int,
         maximumVideoBitrate: Int,
+        featureProfile: WorldwideScreenServiceFeatureProfile = .fullPrimary,
         remoteInputController: MacRemoteInputController,
+        remoteMediaController: any MacRemoteMediaControlling =
+            MacSystemNowPlayingController(),
         captureLifetime: CaptureServiceLifetime? = nil,
         iPhoneMicrophoneForwardingPolicy:
             WorldwideIPhoneMicrophoneForwardingPolicy = .enabled,
@@ -736,16 +1151,26 @@ actor WorldwideScreenService {
         self.systemAudioDisplayID = systemAudioDisplayID
         self.maximumWidth = maximumWidth
         self.framesPerSecond = framesPerSecond
-        self.maximumVideoBitrate = maximumVideoBitrate
+        let effectiveMaximumVideoBitrate = featureProfile
+            .maximumVideoBitrate(configured: maximumVideoBitrate)
+        self.maximumVideoBitrate = effectiveMaximumVideoBitrate
+        self.featureProfile = featureProfile
+        audioClientDiagnosticsReportWriter = featureProfile
+            .allowsAudioClientDiagnostics
+                ? WorldwideAudioClientDiagnosticsReportWriter()
+                : nil
         screenVideoAdaptationPolicy = WorldwideScreenVideoAdaptationPolicy(
-            configuredTotalRTPBitrateBps: maximumVideoBitrate,
+            configuredTotalRTPBitrateBps: effectiveMaximumVideoBitrate,
             baseFramesPerSecond: framesPerSecond
         )
         self.remoteInputController = remoteInputController
+        self.remoteMediaController = remoteMediaController
         self.captureLifetime = captureLifetime
         captureLifetimeIsRequired = captureLifetime != nil
-        self.iPhoneMicrophoneForwardingPolicy =
-            iPhoneMicrophoneForwardingPolicy
+        self.iPhoneMicrophoneForwardingPolicy = featureProfile
+            .allowsIPhoneMicrophoneAndDefaultInputRouting
+                ? iPhoneMicrophoneForwardingPolicy
+                : .suppressedForLANCoexistence
         self.makeServiceTeardownWatchdog = makeServiceTeardownWatchdog
         self.makeNativeCaptureWatchdog = makeNativeCaptureWatchdog
         self.logger = logger
@@ -762,7 +1187,10 @@ actor WorldwideScreenService {
         maximumWidth: Int,
         framesPerSecond: Int,
         maximumVideoBitrate: Int,
+        featureProfile: WorldwideScreenServiceFeatureProfile = .fullPrimary,
         remoteInputController: MacRemoteInputController,
+        remoteMediaController: any MacRemoteMediaControlling =
+            MacSystemNowPlayingController(),
         captureLifetime: CaptureServiceLifetime? = nil,
         iPhoneMicrophoneForwardingPolicy:
             WorldwideIPhoneMicrophoneForwardingPolicy = .enabled,
@@ -787,16 +1215,26 @@ actor WorldwideScreenService {
         self.systemAudioDisplayID = systemAudioDisplayID
         self.maximumWidth = maximumWidth
         self.framesPerSecond = framesPerSecond
-        self.maximumVideoBitrate = maximumVideoBitrate
+        let effectiveMaximumVideoBitrate = featureProfile
+            .maximumVideoBitrate(configured: maximumVideoBitrate)
+        self.maximumVideoBitrate = effectiveMaximumVideoBitrate
+        self.featureProfile = featureProfile
+        audioClientDiagnosticsReportWriter = featureProfile
+            .allowsAudioClientDiagnostics
+                ? WorldwideAudioClientDiagnosticsReportWriter()
+                : nil
         screenVideoAdaptationPolicy = WorldwideScreenVideoAdaptationPolicy(
-            configuredTotalRTPBitrateBps: maximumVideoBitrate,
+            configuredTotalRTPBitrateBps: effectiveMaximumVideoBitrate,
             baseFramesPerSecond: framesPerSecond
         )
         self.remoteInputController = remoteInputController
+        self.remoteMediaController = remoteMediaController
         self.captureLifetime = captureLifetime
         captureLifetimeIsRequired = captureLifetime != nil
-        self.iPhoneMicrophoneForwardingPolicy =
-            iPhoneMicrophoneForwardingPolicy
+        self.iPhoneMicrophoneForwardingPolicy = featureProfile
+            .allowsIPhoneMicrophoneAndDefaultInputRouting
+                ? iPhoneMicrophoneForwardingPolicy
+                : .suppressedForLANCoexistence
         self.makeServiceTeardownWatchdog = makeServiceTeardownWatchdog
         self.makeNativeCaptureWatchdog = makeNativeCaptureWatchdog
         self.logger = logger
@@ -829,6 +1267,12 @@ actor WorldwideScreenService {
         }
         isStarted = true
 
+        if featureProfile.allowsNowPlaying {
+            remoteMediaController.start { [weak self] update in
+                Task { await self?.remoteMediaStateDidChange(update) }
+            }
+        }
+
         await startIPhoneMicrophoneDeviceMonitoringIfNeeded()
         do {
             let events = try await signaling.connect()
@@ -837,7 +1281,12 @@ actor WorldwideScreenService {
             }
         } catch {
             isStopped = true
-            shutdownBlackHoleAudioRouting()
+            if featureProfile.allowsNowPlaying {
+                remoteMediaController.stop()
+            }
+            if featureProfile.allowsIPhoneMicrophoneAndDefaultInputRouting {
+                shutdownBlackHoleAudioRouting()
+            }
             iPhoneMicrophoneForwarding.shutdown()
             completionContinuation.finish()
             throw error
@@ -871,6 +1320,7 @@ actor WorldwideScreenService {
         let teardownWatchdog = makeServiceTeardownWatchdog()
         isStopped = true
         stopIsInProgress = true
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
         defer { finishStopping() }
         safeOutputInvariantNeedsRedrive = false
         safeOutputInvariantVerificationWasFailing = false
@@ -880,7 +1330,9 @@ actor WorldwideScreenService {
             clearCompatibilityBlock: true
         )
 
-        shutdownBlackHoleAudioRouting()
+        if featureProfile.allowsIPhoneMicrophoneAndDefaultInputRouting {
+            shutdownBlackHoleAudioRouting()
+        }
         iPhoneMicrophoneForwarding.shutdown()
         signalingTask?.cancel()
         signalingTask = nil
@@ -888,8 +1340,29 @@ actor WorldwideScreenService {
         peerEventTask = nil
         screenClientDiagnosticsEventTask?.cancel()
         screenClientDiagnosticsEventTask = nil
+        audioClientDiagnosticsEventTask?.cancel()
+        audioClientDiagnosticsEventTask = nil
+        audioClientDiagnosticsFreshnessTask?.cancel()
+        audioClientDiagnosticsFreshnessTask = nil
+        if featureProfile.allowsAudioClientDiagnostics {
+            audioClientDiagnostics.markUnavailable(.stopped)
+            logAudioClientDiagnosticsIfDue()
+        }
+        screenVideoAdaptationTask?.cancel()
+        screenVideoAdaptationTask = nil
+        screenVideoAdaptationFastStatisticsAreAvailable = false
+        screenVideoAdaptationEvidenceLane = nil
+        screenVideoAdaptationLastEvidenceTime = nil
+        screenVideoAdaptationFreshnessFence.reset()
+        screenVideoAdaptationPolicyRevision &+= 1
         keyFrameControlTask?.cancel()
         keyFrameControlTask = nil
+        resetRemoteMediaCommandQueue()
+        if featureProfile.allowsNowPlaying {
+            remoteMediaController.stop()
+        }
+        latestRemoteMediaControllerRevision = 0
+        latestRemoteMediaItem = nil
         let coordinator = recoveryCoordinator
         recoveryCoordinator = nil
         peerGeneration &+= 1
@@ -898,6 +1371,9 @@ actor WorldwideScreenService {
         peerIsConnected = false
         iceIsConnected = false
         controlChannelIsOpen = false
+        cancelRemoteMediaPublicationRetry()
+        remoteMediaPublication.stop()
+        pendingRemoteMediaStateRefresh = nil
         isRecovering = false
         recoveryProofRequired = false
         recoveryProofEpoch &+= 1
@@ -1077,7 +1553,12 @@ actor WorldwideScreenService {
                 role: .host,
                 iceServers: iceServers,
                 icePolicy: icePolicy,
-                maximumVideoBitrate: maximumVideoBitrate
+                maximumVideoBitrate: maximumVideoBitrate,
+                mediaTopology: featureProfile.transportMediaTopology,
+                supportsRemoteMediaControls: featureProfile.allowsNowPlaying
+                    && remoteMediaController.isAvailable,
+                supportsAudioClientDiagnostics:
+                    featureProfile.allowsAudioClientDiagnostics
             )
         )
         cancelSharedClockEpochRecovery(
@@ -1095,11 +1576,20 @@ actor WorldwideScreenService {
         resetAutomaticScreenMediaSuspensionState()
         resetScreenClientDiagnosticsFreshness()
         screenVideoAdaptationPolicy.bind(toPeerGeneration: generation)
+        screenVideoAdaptationPolicyRevision &+= 1
+        screenVideoAdaptationFastStatisticsAreAvailable = false
+        screenVideoAdaptationEvidenceLane = nil
+        screenVideoAdaptationLastEvidenceTime = nil
+        screenVideoAdaptationFreshnessFence.reset()
         appliedScreenVideoRecommendation = nil
         highestRestartRequestID = nil
         peerIsConnected = false
         iceIsConnected = false
         controlChannelIsOpen = false
+        resetRemoteMediaCommandQueue()
+        cancelRemoteMediaPublicationRetry()
+        remoteMediaPublication.startNewPeer()
+        pendingRemoteMediaStateRefresh = nil
         isRecovering = false
         recoveryProofRequired = false
         recoveryProofEpoch &+= 1
@@ -1130,6 +1620,9 @@ actor WorldwideScreenService {
             }
         )
         self.peer = peer
+        if featureProfile.allowsAudioClientDiagnostics {
+            audioClientDiagnostics.bind(peerGeneration: generation)
+        }
         iPhoneMicrophoneForwarding.replacePeer(
             peer: peer,
             peerGeneration: generation
@@ -1137,6 +1630,9 @@ actor WorldwideScreenService {
         recoveryCoordinator = coordinator
         let events = peer.events
         let screenClientDiagnosticsEvents = peer.screenClientDiagnosticsEvents
+        let audioClientDiagnosticsEvents = featureProfile.allowsAudioClientDiagnostics
+            ? peer.audioClientDiagnosticsEvents
+            : nil
         peerEventTask = Task { [weak self] in
             await self?.consumePeerEvents(
                 events,
@@ -1151,8 +1647,41 @@ actor WorldwideScreenService {
                 sourcePeerGeneration: generation
             )
         }
-        try await peer.startStatistics()
+        if let audioClientDiagnosticsEvents {
+            audioClientDiagnosticsEventTask = Task { [weak self] in
+                for await event in audioClientDiagnosticsEvents {
+                    guard !Task.isCancelled else { return }
+                    await self?.handleAudioClientDiagnosticsEvent(
+                        event, sourcePeer: peer, sourcePeerGeneration: generation
+                    )
+                }
+                guard !Task.isCancelled else { return }
+                await self?.audioClientDiagnosticsStreamEnded(
+                    sourcePeer: peer, sourcePeerGeneration: generation
+                )
+            }
+            audioClientDiagnosticsFreshnessTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                    let negotiated = await peer.audioClientDiagnosticsIsNegotiated()
+                    guard !Task.isCancelled else { return }
+                    await self?.tickAudioClientDiagnostics(
+                        negotiated: negotiated, sourcePeer: peer, sourcePeerGeneration: generation
+                    )
+                }
+            }
+        }
+        try await peer.startStatistics(
+            interval: Self.screenVideoAdaptationFallbackStatisticsInterval
+        )
         try await peer.start()
+        screenVideoAdaptationFastStatisticsAreAvailable = false
+        screenVideoAdaptationTask = Task { [weak self] in
+            await self?.sampleScreenVideoAdaptationStatistics(
+                sourcePeer: peer,
+                sourcePeerGeneration: generation
+            )
+        }
         logger.info("Worldwide WebRTC negotiation started")
     }
 
@@ -1218,6 +1747,342 @@ actor WorldwideScreenService {
         }
     }
 
+    // MARK: - Best-effort client audio evidence
+
+    private func handleAudioClientDiagnosticsEvent(
+        _ event: WebRTCAudioClientDiagnosticsEvent,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard !isStopped, peer === sourcePeer, peerGeneration == sourcePeerGeneration else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        switch event {
+        case .heartbeat(let value):
+            guard value.isValid else { return }
+            _ = audioClientDiagnostics.receive(value, peerGeneration: sourcePeerGeneration, now: now)
+        case .laneFailure:
+            // Lane failures carry no negotiation authority. A queued old failure cannot replace
+            // a current valid sample; revocation/freshness is checked independently below.
+            if case .fresh = audioClientDiagnostics.latest(now: now).status { break }
+            audioClientDiagnostics.markUnavailable(.laneUnavailable)
+        }
+        logAudioClientDiagnosticsIfDue()
+    }
+
+    private func audioClientDiagnosticsStreamEnded(
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard !isStopped, peer === sourcePeer, peerGeneration == sourcePeerGeneration else { return }
+        audioClientDiagnostics.markUnavailable(.streamEnded)
+        logAudioClientDiagnosticsIfDue()
+    }
+
+    private func tickAudioClientDiagnostics(
+        negotiated: Bool,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard !isStopped, peer === sourcePeer, peerGeneration == sourcePeerGeneration else { return }
+        audioClientDiagnostics.observeNegotiated(negotiated)
+        logAudioClientDiagnosticsIfDue()
+    }
+
+    private func logAudioClientDiagnosticsIfDue() {
+        guard let audioClientDiagnosticsReportWriter else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let latest = audioClientDiagnostics.latest(now: now)
+        let terminal: Bool
+        switch latest.status {
+        case .unavailable, .stale: terminal = true
+        case .fresh: terminal = false
+        }
+        audioClientDiagnosticsReportWriter.submit(
+            .init(latest: latest, uptime: now, date: Date()), terminal: terminal
+        )
+        if let message = audioClientDiagnostics.logMessageIfDue(now: now) {
+            logger.info(message + " reportStorage=\(audioClientDiagnosticsReportWriter.storageStatus.rawValue)")
+        }
+    }
+
+    var latestAudioClientDiagnostics: WorldwideAudioClientDiagnosticsSink.Latest {
+        audioClientDiagnostics.latest(now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    var audioClientDiagnosticsReportWriterIsInstalledForTesting: Bool {
+        audioClientDiagnosticsReportWriter != nil
+    }
+
+    // MARK: - System Now Playing
+
+    private func remoteMediaStateDidChange(
+        _ update: WebRTCRemoteMediaStateUpdate
+    ) async {
+        guard !isStopped,
+              update.isValid,
+              update.revision > latestRemoteMediaControllerRevision else {
+            return
+        }
+        latestRemoteMediaControllerRevision = update.revision
+        latestRemoteMediaItem = update.item
+        remoteMediaPublication.applyControllerUpdate(update)
+        await publishCurrentRemoteMediaStateIfPossible()
+    }
+
+    private func publishCurrentRemoteMediaStateIfPossible() async {
+        while transportAllowsCapture, let peer {
+            let remoteMediaIsAvailable =
+                await peer.remoteMediaControlsAreNegotiated()
+            remoteMediaPublication.setRemoteMediaAvailable(
+                remoteMediaIsAvailable
+            )
+            guard let attempt = remoteMediaPublication.beginIfPossible(
+                transportIsReady: transportAllowsCapture
+            ) else {
+                return
+            }
+            let sourcePeerGeneration = peerGeneration
+            let refresh = pendingRemoteMediaStateRefresh
+            var succeeded = false
+            do {
+                try await peer.sendRemoteMediaState(attempt.update, respondingTo: refresh)
+                if self.peer === peer,
+                   peerGeneration == sourcePeerGeneration {
+                    succeeded = true
+                    if pendingRemoteMediaStateRefresh == refresh {
+                        pendingRemoteMediaStateRefresh = nil
+                    }
+                }
+            } catch {
+                // Peer/ICE/data-channel events own recovery. Keep the newest desired value dirty;
+                // the bounded same-peer retry or a later state/recovery event will redrive it.
+                logger.debug(
+                    "Worldwide remote media state deferred: \(error.localizedDescription)"
+                )
+            }
+            let completion = remoteMediaPublication.complete(
+                attempt,
+                succeeded: succeeded
+            )
+            if succeeded {
+                cancelRemoteMediaPublicationRetry()
+            } else if completion == .retryLatest,
+                      !isStopped,
+                      self.peer === peer,
+                      peerGeneration == sourcePeerGeneration {
+                scheduleRemoteMediaPublicationRetry(
+                    sourcePeer: peer,
+                    sourcePeerGeneration: sourcePeerGeneration
+                )
+            }
+            guard completion == .publishNewest else { return }
+        }
+    }
+
+    private func scheduleRemoteMediaPublicationRetry(
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) {
+        guard remoteMediaPublication.hasPendingPublication,
+              let token = remoteMediaPublicationRetryGate.schedule() else {
+            return
+        }
+        remoteMediaPublicationRetryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            await self.remoteMediaPublicationRetryDidFire(
+                token,
+                sourcePeer: sourcePeer,
+                sourcePeerGeneration: sourcePeerGeneration
+            )
+        }
+    }
+
+    private func remoteMediaPublicationRetryDidFire(
+        _ token: WorldwideRemoteMediaPublicationRetryGate.Token,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        guard remoteMediaPublicationRetryGate.consume(token) else { return }
+        remoteMediaPublicationRetryTask = nil
+        guard !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration else { return }
+        await publishCurrentRemoteMediaStateIfPossible()
+    }
+
+    private func cancelRemoteMediaPublicationRetry() {
+        remoteMediaPublicationRetryGate.cancel()
+        remoteMediaPublicationRetryTask?.cancel()
+        remoteMediaPublicationRetryTask = nil
+    }
+
+    private func enqueueRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        traceRemoteMediaCommand(.serviceReceived, command: command, sourcePeerGeneration: sourcePeerGeneration)
+        guard let commandGeneration = remoteMediaCommandCapacity.reserve() else {
+            traceRemoteMediaCommand(.capacityRejected, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: .failed)
+            await acknowledgeRemoteMediaCommand(
+                command,
+                result: .failed,
+                sourcePeer: sourcePeer,
+                sourcePeerGeneration: sourcePeerGeneration
+            )
+            return
+        }
+        let predecessor = remoteMediaCommandTask
+        remoteMediaCommandTask = Task { [weak self] in
+            _ = await predecessor?.result
+            guard let self else { return }
+            if !Task.isCancelled {
+                await self.executeRemoteMediaCommand(
+                    command,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    commandGeneration: commandGeneration
+                )
+            } else {
+                await self.traceRemoteMediaCommand(.queueCancelled, command: command,
+                                                   sourcePeerGeneration: sourcePeerGeneration)
+            }
+            await self.finishRemoteMediaCommand(generation: commandGeneration)
+        }
+    }
+
+    private func executeRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64,
+        commandGeneration: UInt64
+    ) async {
+        guard !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              remoteMediaCommandCapacity.admits(generation: commandGeneration),
+              command.isValid,
+              transportAllowsCapture else {
+            traceRemoteMediaCommand(.executionRetired, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration)
+            return
+        }
+
+        let request = command.request
+        let result: WebRTCRemoteMediaCommandResult
+        if let rejection = WebRTCRemoteMediaCommandAdmission.rejection(
+            for: request,
+            latestSuccessfullySent: remoteMediaPublication.lastSuccessfullySent
+        ) {
+            result = rejection
+        } else if let item = latestRemoteMediaItem {
+            if item.contextID != request.contextID {
+                result = .staleContext
+            } else if !item.capabilities.permits(request.command) {
+                result = .unsupported
+            } else if let prepared = remoteMediaController.prepareCommand(
+                request.command,
+                contextID: request.contextID,
+                isAuthorized: { command.isValid }
+            ) {
+                result = await remoteMediaController.perform(prepared)
+            } else {
+                result = .staleContext
+            }
+        } else {
+            result = .noActiveMedia
+        }
+
+        traceRemoteMediaCommand(.resultResolved, command: command,
+                                sourcePeerGeneration: sourcePeerGeneration, result: result)
+
+        guard !Task.isCancelled,
+              !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              remoteMediaCommandCapacity.admits(generation: commandGeneration),
+              transportAllowsCapture else {
+            traceRemoteMediaCommand(.acknowledgementRetired, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
+            return
+        }
+        await acknowledgeRemoteMediaCommand(
+            command,
+            result: result,
+            sourcePeer: sourcePeer,
+            sourcePeerGeneration: sourcePeerGeneration
+        )
+    }
+
+    private func acknowledgeRemoteMediaCommand(
+        _ command: WebRTCReceivedRemoteMediaCommand,
+        result: WebRTCRemoteMediaCommandResult,
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        guard !isStopped,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              transportAllowsCapture else {
+            traceRemoteMediaCommand(.acknowledgementRetired, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
+            return
+        }
+        do {
+            try await sourcePeer.acknowledgeRemoteMediaCommand(
+                command,
+                result: result
+            )
+            traceRemoteMediaCommand(.acknowledgementSent, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
+        } catch {
+            traceRemoteMediaCommand(.acknowledgementFailed, command: command,
+                                    sourcePeerGeneration: sourcePeerGeneration, result: result)
+            logger.debug(
+                "Worldwide remote media command acknowledgement deferred: "
+                    + error.localizedDescription
+            )
+        }
+    }
+
+    private func traceRemoteMediaCommand(
+        _ stage: WorldwideRemoteMediaCommandTrace.Stage,
+        command: WebRTCReceivedRemoteMediaCommand,
+        sourcePeerGeneration: UInt64,
+        result: WebRTCRemoteMediaCommandResult? = nil
+    ) {
+        logger.info(WorldwideRemoteMediaCommandTrace.message(
+            stage: stage,
+            session: remoteMediaTraceSession,
+            processID: ProcessInfo.processInfo.processIdentifier,
+            peerGeneration: sourcePeerGeneration,
+            request: command.request,
+            publishedRevision: remoteMediaPublication.lastSuccessfullySent?.revision,
+            contextMatches: latestRemoteMediaItem?.contextID == command.request.contextID,
+            authorized: command.isValid,
+            transportReady: !isStopped && peerGeneration == sourcePeerGeneration && transportAllowsCapture,
+            result: result,
+            uptime: ProcessInfo.processInfo.systemUptime
+        ))
+    }
+
+    private func finishRemoteMediaCommand(generation: UInt64) {
+        remoteMediaCommandCapacity.finish(generation: generation)
+    }
+
+    private func resetRemoteMediaCommandQueue() {
+        remoteMediaCommandTask?.cancel()
+        remoteMediaCommandTask = nil
+        remoteMediaCommandCapacity.reset()
+        remoteMediaController.invalidateCommands()
+    }
+
     /// Updates transport health, routes protocol requests, and emits sanitized diagnostics.
     private func handlePeerEvent(
         _ event: WebRTCTransportEvent,
@@ -1255,6 +2120,7 @@ actor WorldwideScreenService {
                 } else if await markRecoveryHealthyIfPossible() {
                     await recoveryCoordinator?.iceStateChanged(.connected)
                 }
+                await publishCurrentRemoteMediaStateIfPossible()
             case .disconnected:
                 peerIsConnected = false
                 await enterRecovery(reason: "peer disconnected")
@@ -1280,6 +2146,7 @@ actor WorldwideScreenService {
                 } else if await markRecoveryHealthyIfPossible() {
                     await recoveryCoordinator?.iceStateChanged(state)
                 }
+                await publishCurrentRemoteMediaStateIfPossible()
             case .disconnected, .failed:
                 iceIsConnected = false
                 await enterRecovery(reason: "ICE route unavailable")
@@ -1318,6 +2185,7 @@ actor WorldwideScreenService {
                 } else if await markRecoveryHealthyIfPossible() {
                     await recoveryCoordinator?.iceStateChanged(.connected)
                 }
+                await publishCurrentRemoteMediaStateIfPossible()
             }
             if state == .closing || state == .closed || (wasOpen && state != .open) {
                 await enterRecovery(reason: "control channel unavailable")
@@ -1342,7 +2210,36 @@ actor WorldwideScreenService {
             revokeRemoteInputAuthorization()
             logger.info("Worldwide remote input stopped: \(reason)")
 
+        case .remoteMediaControlsAvailabilityChanged(let isAvailable):
+            remoteMediaPublication.setRemoteMediaAvailable(isAvailable)
+            if isAvailable {
+                await publishCurrentRemoteMediaStateIfPossible()
+            } else {
+                pendingRemoteMediaStateRefresh = nil
+                resetRemoteMediaCommandQueue()
+            }
+
+        case .remoteMediaStateRefreshRequested(let refresh):
+            // One latest request is sufficient: a superseded readiness UUID cannot authorize the
+            // viewer's current controls. Congestion uses the existing single-flight retry path.
+            pendingRemoteMediaStateRefresh = refresh
+            remoteMediaPublication.requestRefresh()
+            await publishCurrentRemoteMediaStateIfPossible()
+
+        case .remoteMediaCommandReceived(let command):
+            await enqueueRemoteMediaCommand(
+                command,
+                sourcePeer: sourcePeer,
+                sourcePeerGeneration: sourcePeerGeneration
+            )
+
+        case .remoteMediaStateChanged,
+             .remoteMediaCommandAcknowledgementReceived:
+            // These messages are host-originated and are consumed only by the iPhone viewer.
+            break
+
         case .macHostedCallChallengeReceived(let challenge):
+            guard featureProfile.allowsSystemAudio else { break }
             installMacHostedCallChallenge(
                 challenge,
                 sourcePeer: sourcePeer,
@@ -1451,9 +2348,15 @@ actor WorldwideScreenService {
 
         case .routeChanged(let route):
             logger.info("Worldwide WebRTC route: \(route.kind.rawValue)")
+            screenVideoAdaptationPolicyRevision &+= 1
             screenVideoAdaptationPolicy.invalidateSelectedRoute()
+            screenVideoAdaptationEvidenceLane = nil
+            screenVideoAdaptationLastEvidenceTime = nil
 
-        case .statistics(let snapshot):
+        case .statistics(
+            let snapshot,
+            let wholePeerReportWasCollected
+        ):
             guard peer === sourcePeer,
                   peerGeneration == sourcePeerGeneration else {
                 return
@@ -1557,11 +2460,37 @@ actor WorldwideScreenService {
                   peerGeneration == sourcePeerGeneration else {
                 return
             }
-            await adaptScreenVideoForNetworkConditions(
-                snapshot,
-                sourcePeer: sourcePeer,
-                sourcePeerGeneration: sourcePeerGeneration
-            )
+            let ordinaryFallbackOwnsVideoPolicy =
+                screenMediaSuspension.isAutomaticallySuspended
+                    || !screenVideoAdaptationFastStatisticsAreAvailable
+            if wholePeerReportWasCollected,
+               screenVideoAdaptationFreshnessFence.admits(snapshot),
+               ordinaryFallbackOwnsVideoPolicy {
+                let expectedPolicyRevision =
+                    prepareScreenVideoAdaptationEvidence(
+                        from: .ordinaryFallback
+                    )
+                await adaptScreenVideoForNetworkConditions(
+                    snapshot,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    expectedPolicyRevision: expectedPolicyRevision,
+                    allowsAutomaticResume: true
+                )
+            } else if !wholePeerReportWasCollected,
+                      ordinaryFallbackOwnsVideoPolicy {
+                // The microphone-health event still fires when the native whole-peer request is
+                // busy or times out. Missing telemetry is not transport evidence; it may only
+                // expire an already-raised, time-bounded application-limited video probe.
+                await adaptScreenVideoForNetworkConditions(
+                    nil,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    expectedPolicyRevision:
+                        screenVideoAdaptationPolicyRevision,
+                    allowsAutomaticResume: false
+                )
+            }
             // Client diagnostics are an observability-only lane. Evaluate freshness strictly
             // after media adaptation so these best-effort heartbeats can never drive policy.
             await observeScreenClientDiagnosticsFreshness(
@@ -1713,17 +2642,186 @@ actor WorldwideScreenService {
         )
     }
 
+    /// Starts a fresh threshold window whenever statistics switch between native request lanes or
+    /// arrive after a long gap. This prevents nominally consecutive evidence from being assembled
+    /// out of samples that were actually separated by a timeout or a cadence change.
+    private func prepareScreenVideoAdaptationEvidence(
+        from lane: ScreenVideoAdaptationEvidenceLane
+    ) -> UInt64 {
+        let now = ContinuousClock.now
+        let exceededMaximumGap = screenVideoAdaptationLastEvidenceTime.map {
+            $0.duration(to: now)
+                > Self.screenVideoAdaptationMaximumEvidenceGap
+        } ?? false
+        if let previousLane = screenVideoAdaptationEvidenceLane,
+           previousLane != lane || exceededMaximumGap {
+            screenVideoAdaptationPolicy.resetIncompleteEvidenceWindow()
+            screenVideoAdaptationPolicyRevision &+= 1
+        }
+        screenVideoAdaptationEvidenceLane = lane
+        screenVideoAdaptationLastEvidenceTime = now
+        return screenVideoAdaptationPolicyRevision
+    }
+
+    /// One collector retains ordinary quality decisions while observing bounded startup probes
+    /// between them. Microphone freshness and route maintenance keep their one-second cadence.
+    private func sampleScreenVideoAdaptationStatistics(
+        sourcePeer: WebRTCPeer,
+        sourcePeerGeneration: UInt64
+    ) async {
+        let clock = ContinuousClock()
+        var cadence = WorldwideScreenVideoSamplingCadence(startedAt: clock.now)
+        while !Task.isCancelled {
+            do {
+                try await clock.sleep(until: cadence.nextDeadline)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  !isStopped,
+                  peer === sourcePeer,
+                  peerGeneration == sourcePeerGeneration else {
+                return
+            }
+            guard let sample = cadence.takeDueSample(at: clock.now) else { continue }
+            let capacityProbeOnly = sample == .capacityOnly
+            defer {
+                let now = clock.now
+                cadence.didFinishSample(at: now)
+                cadence.setCapacityProbeEnabled(
+                    captureSource != nil
+                        && automaticScreenMediaResumeContext == nil
+                        && screenVideoAdaptationFastStatisticsAreAvailable
+                        && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil,
+                    at: now
+                )
+            }
+            logNativeScreenProbeDiagnostics()
+            guard captureSource != nil else {
+                screenVideoAdaptationFastStatisticsAreAvailable = false
+                continue
+            }
+            guard automaticScreenMediaResumeContext == nil else {
+                // The exact resume attempt owns the sender ceiling until both the ACK and the
+                // ordinary encoder limits have committed. Do not launch a request inside that
+                // interval: its result could otherwise arrive just after the context is released
+                // and cause a second back-to-back encoder transition from pre-restoration data.
+                continue
+            }
+
+            let expectedPolicyRevision =
+                screenVideoAdaptationPolicyRevision
+            let expectedVisibilityEpoch = screenVisibilityCommandEpoch
+            let expectedCaptureSource = captureSource
+            let expectedCaptureAuthorization = captureAuthorization
+            let statisticsStartedAt = clock.now
+            let report = await sourcePeer.screenVideoStatisticsSnapshot(
+                timeout: capacityProbeOnly
+                    ? .milliseconds(100)
+                    : Self.screenVideoAdaptationStatisticsTimeout
+            )
+            guard !Task.isCancelled,
+                  !isStopped,
+                  peer === sourcePeer,
+                  peerGeneration == sourcePeerGeneration else {
+                return
+            }
+            let statisticsDuration = statisticsStartedAt.duration(to: clock.now).components
+            let statisticsMilliseconds = Double(statisticsDuration.seconds) * 1_000
+                + Double(statisticsDuration.attoseconds) / 1_000_000_000_000_000
+            logger.debug(
+                "Worldwide screen statistics evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular") "
+                    + "peerGeneration=\(sourcePeerGeneration) showEpoch=\(expectedVisibilityEpoch) "
+                    + "durationMs=\(String(format: "%.1f", statisticsMilliseconds)) "
+                    + "received=\(report != nil)"
+            )
+            if let report,
+               case let snapshot = report.snapshot,
+               screenVideoAdaptationFreshnessFence.admits(snapshot),
+               screenVisibilityCommandEpoch == expectedVisibilityEpoch,
+               captureSource === expectedCaptureSource,
+               captureAuthorization === expectedCaptureAuthorization,
+               screenVideoAdaptationPolicyRevision
+                == expectedPolicyRevision {
+                if !capacityProbeOnly {
+                    screenVideoAdaptationFastStatisticsAreAvailable = true
+                }
+                let adaptationRevision = capacityProbeOnly
+                    ? expectedPolicyRevision
+                    : prepareScreenVideoAdaptationEvidence(from: .fastSender)
+                await adaptScreenVideoForNetworkConditions(
+                    snapshot,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    expectedPolicyRevision: adaptationRevision,
+                    allowsAutomaticResume: false,
+                    nativeReportTimestampMicroseconds: report.nativeReportTimestampMicroseconds,
+                    capacityProbeOnly: capacityProbeOnly
+                )
+            } else {
+                // A timeout, an outstanding native request, or an ordered route/policy change
+                // makes the ordinary one-second event the authoritative fallback until a fresh
+                // sender-scoped sample succeeds.
+                if !capacityProbeOnly {
+                    screenVideoAdaptationFastStatisticsAreAvailable = false
+                }
+                // A missing report cannot extend a temporary ceiling indefinitely, even if the
+                // ordinary statistics lane is also stalled. Expiry never supplies health proof.
+                await adaptScreenVideoForNetworkConditions(
+                    nil,
+                    sourcePeer: sourcePeer,
+                    sourcePeerGeneration: sourcePeerGeneration,
+                    expectedPolicyRevision: screenVideoAdaptationPolicyRevision,
+                    allowsAutomaticResume: false
+                )
+            }
+
+        }
+    }
+
+    private func logNativeScreenProbeDiagnostics() {
+        let batch = WebRTCNativeProbeDiagnostics.drain()
+        for event in batch.events {
+            // Native log callbacks are process-wide; do not attach this peer's identity to them.
+            logger.debug(
+                "Worldwide screen native probe scope=process "
+                    + "seq=\(event.sequence) ageMs=\(event.processDiagnosticsAgeMilliseconds) "
+                    + "kind=\(event.kind.rawValue) "
+                    + "active=\(event.isActive.map(String.init) ?? "unknown") "
+                    + "sendBps=\(event.bitrateBps.map(String.init) ?? "unknown") "
+                    + "receiveBps=\(event.receiveBitrateBps.map(String.init) ?? "unknown") "
+                    + "sendIntervalUs=\(event.sendInterval?.diagnosticToken ?? "unknown") "
+                    + "receiveIntervalUs=\(event.receiveInterval?.diagnosticToken ?? "unknown") "
+                    + "minimumBytes=\(event.minimumBytes.map(String.init) ?? "unknown") "
+                    + "minimumPackets=\(event.minimumPackets.map(String.init) ?? "unknown") "
+                    + "cluster=\(event.clusterID.map(String.init) ?? "unknown") "
+                    + "blocked=\(event.blockReason?.rawValue ?? "none") "
+                    + "dropped=\(batch.droppedEventCount)"
+            )
+        }
+    }
+
     /// Applies a new sender ceiling only after the current capture and peer identities survive
     /// the cross-actor parameter update. Failed native updates are retried by the next sample.
     private func adaptScreenVideoForNetworkConditions(
-        _ snapshot: WebRTCStatisticsSnapshot,
+        _ snapshot: WebRTCStatisticsSnapshot?,
         sourcePeer: WebRTCPeer,
-        sourcePeerGeneration: UInt64
+        sourcePeerGeneration: UInt64,
+        expectedPolicyRevision: UInt64,
+        allowsAutomaticResume: Bool,
+        nativeReportTimestampMicroseconds: Double? = nil,
+        capacityProbeOnly: Bool = false
     ) async {
         // Marker and real-frame RTP deltas are valid only while the exact sender configuration
         // remains frozen. The bounded probe owns its temporary ceiling; the first statistics
         // sample after success or retry reapplies ordinary policy.
-        guard automaticScreenMediaResumeContext == nil else { return }
+        guard automaticScreenMediaResumeContext == nil,
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              screenVideoAdaptationPolicyRevision
+                == expectedPolicyRevision else {
+            return
+        }
         let forwardingAuthorization = captureForwardingAuthorization
         let isCaptureActive = captureSource != nil
             && captureSink != nil
@@ -1732,40 +2830,127 @@ actor WorldwideScreenService {
             && forwardingAuthorization.map {
                 captureSink?.allowsActiveUse(authorizedBy: $0) == true
             } == true
+        guard isCaptureActive || allowsAutomaticResume else { return }
 
         var proposedPolicy = screenVideoAdaptationPolicy
-        let changedRecommendation = proposedPolicy.update(
-            peerGeneration: sourcePeerGeneration,
-            isCaptureActive: isCaptureActive,
-            isAutomaticallySuspended:
-                screenMediaSuspension.isAutomaticallySuspended,
-            availableOutgoingBitrateBps: snapshot.availableOutgoingBitrate,
-            currentRoundTripTimeSeconds: snapshot.currentRoundTripTime,
-            selectedRoute: snapshot.route,
-            outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
-            outboundVideoTotalPacketSendDelaySeconds:
-                snapshot.outboundVideo?.totalPacketSendDelay
-        )
+        var capacityDiagnostics: WorldwideScreenCapacityProbeDiagnostics?
+        var floorDiagnostics: WorldwideScreenFloorRecoveryDiagnostics?
+        let changedRecommendation:
+            WorldwideScreenVideoEncodingRecommendation?
+        if let snapshot, capacityProbeOnly {
+            changedRecommendation = proposedPolicy.updateCapacityProbe(
+                peerGeneration: sourcePeerGeneration,
+                isCaptureActive: isCaptureActive,
+                availableOutgoingBitrateBps: snapshot.availableOutgoingBitrate,
+                currentRoundTripTimeSeconds: snapshot.currentRoundTripTime,
+                roundTripTimeObservation: snapshot.roundTripTimeObservation,
+                collectionSequence: snapshot.collectionSequence,
+                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
+                selectedRoute: snapshot.route,
+                outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    snapshot.outboundVideo?.totalPacketSendDelay,
+                diagnostics: { capacityDiagnostics = $0 }
+            )
+        } else if let snapshot {
+            changedRecommendation = proposedPolicy.update(
+                peerGeneration: sourcePeerGeneration,
+                isCaptureActive: isCaptureActive,
+                isAutomaticallySuspended:
+                    screenMediaSuspension.isAutomaticallySuspended,
+                availableOutgoingBitrateBps: snapshot.availableOutgoingBitrate,
+                currentRoundTripTimeSeconds: snapshot.currentRoundTripTime,
+                roundTripTimeObservation: snapshot.roundTripTimeObservation,
+                collectionSequence: snapshot.collectionSequence,
+                requireRoundTripTimeObservation: true,
+                selectedRoute: snapshot.route,
+                outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
+                outboundVideoTotalPacketSendDelaySeconds:
+                    snapshot.outboundVideo?.totalPacketSendDelay,
+                nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
+                diagnostics: { floorDiagnostics = $0 }
+            )
+        } else {
+            changedRecommendation = proposedPolicy
+                .expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: sourcePeerGeneration,
+                    isCaptureActive: isCaptureActive
+                )
+            guard changedRecommendation != nil else { return }
+        }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
+        if let floorDiagnostics,
+           screenVideoAdaptationPolicy.currentTier == .audioPriority
+            || proposedPolicy.currentTier == .audioPriority {
+            logger.debug(
+                "Worldwide screen floor proposal peerGeneration=\(sourcePeerGeneration) "
+                    + "policyRevision=\(expectedPolicyRevision) "
+                    + "visibilityEpoch=\(screenVisibilityCommandEpoch) "
+                    + floorDiagnostics.logFields
+            )
+        }
+        if let capacityDiagnostics {
+            logger.debug(
+                "Worldwide screen capacity proposal peerGeneration=\(sourcePeerGeneration) "
+                    + "policyRevision=\(expectedPolicyRevision) "
+                    + capacityDiagnostics.logFields
+            )
+        }
+        let rttDiagnostics = WorldwideScreenRoundTripTimeDiagnostics(
+            observation: snapshot?.roundTripTimeObservation
+        )
         logger.debug(
             "Worldwide screen network totalCapKbps=\(maximumVideoBitrate / 1_000) "
                 + "fullVideoKbps=\(proposedPolicy.maximumTierVideoBitrateBps / 1_000) "
                 + "tier=\(String(describing: recommendation.tier)) "
+                + "sustainKbps="
+                + "\(proposedPolicy.currentTierMinimumSustainableBitrateBps / 1_000) "
+                + "directUpgradeKbps="
+                + (proposedPolicy.nextHigherTierMinimumDirectUpgradeBitrateBps.map {
+                    String($0 / 1_000)
+                } ?? "none")
+                + " proposedCeilingKbps=\(recommendation.maximumBitrateBps / 1_000)"
+                + " proposedTotalCapKbps="
+                + "\(recommendation.maximumTotalRTPBitrateBps / 1_000)"
+                + " promotionCapKbps="
+                + (proposedPolicy.promotionCapacityContinuity.map {
+                    String($0.maximumTotalRTPBitrateBps / 1_000)
+                } ?? "none")
+                + " probeOrigin="
+                + (proposedPolicy.applicationLimitedProbeOriginTier.map {
+                    String(describing: $0)
+                } ?? "none")
+                + " probeBest="
+                + (proposedPolicy.applicationLimitedProbeBestQualifiedTier.map {
+                    String(describing: $0)
+                } ?? "none")
+                + " probeHealthySamples="
+                + "\(proposedPolicy.applicationLimitedProbeHealthySampleCount)"
+                + " queuePressureSamples=\(proposedPolicy.queuePressureSampleCount) "
                 + "bweKbps="
-                + (snapshot.availableOutgoingBitrate.map {
+                + (snapshot?.availableOutgoingBitrate.map {
                     String(format: "%.0f", $0 / 1_000)
                 } ?? "unknown")
                 + " rttMs="
-                + (snapshot.currentRoundTripTime.map {
+                + (snapshot?.currentRoundTripTime.map {
                     String(format: "%.1f", $0 * 1_000)
                 } ?? "unknown")
-                + " sendQueueMs="
+                + " rttObservation=\(proposedPolicy.roundTripTimeDisposition.rawValue)"
+                + " rttTotalMicros="
+                + (rttDiagnostics.totalMicroseconds.map(String.init) ?? "unknown")
+                + " rttResponses="
+                + (rttDiagnostics.responsesReceived.map(String.init) ?? "unknown")
+                + " collectionSeq="
+                + (snapshot?.collectionSequence.map(String.init) ?? "unknown")
+                + " consumedSeq="
+                + (proposedPolicy.lastConsumedCollectionSequence.map(String.init) ?? "unknown")
+                + " primarySendQueueMs="
                 + (proposedPolicy.lastAveragePacketSendDelaySeconds.map {
                     String(format: "%.1f", $0 * 1_000)
                 } ?? "unknown")
                 + " encoded="
-                + (snapshot.outboundVideo.flatMap { video in
+                + (snapshot?.outboundVideo.flatMap { video in
                     guard let width = video.frameWidth,
                           let height = video.frameHeight else {
                         return nil
@@ -1773,19 +2958,23 @@ actor WorldwideScreenService {
                     return "\(width)x\(height)"
                 } ?? "unknown")
                 + " fps="
-                + (snapshot.outboundVideo?.framesPerSecond.map {
+                + (snapshot?.outboundVideo?.framesPerSecond.map {
                     String(format: "%.1f", $0)
                 } ?? "unknown")
+                + " evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular")"
         )
         guard isCaptureActive else {
             if peer === sourcePeer,
-               peerGeneration == sourcePeerGeneration {
+               peerGeneration == sourcePeerGeneration,
+               screenVideoAdaptationPolicyRevision
+                == expectedPolicyRevision {
                 let decision = proposedPolicy.automaticSuspensionDecision(
                     isCaptureActive: false,
                     isAutomaticallySuspended:
                         screenMediaSuspension.isAutomaticallySuspended
                 )
                 screenVideoAdaptationPolicy = proposedPolicy
+                screenVideoAdaptationPolicyRevision &+= 1
                 if decision == .resume {
                     await beginAutomaticScreenMediaResumeIfPossible(
                         peer: sourcePeer,
@@ -1795,6 +2984,7 @@ actor WorldwideScreenService {
             }
             return
         }
+        var applyingPolicyRevision = expectedPolicyRevision
         if changedRecommendation != nil
             || appliedScreenVideoRecommendation != recommendation {
             guard let source = captureSource,
@@ -1806,12 +2996,22 @@ actor WorldwideScreenService {
                 return
             }
 
+            var attemptConsumption = screenVideoAdaptationPolicy
+            attemptConsumption.retainFloorRecoveryAttemptConsumption(from: proposedPolicy)
+            if attemptConsumption != screenVideoAdaptationPolicy {
+                // The attempt belongs to this Show even if native apply is later superseded.
+                screenVideoAdaptationPolicy = attemptConsumption
+                screenVideoAdaptationPolicyRevision &+= 1
+                applyingPolicyRevision = screenVideoAdaptationPolicyRevision
+            }
             do {
                 let senderUpdate = try await sourcePeer.applyScreenVideoEncodingLimits(
                     recommendation.webRTCLimits
                 )
                 guard peer === sourcePeer,
                       peerGeneration == sourcePeerGeneration,
+                      screenVideoAdaptationPolicyRevision
+                        == applyingPolicyRevision,
                       captureSource === source,
                       captureSink === sink,
                       self.captureAuthorization === captureAuthorization,
@@ -1823,6 +3023,10 @@ actor WorldwideScreenService {
                           authorizedBy: forwardingAuthorization
                       ),
                       captureVideoBaseDimensions == baseDimensions else {
+                    logger.debug(
+                        "Worldwide screen capacity nativeApply=stale "
+                            + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision)"
+                    )
                     do {
                         _ = try await sourcePeer
                             .rollbackScreenVideoEncodingUpdateIfCurrent(
@@ -1836,38 +3040,87 @@ actor WorldwideScreenService {
                     }
                     return
                 }
-                capturer.adaptOutput(
-                    width: Int32(baseDimensions.width),
-                    height: Int32(baseDimensions.height),
-                    framesPerSecond: Int32(
-                        recommendation.maximumFramesPerSecond
+                if appliedScreenVideoRecommendation?.maximumFramesPerSecond
+                    != recommendation.maximumFramesPerSecond {
+                    capturer.adaptOutput(
+                        width: Int32(baseDimensions.width),
+                        height: Int32(baseDimensions.height),
+                        framesPerSecond: Int32(
+                            recommendation.maximumFramesPerSecond
+                        )
                     )
-                )
+                }
                 appliedScreenVideoRecommendation = recommendation
+                logger.debug(
+                    "Worldwide screen capacity nativeApply=accepted "
+                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision) "
+                        + "totalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
+                )
                 logger.info(
                     "Worldwide screen video tier=\(String(describing: recommendation.tier)) "
                         + "maxKbps=\(recommendation.maximumBitrateBps / 1_000) "
                         + "fps=\(recommendation.maximumFramesPerSecond) "
-                        + "scale=\(String(format: "%.2f", recommendation.scaleResolutionDownBy))"
+                        + "scale=\(String(format: "%.2f", recommendation.scaleResolutionDownBy)) "
+                        + "totalCapKbps=\(recommendation.maximumTotalRTPBitrateBps / 1_000) "
+                        + "evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular")"
                 )
             } catch {
                 guard peer === sourcePeer,
-                      peerGeneration == sourcePeerGeneration else {
+                      peerGeneration == sourcePeerGeneration,
+                      screenVideoAdaptationPolicyRevision
+                        == applyingPolicyRevision,
+                      captureSource === source,
+                      captureSink === sink,
+                      self.captureAuthorization === captureAuthorization,
+                      self.captureForwardingAuthorization === forwardingAuthorization,
+                      captureAuthorization.isValid,
+                      forwardingAuthorization.isValid,
+                      sink.allowsActiveUse(authorizedBy: forwardingAuthorization),
+                      captureVideoBaseDimensions == baseDimensions else {
                     return
                 }
                 logger.error(
                     "Worldwide screen video adaptation held its previous tier: "
                         + error.localizedDescription
                 )
+                logger.debug(
+                    "Worldwide screen capacity nativeApply=failed "
+                        + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision) "
+                        + "proposedTotalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
+                )
+                let cancelledFloorRecoveryProbe =
+                    screenVideoAdaptationPolicy.floorRecoveryProbeIsActive
+                        && proposedPolicy.floorRecoveryProbeWasCancelled
+                screenVideoAdaptationPolicy.retainFloorRecoveryAttemptConsumption(
+                    from: proposedPolicy
+                )
+                if cancelledFloorRecoveryProbe
+                    || (capacityProbeOnly
+                        && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil
+                        && proposedPolicy.applicationLimitedProbeOriginTier == nil) {
+                    // A failed cap reduction must not erase a terminal floor or fast negative.
+                    screenVideoAdaptationPolicy = proposedPolicy
+                    screenVideoAdaptationPolicyRevision &+= 1
+                } else if capacityProbeOnly {
+                    screenVideoAdaptationPolicy.retainCapacityProbeObservationIdentity(
+                        from: proposedPolicy
+                    )
+                    screenVideoAdaptationPolicyRevision &+= 1
+                } else {
+                    screenVideoAdaptationPolicyRevision &+= 1
+                }
                 return
             }
         }
 
         guard peer === sourcePeer,
-              peerGeneration == sourcePeerGeneration else {
+              peerGeneration == sourcePeerGeneration,
+              screenVideoAdaptationPolicyRevision
+                == applyingPolicyRevision else {
             return
         }
         screenVideoAdaptationPolicy = proposedPolicy
+        screenVideoAdaptationPolicyRevision &+= 1
     }
 
     private func beginAutomaticScreenMediaResumeIfPossible(
@@ -1892,12 +3145,14 @@ actor WorldwideScreenService {
             return
         }
         screenVideoAdaptationPolicy.automaticResumeAttemptBegan()
+        screenVideoAdaptationPolicyRevision &+= 1
         automaticScreenMediaResumeContext = AutomaticScreenMediaResumeContext(
             binding: binding,
             notice: notice,
             attemptID: attemptID,
             finalAcknowledgementCommit:
                 WorldwideScreenAutomaticResumeCommitLatch(),
+            inputOwnershipClaim: latestShowInputOwnershipClaim,
             probeAuthorization: nil,
             forwardingAuthorization: nil,
             boundary: nil,
@@ -2067,6 +3322,23 @@ actor WorldwideScreenService {
         automaticScreenMediaResumeTimeoutTask = nil
     }
 
+    /// Fences native requests at sender restoration or Hide and discards partial threshold
+    /// evidence from the preceding encoder/visibility epoch.
+    private func beginPostResumeScreenVideoAdaptationEpoch() {
+        if let peer {
+            screenVideoAdaptationFreshnessFence.beginPostResumeEpoch(
+                minimumCollectionSequence:
+                    peer.minimumNextStatisticsCollectionSequence()
+            )
+        } else {
+            screenVideoAdaptationFreshnessFence.reset()
+        }
+        screenVideoAdaptationPolicy.resetIncompleteEvidenceWindow()
+        screenVideoAdaptationEvidenceLane = nil
+        screenVideoAdaptationLastEvidenceTime = nil
+        screenVideoAdaptationPolicyRevision &+= 1
+    }
+
     private func automaticScreenMediaResumeTimedOut(
         attemptID: UUID,
         peerGeneration sourcePeerGeneration: UInt64,
@@ -2098,8 +3370,9 @@ actor WorldwideScreenService {
             // The irreversible send won the same latch. The viewer can already uncover, so a
             // concurrent display/route lifecycle owns any subsequent capture transition.
             cancelAutomaticScreenMediaResumeTimeout()
-            automaticScreenMediaResumeContext = nil
             screenVideoAdaptationPolicy.automaticResumeAttemptSucceeded()
+            beginPostResumeScreenVideoAdaptationEpoch()
+            automaticScreenMediaResumeContext = nil
             return
         }
         let ownedSource = captureSource
@@ -2133,6 +3406,7 @@ actor WorldwideScreenService {
         )
         let failureDiagnostic = screenMediaSuspension.diagnosticSnapshot
         screenVideoAdaptationPolicy.automaticResumeAttemptFailed()
+        screenVideoAdaptationPolicyRevision &+= 1
         await sourcePeer.cancelScreenMediaResumeProbe(
             attemptID: attemptID,
             reason: reason
@@ -2494,7 +3768,9 @@ actor WorldwideScreenService {
                 throw WorldwideScreenServiceError.transportUnavailable
             }
             let inputSession = armRemoteInputIfAvailable(
-                screenRequestID: context.notice.screenRequestID
+                screenRequestID: context.notice.screenRequestID,
+                ownershipClaim: context.inputOwnershipClaim,
+                initialFrameGeometry: boundary.geometry
             )
             // Retire the queued deadline before entering the atomic forwarding/ACK critical
             // section. Its generation fence also makes an already-awakened timeout a no-op.
@@ -2523,11 +3799,30 @@ actor WorldwideScreenService {
                         boundary: boundary,
                         authorizedBy: forwardingAuthorization
                     ) {
-                        try context.finalAcknowledgementCommit.commit(operation)
+                        try context.finalAcknowledgementCommit.commit {
+                            guard let inputSession else {
+                                try operation(false)
+                                return false
+                            }
+                            return try remoteInputController
+                                .withPreparedActivationCommit(
+                                    inputSession.activation,
+                                    operation: operation
+                                )
+                        }
                     }
                 }
             )
+            if let inputSession,
+               !remoteInputController.isCommitted(inputSession.activation),
+               activeInputCapability == inputSession.capability,
+               activeInputAuthorization === inputSession.authorization {
+                inputSession.authorization.revoke()
+                activeInputCapability = nil
+                activeInputAuthorization = nil
+            }
             screenVideoAdaptationPolicy.automaticResumeAttemptSucceeded()
+            screenVideoAdaptationPolicyRevision &+= 1
         } catch {
             await failAutomaticScreenMediaResume(
                 peer: sourcePeer,
@@ -2550,13 +3845,14 @@ actor WorldwideScreenService {
               screenMediaSuspension.owns(context.binding) else {
             return
         }
-        automaticScreenMediaResumeContext = nil
 
         let recommendation = screenVideoAdaptationPolicy.currentRecommendation
         guard let source = captureSource,
               let captureAuthorization,
               let capturer = sourcePeer.externalVideoCapturer,
               let baseDimensions = captureVideoBaseDimensions else {
+            beginPostResumeScreenVideoAdaptationEpoch()
+            automaticScreenMediaResumeContext = nil
             appliedScreenVideoRecommendation = nil
             logger.info("Worldwide screen video resumed after exact receiver presentation")
             return
@@ -2567,7 +3863,10 @@ actor WorldwideScreenService {
             )
             guard peer === sourcePeer,
                   peerGeneration == sourcePeerGeneration,
-                  automaticScreenMediaResumeContext == nil,
+                  let finalizing = automaticScreenMediaResumeContext,
+                  finalizing.attemptID == context.attemptID,
+                  finalizing.binding == context.binding,
+                  finalizing.boundary == boundary,
                   captureSource === source,
                   captureSink === sink,
                   self.captureAuthorization === captureAuthorization,
@@ -2579,6 +3878,12 @@ actor WorldwideScreenService {
                   screenMediaSuspension.owns(context.binding) else {
                 _ = try? await sourcePeer
                     .rollbackScreenVideoEncodingUpdateIfCurrent(senderUpdate)
+                if let current = automaticScreenMediaResumeContext,
+                   current.attemptID == context.attemptID,
+                   current.binding == context.binding {
+                    beginPostResumeScreenVideoAdaptationEpoch()
+                    automaticScreenMediaResumeContext = nil
+                }
                 return
             }
             capturer.adaptOutput(
@@ -2589,9 +3894,17 @@ actor WorldwideScreenService {
                 )
             )
             appliedScreenVideoRecommendation = recommendation
+            beginPostResumeScreenVideoAdaptationEpoch()
+            automaticScreenMediaResumeContext = nil
         } catch {
             // The typed resume already committed. Keep the safe probe ceiling and let the next
             // statistics sample retry ordinary adaptation without hiding the screen.
+            if let current = automaticScreenMediaResumeContext,
+               current.attemptID == context.attemptID,
+               current.binding == context.binding {
+                beginPostResumeScreenVideoAdaptationEpoch()
+                automaticScreenMediaResumeContext = nil
+            }
             appliedScreenVideoRecommendation = nil
             logger.error(
                 "Worldwide screen resumed with its probe ceiling: "
@@ -2617,8 +3930,10 @@ actor WorldwideScreenService {
         if let context = automaticScreenMediaResumeContext {
             if context.finalAcknowledgementCommit.claimFailure() {
                 screenVideoAdaptationPolicy.automaticResumeAttemptFailed()
+                screenVideoAdaptationPolicyRevision &+= 1
             } else {
                 screenVideoAdaptationPolicy.automaticResumeAttemptSucceeded()
+                beginPostResumeScreenVideoAdaptationEpoch()
             }
         }
         automaticScreenMediaResumeContext?.probeAuthorization?.revoke()
@@ -2651,10 +3966,23 @@ actor WorldwideScreenService {
     /// is acknowledged only after native stop succeeds; every uncertainty path revokes media.
     private func handleControlRequest(_ request: WebRTCControlRequest) async {
         guard let peer else {
+            screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+            screenVideoAdaptationPolicyRevision &+= 1
             _ = await stopScreenCaptureOrCloseSession(
                 context: "a control request arrived without a peer"
             )
             return
+        }
+
+        let inputOwnershipClaim: MacRemoteInputOwnershipClaim?
+        if request.command == .showScreen {
+            let claim = remoteInputController.reserveOwnershipClaim(
+                for: remoteInputOwnerToken
+            )
+            latestShowInputOwnershipClaim = claim
+            inputOwnershipClaim = claim
+        } else {
+            inputOwnershipClaim = nil
         }
 
         if request.command != .requestKeyFrame {
@@ -2662,11 +3990,22 @@ actor WorldwideScreenService {
             if screenVisibilityCommandEpoch == 0 {
                 screenVisibilityCommandEpoch = 1
             }
+            if request.command == .showScreen {
+                screenVideoAdaptationPolicy.beginFloorRecoveryVisibility(
+                    peerGeneration: peerGeneration,
+                    showEpoch: screenVisibilityCommandEpoch
+                )
+            } else {
+                screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+            }
+            screenVideoAdaptationPolicyRevision &+= 1
             // Visibility commands own the serial control lane immediately. A deferred key-frame
             // acknowledgement must yield before Hide stops capture or Show starts a new generation.
             keyFrameControlTask?.cancel()
             keyFrameControlTask = nil
         }
+        let visibilityCommandEpoch = screenVisibilityCommandEpoch
+        let visibilityPeerGeneration = peerGeneration
 
         if request.command == .showScreen,
            screenMediaSuspension.activeScreenRequestID != nil {
@@ -2707,7 +4046,11 @@ actor WorldwideScreenService {
                     throw WorldwideScreenServiceError.transportUnavailable
                 }
                 let inputSession = armRemoteInputIfAvailable(
-                    screenRequestID: request.id
+                    screenRequestID: request.id,
+                    ownershipClaim: inputOwnershipClaim,
+                    initialFrameGeometry: sink.remoteInputStartupGeometry(
+                        authorizedBy: authorization
+                    )
                 )
                 let authorizationPeerGeneration = peerGeneration
                 let authorizationRecoveryEpoch = recoveryProofEpoch
@@ -2721,17 +4064,37 @@ actor WorldwideScreenService {
                     inputAuthorization: inputSession?.authorization,
                     finalAuthorizationCheck: {
                         sink.allowsActiveUseWhileAuthorizationHeld(authorization)
+                    },
+                    withFinalInputOwnershipCommit: { operation in
+                        guard let inputSession else {
+                            try operation(false)
+                            return false
+                        }
+                        return try remoteInputController
+                            .withPreparedActivationCommit(
+                                inputSession.activation,
+                                operation: operation
+                            )
                     }
                 )
-                let inputSessionRemainsCurrent: Bool
-                if let inputSession {
-                    inputSessionRemainsCurrent = activeInputCapability == inputSession.capability
-                        && activeInputAuthorization === inputSession.authorization
-                        && inputSession.authorization.isValid
-                } else {
-                    inputSessionRemainsCurrent = activeInputCapability == nil
-                        && activeInputAuthorization == nil
+                if let inputSession,
+                   !remoteInputController.isCommitted(inputSession.activation),
+                   activeInputCapability == inputSession.capability,
+                   activeInputAuthorization === inputSession.authorization {
+                    inputSession.authorization.revoke()
+                    activeInputCapability = nil
+                    activeInputAuthorization = nil
                 }
+                let inputSessionRemainsCurrent =
+                    Self.activeAcknowledgementInputStateIsCurrent(
+                        preparedCapability: inputSession?.capability,
+                        preparedAuthorization: inputSession?.authorization,
+                        activeCapability: activeInputCapability,
+                        activeAuthorization: activeInputAuthorization,
+                        preparedActivationIsCommitted: inputSession.map {
+                            remoteInputController.isCommitted($0.activation)
+                        } ?? false
+                    )
                 let acknowledgementSessionIsCurrent =
                     authorizationPeerGeneration == peerGeneration
                         && authorizationRecoveryEpoch == recoveryProofEpoch
@@ -2743,6 +4106,12 @@ actor WorldwideScreenService {
                       captureTransitionIsOwned else {
                     // The Active transition linearized before a newer uncertainty boundary.
                     // Stop immediately and never send a contradictory ACK for the same ID.
+                    if self.peer === peer,
+                       peerGeneration == visibilityPeerGeneration,
+                       screenVisibilityCommandEpoch == visibilityCommandEpoch {
+                        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+                        screenVideoAdaptationPolicyRevision &+= 1
+                    }
                     _ = await stopScreenCaptureOrCloseSession(
                         context: "screen authorization changed during Active acknowledgement"
                     )
@@ -2750,10 +4119,25 @@ actor WorldwideScreenService {
                     logger.error("Worldwide screen authorization changed during Active acknowledgement")
                     return
                 }
+                if self.peer === peer,
+                   peerGeneration == visibilityPeerGeneration,
+                   screenVisibilityCommandEpoch == visibilityCommandEpoch {
+                    screenVideoAdaptationPolicy.activateFloorRecoveryVisibility(
+                        peerGeneration: visibilityPeerGeneration,
+                        showEpoch: visibilityCommandEpoch
+                    )
+                    screenVideoAdaptationPolicyRevision &+= 1
+                }
                 activateAutomaticScreenMediaSuspensionOwnership(
                     screenRequestID: request.id
                 )
             } catch {
+                if self.peer === peer,
+                   peerGeneration == visibilityPeerGeneration,
+                   screenVisibilityCommandEpoch == visibilityCommandEpoch {
+                    screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+                    screenVideoAdaptationPolicyRevision &+= 1
+                }
                 screenMediaSuspension.retire()
                 if isNativeScreenStopFailure(error) {
                     logger.error(
@@ -2772,6 +4156,15 @@ actor WorldwideScreenService {
             }
 
         case .hideScreen:
+            logger.debug(
+                "Worldwide screen visibility command=hide "
+                    + "requestID=\(request.id) peerGeneration=\(peerGeneration) "
+                    + "hostPID=\(ProcessInfo.processInfo.processIdentifier)"
+            )
+            // Hide and a new Show can complete between statistics polls. Retire old RTT health
+            // and in-flight reports synchronously, without resetting the native watermark.
+            screenVideoAdaptationPolicy.invalidateRoundTripTimeObservation()
+            beginPostResumeScreenVideoAdaptationEpoch()
             if recoveryProofRequired {
                 let proofRequest = PendingRecoveryProofRequest(
                     id: request.id,
@@ -3041,40 +4434,85 @@ actor WorldwideScreenService {
 
     // MARK: - Remote input
 
+    /// A superseded prepared owner is a successful view-only Active transition, not a screen
+    /// failure. If input was published, however, every local identity and the controller commit
+    /// must still match exactly before the service keeps that capability alive.
+    nonisolated static func activeAcknowledgementInputStateIsCurrent(
+        preparedCapability: WebRTCInputCapability?,
+        preparedAuthorization: WebRTCInputAuthorization?,
+        activeCapability: WebRTCInputCapability?,
+        activeAuthorization: WebRTCInputAuthorization?,
+        preparedActivationIsCommitted: Bool
+    ) -> Bool {
+        if activeCapability == nil, activeAuthorization == nil {
+            return true
+        }
+        guard preparedActivationIsCommitted,
+              let preparedCapability,
+              let preparedAuthorization,
+              activeCapability == preparedCapability,
+              activeAuthorization === preparedAuthorization,
+              preparedAuthorization.isValid else {
+            return false
+        }
+        return true
+    }
+
     /// Binds an input capability to the active display and exact Show request.
     private func armRemoteInputIfAvailable(
-        screenRequestID: UInt64
+        screenRequestID: UInt64,
+        ownershipClaim: MacRemoteInputOwnershipClaim?,
+        initialFrameGeometry: ScreenVideoFrameGeometry?
     ) -> ArmedRemoteInputSession? {
         revokeRemoteInputAuthorization()
-        guard let captureDisplayID else {
+        guard let captureDisplayID,
+              let ownershipClaim else {
             return nil
         }
 
         let inputSessionID = UUID()
-        switch remoteInputController.arm(
+        let authorization = WebRTCInputAuthorization()
+        let capability = Self.remoteInputCapability(
+            inputSessionID: inputSessionID,
+            screenRequestID: screenRequestID
+        )
+        switch remoteInputController.prepareArm(
             displayID: captureDisplayID,
             screenRequestID: screenRequestID,
             inputSessionID: inputSessionID,
-            authoritativeDisplayBounds: captureAuthoritativeDisplayBounds
+            ownerToken: remoteInputOwnerToken,
+            ownershipClaim: ownershipClaim,
+            initialFrameGeometry: initialFrameGeometry,
+            authoritativeDisplayBounds: captureAuthoritativeDisplayBounds,
+            supportsFocusedWindowResizeScaleRebinding:
+                capability.supportsFocusedWindowResizeScaleRebinding,
+            revokeAuthorization: {
+                authorization.revoke()
+            }
         ) {
-        case .armed:
-            let capability = Self.remoteInputCapability(
-                inputSessionID: inputSessionID,
-                screenRequestID: screenRequestID
-            )
-            let authorization = WebRTCInputAuthorization()
+        case .prepared(let activation):
             activeInputCapability = capability
             activeInputAuthorization = authorization
-            logger.info("Worldwide remote input is active for this screen session")
+            logger.info("Worldwide remote input is prepared for this screen session")
             return ArmedRemoteInputSession(
                 capability: capability,
-                authorization: authorization
+                authorization: authorization,
+                activation: activation
             )
 
+        case .superseded:
+            authorization.revoke()
+            logger.info(
+                "Worldwide remote input remains inactive because a newer viewer owns control"
+            )
+            return nil
+
         case .disabled:
+            authorization.revoke()
             return nil
 
         case .permissionRequired(let status):
+            authorization.revoke()
             logger.info(
                 "Worldwide remote input remains view-only; Accessibility trusted=" +
                 "\(status.accessibilityTrusted), event posting allowed=\(status.postEventAllowed)"
@@ -3082,20 +4520,23 @@ actor WorldwideScreenService {
             return nil
 
         case .displayUnavailable:
+            authorization.revoke()
             logger.error("Worldwide remote input could not bind the captured display")
             return nil
         }
     }
 
-    /// Injects one request under revocable gates, then returns payload-free feedback.
+    /// Injects one request under revocable gates, then returns content-free feedback.
     private func handleRemoteInputRequest(
         _ request: WebRTCInputRequest,
         authorization: WebRTCInputAuthorization
     ) async {
-        guard let peer else {
+        guard let sourcePeer = peer else {
             revokeRemoteInputAuthorization()
             return
         }
+        let sourcePeerGeneration = peerGeneration
+        let sourceCapability = activeInputCapability
 
         // Keep both revocable gates held through controller validation and OS event injection.
         // The lock order is always input then capture. The first suspension is the feedback send
@@ -3114,20 +4555,29 @@ actor WorldwideScreenService {
             (formatDiagnostic.map { " \($0)" } ?? "")
         )
 
-        let feedback = transportFeedback(for: inputOutcome.result)
+        let feedback = transportFeedback(for: inputOutcome)
         if feedback.revokesSession {
             revokeRemoteInputAuthorization()
         }
 
         do {
-            try await peer.sendInputFeedback(
+            try await sourcePeer.sendInputFeedback(
                 for: request.id,
                 result: feedback.result,
                 rejectionReason: feedback.rejectionReason,
-                focus: feedback.focus
+                screenFormatChanging: feedback.screenFormatChanging,
+                focus: feedback.focus,
+                windowResize: feedback.windowResize,
+                windowMove: feedback.windowMove
             )
         } catch {
-            revokeRemoteInputAuthorization()
+            // A delayed send failure from an old peer must never revoke a newer session.
+            if peer === sourcePeer,
+               peerGeneration == sourcePeerGeneration,
+               activeInputAuthorization === authorization,
+               activeInputCapability == sourceCapability {
+                revokeRemoteInputAuthorization()
+            }
             // Never include action payloads or typed text in diagnostics.
             logger.error("Worldwide remote-input feedback failed: \(error.localizedDescription)")
         }
@@ -3255,6 +4705,19 @@ actor WorldwideScreenService {
                 )
             )
 
+        case .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize:
+            WorldwideFocusedWindowResizeDispatcher.dispatch(
+                request,
+                to: remoteInputController
+            ) ?? WorldwideRemoteInputInjectionOutcome(.rejected(.invalidPoint))
+
+        case .requestFocusedWindowMoveTarget, .selectWindowForMove, .commitFocusedWindowMove:
+            WorldwideFocusedWindowMoveDispatcher.dispatch(
+                request, to: remoteInputController
+            ) ?? WorldwideRemoteInputInjectionOutcome(.rejected(.invalidPoint))
+
         case .insertText(let text, let focusGeneration):
             WorldwideRemoteInputInjectionOutcome(
                 remoteInputController.insertText(
@@ -3296,6 +4759,18 @@ actor WorldwideScreenService {
             return "primary-drag"
         case .scroll:
             return "scroll"
+        case .requestFocusedWindowResizeTarget:
+            return "focused-window-target"
+        case .selectWindowForResize:
+            return "focused-window-selection"
+        case .commitFocusedWindowResize:
+            return "focused-window-resize-commit"
+        case .requestFocusedWindowMoveTarget:
+            return "focused-window-move-target"
+        case .selectWindowForMove:
+            return "focused-window-move-selection"
+        case .commitFocusedWindowMove:
+            return "focused-window-move-commit"
         case .insertText:
             return "committed-text"
         case .backspace:
@@ -3315,6 +4790,16 @@ actor WorldwideScreenService {
             capability.supportsPrimaryDrag
         case .scroll:
             capability.supportsScroll
+        case .requestFocusedWindowResizeTarget,
+             .selectWindowForResize,
+             .commitFocusedWindowResize:
+            capability.supportsFocusedWindowResize
+        case .requestFocusedWindowMoveTarget, .selectWindowForMove:
+            capability.supportsFocusedWindowMove
+        case .commitFocusedWindowMove(_, _, _, let allowsRecoverableOffscreen):
+            capability.supportsFocusedWindowMove
+                && (!allowsRecoverableOffscreen
+                    || capability.supportsFocusedWindowMoveRecoverableOffscreen)
         case .tap, .insertText, .backspace, .returnKey:
             true
         }
@@ -3329,7 +4814,12 @@ actor WorldwideScreenService {
             inputSessionID: inputSessionID,
             screenRequestID: screenRequestID,
             supportsPrimaryDrag: true,
-            supportsScroll: true
+            supportsScroll: true,
+            supportsFocusedWindowResize: true,
+            supportsFocusedWindowResizeScaleRebinding: true,
+            supportsFocusedWindowMove: true,
+            supportsFocusedWindowMoveScaleRebinding: true,
+            supportsFocusedWindowMoveRecoverableOffscreen: true
         )
     }
 
@@ -3347,58 +4837,160 @@ actor WorldwideScreenService {
 
     /// Maps local outcomes to stable wire feedback and session-revocation policy.
     private func transportFeedback(
-        for result: MacRemoteInputResult
+        for outcome: WorldwideRemoteInputInjectionOutcome
     ) -> RemoteInputTransportFeedback {
-        switch result {
+        switch outcome.result {
         case .accepted(.none):
-            return .accepted(focus: .none)
+            return .accepted(
+                focus: .none,
+                windowResize: outcome.isWindowMove ? nil : wireWindowResizeFeedback(outcome.windowResizeFeedback),
+                windowMove: outcome.isWindowMove ? wireWindowMoveFeedback(outcome.windowResizeFeedback) : nil
+            )
         case .accepted(.editable(let generation, let secure)):
-            return .accepted(focus: .editable(generation: generation, secure: secure))
+            return .accepted(
+                focus: .editable(generation: generation, secure: secure),
+                windowResize: outcome.isWindowMove ? nil : wireWindowResizeFeedback(outcome.windowResizeFeedback),
+                windowMove: outcome.isWindowMove ? wireWindowMoveFeedback(outcome.windowResizeFeedback) : nil
+            )
 
         case .rejected(let rejection):
             let reason: WebRTCInputRejectionReason
+            let screenFormatChanging: Bool
             let revokesSession: Bool
             switch rejection {
             case .disabled:
                 reason = .inputDisabled
+                screenFormatChanging = false
                 revokesSession = true
             case .permissionRequired:
                 let permission = remoteInputController.permissionStatus()
                 reason = permission.accessibilityTrusted
                     ? .eventPostingPermissionRequired
                     : .accessibilityPermissionRequired
+                screenFormatChanging = false
                 revokesSession = true
             case .staleSession, .displayUnavailable:
                 reason = .staleSession
+                screenFormatChanging = false
                 revokesSession = true
             case .screenFormatChanging:
                 // Reuse the established non-terminal wire reason so older TestFlight clients
-                // remain decode-compatible during host-first rollout.
+                // remain decode-compatible; newer clients use the optional flag to distinguish
+                // this from real input throttling without retaining action content.
                 reason = .rateLimited
+                screenFormatChanging = true
                 revokesSession = false
             case .invalidPoint, .invalidScrollDelta, .invalidText:
                 reason = .invalidRequest
+                screenFormatChanging = false
                 revokesSession = false
             case .rateLimited:
                 reason = .rateLimited
+                screenFormatChanging = false
                 revokesSession = false
             case .focusChanged:
                 reason = .invalidFocus
+                screenFormatChanging = false
                 revokesSession = false
             case .primaryButtonInUse, .injectionFailed:
                 reason = .injectionFailed
+                screenFormatChanging = false
                 revokesSession = false
+            case .windowUnavailable, .windowResizeFailed:
+                reason = .invalidRequest
+                screenFormatChanging = false
+                revokesSession = false
+            case .windowResizeUncertain:
+                // The AX rollback could not prove the original frame. Reuse the established
+                // terminal session reason so deployed clients revoke all input authority.
+                reason = .staleSession
+                screenFormatChanging = false
+                revokesSession = true
             }
-            return .rejected(reason: reason, revokesSession: revokesSession)
+            return .rejected(
+                reason: reason,
+                screenFormatChanging: screenFormatChanging,
+                focus: wireFocus(outcome.verifiedFocus),
+                revokesSession: revokesSession
+            )
         }
+    }
+
+    private func wireFocus(_ focus: MacRemoteInputFocus?) -> WebRTCInputFocus {
+        switch focus {
+        case .some(.editable(let generation, let secure)):
+            .editable(generation: generation, secure: secure)
+        case .some(.none), nil:
+            .none
+        }
+    }
+
+    private func wireWindowResizeFeedback(
+        _ feedback: MacRemoteWindowResizeFeedback?
+    ) -> WebRTCWindowResizeFeedback? {
+        guard let feedback else { return nil }
+        let kind: WebRTCWindowResizeFeedbackKind? = switch feedback.kind {
+        case .targetAcquired: .targetAcquired
+        case .windowSelected: .windowSelected
+        case .resizeCommitted: .resizeCommitted
+        case .moveCommitted: nil
+        }
+        guard let kind else { return nil }
+        let frame = feedback.target.normalizedFrame
+        return WebRTCWindowResizeFeedback(
+            kind: kind,
+            committedTargetGeneration: feedback.committedTargetGeneration,
+            target: WebRTCWindowResizeTarget(
+                generation: feedback.target.generation,
+                normalizedFrame: WebRTCNormalizedRect(
+                    x: frame.minX,
+                    y: frame.minY,
+                    width: frame.width,
+                    height: frame.height
+                )
+            )
+        )
+    }
+
+    private func wireWindowMoveFeedback(
+        _ feedback: MacRemoteWindowResizeFeedback?
+    ) -> WebRTCWindowMoveFeedback? {
+        guard let feedback else { return nil }
+        let kind: WebRTCWindowMoveFeedbackKind? = switch feedback.kind {
+        case .targetAcquired: .targetAcquired
+        case .windowSelected: .windowSelected
+        case .moveCommitted: .moveCommitted
+        case .resizeCommitted: nil
+        }
+        guard let kind else { return nil }
+        let frame = feedback.target.normalizedFrame
+        let unclipped = feedback.target.unclippedNormalizedFrame
+        return WebRTCWindowMoveFeedback(
+            kind: kind, committedTargetGeneration: feedback.committedTargetGeneration,
+            target: .init(
+                generation: feedback.target.generation,
+                normalizedFrame: .init(
+                    x: frame.minX,
+                    y: frame.minY,
+                    width: frame.width,
+                    height: frame.height
+                ),
+                unclippedNormalizedFrame: unclipped.map {
+                    .init(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height)
+                }
+            )
+        )
     }
 
     /// Revokes the transport token and controller state synchronously.
     private func revokeRemoteInputAuthorization() {
-        activeInputAuthorization?.revoke()
+        let authorization = activeInputAuthorization
         activeInputAuthorization = nil
-        remoteInputController.revoke()
         activeInputCapability = nil
+        // Detach actor state first, then acquire the shared controller before the independent
+        // transport token. The final Active-ACK path owns those locks in that same order.
+        remoteInputController.revoke(ifOwnedBy: remoteInputOwnerToken)
+        authorization?.revoke()
     }
 
     // MARK: - ICE recovery and proof
@@ -3416,6 +5008,8 @@ actor WorldwideScreenService {
     /// Revokes both media gates before asynchronously stopping their native sources.
     private func stopCaptureForTransportUncertainty(_ reason: String) async {
         // Revoke both media gates before either asynchronous ScreenCaptureKit stop begins.
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+        screenVideoAdaptationPolicyRevision &+= 1
         revokeCaptureAuthorization()
         pauseSystemAudioForTransportUncertainty()
         captureSink?.stopForwarding()
@@ -3465,6 +5059,9 @@ actor WorldwideScreenService {
     /// Enters fail-closed recovery and invalidates any pre-uncertainty authorization.
     private func enterRecovery(reason: String) async {
         isRecovering = true
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+        screenVideoAdaptationPolicyRevision &+= 1
+        resetRemoteMediaCommandQueue()
         resetAutomaticScreenMediaSuspensionState()
         revokeCaptureAuthorization()
         pauseSystemAudioForTransportUncertainty()
@@ -3489,6 +5086,9 @@ actor WorldwideScreenService {
     /// Creates a fresh epoch that requires answer installation plus a Hide/Inactive proof.
     @discardableResult
     private func installRecoveryProofBoundary(awaitingAnswer: Bool) -> UInt64 {
+        screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+        screenVideoAdaptationPolicyRevision &+= 1
+        resetRemoteMediaCommandQueue()
         resetAutomaticScreenMediaSuspensionState()
         revokeCaptureAuthorization()
         pauseSystemAudioForTransportUncertainty()
@@ -4389,8 +5989,12 @@ actor WorldwideScreenService {
                 )
                 logger.error(
                     "Worldwide iPhone microphone fresh-epoch recovery " +
-                        "failed closed because track or transport ownership " +
-                        "changed during exact readmission"
+                        "failed exact readmission: " +
+                        WorldwideSharedClockEpochRecoveryAdmissionPolicy
+                            .diagnosticDescription(
+                                snapshot: forwarding,
+                                after: key
+                            )
                 )
                 return
             }
@@ -5168,21 +6772,33 @@ actor WorldwideScreenService {
         guard generation == peerGeneration, !isStopped else {
             return
         }
+        let recoveryAudioIsReady = Self.recoveryAudioIsReady(
+            allowsSystemAudio: featureProfile.allowsSystemAudio,
+            systemAudioIsLive: systemAudioIsLive,
+            audioAuthorizationIsValid: audioAuthorization?.isValid == true
+        )
         if !recoveryProofRequired,
            peerIsConnected,
            iceIsConnected,
            controlChannelIsOpen,
-           systemAudioIsLive,
-           audioAuthorization?.isValid == true {
+           recoveryAudioIsReady {
             isRecovering = false
             return
         }
         guard isRecovering
                 || recoveryProofRequired
                 || systemAudioStartInProgress
-                || !systemAudioIsLive else { return }
+                || !recoveryAudioIsReady else { return }
         logger.error("Worldwide ICE recovery exhausted its bounded attempts")
         await stop()
+    }
+
+    nonisolated static func recoveryAudioIsReady(
+        allowsSystemAudio: Bool,
+        systemAudioIsLive: Bool,
+        audioAuthorizationIsValid: Bool
+    ) -> Bool {
+        !allowsSystemAudio || (systemAudioIsLive && audioAuthorizationIsValid)
     }
 
     // MARK: - Native screen capture
@@ -5354,10 +6970,12 @@ actor WorldwideScreenService {
         // and revoke controller state synchronously before it schedules actor cleanup.
         let authorization = WebRTCControlAuthorization()
         let inputController = remoteInputController
+        let inputOwnerToken = remoteInputOwnerToken
         let sink = WorldwideScreenSampleSink(
             capturer: capturer,
             captureLifetime: captureLifetime,
             remoteInputController: inputController,
+            remoteInputOwnerToken: inputOwnerToken,
             didRequireCaptureFormatRenegotiation: { [weak self] sink in
                 Task {
                     await self?.renegotiateScreenCaptureFormat(for: sink)
@@ -5365,7 +6983,7 @@ actor WorldwideScreenService {
             }
         ) { [weak self] source, message in
             authorization.revoke()
-            inputController.revoke()
+            inputController.revoke(ifOwnedBy: inputOwnerToken)
             Task {
                 await self?.screenCaptureDidStop(
                     source: source,
@@ -5453,7 +7071,8 @@ actor WorldwideScreenService {
             captureVideoBaseDimensions = baseDimensions
             remoteInputController.updateAuthoritativeDisplayBounds(
                 format.authoritativeDisplayBounds,
-                for: format.displayID
+                for: format.displayID,
+                ownerToken: remoteInputOwnerToken
             )
             capturer.adaptOutput(
                 width: Int32(baseDimensions.width),
@@ -5624,6 +7243,7 @@ actor WorldwideScreenService {
                 // yet cleared its bookkeeping context.
                 cancelAutomaticScreenMediaResumeTimeout()
                 screenVideoAdaptationPolicy.automaticResumeAttemptSucceeded()
+                beginPostResumeScreenVideoAdaptationEpoch()
                 automaticScreenMediaResumeContext = nil
             } else {
                 if let peer {
@@ -5680,7 +7300,10 @@ actor WorldwideScreenService {
         captureAuthoritativeDisplayBounds = nil
         captureForwardingAuthorization?.revoke()
         captureForwardingAuthorization = nil
-        remoteInputController.updateScreenVideoFrameGeometry(nil)
+        remoteInputController.updateScreenVideoFrameGeometry(
+            nil,
+            ownerToken: remoteInputOwnerToken
+        )
         do {
             try await source.stop()
             guard captureSink === sink,
@@ -5764,6 +7387,7 @@ actor WorldwideScreenService {
 
     /// Starts audio for a healthy route and closes on non-recoverable startup failure.
     private func startSystemAudioOrStopSession() async -> Bool {
+        guard featureProfile.allowsSystemAudio else { return true }
         guard !systemAudioStartInProgress else { return false }
         do {
             try await startSystemAudio()
@@ -6073,7 +7697,8 @@ actor WorldwideScreenService {
         sourcePeer: WebRTCPeer,
         sourcePeerGeneration: UInt64
     ) {
-        guard peer === sourcePeer,
+        guard featureProfile.allowsSystemAudio,
+              peer === sourcePeer,
               peerGeneration == sourcePeerGeneration,
               sourcePeerGeneration > 0 else {
             return
@@ -6353,26 +7978,41 @@ struct ScreenFormatRenegotiationCoordinator<Sink: AnyObject> {
 private struct RemoteInputTransportFeedback {
     let result: WebRTCInputFeedbackResult
     let rejectionReason: WebRTCInputRejectionReason?
+    let screenFormatChanging: Bool
     let focus: WebRTCInputFocus
+    let windowResize: WebRTCWindowResizeFeedback?
+    let windowMove: WebRTCWindowMoveFeedback?
     let revokesSession: Bool
 
-    static func accepted(focus: WebRTCInputFocus) -> Self {
+    static func accepted(
+        focus: WebRTCInputFocus,
+        windowResize: WebRTCWindowResizeFeedback? = nil,
+        windowMove: WebRTCWindowMoveFeedback? = nil
+    ) -> Self {
         Self(
             result: .accepted,
             rejectionReason: nil,
+            screenFormatChanging: false,
             focus: focus,
+            windowResize: windowResize,
+            windowMove: windowMove,
             revokesSession: false
         )
     }
 
     static func rejected(
         reason: WebRTCInputRejectionReason,
+        screenFormatChanging: Bool = false,
+        focus: WebRTCInputFocus = .none,
         revokesSession: Bool
     ) -> Self {
         Self(
             result: .rejected,
             rejectionReason: reason,
-            focus: .none,
+            screenFormatChanging: screenFormatChanging,
+            focus: focus,
+            windowResize: nil,
+            windowMove: nil,
             revokesSession: revokesSession
         )
     }
@@ -6385,9 +8025,10 @@ private struct PendingRecoveryProofRequest: Equatable {
 }
 
 /// Transport capability and revocable authorization installed for one Show request.
-private struct ArmedRemoteInputSession {
+private struct ArmedRemoteInputSession: Sendable {
     let capability: WebRTCInputCapability
     let authorization: WebRTCInputAuthorization
+    let activation: MacRemoteInputPreparedActivation
 }
 
 /// Thread-safe gate between ScreenCaptureKit callbacks and the WebRTC video capturer.
@@ -6407,7 +8048,10 @@ extension MacExternalVideoCapturer: WorldwideScreenFrameCapturing {
 /// The only remote-input capability needed by the screen-sample boundary. Keeping this narrow
 /// makes geometry continuity independently testable without exposing input injection itself.
 protocol WorldwideRemoteInputGeometryUpdating: Sendable {
-    func updateScreenVideoFrameGeometry(_ geometry: ScreenVideoFrameGeometry?)
+    func updateScreenVideoFrameGeometry(
+        _ geometry: ScreenVideoFrameGeometry?,
+        ownerToken: MacRemoteInputOwnerToken
+    )
 }
 
 extension MacRemoteInputController: WorldwideRemoteInputGeometryUpdating {}
@@ -6465,6 +8109,7 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
 
     private let capturer: any WorldwideScreenFrameCapturing
     private let remoteInputController: any WorldwideRemoteInputGeometryUpdating
+    private let remoteInputOwnerToken: MacRemoteInputOwnerToken
     private let didRequireCaptureFormatRenegotiation:
         @Sendable (WorldwideScreenSampleSink) -> Void
     private let didStop: @Sendable (ScreenVideoCaptureSource, String) -> Void
@@ -6501,6 +8146,7 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
         capturer: any WorldwideScreenFrameCapturing,
         captureLifetime: CaptureServiceLifetime? = nil,
         remoteInputController: any WorldwideRemoteInputGeometryUpdating,
+        remoteInputOwnerToken: MacRemoteInputOwnerToken = MacRemoteInputOwnerToken(),
         didRequireCaptureFormatRenegotiation: @escaping @Sendable (
             WorldwideScreenSampleSink
         ) -> Void,
@@ -6517,6 +8163,7 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
         self.captureLifetime = captureLifetime
         captureLifetimeIsRequired = captureLifetime != nil
         self.remoteInputController = remoteInputController
+        self.remoteInputOwnerToken = remoteInputOwnerToken
         self.didRequireCaptureFormatRenegotiation =
             didRequireCaptureFormatRenegotiation
         self.scheduleFormatRenegotiationFallback =
@@ -6539,7 +8186,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
             guard lifetimeAllowsCapture, forwardingPhase == .ready else {
                 return (false, nil)
             }
-            remoteInputController.updateScreenVideoFrameGeometry(nil)
+            remoteInputController.updateScreenVideoFrameGeometry(
+                nil,
+                ownerToken: remoteInputOwnerToken
+            )
             invalidateFormatRenegotiationFallbackLocked()
             formatRenegotiationDetector.reset()
             let retiredAuthorization = forwardingAuthorization
@@ -6601,6 +8251,25 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
             return true
         }
         return committed && authorization.isValid
+    }
+
+    /// Returns the exact frame transform already admitted for this Show generation.
+    ///
+    /// Remote input arms after native capture startup. Handing this snapshot to the controller
+    /// prevents an otherwise static screen from waiting indefinitely for another post-arm frame.
+    func remoteInputStartupGeometry(
+        authorizedBy authorization: WebRTCControlAuthorization
+    ) -> ScreenVideoFrameGeometry? {
+        guard authorization.isValid else { return nil }
+        return lock.withLock {
+            guard forwardingAuthorization === authorization,
+                  forwardingPhase == .active,
+                  formatIsProven,
+                  callbackGateAllowsEntry else {
+                return nil
+            }
+            return lastProvenFrameGeometry
+        }
     }
 
     /// Distinguishes a retriable display transition from terminal startup unavailability.
@@ -6707,7 +8376,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
             return nil
         }
         guard let boundary else { return nil }
-        remoteInputController.updateScreenVideoFrameGeometry(nil)
+        remoteInputController.updateScreenVideoFrameGeometry(
+            nil,
+            ownerToken: remoteInputOwnerToken
+        )
         return boundary
     }
 
@@ -6784,7 +8456,8 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
                 automaticResumeRealFrameCount = 0
                 lastAutomaticResumeRealFrameTimestampSeconds = nil
                 remoteInputController.updateScreenVideoFrameGeometry(
-                    boundary.geometry
+                    boundary.geometry,
+                    ownerToken: remoteInputOwnerToken
                 )
                 do {
                     return try operation()
@@ -6793,7 +8466,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
                     // remove geometry before releasing either lock so input cannot leak through.
                     forwardingPhase = .resumeAwaitingPresentation
                     resumeBoundaryGeometry = boundary.geometry
-                    remoteInputController.updateScreenVideoFrameGeometry(nil)
+                    remoteInputController.updateScreenVideoFrameGeometry(
+                        nil,
+                        ownerToken: remoteInputOwnerToken
+                    )
                     throw error
                 }
             }
@@ -6822,7 +8498,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
             return authorization
         }
         retiredAuthorization?.revoke()
-        remoteInputController.updateScreenVideoFrameGeometry(nil)
+        remoteInputController.updateScreenVideoFrameGeometry(
+            nil,
+            ownerToken: remoteInputOwnerToken
+        )
     }
 
     /// Forwards image-backed, timestamped samples only while the gate is open.
@@ -6988,7 +8667,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
                     // Defensive backstop: invalid metadata must never enter media/input admission
                     // even if the detector's classification changes in a future refactor.
                     formatIsProven = false
-                    remoteInputController.updateScreenVideoFrameGeometry(nil)
+                    remoteInputController.updateScreenVideoFrameGeometry(
+                        nil,
+                        ownerToken: remoteInputOwnerToken
+                    )
                     return (false, nil, armFormatRenegotiationFallbackLocked())
                 }
                 invalidateFormatRenegotiationFallbackLocked()
@@ -6996,21 +8678,31 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
                 capturer.captureScreenFrame(pixelBuffer: pixelBuffer, timestamp: timestamp)
                 if let frameGeometry {
                     lastProvenFrameGeometry = frameGeometry
-                    remoteInputController.updateScreenVideoFrameGeometry(frameGeometry)
+                    remoteInputController.updateScreenVideoFrameGeometry(
+                        frameGeometry,
+                        ownerToken: remoteInputOwnerToken
+                    )
                 } else if let lastProvenFrameGeometry {
                     // Missing per-frame attachments are not themselves a format transition. The
                     // exact pixel-surface check above and the authoritative display-mode callback
                     // fence this reuse to the currently proven capture generation.
                     remoteInputController.updateScreenVideoFrameGeometry(
-                        lastProvenFrameGeometry
+                        lastProvenFrameGeometry,
+                        ownerToken: remoteInputOwnerToken
                     )
                 } else {
-                    remoteInputController.updateScreenVideoFrameGeometry(nil)
+                    remoteInputController.updateScreenVideoFrameGeometry(
+                        nil,
+                        ownerToken: remoteInputOwnerToken
+                    )
                 }
                 return (false, nil, nil)
             case .dropFrame:
                 formatIsProven = false
-                remoteInputController.updateScreenVideoFrameGeometry(nil)
+                remoteInputController.updateScreenVideoFrameGeometry(
+                    nil,
+                    ownerToken: remoteInputOwnerToken
+                )
                 return (false, nil, armFormatRenegotiationFallbackLocked())
             case .renegotiate:
                 let suspension = suspendForFormatRenegotiationLocked()
@@ -7023,7 +8715,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
         }
         transition.retiredAuthorization?.revoke()
         if transition.requiresRenegotiation {
-            remoteInputController.updateScreenVideoFrameGeometry(nil)
+            remoteInputController.updateScreenVideoFrameGeometry(
+                nil,
+                ownerToken: remoteInputOwnerToken
+            )
             didRequireCaptureFormatRenegotiation(self)
         }
         if let fallbackToken = transition.fallbackToken {
@@ -7073,7 +8768,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
         }
         guard transition.didLatch else { return }
         // Clear the old transform before revocation waits for an already-linearized input action.
-        remoteInputController.updateScreenVideoFrameGeometry(nil)
+        remoteInputController.updateScreenVideoFrameGeometry(
+            nil,
+            ownerToken: remoteInputOwnerToken
+        )
         transition.retiredAuthorization?.revoke()
     }
 
@@ -7114,7 +8812,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
         }
         // Close the stale coordinate map before token revocation can wait for an input operation
         // that already linearized against the previous sink generation.
-        remoteInputController.updateScreenVideoFrameGeometry(nil)
+        remoteInputController.updateScreenVideoFrameGeometry(
+            nil,
+            ownerToken: remoteInputOwnerToken
+        )
         transition.retiredAuthorization?.revoke()
         if transition.requiresRenegotiation {
             didRequireCaptureFormatRenegotiation(self)
@@ -7177,7 +8878,10 @@ final class WorldwideScreenSampleSink: ScreenVideoSampleConsumer, @unchecked Sen
         }
         transition.retiredAuthorization?.revoke()
         if transition.requiresRenegotiation {
-            remoteInputController.updateScreenVideoFrameGeometry(nil)
+            remoteInputController.updateScreenVideoFrameGeometry(
+                nil,
+                ownerToken: remoteInputOwnerToken
+            )
             didRequireCaptureFormatRenegotiation(self)
         }
     }
