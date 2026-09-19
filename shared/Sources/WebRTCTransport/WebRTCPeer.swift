@@ -7484,6 +7484,9 @@ public actor WebRTCPeer {
 
             didClaimNativeWrite = true
             _ = advanceIPhoneMicrophonePolicyGeneration()
+            // Privacy closes before the native setter can block or fail. A framework stop
+            // must not rebuild between staging this token and its exact native claim.
+            // Keep the public-disable and suspended-owner regressions in MICROPHONE_REGRESSION_GUARDRAILS.md.
             retiringAuthorization?.revoke()
             activeIPhoneMicrophoneAuthorization = nil
             localIPhoneMicrophoneTrack?.isEnabled = false

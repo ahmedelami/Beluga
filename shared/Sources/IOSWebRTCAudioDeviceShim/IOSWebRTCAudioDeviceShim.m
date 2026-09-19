@@ -1912,6 +1912,8 @@ ASClassifyExpectedRouteChangeEvidence(
 /// An exact category observation may carry the pending transaction's input-route change
 /// without a separate reason-8 notification. Advance only its chained route cursor; this is
 /// not a reason-8 disposition, start-settlement claim, route-readiness proof or gate opener.
+/// Regression (including the handler's cursor update, not just this predicate):
+/// WebRTCAudioPlaybackSessionTests.testPendingCategoryRouteCursorRequiresExactChainedTransactionEvidence.
 static BOOL ASExpectedCategoryObservationAdvancesPendingCursor(
     ASExpectedRouteChangeEvidence evidence,
     BOOL expectedCategoryObservation,
@@ -2218,6 +2220,8 @@ static AVAudioSessionRouteSharingPolicy ASOrdinaryRouteSharingPolicy(BOOL inputR
 /// This is a compatibility contract, never an attribution of an observation to MediaPlayer.
 /// Only this exact, non-hosted duplex tuple permits both values. It conveys no microphone,
 /// route, ownership or generation authority; those independent fences must still succeed.
+/// Preserve actual readback in receipts; never normalize it to the requested policy.
+/// Regression: WebRTCAudioPlaybackSessionTests.testOutputOnlyPolicyRepairIsOneShotAndKeepsExactTransactionFences.
 static BOOL ASAudioPolicyProfileMatchesEffectiveTuple(
     BOOL hostedCallMode,
     BOOL inputRequired,
@@ -8543,6 +8547,7 @@ static OSStatus ASRemoteIOInput(
     // only an explicit authorized operation may replace the still-configured duplex unit.
     // Keep _inputBusEnabled truthful until that disposal. A later bare startRecording sees
     // no authorization and cannot reopen capture; pending A/B/C tags are not consumed here.
+    // Regression: WebRTCAudioPlaybackSessionTests.testFrameworkMicrophoneStopClosesCaptureWithoutStealingOutputOnlyTransaction.
     _recording = NO;
     return YES;
 }

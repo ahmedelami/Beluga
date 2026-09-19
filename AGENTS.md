@@ -535,6 +535,12 @@ worker.
 
 ## Commits
 
+Before microphone-affecting changes, read [MICROPHONE_REGRESSION_GUARDRAILS.md](MICROPHONE_REGRESSION_GUARDRAILS.md).
+Preserve its cross-layer policy, immediate privacy-stop, exact operation ownership and
+fresh-reconnect invariants. Run the required suites and applicable physical oracles;
+do not treat archive success, comments, mocked reconnects or on/off cycles as physical
+paired-reconnect proof. The upload script does not run these tests for you.
+
 Release validation must follow [TESTING_ORACLES.md](TESTING_ORACLES.md). A source string, mocked
 state transition, UI label, or stale artifact is not sufficient proof of a production behavior;
 use the independent artifact/runtime oracle and mutation described there.
