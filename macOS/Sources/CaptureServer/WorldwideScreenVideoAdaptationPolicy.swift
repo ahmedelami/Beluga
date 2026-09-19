@@ -298,6 +298,25 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private var floorRecoveryLastRegularSequence: UInt64?
     private var floorRecoveryLastRegularTimestamp: Double?
     private var floorRecoveryLastCooldownObservation: ContinuousClock.Instant?
+    // A cold Show prioritizes readable pixels, not a speculative full-traffic tier: keep
+    // existing video/peer ceilings and <=5 fps while bandwidth is learned. Healthy tier
+    // promotion must not shrink those pixels; real pressure terminates this mode for the
+    // exact Show. Missing/cached reports are not negative evidence or permission for FPS.
+    private(set) var startupSpatialModePeerGeneration: UInt64?
+    private(set) var startupSpatialModeShowEpoch: UInt64?
+    private(set) var startupSpatialModeIsDisproved = false
+
+    var startupSpatialModeIsActive: Bool {
+        guard !startupSpatialModeIsDisproved,
+              let startupSpatialModePeerGeneration,
+              let startupSpatialModeShowEpoch else {
+            return false
+        }
+        return peerGeneration == startupSpatialModePeerGeneration
+            && floorRecoveryShowEpoch == startupSpatialModeShowEpoch
+            && (floorRecoveryVisibilityIsReserved
+                || floorRecoveryVisibilityIsActive)
+    }
 
     var floorRecoveryProbeIsActive: Bool {
         floorRecoveryProbeSeedBandwidthBps != nil
@@ -340,12 +359,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         guard applicationLimitedProbeOriginTier != nil,
               let applicationLimitedProbeMaximumTotalRTPBitrateBps else {
-            return ordinaryRecommendation
+            return applyingStartupSpatialMode(to: ordinaryRecommendation)
         }
         // A capacity probe raises libwebrtc's peer-wide BWE ceiling in bounded steps. Geometry
         // changes require separate ordinary-report qualification. This path can extend a native
         // probe without requiring ALR; the requested budget retains its existing 2x bound.
-        return WorldwideScreenVideoEncodingRecommendation(
+        return applyingStartupSpatialMode(to: WorldwideScreenVideoEncodingRecommendation(
             tier: currentTier,
             maximumBitrateBps: maximumTierVideoBitrateBps,
             maximumTotalRTPBitrateBps:
@@ -354,6 +373,23 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 ordinaryRecommendation.maximumFramesPerSecond,
             scaleResolutionDownBy:
                 ordinaryRecommendation.scaleResolutionDownBy
+        ))
+    }
+
+    private func applyingStartupSpatialMode(
+        to recommendation: WorldwideScreenVideoEncodingRecommendation
+    ) -> WorldwideScreenVideoEncodingRecommendation {
+        guard startupSpatialModeIsActive else { return recommendation }
+        return WorldwideScreenVideoEncodingRecommendation(
+            tier: recommendation.tier,
+            maximumBitrateBps: recommendation.maximumBitrateBps,
+            maximumTotalRTPBitrateBps:
+                recommendation.maximumTotalRTPBitrateBps,
+            maximumFramesPerSecond: min(
+                WorldwideScreenVideoAdaptationTier.survival.framesPerSecond,
+                recommendation.maximumFramesPerSecond
+            ),
+            scaleResolutionDownBy: 1
         )
     }
 
@@ -401,6 +437,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     @discardableResult
     mutating func bind(toPeerGeneration generation: UInt64) -> Bool {
         guard peerGeneration != generation else { return false }
+        clearStartupSpatialMode()
         peerGeneration = generation
         currentTier = Self.initialTier(
             configuredTotalRTPBitrateBps: configuredTotalRTPBitrateBps
@@ -440,6 +477,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         floorRecoveryVisibilityIsReserved = true
         floorRecoveryAttemptConsumed = false
         floorRecoveryProbeWasCancelled = false
+        armStartupSpatialModeIfEligible(
+            peerGeneration: generation,
+            showEpoch: showEpoch
+        )
     }
 
     mutating func activateFloorRecoveryVisibility(peerGeneration generation: UInt64, showEpoch: UInt64) {
@@ -449,6 +490,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     mutating func endFloorRecoveryVisibility() {
+        clearStartupSpatialMode()
         floorRecoveryVisibilityIsReserved = false
         floorRecoveryVisibilityIsActive = false
         floorRecoveryFirstWitness = nil
@@ -476,9 +518,61 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     /// Clears latency history when ICE invalidates the selected path, while retaining the
     /// conservative quality tier learned for this peer lifetime.
     mutating func invalidateSelectedRoute() {
+        let replacedSelectedRoute = selectedRoute != nil
         selectedRoute = nil
+        if replacedSelectedRoute {
+            _ = disproveStartupSpatialMode()
+        }
         revertApplicationLimitedProbeIfActive()
         resetPathMeasurements()
+    }
+
+    /// Retains only a terminal same-Show negative after native application fails. This can never
+    /// arm a mode, borrow a successor Show, or import positive network evidence.
+    mutating func retainStartupSpatialModeTerminalState(from observed: Self) {
+        guard !startupSpatialModeIsDisproved,
+              observed.startupSpatialModeIsDisproved,
+              let peer = startupSpatialModePeerGeneration,
+              let show = startupSpatialModeShowEpoch,
+              self.peerGeneration == peer,
+              self.floorRecoveryShowEpoch == show,
+              observed.startupSpatialModePeerGeneration == peer,
+              observed.startupSpatialModeShowEpoch == show,
+              observed.peerGeneration == peer,
+              observed.floorRecoveryShowEpoch == show else {
+            return
+        }
+        startupSpatialModeIsDisproved = true
+    }
+
+    private mutating func armStartupSpatialModeIfEligible(
+        peerGeneration generation: UInt64,
+        showEpoch: UInt64
+    ) {
+        guard peerGeneration == generation,
+              floorRecoveryShowEpoch == showEpoch,
+              floorRecoveryVisibilityIsReserved,
+              currentTier == .survival,
+              requiredOutgoingBitrateBps(for: .full)
+                <= Double(configuredTotalRTPBitrateBps) else {
+            return
+        }
+        startupSpatialModePeerGeneration = generation
+        startupSpatialModeShowEpoch = showEpoch
+        startupSpatialModeIsDisproved = false
+    }
+
+    @discardableResult
+    private mutating func disproveStartupSpatialMode() -> Bool {
+        guard startupSpatialModeIsActive else { return false }
+        startupSpatialModeIsDisproved = true
+        return true
+    }
+
+    private mutating func clearStartupSpatialMode() {
+        startupSpatialModePeerGeneration = nil
+        startupSpatialModeShowEpoch = nil
+        startupSpatialModeIsDisproved = false
     }
 
     /// Revokes RTT health synchronously at Hide, even if Show arrives before an inactive stats
@@ -612,6 +706,20 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         evaluation.identity = floorRecoveryReportIsFresh ? .fresh
             : (requireRoundTripTimeObservation ? .rejectedTimestamp : .rejectedOrder)
+        if startupSpatialModeIsActive,
+           requireRoundTripTimeObservation,
+           !floorRecoveryReportIsFresh {
+            evaluation.reason = .rejectedTimestamp
+            // During the speculative full-pixel startup window, the native report identity is
+            // the evidence boundary for every network signal, not only floor recovery. A newer
+            // request carrying a missing, equal, or regressing native timestamp may age an
+            // already-running ceiling, but cannot blur the Show or mint RTT/queue/BWE health.
+            return expireApplicationLimitedProbeWithoutReport(
+                peerGeneration: generation,
+                isCaptureActive: isCaptureActive,
+                observedAt: observedAt
+            )
+        }
         defer {
             recordCapacityProbeBaseline(
                 nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
@@ -621,6 +729,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             )
         }
         let previousRecommendation = currentRecommendation
+        let previousTier = currentTier
+        let startupSpatialModeWasActive = startupSpatialModeIsActive
         let hadPromotionCapacityContinuity = promotionCapacityContinuity != nil
         updatePromotionCapacityContinuity(
             availableOutgoingBitrateBps: availableOutgoingBitrateBps,
@@ -647,9 +757,18 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         if lastSampleHasLatencyPressure {
             promotionCapacityContinuity = nil
         }
+        if lastSampleHasLatencyPressure
+            || currentTier.rawValue > previousTier.rawValue {
+            _ = disproveStartupSpatialMode()
+        } else if startupSpatialModeIsActive, currentTier == .full {
+            clearStartupSpatialMode()
+        }
+        let startupSpatialRecommendationChanged =
+            startupSpatialModeWasActive != startupSpatialModeIsActive
         // Cap expiry/shrink must reach the sender even when no visible tier changed.
         guard isCaptureActive,
               changedRecommendation != nil
+                || startupSpatialRecommendationChanged
                 || (hadPromotionCapacityContinuity
                     && currentRecommendation != previousRecommendation) else {
             return nil
@@ -743,6 +862,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         roundTripTimeObservationFence = validation.roundTripTimeObservationFence
         guard rtt.allowsUpgrade else {
             evaluation.reason = .roundTripTime
+            if rtt.hasFreshPressure {
+                _ = disproveStartupSpatialMode()
+            }
             revokeRoundTripTimeHealth()
             permitsInitialRoundTripTimeReference = false
             if !rtt.hasFreshPressure {
@@ -762,6 +884,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         }
         if selectedRoute != self.selectedRoute {
             evaluation.reason = .routeChanged
+            _ = disproveStartupSpatialMode()
             // Sender-filtered stats can reveal a route change before the ordinary route event.
             // Its RTT tuple must not become new health when the next regular report reuses it.
             revokeRoundTripTimeHealth()
@@ -798,6 +921,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         case let .measured(delay):
             if delay >= Self.immediateAveragePacketSendDelaySeconds {
                 evaluation.reason = .immediateQueue
+                _ = disproveStartupSpatialMode()
                 failApplicationLimitedProbe(revertingTo: origin)
                 return currentRecommendation
             }
@@ -821,6 +945,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             WorldwideScreenCapacityProbeDiagnostics.boundedInteger(collapseThreshold)
         if availableOutgoingBitrateBps < collapseThreshold {
             evaluation.reason = .bandwidthCollapse
+            _ = disproveStartupSpatialMode()
             failApplicationLimitedProbe(revertingTo: origin)
             return currentRecommendation
         }
@@ -903,10 +1028,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         if let selectedRoute,
            selectedRoute != self.selectedRoute {
+            let startupSpatialRouteWasAlreadyBound = self.selectedRoute != nil
             let isInitialRoute = self.selectedRoute == nil
                 && roundTripTimeWatermark == nil
                 && permitsInitialRoundTripTimeReference
             self.selectedRoute = selectedRoute
+            if startupSpatialRouteWasAlreadyBound {
+                _ = disproveStartupSpatialMode()
+            }
             revertApplicationLimitedProbeIfActive()
             resetPathMeasurements()
             if isInitialRoute {
@@ -921,6 +1050,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         // active sender or an explicit automatic-pause recovery probe.
         guard isCaptureActive || isAutomaticallySuspended else {
             floorDiagnostics.reason = .inactiveVisibility
+            clearStartupSpatialMode()
             currentTier = Self.initialTier(
                 configuredTotalRTPBitrateBps: configuredTotalRTPBitrateBps
             )
@@ -1114,6 +1244,16 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             if consumeApplicationLimitedProbeCooldown(
                 isCaptureActive: isCaptureActive
             ) {
+                healthyUpgradeSampleCount = 0
+                return isCaptureActive && didResetForNewPeer
+                    ? currentRecommendation
+                    : nil
+            }
+
+            // Missing optional BWE cannot calibrate full-pixel demand. Keep the Show-bound
+            // full-spatial 5 fps profile at its existing caps until measured capacity returns;
+            // absence alone is neither congestion nor permission to raise a transport tier.
+            if startupSpatialModeIsActive {
                 healthyUpgradeSampleCount = 0
                 return isCaptureActive && didResetForNewPeer
                     ? currentRecommendation
@@ -1555,6 +1695,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
            observedAt >= deadline {
             finishApplicationLimitedProbe(revertingTo: originTier)
         }
+        if startupSpatialModeIsActive, currentTier == .full {
+            clearStartupSpatialMode()
+        }
         return currentRecommendation != previousRecommendation
             ? currentRecommendation
             : nil
@@ -1673,6 +1816,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     mutating func resetForInactiveCapture() {
+        clearStartupSpatialMode()
         currentTier = Self.initialTier(
             configuredTotalRTPBitrateBps: configuredTotalRTPBitrateBps
         )

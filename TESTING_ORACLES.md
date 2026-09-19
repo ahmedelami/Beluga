@@ -270,6 +270,17 @@ and uninterrupted typing.
 
 ## Screen startup quality boundary
 
+Cold Show spatial-first startup must keep the existing video/peer-wide ceilings and at
+most 5 fps while preserving full pixels through healthy intermediate promotions. Only
+fresh affirmative congestion or lifecycle replacement retires the exact-Show mode;
+cached/missing reports and probe expiry must not manufacture a clear-to-blurry transition.
+Retain only terminal same-Show disproof after a rejected native apply, never positive
+geometry/FPS permission or successor ownership. Exercise real decoded fine-detail pixels
+in fresh-process opt-in native loopbacks, including the actual adaptation reducer. Static
+sender profiles alone do not prove that the live reducer preserves startup clarity.
+The fixed-5-fps loopback does not prove full-FPS load, Internet congestion, or iPhone
+presentation timing; these remain separate deployment/physical evidence boundaries.
+
 Replay promotion-cap contraction and the recorded adverse queue, RTT, and bandwidth
 samples independently. A temporary promotion ceiling must use fresh measured capacity,
 never exceed the active probe/configured ceiling, expire without statistics, and be

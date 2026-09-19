@@ -2927,6 +2927,10 @@ actor WorldwideScreenService {
                 } ?? "none")
                 + " probeHealthySamples="
                 + "\(proposedPolicy.applicationLimitedProbeHealthySampleCount)"
+                + " startupSpatial="
+                + (proposedPolicy.startupSpatialModeIsActive ? "active"
+                    : (proposedPolicy.startupSpatialModeIsDisproved
+                        ? "disproved" : "inactive"))
                 + " queuePressureSamples=\(proposedPolicy.queuePressureSampleCount) "
                 + "bweKbps="
                 + (snapshot?.availableOutgoingBitrate.map {
@@ -3091,6 +3095,8 @@ actor WorldwideScreenService {
                 let cancelledFloorRecoveryProbe =
                     screenVideoAdaptationPolicy.floorRecoveryProbeIsActive
                         && proposedPolicy.floorRecoveryProbeWasCancelled
+                screenVideoAdaptationPolicy
+                    .retainStartupSpatialModeTerminalState(from: proposedPolicy)
                 screenVideoAdaptationPolicy.retainFloorRecoveryAttemptConsumption(
                     from: proposedPolicy
                 )
