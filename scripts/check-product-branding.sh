@@ -117,6 +117,64 @@ is_readme_release_identity_match() {
   return 1
 }
 
+is_scoped_compatibility_content_match() {
+  local file_path=$1 line=$2 token=$3 content
+  case "$file_path" in
+    iOS/opensteamer/Tests/WebRTCAudioPlaybackSessionTests.swift|\
+      macOS/Tests/CaptureServerTests/DiagnosticDriverV2ResumeContractTests.swift|\
+      macOS/scripts/opensteamer-diagnostic-driver-v1-update-controller.rs|\
+      macOS/scripts/opensteamer-diagnostic-driver-v2-resume-stager.rs|\
+      macOS/scripts/opensteamer-diagnostic-driver-v2-update-controller.rs) ;;
+    *) return 1 ;;
+  esac
+  content=$(awk -v wanted="$line" 'NR == wanted {
+    sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit
+  }' "$file_path")
+
+  case "$file_path" in
+    iOS/opensteamer/Tests/WebRTCAudioPlaybackSessionTests.swift)
+      [[ "$token" == "${FORMER_CAMEL}.dev" && \
+        ("$content" == "guard Bundle.main.bundleIdentifier == \"${DEBUG_BUNDLE_ID}\" else {" || \
+         "$content" == "try require(Bundle.main.bundleIdentifier == \"${DEBUG_BUNDLE_ID}\", \"The distinct spare development app is required.\")") ]]
+      ;;
+    macOS/Tests/CaptureServerTests/DiagnosticDriverV2ResumeContractTests.swift)
+      case "$token" in
+        "$FORMER_CAMEL")
+          [[ "$content" == "\"/Applications/${FORMER_CAMEL} Host.app/Contents/MacOS/CaptureServer\"," || \
+             "$content" == "\"${FORMER_CAMEL} Host.app\"," ]] ;;
+        "$FORMER_LOWER.worldwide")
+          [[ "$content" == "\"com.elamin.${FORMER_LOWER}.worldwide\"," ]] ;;
+        "$FORMER_CAMEL.CaptureServer.WorldwidePairing")
+          [[ "$content" == "\"com.elamin.${FORMER_CAMEL}.CaptureServer.WorldwidePairing\", \".v1\"," ]] ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      # Frozen diagnostic controllers retain only these exact deployed identities/paths.
+      case "$token" in
+        "$FORMER_CAMEL.CaptureServer")
+          [[ "$content" == "const HOST_IDENTIFIER: &str = \"com.elamin.${FORMER_CAMEL}.CaptureServer\";" ]] ;;
+        "$PRODUCTION_RENDEZVOUS_HOST")
+          [[ "$content" == "const HOST_RENDEZVOUS_URL: &str = \"wss://${PRODUCTION_RENDEZVOUS_HOST}\";" ]] ;;
+        "$FORMER_CAMEL.CaptureServer.runtime")
+          [[ "$content" == "const HOST_LOCK: &str = \"/Users/ahmed/Library/Application Support/com.elamin.${FORMER_CAMEL}.CaptureServer.runtime/worldwide-host.lock\";" ]] ;;
+        "$FORMER_LOWER.worldwide.plist")
+          [[ "$content" == "\"/Users/ahmed/Library/LaunchAgents/com.elamin.${FORMER_LOWER}.worldwide.plist\";" ]] ;;
+        "$FORMER_LOWER.worldwide")
+          [[ "$content" == "const LEGACY_LABEL: &str = \"com.elamin.${FORMER_LOWER}.worldwide\";" ]] ;;
+        "$FORMER_CAMEL")
+          [[ "$content" == "const LEGACY_EXECUTABLE: &str = \"/Applications/${FORMER_CAMEL} Host.app/Contents/MacOS/CaptureServer\";" || \
+            ("$file_path" == macOS/scripts/opensteamer-diagnostic-driver-v2-resume-stager.rs && \
+             "$content" == "\"streamer-failed-20260720-102747-44276/${FORMER_CAMEL} Host.app\",") ]] ;;
+        "$FORMER_CAMEL.CaptureServer.WorldwidePairing")
+          [[ "$file_path" == macOS/scripts/opensteamer-diagnostic-driver-v2-resume-stager.rs && \
+             "$content" == "\"com.elamin.${FORMER_CAMEL}.CaptureServer.WorldwidePairing\"," ]] ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+}
+
 is_project_yml_production_rendezvous_match() {
   local line=$1
 
@@ -500,6 +558,7 @@ UNAPPROVED=""
 while IFS=: read -r file_path line token; do
   [[ -n "$file_path" ]] || continue
   if is_allowed_legacy_token "$file_path" "$token" || \
+    is_scoped_compatibility_content_match "$file_path" "$line" "$token" || \
     is_readme_release_identity_match "$file_path" "$line" "$token" || \
     is_production_rendezvous_match "$file_path" "$line" "$token"; then
     continue
