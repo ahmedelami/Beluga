@@ -308,6 +308,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private(set) var startupSpatialModeIsDisproved = false
     // Proof of a whole selected-pair telemetry gap, scoped to the exact active trial deadline.
     // Unknown RTT from malformed data must never acquire this bounded wait permission.
+    // Keep the sequence and mutation oracles in SCREEN_STARTUP_REGRESSION_GUARDRAILS.md.
     private var startupSparseProbeDeadline: ContinuousClock.Instant?
 
     var startupSpatialModeIsActive: Bool {

@@ -270,6 +270,10 @@ and uninterrupted typing.
 
 ## Screen startup quality boundary
 
+Use the fail-closed contributor gate and invariant-to-test map in
+`SCREEN_STARTUP_REGRESSION_GUARDRAILS.md`. A selected-but-skipped native fixture is not
+evidence. Preserve assertion-failing negative mutations when changing these boundaries.
+
 Cold Show spatial-first startup must keep the existing video/peer-wide ceilings and start at
 most 5 fps while preserving full pixels through healthy intermediate promotions. Qualified
 intermediate tiers may increase FPS within their ordinary approximate pixel-rate budget

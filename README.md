@@ -249,6 +249,13 @@ Run the shared Swift and macOS regression suite from the repository root:
 swift test
 ```
 
+For screen startup/adaptation changes, follow
+[Screen startup regression guardrails](SCREEN_STARTUP_REGRESSION_GUARDRAILS.md) and run
+`scripts/validate-screen-startup.sh --scratch-path /absolute/dedicated/cache` with an
+explicit reviewed `DEVELOPER_DIR`. Add `--native` for the required fresh-process
+encoded/decoded video checks. The gate rejects empty, skipped, missing, or failed tests;
+ordinary `swift test` alone skips the native experiments.
+
 Generate and open the iOS project:
 
 ```sh

@@ -76,11 +76,12 @@ Process-global feedback is supplemental, not a peer-specific authorization.
 
 ## Reproduction and unproven boundaries
 
-Build tests once using the repository's pinned toolchain. Then set
-`OPENSTEAMER_RUN_STARTUP_CLARITY_EXPERIMENT=1` and use `swift test --skip-build --filter`
-to run one `WebRTCStartupClarityExperimentTests` method per fresh process. The default
-test run skips these diagnostic experiments. Run `WorldwideScreenStartupSpatialPolicyTests`
-and the surrounding video/floor/capacity policy suites normally.
+Use `scripts/validate-screen-startup.sh --scratch-path /absolute/dedicated/cache --native`
+with an explicit reviewed `DEVELOPER_DIR`. See `SCREEN_STARTUP_REGRESSION_GUARDRAILS.md`
+for the contributor gate and required invariant-to-test map. The gate builds/discovers
+once and binds each fresh-process execution to that invocation's source identity;
+do not reuse `--skip-build` across source edits. Default `swift test` skips native
+diagnostics and does not establish that this gate passed.
 
 Validation for the initial candidate: 239 focused adaptation/floor/capacity tests passed.
 Three independent mutations (removing full-pixel shaping, accepting stale native
@@ -93,6 +94,18 @@ provenance tests. New regressions first reproduced the moderate-bandwidth 5-fps 
 sparse-report cap reset, and lost requalification handoff before the fixes. The opt-in
 delayed fixture also asserts decoded detail and frame-rate improvement, not only requested
 geometry. The native blackout test proves the fixture cannot use an unmediated ICE path.
+
+The regression-hardening follow-up adds seeded transition sequences across source FPS,
+configured caps, stale/missing/malformed reports, terminal pressure, expiry, failed native
+apply, Hide and peer replacement. Four deliberate mutations were detected by actual
+assertion failures: fixed-5-fps shaping (2 failures), bypassed timestamp admission
+(31 failures, including 22 from the new sequences), removed gap/probe marker (3 failures),
+and diagnostic-route contamination of native evidence (20 failures). Both production
+files were restored to their exact pre-mutation hashes before final validation.
+The final guarded invocation passed 324 deterministic methods and both fresh-process
+native methods, with zero skips. The gate's own 48 fake-runner scenarios also passed.
+The serial-XCTest log verifier was exercised against the actual reviewed Xcode output,
+which did not emit the requested xUnit file; incomplete or empty results still fail closed.
 
 The startup mode remains at 5 fps at lower qualified tiers; moderate qualified capacity
 can now improve motion without requiring the full tier. These fixtures do not establish

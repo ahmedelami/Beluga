@@ -350,6 +350,11 @@ manual IP addresses, router configuration, or public TCP ports.
   application-limited, not as standalone congestion proof, and use bounded higher-tier probes to
   recover quality. Retain failed-probe evidence until capacity rises, a later probe succeeds, or the
   route/peer resets; it may constrain quality but must not authorize an adaptation-driven blackout.
+- Before changing screen startup/adaptation or sender-statistics provenance, read
+  [SCREEN_STARTUP_REGRESSION_GUARDRAILS.md](SCREEN_STARTUP_REGRESSION_GUARDRAILS.md).
+  Preserve exact peer/Show ownership and native-evidence fences. Run its fail-closed gate;
+  native-boundary changes require the fresh-process `--native` gate, not skipped diagnostics.
+  Changed invariants need an assertion-failing mutation oracle, not only source-string checks.
 - Worldwide remote input is a separate, host-authorized capability and is off by
   default. It may be enabled only by launching the host with both `--worldwide` and
   `--allow-remote-control`; the trusted-LAN viewer remains view-only. Input uses the

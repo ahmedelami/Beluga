@@ -1,6 +1,7 @@
 /// Sender-scoped native collection metadata kept outside the serialized diagnostics snapshot.
 public struct WebRTCScreenVideoStatisticsReport: Sendable {
-    /// Exact native parser output, without cached delegate-route enrichment.
+    /// Exact native parser output, without cached delegate-route enrichment. Policy authority
+    /// must use this, never `snapshot`; see SCREEN_STARTUP_REGRESSION_GUARDRAILS.md.
     public let nativeSnapshot: WebRTCStatisticsSnapshot
     /// Diagnostic projection that may include a previously observed route.
     public let snapshot: WebRTCStatisticsSnapshot
