@@ -8,14 +8,32 @@ with the pinned Xcode 26.6 / bundled LiveKit SDK, not the installed host or iPho
 
 A new eligible Show starts with full source pixels at at most 5 fps. It retains the
 existing video and peer-wide bitrate ceilings. This is not permission to use the
-full-bandwidth tier. Qualified intermediate tiers preserve these startup pixels;
-qualified full releases the frame-rate limit. Confirmed congestion restores the
+full-bandwidth tier. Qualified intermediate tiers preserve these startup pixels and
+increase FPS within their ordinary approximate pixel-rate budget: with a 60-fps source,
+balanced uses 13 fps and high uses 28 fps, instead of staying at 5 indefinitely.
+This is an encode-work proxy, not measured codec demand or extra bandwidth permission.
+Qualified full releases the startup limit. Confirmed congestion restores the
 ordinary spatial/temporal policy without restarting capture. Explicitly low configured
 ceilings do not opt in.
 
 Ownership is exact peer + Show. Missing/stale reports cannot supply positive or
 negative capacity evidence. Native apply failure retains only a terminal same-Show
 disproof, not the unapplied quality proposal. See `TESTING_ORACLES.md` for boundaries.
+
+Sender reports retain their exact native snapshot separately from diagnostic enrichment.
+The cached delegate route may omit metadata (such as network type) present in native
+statistics. When the selected pair is temporarily absent, substituting that cached
+route used to look like a real route replacement and blur an otherwise healthy Show.
+The service now feeds only the raw native snapshot into adaptation. Actual route events
+and fresh native replacements retain their existing invalidation behavior.
+
+A whole selected-pair telemetry gap may hold an already accepted discovery cap only
+under its original deadline. Its marker belongs to the exact active Show and probe.
+A genuinely advancing fast RTT after that gap may wait for the next ordinary report,
+but cannot repair primary RTT permission, extend a lease, or grow the cap. Independent
+sender queue pressure and fresh route/BWE negatives still terminate the wait. Malformed
+or partial evidence cannot acquire it. Fresh sender counters survive the gap only as a
+queue-delta baseline, never as bandwidth evidence.
 
 ## Native characterization
 
@@ -38,6 +56,19 @@ kept that geometry/contrast through a 10-second observation. Its zero local ICE 
 correctly did not authorize FPS upgrades. This proves startup survival, not recovery
 to full frame rate. Synthetic policy tests separately exercise qualified promotion.
 
+The delayed dynamic-FPS fixture uses two per-test loopback UDP sockets with 50 ms
+delay in each direction. It rewrites all supported ICE candidates, filters alternatives,
+pins exact local endpoints, bounds queued packets, and cleans up its sockets. Initial
+blackout prevents connection; blackout after media starts stops decoded frames after
+drain. No system network settings or running host are involved.
+
+On the final candidate, this path measured 106 ms native RTT, presented its first
+full-detail frame 296 ms after capture began, and finished at 54.5 decoded fps. All
+decoded frames retained 1080x1920 geometry and >0.9 signed fine-stripe contrast during
+the 12-second observation, including actual sparse selected-pair reports. This fixture
+changes only a cursor over prebuilt dense content, not a moving-photo workload. The
+timing excludes ICE setup and is not a promise about real-iPhone connection latency.
+
 The pre-Show experiment observed sender-scoped BWE increase from 300,000 to 1,693,440
 bps in about 1.56 s, with zero encoded video frames/media bytes and successful native
 padding-probe feedback. This background-probing behavior was NOT added to production.
@@ -51,13 +82,19 @@ to run one `WebRTCStartupClarityExperimentTests` method per fresh process. The d
 test run skips these diagnostic experiments. Run `WorldwideScreenStartupSpatialPolicyTests`
 and the surrounding video/floor/capacity policy suites normally.
 
-Validation for this candidate: 239 focused adaptation/floor/capacity tests passed.
+Validation for the initial candidate: 239 focused adaptation/floor/capacity tests passed.
 Three independent mutations (removing full-pixel shaping, accepting stale native
 reports, and discarding failed-apply terminal disproof) each failed its behavioral
 regression. The original policy file was restored byte-for-byte and all 239 tests
 passed again.
 
-The startup mode may remain at 5 fps until full capacity is qualified or real pressure
-returns it to ordinary adaptation. These fixtures do not establish moving-content load,
-Internet packet loss/latency, simultaneous microphone/audio load, or iPhone presentation.
+The refined candidate passes 277 focused adaptation, input-wiring, and native-report
+provenance tests. New regressions first reproduced the moderate-bandwidth 5-fps plateau,
+sparse-report cap reset, and lost requalification handoff before the fixes. The opt-in
+delayed fixture also asserts decoded detail and frame-rate improvement, not only requested
+geometry. The native blackout test proves the fixture cannot use an unmediated ICE path.
+
+The startup mode remains at 5 fps at lower qualified tiers; moderate qualified capacity
+can now improve motion without requiring the full tier. These fixtures do not establish
+moving-content load, Internet packet loss, simultaneous microphone/audio load, or iPhone presentation.
 No deployment or physical-device result is implied by these source-level experiments.

@@ -40,9 +40,13 @@ private struct StartupClarityVariant: Sendable {
 private actor StartupClarityState {
     var remoteTrack: WebRTCRemoteVideoTrack?
     var activeAcknowledged = false
+    var viewerControlOpen = false
     var relayErrors: [String] = []
 
     func observe(_ event: WebRTCTransportEvent, viewerSide: Bool) {
+        if viewerSide, case .dataChannelStateChanged(let channelState) = event {
+            viewerControlOpen = channelState == .open
+        }
         if viewerSide, case .remoteVideoTrack(let track) = event {
             remoteTrack = track
         }
@@ -320,7 +324,7 @@ private final class StartupClarityRenderer:
         )
         lock.withLock {
             guard timestamps.insert(frame.timeStamp).inserted else { return }
-            if observations.count < 128 {
+            if observations.count < 1_024 {
                 observations.append(observation)
             }
         }
@@ -400,14 +404,23 @@ private func startupClarityRelay(
     from: WebRTCPeer,
     to: WebRTCPeer,
     viewerSide: Bool,
-    state: StartupClarityState
+    state: StartupClarityState,
+    networkRelay: StartupVideoDatagramRelay? = nil
 ) -> Task<Void, Never> {
     Task {
         do {
             for await event in from.events {
                 await state.observe(event, viewerSide: viewerSide)
                 if case .outboundSignal(let payload) = event {
-                    try await to.handle(payload)
+                    if let networkRelay {
+                        if let rewritten = try networkRelay.rewrite(
+                            payload, from: viewerSide ? .viewer : .host
+                        ) {
+                            try await to.handle(rewritten)
+                        }
+                    } else {
+                        try await to.handle(payload)
+                    }
                 }
                 if !viewerSide,
                    case .controlRequestReceived(let request) = event,
@@ -443,7 +456,8 @@ private func startupClarityClose(
     relays: [Task<Void, Never>],
     pump: Task<Void, Never>?,
     track: WebRTCRemoteVideoTrack?,
-    renderer: StartupClarityRenderer
+    renderer: StartupClarityRenderer,
+    networkRelay: StartupVideoDatagramRelay? = nil
 ) async {
     pump?.cancel()
     await pump?.value
@@ -454,6 +468,15 @@ private func startupClarityClose(
     await viewer.close(reason: .normal)
     for relay in relays { relay.cancel() }
     for relay in relays { await relay.value }
+    await networkRelay?.stop()
+}
+
+private final class StartupClarityCaptureCadence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fps = 5
+
+    func update(_ newFPS: Int) { lock.withLock { fps = min(60, max(1, newFPS)) } }
+    var interval: Duration { lock.withLock { .nanoseconds(1_000_000_000 / fps) } }
 }
 
 private func startupClarityMilliseconds(_ duration: Duration) -> Double {
@@ -554,7 +577,74 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
         try await runDenseProductionPolicyNativeLoopback()
     }
 
-    private func runDenseProductionPolicyNativeLoopback() async throws {
+    func testDenseProductionPolicyDelayedNetworkWithDynamicFrameRateCharacterization() async throws {
+        try await runDenseProductionPolicyNativeLoopback(oneWayDelayMilliseconds: 50,
+                                                       followsPolicyFPS: true)
+    }
+
+    func testDelayedNetworkBlackoutPreventsDirectICEBypass() async throws {
+        guard ProcessInfo.processInfo.environment[
+            "OPENSTEAMER_RUN_STARTUP_CLARITY_EXPERIMENT"
+        ] == "1" else {
+            throw XCTSkip("Opt-in fresh-process startup clarity characterization")
+        }
+        let host = try WebRTCPeer(configuration: WebRTCTransportConfiguration(
+            role: .host, iceServers: [], mediaTopology: .videoControlOnly,
+            supportsAudioClientDiagnostics: false))
+        let viewer: WebRTCPeer
+        do {
+            viewer = try WebRTCPeer(configuration: WebRTCTransportConfiguration(
+                role: .viewer, iceServers: [], mediaTopology: .videoControlOnly,
+                supportsAudioClientDiagnostics: false))
+        } catch {
+            await host.close(reason: .normal)
+            throw error
+        }
+        let networkRelay: StartupVideoDatagramRelay
+        do {
+            networkRelay = try StartupVideoDatagramRelay(dropAll: true)
+        } catch {
+            await host.close(reason: .normal)
+            await viewer.close(reason: .normal)
+            throw error
+        }
+        let state = StartupClarityState()
+        let renderer = StartupClarityRenderer()
+        let relays = [
+            startupClarityRelay(from: host, to: viewer, viewerSide: false, state: state,
+                                networkRelay: networkRelay),
+            startupClarityRelay(from: viewer, to: host, viewerSide: true, state: state,
+                                networkRelay: networkRelay),
+        ]
+        do {
+            try await host.start()
+            try await Task.sleep(for: .seconds(3))
+            let healthy = await host.isTransportHealthyForCapture()
+            let evidence = networkRelay.snapshot()
+            XCTAssertFalse(healthy, "No alternate native candidate may bypass the relay")
+            XCTAssertEqual(evidence.mappedSideCount, 2)
+            XCTAssertGreaterThan(evidence.hostToViewer.droppedDatagrams
+                + evidence.viewerToHost.droppedDatagrams, 0)
+            XCTAssertEqual(evidence.hostToViewer.forwardedDatagrams, 0)
+            XCTAssertEqual(evidence.viewerToHost.forwardedDatagrams, 0)
+            XCTAssertEqual(evidence.errorCount, 0)
+            let errors = await state.relayErrors
+            XCTAssertEqual(errors, [])
+            print("STARTUP_NETWORK_BLACKOUT \(evidence)")
+        } catch {
+            await startupClarityClose(host: host, viewer: viewer, relays: relays,
+                pump: nil, track: nil, renderer: renderer, networkRelay: networkRelay)
+            throw error
+        }
+        await startupClarityClose(host: host, viewer: viewer, relays: relays,
+            pump: nil, track: nil, renderer: renderer, networkRelay: networkRelay)
+        XCTAssertTrue(networkRelay.snapshot().stopped)
+        XCTAssertEqual(networkRelay.snapshot().pendingDatagrams, 0)
+    }
+
+    private func runDenseProductionPolicyNativeLoopback(
+        oneWayDelayMilliseconds: Int? = nil, followsPolicyFPS: Bool = false
+    ) async throws {
         guard ProcessInfo.processInfo.environment[
             "OPENSTEAMER_RUN_STARTUP_CLARITY_EXPERIMENT"
         ] == "1" else {
@@ -599,11 +689,26 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
             throw error
         }
 
+        let networkRelay: StartupVideoDatagramRelay?
+        do {
+            if let oneWayDelayMilliseconds {
+                networkRelay = try StartupVideoDatagramRelay(
+                    oneWayDelayMilliseconds: oneWayDelayMilliseconds)
+            } else {
+                networkRelay = nil
+            }
+        } catch {
+            await host.close(reason: .normal)
+            await viewer.close(reason: .normal)
+            throw error
+        }
         let state = StartupClarityState()
         let renderer = StartupClarityRenderer()
         let relays = [
-            startupClarityRelay(from: host, to: viewer, viewerSide: false, state: state),
-            startupClarityRelay(from: viewer, to: host, viewerSide: true, state: state),
+            startupClarityRelay(from: host, to: viewer, viewerSide: false, state: state,
+                                networkRelay: networkRelay),
+            startupClarityRelay(from: viewer, to: host, viewerSide: true, state: state,
+                                networkRelay: networkRelay),
         ]
         var track: WebRTCRemoteVideoTrack?
         var pump: Task<Void, Never>?
@@ -618,7 +723,8 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
             try await startupClarityWait {
                 let healthy = await host.isTransportHealthyForCapture()
                 let hasTrack = await state.remoteTrack != nil
-                return healthy && hasTrack
+                let viewerReady = await state.viewerControlOpen
+                return healthy && hasTrack && viewerReady
             }
             let remoteTrackValue = await state.remoteTrack
             let remoteTrack = try XCTUnwrap(remoteTrackValue)
@@ -645,12 +751,15 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                 pixelBuffer: pattern.buffers[0],
                 timestampNanoseconds: Int64(clamping: DispatchTime.now().uptimeNanoseconds)
             )
-            // Deliberately fixed at 5 fps: this checks startup spatial survival against native
-            // feedback, but does not exercise the policy's eventual full-frame-rate demand.
+            // Cursor-only content separates native frame cadence from a moving-photo workload.
+            // The original direct loopback stays fixed at 5 fps; the delayed case follows the
+            // actual applied policy so intermediate/full FPS requests must reach the decoder.
+            let captureCadence = StartupClarityCaptureCadence()
+            captureCadence.update(appliedRecommendation.maximumFramesPerSecond)
             pump = Task.detached {
                 var index = 1
                 while !Task.isCancelled {
-                    do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
+                    do { try await Task.sleep(for: captureCadence.interval) } catch { break }
                     guard !Task.isCancelled else { break }
                     capturer.capture(
                         pixelBuffer: pattern.buffers[index % pattern.buffers.count],
@@ -670,9 +779,12 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
             ]
             let clock = ContinuousClock()
             var cadence = WorldwideScreenVideoSamplingCadence(startedAt: captureStartedAt)
-            let deadline = captureStartedAt.advanced(by: .seconds(10))
+            let observationSeconds = followsPolicyFPS ? 12 : 10
+            let deadline = captureStartedAt.advanced(by: .seconds(observationSeconds))
             var ordinaryReportCount = 0
             var capacityReportCount = 0
+            var maximumRequestedFPS = appliedRecommendation.maximumFramesPerSecond
+            var maximumNativeRTT = 0.0
             while ContinuousClock.now < deadline {
                 let wake = min(cadence.nextDeadline, deadline)
                 if ContinuousClock.now < wake {
@@ -690,11 +802,12 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                     )
                 )
                 let observedAt = ContinuousClock.now
+                let previousRoute = policy.selectedRoute
                 var proposedPolicy = policy
                 let changedRecommendation: WorldwideScreenVideoEncodingRecommendation?
                 if let report, capacityOnly {
                     capacityReportCount += 1
-                    let snapshot = report.snapshot
+                    let snapshot = report.nativeSnapshot
                     changedRecommendation = proposedPolicy.updateCapacityProbe(
                         peerGeneration: peerGeneration,
                         isCaptureActive: true,
@@ -712,7 +825,7 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                     )
                 } else if let report {
                     ordinaryReportCount += 1
-                    let snapshot = report.snapshot
+                    let snapshot = report.nativeSnapshot
                     changedRecommendation = proposedPolicy.update(
                         peerGeneration: peerGeneration,
                         isCaptureActive: true,
@@ -752,10 +865,18 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                         )
                     )
                     appliedRecommendation = recommendation
+                    if followsPolicyFPS {
+                        captureCadence.update(recommendation.maximumFramesPerSecond)
+                    }
+                    maximumRequestedFPS = max(maximumRequestedFPS,
+                                              recommendation.maximumFramesPerSecond)
                 }
                 policy = proposedPolicy
 
-                let snapshot = report?.snapshot
+                let snapshot = report?.nativeSnapshot
+                if let rtt = snapshot?.currentRoundTripTime, rtt.isFinite {
+                    maximumNativeRTT = max(maximumNativeRTT, rtt)
+                }
                 trace.append(
                     "{elapsedMs:"
                         + "\(startupClarityJSONNumber(startupClarityMilliseconds(captureStartedAt.duration(to: observedAt)))),"
@@ -769,6 +890,13 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                         + "\(startupClarityJSONNumber(report?.nativeReportTimestampMicroseconds)),"
                         + "rtt:\(startupClarityJSONNumber(snapshot?.currentRoundTripTime)),"
                         + "route:\(snapshot?.route?.kind.rawValue ?? "unknown"),"
+                        + "diagnosticRouteDiffers:\(report?.snapshot.route != snapshot?.route),"
+                        + "routeChanged:\(snapshot?.route != previousRoute),"
+                        + "routeLocalPresent:\(snapshot?.route?.local != nil),"
+                        + "routeRemotePresent:\(snapshot?.route?.remote != nil),"
+                        + "latencyPressure:\(policy.lastSampleHasLatencyPressure),"
+                        + "rttDisposition:\(policy.roundTripTimeDisposition),"
+                        + "spatialDisproved:\(policy.startupSpatialModeIsDisproved),"
                         + "packets:\(snapshot?.outboundVideo?.packets.map(String.init) ?? "null"),"
                         + "packetDelay:"
                         + "\(startupClarityJSONNumber(snapshot?.outboundVideo?.totalPacketSendDelay))}"
@@ -813,9 +941,17 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                 ? finalBytes - baselineBytes
                 : 0
             let transportHealthy = await host.isTransportHealthyForCapture()
+            let lastWindowStart = deadline.advanced(by: .seconds(-2))
+            let finalDecodedFPS = Double(observations.filter {
+                $0.receivedAt >= lastWindowStart && $0.receivedAt < deadline
+            }.count) / 2
             print(
-                "STARTUP_POLICY_NATIVE_LOOPBACK {denseContent:true,pumpFPS:5,"
-                    + "exercisesFullFPSDemand:false,ordinaryReports:\(ordinaryReportCount),"
+                "STARTUP_POLICY_NATIVE_LOOPBACK {denseContent:true,contentMotion:cursorOnly,"
+                    + "followsPolicyFPS:\(followsPolicyFPS),"
+                    + "oneWayDelayMs:\(oneWayDelayMilliseconds ?? 0),"
+                    + "maximumRequestedFPS:\(maximumRequestedFPS),finalDecodedFPS:\(finalDecodedFPS),"
+                    + "maximumNativeRTT:\(startupClarityJSONNumber(maximumNativeRTT)),"
+                    + "ordinaryReports:\(ordinaryReportCount),"
                     + "capacityReports:\(capacityReportCount),"
                     + "finalInboundByteDelta:\(inboundByteDelta),"
                     + "policyTrace:[\(trace.joined(separator: ","))],"
@@ -826,6 +962,35 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
             XCTAssertGreaterThan(ordinaryReportCount, 0)
             XCTAssertGreaterThan(finalBytes, baselineBytes)
             XCTAssertFalse(observations.isEmpty)
+            if let oneWayDelayMilliseconds {
+                XCTAssertGreaterThanOrEqual(maximumNativeRTT,
+                    Double(oneWayDelayMilliseconds) / 1_000,
+                    "The native ICE path must actually traverse the delayed datagrams")
+                XCTAssertTrue(observations.allSatisfy {
+                    $0.width == StartupClarityPattern.width
+                        && $0.height == StartupClarityPattern.height
+                        && $0.signedIdealNormalizedContrast.minimum > 0.9
+                }, "A lossless delayed path must retain actual decoded startup detail")
+                XCTAssertGreaterThan(maximumRequestedFPS, 5,
+                                     "Healthy discovery must eventually improve motion")
+                XCTAssertGreaterThan(finalDecodedFPS, 5,
+                                     "The frame-rate improvement must reach the decoder")
+            }
+            if let networkRelay {
+                let evidence = networkRelay.snapshot()
+                print("STARTUP_NETWORK_RELAY \(evidence)")
+                XCTAssertEqual(evidence.mappedSideCount, 2)
+                XCTAssertGreaterThan(evidence.hostToViewer.forwardedDatagrams, 0)
+                XCTAssertGreaterThan(evidence.viewerToHost.forwardedDatagrams, 0)
+                XCTAssertEqual(evidence.errorCount, 0)
+                // Prove the decoded media, not just ICE, uses this exact path.
+                networkRelay.setDropAll(true)
+                try await Task.sleep(for: .seconds(1))
+                let drainedFrameCount = renderer.snapshot().count
+                try await Task.sleep(for: .seconds(1))
+                XCTAssertEqual(renderer.snapshot().count, drainedFrameCount,
+                               "Decoded media must stop after relay blackout and drain")
+            }
             let relayErrors = await state.relayErrors
             XCTAssertEqual(relayErrors, [])
         } catch {
@@ -835,7 +1000,8 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
                 relays: relays,
                 pump: pump,
                 track: track,
-                renderer: renderer
+                renderer: renderer,
+                networkRelay: networkRelay
             )
             throw error
         }
@@ -846,7 +1012,8 @@ final class WebRTCStartupClarityExperimentTests: XCTestCase {
             relays: relays,
             pump: pump,
             track: track,
-            renderer: renderer
+            renderer: renderer,
+            networkRelay: networkRelay
         )
     }
 

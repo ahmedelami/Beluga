@@ -270,10 +270,24 @@ and uninterrupted typing.
 
 ## Screen startup quality boundary
 
-Cold Show spatial-first startup must keep the existing video/peer-wide ceilings and at
-most 5 fps while preserving full pixels through healthy intermediate promotions. Only
+Cold Show spatial-first startup must keep the existing video/peer-wide ceilings and start at
+most 5 fps while preserving full pixels through healthy intermediate promotions. Qualified
+intermediate tiers may increase FPS within their ordinary approximate pixel-rate budget
+(13 fps balanced, 28 fps high with a 60-fps source), never above configured source FPS.
+Exercise stable 3/6/9 Mbps paths, unchanged caps, and missing/negative evidence after promotion. Only
 fresh affirmative congestion or lifecycle replacement retires the exact-Show mode;
 cached/missing reports and probe expiry must not manufacture a clear-to-blurry transition.
+Keep the original native snapshot separate from cached diagnostic route enrichment. An absent
+selected pair must not turn optional delegate-versus-native candidate metadata into a route
+replacement. Copies must preserve native evidence and identity; the service must consume it.
+A whole-pair telemetry gap may hold an already accepted discovery budget only under the
+same Show/probe deadline. A later fresh fast ping must await ordinary requalification,
+without renewing primary RTT/queue leases or increasing any cap. Preserve sender counters
+only for queue deltas, not capacity. Malformed/partial data cannot acquire the gap marker;
+real route/BWE/queue negatives and both the primary lease and absolute deadline still win.
+For native delayed-network coverage, keep impairment per-fixture: require initial blackout
+to prevent connection and post-start blackout to stop decoded frames after drain. A passing
+healthy case must retain decoded fine detail and advance decoded FPS, not only set a parameter.
 Retain only terminal same-Show disproof after a rejected native apply, never positive
 geometry/FPS permission or successor ownership. Exercise real decoded fine-detail pixels
 in fresh-process opt-in native loopbacks, including the actual adaptation reducer. Static

@@ -508,6 +508,9 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         XCTAssertTrue(sampler.contains("if let report"))
         XCTAssertTrue(sampler.contains("capacityProbeOnly: capacityProbeOnly"))
         XCTAssertTrue(sampler.contains("report.nativeReportTimestampMicroseconds"))
+        // Behavioral report/reducer tests cover the value semantics; guard the actual service
+        // wiring too, so cached diagnostic route enrichment cannot become policy evidence.
+        XCTAssertTrue(sampler.contains("case let snapshot = report.nativeSnapshot"))
         XCTAssertTrue(
             sampler.contains(
                 "screenVideoAdaptationFastStatisticsAreAvailable = false"

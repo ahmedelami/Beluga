@@ -2736,7 +2736,9 @@ actor WorldwideScreenService {
                     + "received=\(report != nil)"
             )
             if let report,
-               case let snapshot = report.snapshot,
+               // The enriched diagnostics route can be cached and differ only in optional
+               // metadata. Only this native report's route may reset adaptation ownership.
+               case let snapshot = report.nativeSnapshot,
                screenVideoAdaptationFreshnessFence.admits(snapshot),
                screenVisibilityCommandEpoch == expectedVisibilityEpoch,
                captureSource === expectedCaptureSource,
