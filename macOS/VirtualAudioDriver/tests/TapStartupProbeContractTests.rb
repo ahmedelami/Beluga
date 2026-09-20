@@ -27,6 +27,150 @@ class TapStartupProbeContractTests < Minitest::Test
     assert_equal 'input_callbacks_progressed', TapStartupAB.input_outcome(arm(1))
     assert_equal 'no_input_start_failure_observed', TapStartupAB.verdict([1, 0, 0, 1].map { |v| arm(v) })
   end
+  def aligned_arm(auto_start, input_status: 0)
+    sample = arm(auto_start, input_status: input_status)
+    sample[:production_aligned] = true
+    sample[:owner_exit_status] = 0
+    sample[:reader_exit_status] = input_status == 0 ? 0 : 1
+    owner, reader = sample.values_at(:owner_pid, :reader_pid)
+    sample[:events].concat([
+      event(owner, 'checked', 'production_aligned', 1), event(reader, 'checked', 'production_aligned', 1),
+      event(owner, 'checked', 'reader_included', 1), event(owner, 'end', 'tap_start', 0),
+      event(owner, 'begin', 'writer_start', 0), event(owner, 'ready', 'production_forwarding', 1),
+      event(owner, 'checked', 'writer_uid_before_start', 1), event(owner, 'checked', 'writer_uid_after_start', 1),
+      event(owner, 'checked', 'writer_format_after_start', 1), event(owner, 'measurement', 'writer_callback_error', 0),
+      event(reader, 'checked', 'input_uid_before_start', 1), event(reader, 'checked', 'input_voice_processing_disabled', 1),
+      event(reader, 'end', 'input_setup', 0), event(reader, 'begin', 'input_engine_start', 0),
+      event(reader, 'end', 'input_engine_start', input_status), event(reader, 'checked', 'input_error_domain', input_status == 0 ? 0 : 2),
+      event(reader, 'checked', 'input_only_after_start', 1), event(reader, 'checked', 'input_callbacks_drained', 1),
+      event(reader, 'checked', 'input_hardware_format_status', 0), event(reader, 'checked', 'input_hardware_format_rate', 48000),
+      event(reader, 'checked', 'input_hardware_format_channels', 1), event(reader, 'checked', 'input_hardware_format_flags', 41),
+      event(reader, 'checked', 'input_format_after_prepare', 1), event(reader, 'checked', 'input_format_after_start', 1),
+      event(owner, 'measurement', 'own_output_observed', 1), event(owner, 'measurement', 'peer_output_observed', 0),
+      event(reader, 'measurement', 'own_output_observed', 0), event(reader, 'measurement', 'peer_output_observed', 1)
+    ])
+    [['end', 'tap_start'], ['begin', 'writer_start'], ['end', 'writer_start'],
+     ['ready', 'production_forwarding'], ['begin', 'input_start']].each_with_index do |(kind, stage), index|
+      sample[:events].find { |e| e['event'] == kind && e['stage'] == stage }['monotonicNS'] = 100 + index
+    end
+    sample
+  end
+  def test_aligned_baseline_stops_without_reproduction
+    sample = aligned_arm(1)
+    assert_equal 'input_callbacks_progressed', TapStartupAB.input_outcome(sample)
+    assert_equal 'baseline_did_not_reproduce_input_failure', TapStartupAB.verdict([sample])
+    refute_equal 'baseline_did_not_reproduce_input_failure', TapStartupAB.verdict([arm(1)])
+  end
+  def test_aligned_mode_requires_configuration_device_and_order_proof
+    stages = %w[production_aligned reader_included writer_uid_before_start writer_uid_after_start
+                input_uid_before_start input_voice_processing_disabled production_forwarding
+                writer_format_after_start writer_callback_error input_setup input_engine_start
+                input_error_domain input_only_after_start input_callbacks_drained own_output_observed peer_output_observed
+                input_hardware_format_status input_hardware_format_rate input_hardware_format_channels
+                input_hardware_format_flags input_format_after_prepare input_format_after_start]
+    stages.each do |stage|
+      sample = aligned_arm(1)
+      sample[:events].reject! { |e| e['stage'] == stage }
+      assert_equal 'invalid', TapStartupAB.input_outcome(sample), stage
+    end
+    sample = aligned_arm(1)
+    sample[:events].find { |e| e['stage'] == 'input_start' && e['event'] == 'begin' }['monotonicNS'] = 99
+    assert_equal 'invalid', TapStartupAB.input_outcome(sample), 'reader started before forwarding'
+    sample = aligned_arm(1)
+    sample[:events].find { |e| e['stage'] == 'tap_start' && e['event'] == 'end' }['value'] = 60
+    assert_equal 'invalid', TapStartupAB.input_outcome(sample), 'tap failure is not receiver failure'
+  end
+  def test_aligned_cold_and_cleanup_gates_precede_non_reproduction
+    sample = aligned_arm(1)
+    sample[:events].find { |e| e['stage'] == 'foreign_output_observed' }['value'] = 1
+    assert_equal 'non_cold_playback_observed_inconclusive', TapStartupAB.verdict([sample])
+    sample[:killed] = true
+    assert_equal 'invalid_or_incomplete', TapStartupAB.verdict([sample])
+    assert_equal 'invalid_or_incomplete', TapStartupAB.verdict([aligned_arm(1, input_status: 60), arm(0)])
+  end
+  def test_aligned_differential_stays_noncausal
+    arms = [aligned_arm(1, input_status: 60), aligned_arm(0), aligned_arm(0), aligned_arm(1, input_status: 60)]
+    assert_nil TapStartupAB.early_stop_reason(arms.first(1))
+    assert_equal 'input_start_differential_observed_not_causal_proof', TapStartupAB.verdict(arms)
+  end
+  def retired_tap_arm
+    sample = aligned_arm(1)
+    sample[:tap_retirement_requested] = true
+    owner, reader = sample.values_at(:owner_pid, :reader_pid)
+    sample[:events].find { |e| e['event'] == 'begin' && e['stage'] == 'input_engine_start' }['monotonicNS'] = 1000
+    sample[:events].find { |e| e['event'] == 'end' && e['stage'] == 'input_engine_start' }['monotonicNS'] = 18_001_000_000
+    sample[:events].concat([
+      event(owner, 'begin', 'tap_retirement', 0).merge('monotonicNS' => 18_000_000_000),
+      event(owner, 'end', 'tap_retirement', 0), event(owner, 'teardown', 'tap_only', 1),
+      event(owner, 'measurement', 'writer_callbacks_before_tap_retirement', 1800),
+      event(owner, 'measurement', 'writer_callbacks_after_tap_retirement', 1820)
+    ])
+    %w[writer_uid_before_tap_retirement writer_uid_after_tap_retirement writer_format_before_tap_retirement
+       writer_format_after_tap_retirement writer_continued_during_tap_retirement].each do |stage|
+      sample[:events] << event(owner, 'checked', stage, 1)
+    end
+    sample
+  end
+  def test_pending_input_can_only_be_bound_to_a_verified_tap_only_intervention
+    sample = retired_tap_arm
+    assert_equal 'input_pending_until_tap_retirement', TapStartupAB.input_outcome(sample)
+    assert_equal 'input_start_differential_observed_not_causal_proof',
+                 TapStartupAB.verdict([sample, aligned_arm(0), aligned_arm(0), retired_tap_arm])
+    %w[tap_only writer_uid_before_tap_retirement writer_uid_after_tap_retirement
+       writer_format_before_tap_retirement writer_format_after_tap_retirement writer_continued_during_tap_retirement].each do |stage|
+      bad = retired_tap_arm
+      bad[:events].reject! { |e| e['stage'] == stage }
+      assert_equal 'invalid', TapStartupAB.input_outcome(bad), stage
+    end
+    bad = retired_tap_arm
+    bad[:events].find { |e| e['stage'] == 'writer_callbacks_after_tap_retirement' }['value'] = 1800
+    assert_equal 'invalid', TapStartupAB.input_outcome(bad), 'writer stopped too'
+    bad = retired_tap_arm
+    bad[:events].find { |e| e['event'] == 'end' && e['stage'] == 'input_engine_start' }['monotonicNS'] = 17_000_000_000
+    assert_equal 'invalid', TapStartupAB.input_outcome(bad), 'input returned before intervention'
+    bad = retired_tap_arm
+    bad[:events].find { |e| e['stage'] == 'tap_callbacks' }['value'] = 3
+    assert_equal 'invalid', TapStartupAB.input_outcome(bad), 'tap already advancing'
+    bad = retired_tap_arm
+    bad[:killed] = true
+    assert_equal 'invalid', TapStartupAB.input_outcome(bad), 'killed reader remains invalid'
+  end
+  def test_reader_output_cannot_warm_the_baseline_unobserved
+    sample = aligned_arm(1)
+    sample[:events].find { |e| e['pid'] == sample[:reader_pid] && e['stage'] == 'own_output_observed' }['value'] = 1
+    assert_equal 'reader_output_observed_inconclusive', TapStartupAB.verdict([sample])
+  end
+  def test_stereo_or_incompatible_hardware_format_cannot_satisfy_aligned_baseline
+    {'input_hardware_format_channels' => 2, 'input_hardware_format_rate' => 44100,
+     'input_hardware_format_flags' => 42, 'input_hardware_format_status' => -50}.each do |stage, value|
+      sample = aligned_arm(1)
+      sample[:events].find { |e| e['stage'] == stage }['value'] = value
+      assert_equal 'invalid', TapStartupAB.input_outcome(sample), stage
+    end
+  end
+  def test_setup_failure_is_not_a_comparable_engine_start_failure
+    sample = aligned_arm(1, input_status: 60)
+    sample[:events].find { |e| e['stage'] == 'input_setup' }['value'] = -50
+    assert_equal 'invalid', TapStartupAB.input_outcome(sample)
+    sample = aligned_arm(1, input_status: 60)
+    sample[:events].find { |e| e['stage'] == 'input_engine_start' && e['event'] == 'end' }['value'] = -50
+    assert_equal 'invalid', TapStartupAB.input_outcome(sample)
+    sample = aligned_arm(1)
+    sample[:owner_exit_status] = 1
+    assert_equal 'invalid', TapStartupAB.input_outcome(sample), 'late owner failure'
+    sample = aligned_arm(1)
+    sample[:reader_exit_status] = 1
+    assert_equal 'invalid', TapStartupAB.input_outcome(sample), 'late reader failure'
+  end
+  def test_supervisor_does_not_launch_more_arms_after_clean_non_reproduction
+    fixture = aligned_arm(1)
+    calls = []
+    supervisor = TapStartupAB::Supervisor.new(production_aligned: true)
+    supervisor.define_singleton_method(:arm) { |auto_start| calls << auto_start; fixture }
+    result = supervisor.run
+    assert_equal [1], calls
+    assert_equal 'baseline_did_not_reproduce_input_failure', result[:verdict]
+  end
   def test_counterbalanced_native_differential_is_not_labeled_cause
     arms = [arm(1, input_status: 60), arm(0), arm(0), arm(1, input_status: 60)]
     assert_equal 'input_start_differential_observed_not_causal_proof', TapStartupAB.verdict(arms)

@@ -106,6 +106,65 @@ The report is created exclusively with mode 0600 and is never overwritten.
 
 ## Evidence limits
 
+### Production-aligned comparison
+
+The supervisor's optional `--production-aligned` mode is a separate diagnostic
+configuration. It starts the same private real-output-clock tap first, then a
+silent hidden-writer AudioQueue, waits for advancing writer callbacks, and only
+then starts a fresh AVAudioEngine reader. The tap excludes its owner but includes
+the reader, matching the production exclusion boundary more closely. The reader
+is explicitly pinned to the visible product input; this still differs from
+Codex's default-device discovery and does not reproduce Codex's entire graph.
+
+The supervisor requires native configuration and before/after device readbacks,
+disabled voice processing, and strictly ordered tap-start, writer-start,
+forwarding-ready, and reader-start timestamps. It retains all existing runtime,
+selector, permission, ownership, output-activity and acknowledged-teardown gates.
+It stops after the first true arm if the input starts successfully, reporting
+`baseline_did_not_reproduce_input_failure`; it also stops on playback contamination
+or invalid evidence. The sampler reports owner/peer output separately, and observed
+reader output yields `reader_output_observed_inconclusive`; a later input-only
+readback cannot erase graph-initialization output. Sampling can still miss brief
+activity. Both owned process exit statuses and acknowledged teardown must agree
+with the reported startup result. Do not repeat unchanged successful controls as though more
+iterations could establish the observed Codex failure. A native start error still
+requires correlation with the receiving-boundary logs before identifying it as
+the same approximately 14-second timeout.
+
+If an aligned reader has completed setup but its native engine-start call remains
+pending for18 seconds, the supervisor requests one prospectively defined
+`retire-tap` intervention. It removes only that owner's private tap/aggregate,
+without stopping or rebuilding its hidden writer or changing any default device.
+The owner must prove the same writer UID/format and advancing callbacks around
+retirement. Within a further8 seconds the reader must return and advance callbacks,
+and both workers must acknowledge cleanup with matching exit statuses. The report
+labels this `input_pending_until_tap_retirement`, separately from an ordinary
+startup success. It requires a dormant tap, a native input call pending at least
+15 seconds, and return after retirement begins; a late success before intervention,
+a stopped writer, stale format, or killed worker is invalid. Counterbalanced
+true/false results remain native-boundary evidence, not Codex transcription proof.
+
+Native command waits check cancellation before polling and read bounded command
+bytes in100ms slices. The no-audio `--offline-command-cancellation-test` verifies
+pre-cancel, guard failure, valid command, partial-command cancellation and EOF.
+An earlier killed run remains invalid even if a later runtime audit proves the
+OS removed its audio resources; never relabel it as a clean arm.
+
+This mode changes only the standalone diagnostic. The installed host, driver,
+pairing, iOS application, and production TapAutoStart policy are untouched.
+Live use still requires the separately approved idle boundary described above.
+
+The2026-09-20 task-local `result-tap-isolation.json` report in
+`/Volumes/t7/opensteamer-aligned-startup-run.GuHmgA` records a clean
+true/false/false/true differential. Both true arms remained pending until the
+18-second tap-only intervention and returned about46–49ms afterward while the
+same writer continued. Both false arms started in about12ms. All four readers
+then advanced20 callbacks/96,000 frames; all eight idle checks and both-worker
+teardown/exit proofs passed, with no observed foreign or reader output activity.
+This native result supports a narrowly scoped production candidate, but it is
+not actual Codex transcription, real phone PCM or fresh paired-reconnect proof.
+The earlier format-rejected and killed-reader reports remain invalid and retained.
+
 - Apple documents TapAutoStart=true as making aggregate start wait for the first
   tapped audio. A tap-start timeout without an independent input failure is not
   evidence of a microphone defect.

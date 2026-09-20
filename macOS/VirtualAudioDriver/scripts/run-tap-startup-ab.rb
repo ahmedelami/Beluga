@@ -39,7 +39,20 @@ module TapStartupAB
               process_output_scan driver_snapshot preexisting_active_client foreign_active_client peer_identity
               driver_hash host_hash endpoint_format selector_listener microphone_permission
               host_process_list host_unnamed_live_process host_pid_or_ambiguity host_path host_bsd_metadata
-              host_start_tuple host_file_identity host_presence host_public_process_metadata_unknown].freeze
+              host_start_tuple host_file_identity host_presence host_public_process_metadata_unknown
+              production_aligned reader_included production_forwarding writer_uid_before_start
+              writer_uid_after_start input_uid_before_start input_voice_processing_disabled
+              input_error_domain input_engine_start input_setup input_only_after_start
+              input_callbacks_drained writer_format_after_start writer_callback_error
+              own_output_observed peer_output_observed
+              input_node_format_rate input_node_format_channels input_node_format_common
+              input_hardware_format_status input_hardware_format_rate input_hardware_format_channels input_hardware_format_flags
+              input_unit_format_status input_unit_format_rate input_unit_format_channels input_unit_format_flags
+              input_format_after_prepare input_format_after_start tap_retirement tap_only
+              writer_callbacks_before_tap_retirement writer_callbacks_after_tap_retirement
+              writer_uid_before_tap_retirement writer_uid_after_tap_retirement
+              writer_format_before_tap_retirement writer_format_after_tap_retirement
+              writer_continued_during_tap_retirement].freeze
   def self.value(events, event, stage)
     found = events.select { |e| e['event'] == event && e['stage'] == stage }
     found.length == 1 ? found.first['value'] : nil
@@ -56,17 +69,82 @@ module TapStartupAB
       (value(owner, 'measurement', 'writer_callbacks') || 0) > 0 &&
       !value(owner, 'measurement', 'tap_callbacks').nil? &&
       [owner, reader].all? { |events| [0, 1].include?(value(events, 'measurement', 'foreign_output_observed')) }
+    if arm[:production_aligned]
+      return 'invalid' unless arm[:owner_exit_status] == 0 &&
+        [owner, reader].all? { |events| value(events, 'checked', 'production_aligned') == 1 } &&
+        value(owner, 'checked', 'reader_included') == 1 && value(owner, 'end', 'tap_start') == 0 &&
+        value(owner, 'checked', 'writer_uid_before_start') == 1 && value(owner, 'checked', 'writer_uid_after_start') == 1 &&
+        value(owner, 'checked', 'writer_format_after_start') == 1 && value(owner, 'measurement', 'writer_callback_error') == 0 &&
+        value(reader, 'checked', 'input_uid_before_start') == 1 && value(reader, 'checked', 'input_voice_processing_disabled') == 1 &&
+        value(reader, 'end', 'input_setup') == 0 && value(reader, 'checked', 'input_callbacks_drained') == 1 &&
+        value(reader, 'checked', 'input_hardware_format_status') == 0 &&
+        value(reader, 'checked', 'input_hardware_format_rate') == 48000 &&
+        value(reader, 'checked', 'input_hardware_format_channels') == 1 &&
+        [9, 41].include?(value(reader, 'checked', 'input_hardware_format_flags')) &&
+        value(reader, 'checked', 'input_format_after_prepare') == 1 &&
+        value(reader, 'begin', 'input_engine_start') == 0 &&
+        value(owner, 'ready', 'production_forwarding') == 1 &&
+        [owner, reader].all? { |events| %w[own_output_observed peer_output_observed].all? { |stage| [0, 1].include?(value(events, 'measurement', stage)) } }
+      ordered = [[owner, 'end', 'tap_start'], [owner, 'begin', 'writer_start'],
+                 [owner, 'end', 'writer_start'], [owner, 'ready', 'production_forwarding'],
+                 [reader, 'begin', 'input_start']].map do |events, event, stage|
+        matches = events.select { |e| e['event'] == event && e['stage'] == stage }
+        matches.length == 1 ? matches.first['monotonicNS'] : nil
+      end
+      return 'invalid' unless ordered.all? { |time| time.is_a?(Integer) && time > 0 } &&
+        ordered.each_cons(2).all? { |before, after| before < after }
+    end
     status = value(reader, 'end', 'input_start')
     return 'invalid' if status.nil?
+    if arm[:production_aligned]
+      return 'invalid' unless value(reader, 'end', 'input_engine_start') == status &&
+        arm[:reader_exit_status] == (status == 0 ? 0 : 1) &&
+        (status == 0 ? value(reader, 'checked', 'input_error_domain') == 0 : [1, 2, 3, 4].include?(value(reader, 'checked', 'input_error_domain')))
+      return 'invalid' if status == 0 && (value(reader, 'checked', 'input_only_after_start') != 1 ||
+        value(reader, 'checked', 'input_format_after_start') != 1)
+    end
+    return 'invalid' if arm[:tap_retirement_requested] && status != 0
     return 'input_start_error' unless status == 0
     return 'invalid' unless value(reader, 'checked', 'input_uid_after_start') == 1 && value(reader, 'measurement', 'input_callback_error') == 0
     callbacks = value(reader, 'measurement', 'input_callbacks')
     frames = value(reader, 'measurement', 'input_frames')
     advancing = value(reader, 'measurement', 'input_advancing_timestamps')
     return 'invalid' if [callbacks, frames, advancing].any?(&:nil?)
-    callbacks >= 2 && frames > 0 && advancing > 0 ? 'input_callbacks_progressed' : 'input_did_not_progress'
+    progressed = callbacks >= 2 && frames > 0 && advancing > 0
+    if arm[:tap_retirement_requested]
+      return 'invalid' unless arm[:production_aligned] && progressed &&
+        value(owner, 'begin', 'tap_retirement') == 0 && value(owner, 'end', 'tap_retirement') == 0 &&
+        value(owner, 'teardown', 'tap_only') == 1 && value(owner, 'measurement', 'tap_callbacks') == 0 &&
+        %w[writer_uid_before_tap_retirement writer_uid_after_tap_retirement writer_format_before_tap_retirement
+           writer_format_after_tap_retirement writer_continued_during_tap_retirement].all? { |stage| value(owner, 'checked', stage) == 1 }
+      before = value(owner, 'measurement', 'writer_callbacks_before_tap_retirement')
+      after = value(owner, 'measurement', 'writer_callbacks_after_tap_retirement')
+      return 'invalid' unless before.is_a?(Integer) && before > 0 && after.is_a?(Integer) && after >= before + 2
+      started = reader.find { |e| e['event'] == 'begin' && e['stage'] == 'input_engine_start' }['monotonicNS']
+      returned = reader.find { |e| e['event'] == 'end' && e['stage'] == 'input_engine_start' }['monotonicNS']
+      retired = owner.find { |e| e['event'] == 'begin' && e['stage'] == 'tap_retirement' }['monotonicNS']
+      return 'invalid' unless retired - started >= 15_000_000_000 && returned >= retired && returned - retired <= 5_000_000_000
+      return 'input_pending_until_tap_retirement'
+    end
+    progressed ? 'input_callbacks_progressed' : 'input_did_not_progress'
+  end
+  def self.early_stop_reason(arms)
+    return nil unless arms.any? { |arm| arm[:production_aligned] }
+    return 'invalid_or_incomplete' unless arms.all? { |arm| arm[:production_aligned] && input_outcome(arm) != 'invalid' }
+    return 'non_cold_playback_observed_inconclusive' if arms.any? { |arm| arm[:events].any? { |e| e['stage'] == 'foreign_output_observed' && e['value'] == 1 } }
+    return 'reader_output_observed_inconclusive' if arms.any? do |arm|
+      arm[:events].any? { |e| e['event'] == 'measurement' && e['value'] == 1 &&
+        ((e['pid'] == arm[:reader_pid] && e['stage'] == 'own_output_observed') ||
+         (e['pid'] == arm[:owner_pid] && e['stage'] == 'peer_output_observed')) }
+    end
+    if arms.length == 1 && arms.first[:auto_start] == 1 && input_outcome(arms.first) == 'input_callbacks_progressed'
+      return 'baseline_did_not_reproduce_input_failure'
+    end
+    nil
   end
   def self.verdict(arms)
+    early = early_stop_reason(arms)
+    return early if early
     return 'invalid_or_incomplete' unless arms.length == 4 && arms.map { |a| a[:auto_start] } == [1, 0, 0, 1]
     outcomes = arms.map { |a| input_outcome(a) }
     return 'invalid_or_incomplete' if outcomes.include?('invalid')
@@ -94,6 +172,7 @@ module TapStartupAB
         'host-start-seconds' => @options.fetch(:host_start_seconds), 'host-start-microseconds' => @options.fetch(:host_start_microseconds),
         'host-sha256' => @options.fetch(:host_sha256), 'audio-capture-permission-confirmed' => 'already-authorized'
       }
+      args['production-aligned'] = 1 if @options[:production_aligned]
       child_input, input = IO.pipe
       output, child_output = IO.pipe
       error, child_error = IO.pipe
@@ -196,7 +275,7 @@ module TapStartupAB
       run_id = SecureRandom.uuid.upcase
       raise Invalid, 'passive idle preflight failed' unless passive_check(run_id)
       children = []
-      result = {auto_start: auto_start, run_id: run_id, events: [], passive_after: false, clean_exit: false, killed: false}
+      result = {auto_start: auto_start, production_aligned: !!@options[:production_aligned], run_id: run_id, events: [], passive_after: false, clean_exit: false, killed: false}
       begin
         reader = spawn_worker('reader', run_id, auto_start)
         children << reader
@@ -204,10 +283,31 @@ module TapStartupAB
         owner = spawn_worker('owner', run_id, auto_start, reader[:pid])
         children << owner
         result[:reader_pid], result[:owner_pid] = reader[:pid], owner[:pid]
-        wait_for(children, now + 8) { TapStartupAB.value(owner[:events], 'begin', 'tap_start') == auto_start }
-        # Reader starts in a distinct process while the tap owner's native start may block.
+        if @options[:production_aligned]
+          wait_for(children, now + 8) { TapStartupAB.value(owner[:events], 'ready', 'production_forwarding') == 1 }
+        else
+          wait_for(children, now + 8) { TapStartupAB.value(owner[:events], 'begin', 'tap_start') == auto_start }
+        end
+        # Aligned mode waits for the tap and writer; legacy mode deliberately races tap start.
         reader[:input].puts("start #{owner[:pid]}"); reader[:input].flush
-        wait_for(children, now + 20) { TapStartupAB.value(reader[:events], 'ready', 'reader_teardown') == 0 }
+        begin
+          wait_for(children, now + (@options[:production_aligned] ? 18 : 20)) { TapStartupAB.value(reader[:events], 'ready', 'reader_teardown') == 0 }
+        rescue Invalid => error
+          # A prospectively bounded tap-only intervention is not a timeout bypass:
+          # setup must already be proven, both workers alive, and native input start
+          # still pending. Every cleanup, callback and unchanged-writer proof follows.
+          raise unless @options[:production_aligned] && error.message == 'native stage deadline exceeded' &&
+            children.all? { |child| child[:waiter].alive? } &&
+            TapStartupAB.value(reader[:events], 'end', 'input_setup') == 0 &&
+            TapStartupAB.value(reader[:events], 'begin', 'input_engine_start') == 0 &&
+            !reader[:events].any? { |event| event['event'] == 'end' && event['stage'] == 'input_engine_start' }
+          result[:tap_retirement_requested] = true
+          owner[:input].puts('retire-tap'); owner[:input].flush
+          wait_for(children, now + 8) do
+            TapStartupAB.value(owner[:events], 'teardown', 'tap_only') == 1 &&
+              TapStartupAB.value(reader[:events], 'ready', 'reader_teardown') == 0
+          end
+        end
       rescue Invalid => error
         result[:failure] = error.message
       ensure
@@ -216,6 +316,8 @@ module TapStartupAB
         result[:stderr_bytes] = children.sum { |c| c[:stderr_bytes] }
         result[:killed] = children.any? { |c| c[:killed] }
         result[:clean_exit] = children.length == 2 && children.all? { |c| !c[:waiter].alive? && c[:waiter].value.exited? }
+        result[:owner_exit_status] = owner[:waiter].value.exitstatus if owner && !owner[:waiter].alive?
+        result[:reader_exit_status] = reader[:waiter].value.exitstatus if reader && !reader[:waiter].alive?
       end
       # Private taps are invisible to other processes. A killed owner cannot furnish
       # destruction acknowledgements, so NEVER start another arm after a killed worker.
@@ -230,6 +332,7 @@ module TapStartupAB
         [1, 0, 0, 1].each do |auto_start|
           arms << arm(auto_start)
           break if arms.last[:outcome] == 'invalid' || arms.last[:failure]
+          break if TapStartupAB.early_stop_reason(arms)
         end
       rescue Invalid => error
         failure = error.message
@@ -237,7 +340,7 @@ module TapStartupAB
       {schema: 1, verdict: TapStartupAB.verdict(arms), arms: arms, passive_checks: @passive_checks, failure: failure,
        limitations: ['Private foreign taps cannot be enumerated; observed public exclusivity is not absolute exclusivity.',
                      '100 ms monitoring can miss transient foreign activity.',
-                     'Audio Queue is a native reader, not the Codex dictation service.',
+                     (@options[:production_aligned] ? 'AVAudioEngine is a native reader, not the Codex dictation service; explicit device binding differs from default discovery.' : 'Audio Queue is a native reader, not the Codex dictation service.'),
                      'Only silent writer PCM is generated. No PCM bytes are read, retained, or logged; acoustic correctness is untested.']}
     ensure
       stop(@children.select { |c| c[:waiter].alive? }) unless @children.empty?
@@ -250,6 +353,7 @@ module TapStartupAB
       p.banner = 'Explicit opt-in native A/B probe; read Probes/TapStartupProbe.md before running.'
       p.on('--live-opt-in') { options[:live] = true }
       p.on('--audio-capture-permission-confirmed') { options[:audio_capture_permission_confirmed] = true }
+      p.on('--production-aligned') { options[:production_aligned] = true }
       %w[native native-sha256 driver-sha256 driver-instance clock-uid input-uid output-uid system-output-uid report].each do |key|
         p.on("--#{key} VALUE") { |v| options[key.tr('-', '_').to_sym] = v }
       end
