@@ -16,6 +16,7 @@ lifecycle, MediaPlayer setup, reconnect, or audio diagnostics. Keep
 | Fresh admission | Require current peer/transport, granted permission, allowed call state, exact built-in input, raw RemoteIO processing, and the exact approved native recording generation. A prior connection's policy, capability, statistics or receipt is never fresh proof. | `testSuspendedRawMicrophoneStatisticsReadCannotRepublishAcrossEveryRevocationBoundary`; `testMicrophoneApprovalRejectsZeroWrongStaleRevokedAndRetiredGenerations` |
 | User intent and reconnect | Manual off and denied permission must not loop back on during the same session. A genuinely new authenticated session gets its own admission lifetime. Replacement waits for exact prior-peer teardown. | `testManualMicrophoneOffCancelsPendingAutomaticAttemptAndPersistsAcrossRecovery`; `testNewAuthenticatedSessionMayRetryAutomaticMicrophoneAfterDenial`; `testReplacementConnectionWaitsForRetiredPeerCloseBeforeAudioActivation` |
 | Failure evidence | Retain the first concrete rejection, requested/actual policy and pre-rollback route evidence. Diagnostics explain failures; they never grant authority or turn failed capture into success. | `testCategoryObservationFailureDetailPrecedesGenericFailureAndIgnoresRetiredReceipts`; `IOSAudioDiagnosticsJournalTests` |
+| Mac process-tap startup | Keep `kAudioAggregateDeviceTapAutoStartKey` false on every fresh aggregate. Nonzero waits for tapped playback and can stall a fresh microphone reader on a silent Mac. Preserve the real output clock, private/unmuted tap, exclusions and exact native teardown. Never work around this with synthetic playback or a Voice Memos launch. | `testEveryFreshAggregateStartsWithoutWaitingForTappedPlayback`; production-aligned `TapStartupProbe` comparison with tap-only retirement and clean reader/writer teardown |
 
 The native boundaries are in `shared/Sources/IOSWebRTCAudioDeviceShim/IOSWebRTCAudioDeviceShim.m`.
 The Swift stop/ownership ordering is in `WebRTCPeer.performIPhoneMicrophoneOutputOnlyDisable`.
@@ -68,6 +69,12 @@ strict-default-only matching, allow an unsupported policy, remove the actual Pen
 cursor update, or restore the unowned stop-time rebuild. Each targeted oracle must fail
 for its intended defect. Restore the exact source and rerun affected suites before
 committing. Never install or upload a deliberately broken variant.
+
+For Mac tap startup, mutate only the production aggregate's auto-start value back to
+true and require the aggregate configuration test to fail. The native comparison is
+opt-in and needs an approved idle boundary; follow
+`macOS/VirtualAudioDriver/Probes/TapStartupProbe.md`. A matched native startup result
+does not prove Codex transcription or real paired-phone reconnect behavior.
 
 ## Physical coverage: keep the claims separate
 

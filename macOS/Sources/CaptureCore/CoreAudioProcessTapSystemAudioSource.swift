@@ -3,6 +3,36 @@ import CoreAudio
 import CoreMedia
 import Foundation
 
+@available(macOS 14.2, *)
+enum CoreAudioProcessTapAggregateConfiguration {
+    // Nonzero means "wait for tapped playback", not "start capturing now". A dormant
+    // tap can block a fresh AVAudioEngine microphone reader; keep the real output clock
+    // running independently. See the production-aligned TapStartupProbe regression.
+    static let tapAutoStartRequested = false
+
+    static func description(
+        aggregateUID: String,
+        tapUID: String,
+        clockDeviceUID: String
+    ) -> [String: Any] {
+        [
+            kAudioAggregateDeviceNameKey: "Beluga System Audio Tap",
+            kAudioAggregateDeviceUIDKey: aggregateUID,
+            kAudioAggregateDeviceMainSubDeviceKey: clockDeviceUID,
+            kAudioAggregateDeviceSubDeviceListKey: [[
+                kAudioSubDeviceUIDKey: clockDeviceUID,
+            ]],
+            kAudioAggregateDeviceTapListKey: [[
+                kAudioSubTapUIDKey: tapUID,
+                kAudioSubTapDriftCompensationKey: true,
+            ]],
+            kAudioAggregateDeviceTapAutoStartKey: tapAutoStartRequested,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceIsPrivateKey: true,
+        ]
+    }
+}
+
 /// One atomic observation of a Core Audio process object. Optional running values preserve
 /// property-read failure as unknown instead of accidentally treating it as activity.
 struct CoreAudioFaceTimeProcessActivitySnapshot: Equatable, Sendable {
@@ -1238,9 +1268,8 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             throw CoreAudioProcessTapError.alreadyRunning
         }
 
-        let tapAutoStartRequested = true
         let diagnostics = CoreAudioProcessTapStartupDiagnostics(
-            tapAutoStartRequested: tapAutoStartRequested
+            tapAutoStartRequested: CoreAudioProcessTapAggregateConfiguration.tapAutoStartRequested
         )
         var createdTapID = AudioObjectID(kAudioObjectUnknown)
         var createdAggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
@@ -1279,21 +1308,11 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             let clockDevice = try Self.aggregateClockDevice()
             let aggregateUID =
                 "com.elamin.opensteamer.SystemAudioTap.\(UUID().uuidString)"
-            let aggregateDescription: [String: Any] = [
-                kAudioAggregateDeviceNameKey: "Beluga System Audio Tap",
-                kAudioAggregateDeviceUIDKey: aggregateUID,
-                kAudioAggregateDeviceMainSubDeviceKey: clockDevice.uid,
-                kAudioAggregateDeviceSubDeviceListKey: [[
-                    kAudioSubDeviceUIDKey: clockDevice.uid,
-                ]],
-                kAudioAggregateDeviceTapListKey: [[
-                    kAudioSubTapUIDKey: tapUID,
-                    kAudioSubTapDriftCompensationKey: true,
-                ]],
-                kAudioAggregateDeviceTapAutoStartKey: tapAutoStartRequested,
-                kAudioAggregateDeviceIsStackedKey: false,
-                kAudioAggregateDeviceIsPrivateKey: true,
-            ]
+            let aggregateDescription = CoreAudioProcessTapAggregateConfiguration.description(
+                aggregateUID: aggregateUID,
+                tapUID: tapUID,
+                clockDeviceUID: clockDevice.uid
+            )
             recordStartupEvent(
                 "aggregate-create-begin", diagnostics: diagnostics,
                 detail: "clockDeviceID=\(clockDevice.deviceID) "
