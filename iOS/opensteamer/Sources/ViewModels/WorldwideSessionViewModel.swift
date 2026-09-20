@@ -2279,7 +2279,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                   diagnostics.categoryOptionsAreIPhoneMicrophoneRouting,
                   !diagnostics.categoryOptionsAreEmpty,
                   !diagnostics.categoryOptionsAreMixWithOthers,
-                  diagnostics.captureRouteIsBuiltInMicrophone,
+                  diagnostics.captureRouteIsSupportedMicrophone,
                   diagnostics.captureRouteProofGeneration > 0,
                   microphoneAuthorization?.isValid == true else {
                 return false
@@ -7762,7 +7762,7 @@ final class WorldwideSessionViewModel: ObservableObject {
                 == exactStatistics.sender
                     .approvedRecordingGeneration,
               exactStatistics.sender
-                .captureRouteIsBuiltInMicrophone,
+                .captureRouteIsSupportedMicrophone,
               exactStatistics.sender
                 .captureRouteProofGeneration > 0 else {
             rawMicrophoneContinuityTracker.reset()

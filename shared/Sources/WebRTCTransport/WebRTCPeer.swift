@@ -744,7 +744,7 @@ enum WebRTCIPhoneMicrophoneSenderStatisticsSampler {
               diagnostics.modeIsDefault,
               diagnostics.usesRemoteIO,
               diagnostics.inputBusEnabled,
-              diagnostics.captureRouteIsBuiltInMicrophone,
+              diagnostics.captureRouteIsSupportedMicrophone,
               diagnostics.outputBusEnabled,
               !diagnostics.categoryOptionsAreEmpty,
               diagnostics.categoryOptionsAreIPhoneMicrophoneRouting,
@@ -836,6 +836,10 @@ enum WebRTCIPhoneMicrophoneSenderStatisticsSampler {
                 == diagnostics.approvedRecordingGeneration,
               previous.sender.captureRouteProofGeneration
                 == diagnostics.captureRouteProofGeneration,
+              previous.sender.captureRouteIsBuiltInMicrophone
+                == diagnostics.captureRouteIsBuiltInMicrophone,
+              previous.sender.captureRouteIsWiredMicrophone
+                == diagnostics.captureRouteIsWiredMicrophone,
               previous.collectedAt <= collectedAt,
               diagnostics.realtimeAdmissionCount
                 >= previous.sender.realtimeAdmissionCount,
@@ -2556,6 +2560,7 @@ public struct WebRTCIOSPlayoutRecoveryTestDiagnostics: Equatable, Sendable {
     public let remoteIOCreated: Bool
     public let inputBusEnabled: Bool
     public let captureRouteIsBuiltInMicrophone: Bool
+    public var captureRouteIsWiredMicrophone: Bool = false
     public let captureRouteProofGeneration: UInt64
     public let outputBusEnabled: Bool
     public let recoveryRequired: Bool
@@ -2871,6 +2876,8 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
             inputBusEnabled: value.inputBusEnabled,
             captureRouteIsBuiltInMicrophone:
                 value.captureRouteIsBuiltInMicrophone,
+            captureRouteIsWiredMicrophone:
+                value.captureRouteIsWiredMicrophone,
             captureRouteProofGeneration:
                 value.captureRouteProofGeneration,
             outputBusEnabled: value.outputBusEnabled,
@@ -3268,6 +3275,14 @@ public final class WebRTCIOSPlayoutRecoveryTestHarness: @unchecked Sendable {
         )
     }
 
+    public func debugSetCaptureRouteWiredMicrophoneForTesting(_ isWired: Bool) {
+        native.debugSetCaptureRouteWiredMicrophone(forTesting: isWired)
+    }
+
+    public func debugWiredMicrophoneRoutePolicyForTesting() -> [String: NSNumber] {
+        native.debugWiredMicrophoneRoutePolicyForTesting()
+    }
+
     public func debugFailNextHostedCallActivationForTesting() {
         native.debugFailNextHostedCallActivationForTesting()
     }
@@ -3302,6 +3317,14 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
     public let remoteIOCreated: Bool
     public let inputBusEnabled: Bool
     public let captureRouteIsBuiltInMicrophone: Bool
+    public let captureRouteIsWiredMicrophone: Bool
+    public var captureRouteIsSupportedMicrophone: Bool {
+        WebRTCIOSRawMicrophoneRoutePolicy.matches(
+            builtIn: captureRouteIsBuiltInMicrophone,
+            wired: captureRouteIsWiredMicrophone,
+            proofGeneration: captureRouteProofGeneration
+        )
+    }
     public let captureRouteProofGeneration: UInt64
     public let outputBusEnabled: Bool
     public let recoveryRequired: Bool
@@ -3367,6 +3390,7 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
         remoteIOCreated: Bool,
         inputBusEnabled: Bool,
         captureRouteIsBuiltInMicrophone: Bool = false,
+        captureRouteIsWiredMicrophone: Bool = false,
         captureRouteProofGeneration: UInt64 = 0,
         outputBusEnabled: Bool,
         recoveryRequired: Bool,
@@ -3434,6 +3458,7 @@ public struct WebRTCIOSPlayoutDiagnostics: Sendable {
         self.inputBusEnabled = inputBusEnabled
         self.captureRouteIsBuiltInMicrophone =
             captureRouteIsBuiltInMicrophone
+        self.captureRouteIsWiredMicrophone = captureRouteIsWiredMicrophone
         self.captureRouteProofGeneration =
             captureRouteProofGeneration
         self.outputBusEnabled = outputBusEnabled
@@ -7743,6 +7768,8 @@ public actor WebRTCPeer {
             inputBusEnabled: value.inputBusEnabled,
             captureRouteIsBuiltInMicrophone:
                 value.captureRouteIsBuiltInMicrophone,
+            captureRouteIsWiredMicrophone:
+                value.captureRouteIsWiredMicrophone,
             captureRouteProofGeneration:
                 value.captureRouteProofGeneration,
             outputBusEnabled: value.outputBusEnabled,
@@ -9048,7 +9075,11 @@ public actor WebRTCPeer {
             && native.categoryIsMediaPlayAndRecord
             && native.modeIsDefault
             && native.inputBusEnabled
-            && native.captureRouteIsBuiltInMicrophone
+            && WebRTCIOSRawMicrophoneRoutePolicy.matches(
+                builtIn: native.captureRouteIsBuiltInMicrophone,
+                wired: native.captureRouteIsWiredMicrophone,
+                proofGeneration: native.captureRouteProofGeneration
+            )
             && native.captureRouteProofGeneration > 0
             && native.outputBusEnabled
             && !native.categoryOptionsAreEmpty
@@ -9100,6 +9131,8 @@ public actor WebRTCPeer {
             inputBusEnabled: native.inputBusEnabled,
             captureRouteIsBuiltInMicrophone:
                 native.captureRouteIsBuiltInMicrophone,
+            captureRouteIsWiredMicrophone:
+                native.captureRouteIsWiredMicrophone,
             captureRouteProofGeneration:
                 native.captureRouteProofGeneration,
             outputBusEnabled: native.outputBusEnabled,

@@ -213,6 +213,8 @@ typedef struct ASIOSStereoPlayoutDiagnostics {
     bool inputBusEnabled;
     /// Privacy-minimal live capture-source proof; no port name or UID leaves native code.
     bool captureRouteIsBuiltInMicrophone;
+    /// Exact selected HeadsetMic/Headphones or USB/USB proof, mutually exclusive with built-in.
+    bool captureRouteIsWiredMicrophone;
     /// Nonzero exact native route-publication epoch; never a route name or identifier.
     uint64_t captureRouteProofGeneration;
     bool outputBusEnabled;
@@ -846,6 +848,9 @@ typedef NS_ENUM(NSInteger, ASIOSPlayoutRetryFailureTestScenario) {
 - (void)debugAdvanceSystemAudioGenerationForTesting;
 - (void)debugSetOutputRouteAvailableForTesting:(BOOL)available;
 - (void)debugSetCaptureRouteBuiltInMicrophoneForTesting:(BOOL)isBuiltIn;
+- (void)debugSetCaptureRouteWiredMicrophoneForTesting:(BOOL)isWired;
+/// Pure synthetic routes plus the production native transaction boundaries; never opens I/O.
+- (NSDictionary<NSString *, NSNumber *> *)debugWiredMicrophoneRoutePolicyForTesting;
 - (void)debugFailNextHostedCallActivationForTesting;
 - (BOOL)runNextQueuedOperation;
 

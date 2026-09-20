@@ -228,7 +228,10 @@ private func admittedIPhoneMicrophoneSenderDiagnostics(
     rawProcessingIsLive: Bool = true,
     transceiverIsStopped: Bool = false,
     preferredDirectionIncludesSending: Bool = true,
-    currentDirectionIncludesSending: Bool = true
+    currentDirectionIncludesSending: Bool = true,
+    captureRouteIsBuiltInMicrophone: Bool = true,
+    captureRouteIsWiredMicrophone: Bool = false,
+    captureRouteProofGeneration: UInt64 = 13
 ) -> WebRTCIPhoneMicrophoneSenderDiagnostics {
     WebRTCIPhoneMicrophoneSenderDiagnostics(
         peerEpoch: peerEpoch,
@@ -263,8 +266,9 @@ private func admittedIPhoneMicrophoneSenderDiagnostics(
         modeIsDefault: true,
         usesRemoteIO: true,
         inputBusEnabled: true,
-        captureRouteIsBuiltInMicrophone: true,
-        captureRouteProofGeneration: 13,
+        captureRouteIsBuiltInMicrophone: captureRouteIsBuiltInMicrophone,
+        captureRouteIsWiredMicrophone: captureRouteIsWiredMicrophone,
+        captureRouteProofGeneration: captureRouteProofGeneration,
         outputBusEnabled: true,
         categoryOptionsAreEmpty: false,
         categoryOptionsAreIPhoneMicrophoneRouting: true,
@@ -389,6 +393,58 @@ private func makeScreenClientDiagnosticsHeartbeat(
 }
 
 final class WebRTCPeerLoopbackTests: XCTestCase {
+    func testWiredMicrophoneSenderRequiresExclusiveCurrentRouteProof() {
+        let identity = SenderStatisticsIdentity()
+        let now = Date()
+        let validation = senderStatisticsValidation(authorizationIdentity: ObjectIdentifier(identity))
+        for builtIn in [false, true] {
+            for wired in [false, true] {
+                for proof in [UInt64(0), 13, 14] {
+                    for healthy in [false, true] {
+                        let diagnostics = admittedIPhoneMicrophoneSenderDiagnostics(
+                            transportIsHealthy: healthy,
+                            captureRouteIsBuiltInMicrophone: builtIn,
+                            captureRouteIsWiredMicrophone: wired,
+                            captureRouteProofGeneration: proof
+                        )
+                        let sampled = sampleIPhoneMicrophoneSenderStatistics(
+                            parsed: senderOutboundStatistics(reportDate: now),
+                            captured: validation, current: validation,
+                            diagnostics: diagnostics, callbackCompletedAt: now, currentTime: now
+                        )
+                        XCTAssertEqual(sampled != nil, builtIn != wired && proof == 13 && healthy,
+                                       "builtIn=\(builtIn) wired=\(wired) proof=\(proof) healthy=\(healthy)")
+                        if let sampled {
+                            XCTAssertEqual(sampled.baseline.statistics.sender.captureRouteIsBuiltInMicrophone, builtIn)
+                            XCTAssertEqual(sampled.baseline.statistics.sender.captureRouteIsWiredMicrophone, wired)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testWiredMicrophoneRouteCannotBorrowBuiltInProofGeneration() throws {
+        let identity = SenderStatisticsIdentity()
+        let now = Date()
+        let validation = senderStatisticsValidation(authorizationIdentity: ObjectIdentifier(identity))
+        let original = try XCTUnwrap(sampleIPhoneMicrophoneSenderStatistics(
+            parsed: senderOutboundStatistics(reportDate: now), captured: validation,
+            current: validation, diagnostics: admittedIPhoneMicrophoneSenderDiagnostics(),
+            callbackCompletedAt: now, currentTime: now
+        ))
+        let later = now.addingTimeInterval(1)
+        for wired in [false, true] {
+            let sampled = sampleIPhoneMicrophoneSenderStatistics(
+                parsed: senderOutboundStatistics(reportDate: later, packetsSent: 100, bytesSent: 16_000),
+                captured: validation, current: validation,
+                diagnostics: admittedIPhoneMicrophoneSenderDiagnostics(
+                    captureRouteIsBuiltInMicrophone: !wired, captureRouteIsWiredMicrophone: wired
+                ), callbackCompletedAt: later, currentTime: later, previousBaseline: original.baseline
+            )
+            XCTAssertEqual(sampled != nil, !wired, "A different route needs a fresh native proof generation.")
+        }
+    }
     func testVideoControlOnlyHostBuildsNoAudioTopologyOrSDPSection() async throws {
         let host = try WebRTCPeer(
             configuration: WebRTCTransportConfiguration(

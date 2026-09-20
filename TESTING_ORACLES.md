@@ -144,6 +144,22 @@ authority and stores scalar measurements only. Two fresh launches passed on the 
 iPhone15 with effective long-form sharing. This does not exercise the production view
 model, a Mac consumer, worldwide traversal, actual remote-command delivery or TestFlight.
 
+## Wired iPhone audio boundary
+
+Exercise the production native input selector and route-transaction matcher for
+HeadsetMic/Headphones and USBAudio/USBAudio, built-in with speakers/A2DP/headphones
+without input, absent/ambiguous inputs, wrong output, and unknown/HFP ports. Require
+exact type and UID through convergence and capture publication, exclusive factual
+built-in/wired bits and a fresh proof generation. Replacing a type while reusing a
+UID must fail; an input appearing in the inventory is not a selected-route proof.
+Independently restore built-in-only admission and remove type/UID fencing and require
+the respective behavioral assertions to fail. Swift sender statistics and lifecycle
+proof must accept wired only with unchanged privacy, transport, raw processing and
+generation guards. Rust's category/sharing target contract is unchanged by port kind.
+Do not modify v1 wire keys without negotiation with deployed hosts. A Simulator pass
+does not prove adapter capabilities or acoustic output: require the matching iPhone
+artifact with a real headset for cold connect, mic on/off, unplug/replug and reconnect.
+
 ## Native media controls release boundary
 
 Thumbnail decoration must remain independent of command delivery. Cover legacy/malformed
@@ -269,6 +285,35 @@ deployed host and iPhone build, a disposable real window, before/after bounds an
 and uninterrupted typing.
 
 ## Screen startup quality boundary
+
+Use the fail-closed contributor gate and invariant-to-test map in
+`SCREEN_STARTUP_REGRESSION_GUARDRAILS.md`. A selected-but-skipped native fixture is not
+evidence. Preserve assertion-failing negative mutations when changing these boundaries.
+
+Cold Show spatial-first startup must keep the existing video/peer-wide ceilings and start at
+most 5 fps while preserving full pixels through healthy intermediate promotions. Qualified
+intermediate tiers may increase FPS within their ordinary approximate pixel-rate budget
+(13 fps balanced, 28 fps high with a 60-fps source), never above configured source FPS.
+Exercise stable 3/6/9 Mbps paths, unchanged caps, and missing/negative evidence after promotion. Only
+fresh affirmative congestion or lifecycle replacement retires the exact-Show mode;
+cached/missing reports and probe expiry must not manufacture a clear-to-blurry transition.
+Keep the original native snapshot separate from cached diagnostic route enrichment. An absent
+selected pair must not turn optional delegate-versus-native candidate metadata into a route
+replacement. Copies must preserve native evidence and identity; the service must consume it.
+A whole-pair telemetry gap may hold an already accepted discovery budget only under the
+same Show/probe deadline. A later fresh fast ping must await ordinary requalification,
+without renewing primary RTT/queue leases or increasing any cap. Preserve sender counters
+only for queue deltas, not capacity. Malformed/partial data cannot acquire the gap marker;
+real route/BWE/queue negatives and both the primary lease and absolute deadline still win.
+For native delayed-network coverage, keep impairment per-fixture: require initial blackout
+to prevent connection and post-start blackout to stop decoded frames after drain. A passing
+healthy case must retain decoded fine detail and advance decoded FPS, not only set a parameter.
+Retain only terminal same-Show disproof after a rejected native apply, never positive
+geometry/FPS permission or successor ownership. Exercise real decoded fine-detail pixels
+in fresh-process opt-in native loopbacks, including the actual adaptation reducer. Static
+sender profiles alone do not prove that the live reducer preserves startup clarity.
+The fixed-5-fps loopback does not prove full-FPS load, Internet congestion, or iPhone
+presentation timing; these remain separate deployment/physical evidence boundaries.
 
 Replay promotion-cap contraction and the recorded adverse queue, RTT, and bandwidth
 samples independently. A temporary promotion ceiling must use fresh measured capacity,

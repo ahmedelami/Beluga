@@ -13,9 +13,10 @@ lifecycle, MediaPlayer setup, reconnect, or audio diagnostics. Keep
 | Framework `stopRecording` | Revoke authorization, drain capture and clear recording generations immediately. Do **not** rebuild the audio session or consume an app operation here. Retain the truthful configured input-bus state until the exact authorized output-only operation disposes/rebuilds it. A bare restart must not reopen input. | `testFrameworkMicrophoneStopClosesCaptureWithoutStealingOutputOnlyTransaction` |
 | Public mic-off / transport loss | Revoke and mute before waiting for the policy owner or entering a native setter that can block/fail. Only the exact output-only token may write the replacement policy. No fallback write, reused token or late completion may affect a successor. | `testTransportUncertaintyClosesMicrophonePrivacyBeforeOutputOnlyOwnerReturns`; `testPublicOutputOnlyDisableClosesMicrophonePrivacyBeforeNativeAttemptForSuccessAndFailure` |
 | Pending route convergence | A category observation can advance only its exact current Pending transaction's chained route cursor, with matching generations, deadline, ownership, profile and pinned output. It is not reason-8 evidence, startup settlement or capture authorization. | `testPendingCategoryRouteCursorRequiresExactChainedTransactionEvidence` |
-| Fresh admission | Require current peer/transport, granted permission, allowed call state, exact built-in input, raw RemoteIO processing, and the exact approved native recording generation. A prior connection's policy, capability, statistics or receipt is never fresh proof. | `testSuspendedRawMicrophoneStatisticsReadCannotRepublishAcrossEveryRevocationBoundary`; `testMicrophoneApprovalRejectsZeroWrongStaleRevokedAndRetiredGenerations` |
+| Fresh admission | Require current peer/transport, granted permission, allowed call state, exact supported input type and UID, raw RemoteIO processing, and the exact approved native recording generation. Preserve an already selected wired headset or USB duplex route; retain built-in input for speaker, A2DP and headphones without a mic. Built-in and wired proof bits are factual, exclusive and generation-bound. A prior connection's policy, capability, statistics or receipt is never fresh proof. | `testSuspendedRawMicrophoneStatisticsReadCannotRepublishAcrossEveryRevocationBoundary`; `testMicrophoneApprovalRejectsZeroWrongStaleRevokedAndRetiredGenerations`; `testWiredMicrophoneSenderRequiresExclusiveCurrentRouteProof`; `testWiredMicrophoneOracleRequiresFreshExclusiveRouteAndPrivacyAuthority` |
 | User intent and reconnect | Manual off and denied permission must not loop back on during the same session. A genuinely new authenticated session gets its own admission lifetime. Replacement waits for exact prior-peer teardown. | `testManualMicrophoneOffCancelsPendingAutomaticAttemptAndPersistsAcrossRecovery`; `testNewAuthenticatedSessionMayRetryAutomaticMicrophoneAfterDenial`; `testReplacementConnectionWaitsForRetiredPeerCloseBeforeAudioActivation` |
 | Failure evidence | Retain the first concrete rejection, requested/actual policy and pre-rollback route evidence. Diagnostics explain failures; they never grant authority or turn failed capture into success. | `testCategoryObservationFailureDetailPrecedesGenericFailureAndIgnoresRetiredReceipts`; `IOSAudioDiagnosticsJournalTests` |
+| Mac process-tap startup | Keep `kAudioAggregateDeviceTapAutoStartKey` false on every fresh aggregate. Nonzero waits for tapped playback and can stall a fresh microphone reader on a silent Mac. Preserve the real output clock, private/unmuted tap, exclusions and exact native teardown. Never work around this with synthetic playback or a Voice Memos launch. | `testEveryFreshAggregateStartsWithoutWaitingForTappedPlayback`; production-aligned `TapStartupProbe` comparison with tap-only retirement and clean reader/writer teardown |
 
 The native boundaries are in `shared/Sources/IOSWebRTCAudioDeviceShim/IOSWebRTCAudioDeviceShim.m`.
 The Swift stop/ownership ordering is in `WebRTCPeer.performIPhoneMicrophoneOutputOnlyDisable`.
@@ -23,6 +24,15 @@ The effective-policy contract must agree with `WebRTCIOSOrdinaryRawMicrophonePol
 `AudioTransactionTarget.acceptsObservedRouteSharingPolicy` and Rust `Target::accepts_observed`.
 Do not update just one layer. Changes to Rust source require its existing source/artifact
 manifest and XCFramework rebuild/verification workflow, not a hand-edited manifest.
+
+Wired admission must preserve the exact current output fingerprint, raw 48 kHz stereo
+playout and mono capture, and type-plus-UID input fencing through convergence, start,
+publication and reopen. Never accept arbitrary external inputs, an unknown port, HFP,
+or stale route proof. Do not weaken interruption or private-route-loss handling.
+The v1 remote diagnostics schema retains its literal built-in flag (false for wired);
+do not relabel wired as built-in or add an unnegotiated key that old hosts reject.
+Local diagnostics carry the separate wired flag. Real headset/adapter capture and
+playback, unplug/replug and reconnect remain physical-device evidence boundaries.
 
 ## Required checks for microphone-affecting code changes
 
@@ -68,6 +78,12 @@ strict-default-only matching, allow an unsupported policy, remove the actual Pen
 cursor update, or restore the unowned stop-time rebuild. Each targeted oracle must fail
 for its intended defect. Restore the exact source and rerun affected suites before
 committing. Never install or upload a deliberately broken variant.
+
+For Mac tap startup, mutate only the production aggregate's auto-start value back to
+true and require the aggregate configuration test to fail. The native comparison is
+opt-in and needs an approved idle boundary; follow
+`macOS/VirtualAudioDriver/Probes/TapStartupProbe.md`. A matched native startup result
+does not prove Codex transcription or real paired-phone reconnect behavior.
 
 ## Physical coverage: keep the claims separate
 

@@ -871,6 +871,7 @@ actor WorldwideScreenService {
         ContinuousClock.Instant?
     private var screenVideoAdaptationFreshnessFence =
         WorldwideScreenVideoAdaptationFreshnessFence()
+    private var screenStartupDiagnostics = WorldwideScreenStartupDiagnostics()
     private var keyFrameControlTask: Task<Void, Never>?
     private var remoteMediaCommandTask: Task<Void, Never>?
     private let remoteMediaTraceSession = UUID()
@@ -2348,10 +2349,21 @@ actor WorldwideScreenService {
 
         case .routeChanged(let route):
             logger.info("Worldwide WebRTC route: \(route.kind.rawValue)")
+            let policyBeforeRouteEvent = screenVideoAdaptationPolicy
             screenVideoAdaptationPolicyRevision &+= 1
             screenVideoAdaptationPolicy.invalidateSelectedRoute()
             screenVideoAdaptationEvidenceLane = nil
             screenVideoAdaptationLastEvidenceTime = nil
+            logger.debug(
+                "Worldwide screen startup boundary event=routeChanged "
+                    + "peerGeneration=\(sourcePeerGeneration) showEpoch=\(screenVisibilityCommandEpoch) "
+                    + "policyRevision=\(screenVideoAdaptationPolicyRevision) pairIdentity=notProvidedByEvent "
+                    + WorldwideScreenStartupDiagnostics.transitionFields(
+                        before: policyBeforeRouteEvent,
+                        after: screenVideoAdaptationPolicy,
+                        incomingRoute: route
+                    )
+            )
 
         case .statistics(
             let snapshot,
@@ -2736,7 +2748,9 @@ actor WorldwideScreenService {
                     + "received=\(report != nil)"
             )
             if let report,
-               case let snapshot = report.snapshot,
+               // The enriched diagnostics route can be cached and differ only in optional
+               // metadata. Only this native report's route may reset adaptation ownership.
+               case let snapshot = report.nativeSnapshot,
                screenVideoAdaptationFreshnessFence.admits(snapshot),
                screenVisibilityCommandEpoch == expectedVisibilityEpoch,
                captureSource === expectedCaptureSource,
@@ -2880,9 +2894,20 @@ actor WorldwideScreenService {
         }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
+        let pairContinuity = screenStartupDiagnostics.observePair(
+            peerGeneration: sourcePeerGeneration,
+            showEpoch: screenVisibilityCommandEpoch,
+            collectionSequence: snapshot?.collectionSequence,
+            nativeTimestamp: nativeReportTimestampMicroseconds,
+            observation: snapshot?.roundTripTimeObservation
+        )
+        // Keep the regular-lane admission evidence during spatial startup as well as at the
+        // recovery floor. In particular, a proposal is not an accepted native geometry change.
         if let floorDiagnostics,
            screenVideoAdaptationPolicy.currentTier == .audioPriority
-            || proposedPolicy.currentTier == .audioPriority {
+            || proposedPolicy.currentTier == .audioPriority
+            || screenVideoAdaptationPolicy.startupSpatialModeIsActive
+            || proposedPolicy.startupSpatialModeIsActive {
             logger.debug(
                 "Worldwide screen floor proposal peerGeneration=\(sourcePeerGeneration) "
                     + "policyRevision=\(expectedPolicyRevision) "
@@ -2901,7 +2926,19 @@ actor WorldwideScreenService {
             observation: snapshot?.roundTripTimeObservation
         )
         logger.debug(
-            "Worldwide screen network totalCapKbps=\(maximumVideoBitrate / 1_000) "
+            "Worldwide screen network peerGeneration=\(sourcePeerGeneration) "
+                + "showEpoch=\(screenVisibilityCommandEpoch) policyRevision=\(expectedPolicyRevision) "
+                + "nativePairContinuity=\(pairContinuity.rawValue) "
+                + "nativeReportMicros="
+                + (WorldwideScreenCapacityProbeDiagnostics.boundedInteger(
+                    nativeReportTimestampMicroseconds
+                ).map(String.init) ?? "unknown")
+                + " " + WorldwideScreenStartupDiagnostics.transitionFields(
+                    before: screenVideoAdaptationPolicy,
+                    after: proposedPolicy,
+                    incomingRoute: snapshot?.route
+                )
+                + " totalCapKbps=\(maximumVideoBitrate / 1_000) "
                 + "fullVideoKbps=\(proposedPolicy.maximumTierVideoBitrateBps / 1_000) "
                 + "tier=\(String(describing: recommendation.tier)) "
                 + "sustainKbps="
@@ -2927,6 +2964,10 @@ actor WorldwideScreenService {
                 } ?? "none")
                 + " probeHealthySamples="
                 + "\(proposedPolicy.applicationLimitedProbeHealthySampleCount)"
+                + " startupSpatial="
+                + (proposedPolicy.startupSpatialModeIsActive ? "active"
+                    : (proposedPolicy.startupSpatialModeIsDisproved
+                        ? "disproved" : "inactive"))
                 + " queuePressureSamples=\(proposedPolicy.queuePressureSampleCount) "
                 + "bweKbps="
                 + (snapshot?.availableOutgoingBitrate.map {
@@ -3054,6 +3095,7 @@ actor WorldwideScreenService {
                 logger.debug(
                     "Worldwide screen capacity nativeApply=accepted "
                         + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision) "
+                        + "showEpoch=\(screenVisibilityCommandEpoch) "
                         + "totalCapBps=\(recommendation.maximumTotalRTPBitrateBps)"
                 )
                 logger.info(
@@ -3091,6 +3133,8 @@ actor WorldwideScreenService {
                 let cancelledFloorRecoveryProbe =
                     screenVideoAdaptationPolicy.floorRecoveryProbeIsActive
                         && proposedPolicy.floorRecoveryProbeWasCancelled
+                screenVideoAdaptationPolicy
+                    .retainStartupSpatialModeTerminalState(from: proposedPolicy)
                 screenVideoAdaptationPolicy.retainFloorRecoveryAttemptConsumption(
                     from: proposedPolicy
                 )

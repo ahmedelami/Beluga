@@ -3,6 +3,36 @@ import CoreAudio
 import CoreMedia
 import Foundation
 
+@available(macOS 14.2, *)
+enum CoreAudioProcessTapAggregateConfiguration {
+    // Nonzero means "wait for tapped playback", not "start capturing now". A dormant
+    // tap can block a fresh AVAudioEngine microphone reader; keep the real output clock
+    // running independently. See the production-aligned TapStartupProbe regression.
+    static let tapAutoStartRequested = false
+
+    static func description(
+        aggregateUID: String,
+        tapUID: String,
+        clockDeviceUID: String
+    ) -> [String: Any] {
+        [
+            kAudioAggregateDeviceNameKey: "Beluga System Audio Tap",
+            kAudioAggregateDeviceUIDKey: aggregateUID,
+            kAudioAggregateDeviceMainSubDeviceKey: clockDeviceUID,
+            kAudioAggregateDeviceSubDeviceListKey: [[
+                kAudioSubDeviceUIDKey: clockDeviceUID,
+            ]],
+            kAudioAggregateDeviceTapListKey: [[
+                kAudioSubTapUIDKey: tapUID,
+                kAudioSubTapDriftCompensationKey: true,
+            ]],
+            kAudioAggregateDeviceTapAutoStartKey: tapAutoStartRequested,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceIsPrivateKey: true,
+        ]
+    }
+}
+
 /// One atomic observation of a Core Audio process object. Optional running values preserve
 /// property-read failure as unknown instead of accidentally treating it as activity.
 struct CoreAudioFaceTimeProcessActivitySnapshot: Equatable, Sendable {
@@ -564,6 +594,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
         var tapID: AudioObjectID
         var aggregateDeviceID: AudioObjectID
         var ioProcID: AudioDeviceIOProcID?
+        var diagnostics: CoreAudioProcessTapStartupDiagnostics? = nil
 
         var policyResources: CoreAudioProcessTapNativeTeardownPolicy.Resources {
             .init(
@@ -582,6 +613,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
     private var tapUUID: UUID?
     private var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
+    private var nativeStartupDiagnostics: CoreAudioProcessTapStartupDiagnostics?
     private var isRunning = false
     /// Exact native identities whose destruction returned an error during failed startup/stop.
     /// Keeping them attached prevents a later start from replacing potentially live callbacks.
@@ -608,6 +640,8 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
     }
 
     private var processListListener: AudioObjectPropertyListenerBlock?
+    private var startupDiagnostics: CoreAudioProcessTapStartupDiagnostics?
+    private var startupDiagnosticsTimer: DispatchSourceTimer?
     private var faceTimeProcessListeners:
         [AudioObjectID: FaceTimeProcessListenerRegistration] = [:]
     private var faceTimeCausalEpochBinder =
@@ -627,6 +661,101 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
         self.logger = logger
         self.faceTimeDuplexActivityHandler =
             faceTimeDuplexActivityHandler
+    }
+
+    // MARK: - Startup diagnostics
+
+    private func beginStartupDiagnostics(
+        _ diagnostics: CoreAudioProcessTapStartupDiagnostics
+    ) {
+        queues.asyncControl { [weak self] in
+            guard let self else { return }
+            startupDiagnosticsTimer?.cancel()
+            startupDiagnostics?.retire()
+            startupDiagnostics = diagnostics
+            let timer = DispatchSource.makeTimerSource(queue: queues.controlQueue)
+            timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+            timer.setEventHandler { [weak self] in
+                self?.sampleStartupProgress(diagnostics)
+            }
+            startupDiagnosticsTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func sampleStartupProgress(
+        _ diagnostics: CoreAudioProcessTapStartupDiagnostics
+    ) {
+        dispatchPrecondition(condition: .onQueue(queues.controlQueue))
+        guard startupDiagnostics === diagnostics,
+              !diagnostics.sampleIsPending else { return }
+        diagnostics.sampleIsPending = true
+        queues.ioCallbackQueue.async { [weak self] in
+            let progress = diagnostics.callbacks.progress
+            self?.queues.asyncControl { [weak self] in
+                guard let self, startupDiagnostics === diagnostics else { return }
+                diagnostics.sampleIsPending = false
+                guard let event = diagnostics.observe(
+                    progress, lifetimeID: diagnostics.lifetimeID
+                ) else { return }
+                let firstCallbackMilliseconds = progress.callbackCount == 0
+                    ? "none"
+                    : String(diagnostics.elapsedMilliseconds(at: progress.firstCallbackHostTime))
+                let latestCallbackMilliseconds = progress.callbackCount == 0
+                    ? "none"
+                    : String(diagnostics.elapsedMilliseconds(at: progress.latestCallbackHostTime))
+                logger.info(
+                    "Core Audio tap startup lifetime=\(diagnostics.lifetimeID) "
+                        + "event=\(event.rawValue) "
+                        + "elapsedMs=\(diagnostics.elapsedMilliseconds(at: AudioGetCurrentHostTime())) "
+                        + "callbacks=\(progress.callbackCount) frames=\(progress.frameCount) "
+                        + "firstCallbackMs=\(firstCallbackMilliseconds) "
+                        + "latestCallbackMs=\(latestCallbackMilliseconds)"
+                )
+                if diagnostics.progressTracker.didObserveAdvancement {
+                    startupDiagnosticsTimer?.cancel()
+                    startupDiagnosticsTimer = nil
+                }
+            }
+        }
+    }
+
+    private func recordStartupEvent(
+        _ event: String,
+        diagnostics: CoreAudioProcessTapStartupDiagnostics,
+        detail: String = "",
+        apiStartStatus: OSStatus? = nil
+    ) {
+        let elapsed = diagnostics.elapsedMilliseconds(at: AudioGetCurrentHostTime())
+        queues.asyncControl { [logger] in
+            if let apiStartStatus {
+                diagnostics.recordAPIStartResult(apiStartStatus)
+            }
+            logger.info(
+                "Core Audio tap startup lifetime=\(diagnostics.lifetimeID) "
+                    + "event=\(event) elapsedMs=\(elapsed) "
+                    + "requestedTapAutoStart=\(diagnostics.tapAutoStartRequested ? 1 : 0) \(detail)"
+            )
+        }
+    }
+
+    private func endStartupDiagnostics(
+        _ diagnostics: CoreAudioProcessTapStartupDiagnostics
+    ) {
+        queues.syncControl {
+            guard startupDiagnostics === diagnostics else { return }
+            startupDiagnosticsTimer?.cancel()
+            startupDiagnosticsTimer = nil
+            startupDiagnostics = nil
+            diagnostics.retire()
+            let apiStartStatus = diagnostics.apiStartStatus.map(String.init) ?? "unavailable"
+            logger.info(
+                "Core Audio tap startup lifetime=\(diagnostics.lifetimeID) event=retired "
+                    + "elapsedMs=\(diagnostics.elapsedMilliseconds(at: AudioGetCurrentHostTime())) "
+                    + "apiStartStatus=\(apiStartStatus) "
+                    + "callbackAdvancementObserved=\(diagnostics.progressTracker.didObserveAdvancement ? 1 : 0)"
+            )
+        }
     }
 
     // MARK: - Mac-hosted FaceTime evidence
@@ -1139,26 +1268,37 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             throw CoreAudioProcessTapError.alreadyRunning
         }
 
-        let excludedBundleIdentifiers =
-            SystemAudioApplicationExclusionPolicy.excludedBundleIdentifiers(
-                currentBundleIdentifier: Bundle.main.bundleIdentifier
-            )
-        let excludedProcessIDs = try Self.processObjectIDs(
-            matchingBundleIdentifiers: Set(excludedBundleIdentifiers)
+        let diagnostics = CoreAudioProcessTapStartupDiagnostics(
+            tapAutoStartRequested: CoreAudioProcessTapAggregateConfiguration.tapAutoStartRequested
         )
-        let createdTapUUID = UUID()
-        let tapDescription = Self.makeTapDescription(
-            uuid: createdTapUUID,
-            excludedProcessIDs: excludedProcessIDs,
-            excludedBundleIdentifiers: excludedBundleIdentifiers
-        )
-
         var createdTapID = AudioObjectID(kAudioObjectUnknown)
         var createdAggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
         var createdIOProcID: AudioDeviceIOProcID?
         do {
+            beginStartupDiagnostics(diagnostics)
+            recordStartupEvent("source-start-begin", diagnostics: diagnostics)
+            let excludedBundleIdentifiers =
+                SystemAudioApplicationExclusionPolicy.excludedBundleIdentifiers(
+                    currentBundleIdentifier: Bundle.main.bundleIdentifier
+                )
+            let excludedProcessIDs = try Self.processObjectIDs(
+                matchingBundleIdentifiers: Set(excludedBundleIdentifiers)
+            )
+            let createdTapUUID = UUID()
+            let tapDescription = Self.makeTapDescription(
+                uuid: createdTapUUID,
+                excludedProcessIDs: excludedProcessIDs,
+                excludedBundleIdentifiers: excludedBundleIdentifiers
+            )
+
+            recordStartupEvent("tap-create-begin", diagnostics: diagnostics)
+            let createTapStatus = AudioHardwareCreateProcessTap(tapDescription, &createdTapID)
+            recordStartupEvent(
+                "tap-create-end", diagnostics: diagnostics,
+                detail: "status=\(createTapStatus) tapID=\(createdTapID)"
+            )
             try Self.requireNoError(
-                AudioHardwareCreateProcessTap(tapDescription, &createdTapID),
+                createTapStatus,
                 operation: "create Core Audio process tap"
             )
             let tapUID = try Self.stringProperty(
@@ -1168,26 +1308,26 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             let clockDevice = try Self.aggregateClockDevice()
             let aggregateUID =
                 "com.elamin.opensteamer.SystemAudioTap.\(UUID().uuidString)"
-            let aggregateDescription: [String: Any] = [
-                kAudioAggregateDeviceNameKey: "Beluga System Audio Tap",
-                kAudioAggregateDeviceUIDKey: aggregateUID,
-                kAudioAggregateDeviceMainSubDeviceKey: clockDevice.uid,
-                kAudioAggregateDeviceSubDeviceListKey: [[
-                    kAudioSubDeviceUIDKey: clockDevice.uid,
-                ]],
-                kAudioAggregateDeviceTapListKey: [[
-                    kAudioSubTapUIDKey: tapUID,
-                    kAudioSubTapDriftCompensationKey: true,
-                ]],
-                kAudioAggregateDeviceTapAutoStartKey: true,
-                kAudioAggregateDeviceIsStackedKey: false,
-                kAudioAggregateDeviceIsPrivateKey: true,
-            ]
+            let aggregateDescription = CoreAudioProcessTapAggregateConfiguration.description(
+                aggregateUID: aggregateUID,
+                tapUID: tapUID,
+                clockDeviceUID: clockDevice.uid
+            )
+            recordStartupEvent(
+                "aggregate-create-begin", diagnostics: diagnostics,
+                detail: "clockDeviceID=\(clockDevice.deviceID) "
+                    + "clockUID=\(CoreAudioProcessTapStartupDiagnostics.clockUIDDiagnostic(clockDevice.uid))"
+            )
+            let createAggregateStatus = AudioHardwareCreateAggregateDevice(
+                aggregateDescription as CFDictionary,
+                &createdAggregateDeviceID
+            )
+            recordStartupEvent(
+                "aggregate-create-end", diagnostics: diagnostics,
+                detail: "status=\(createAggregateStatus) aggregateID=\(createdAggregateDeviceID)"
+            )
             try Self.requireNoError(
-                AudioHardwareCreateAggregateDevice(
-                    aggregateDescription as CFDictionary,
-                    &createdAggregateDeviceID
-                ),
+                createAggregateStatus,
                 operation: "create process-tap aggregate audio device"
             )
 
@@ -1204,6 +1344,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             }
 
             let consumer = self.consumer
+            let callbackCounter = diagnostics.callbacks
             let callbackFormat = format
             let callback: AudioDeviceIOBlock = {
                 _, inputData, inputTime, _, _ in
@@ -1214,6 +1355,9 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
                     ) else {
                     return
                 }
+                callbackCounter.recordValidCallback(
+                    frameCount: frameCount, hostTime: AudioGetCurrentHostTime()
+                )
                 let presentationTime =
                     CoreAudioProcessTapBufferPolicy.presentationTime(
                         inputTime: inputTime,
@@ -1238,11 +1382,18 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             guard let createdIOProcID else {
                 throw CoreAudioProcessTapError.missingIOProcedure
             }
+            recordStartupEvent(
+                "io-start-begin", diagnostics: diagnostics,
+                detail: "aggregateID=\(createdAggregateDeviceID)"
+            )
+            let startStatus = AudioDeviceStart(createdAggregateDeviceID, createdIOProcID)
+            recordStartupEvent(
+                "io-start-end", diagnostics: diagnostics,
+                detail: "status=\(startStatus) aggregateID=\(createdAggregateDeviceID)",
+                apiStartStatus: startStatus
+            )
             try Self.requireNoError(
-                AudioDeviceStart(
-                    createdAggregateDeviceID,
-                    createdIOProcID
-                ),
+                startStatus,
                 operation: "start process-tap aggregate audio device"
             )
 
@@ -1257,6 +1408,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
                             tapUUID = createdTapUUID
                             aggregateDeviceID = createdAggregateDeviceID
                             ioProcID = createdIOProcID
+                            nativeStartupDiagnostics = diagnostics
                             isRunning = true
                         }
                     },
@@ -1277,6 +1429,8 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             return format
         } catch {
             let startupError = error
+            recordStartupEvent("startup-failed", diagnostics: diagnostics)
+            endStartupDiagnostics(diagnostics)
             let cleanup = attemptNativeTeardown(
                 NativeTeardownResources(
                     tapID: createdTapID,
@@ -1368,6 +1522,7 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             tapUUID = nil
             aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
             ioProcID = nil
+            nativeStartupDiagnostics = nil
             isRunning = false
             return true
         }
@@ -1389,17 +1544,22 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
             let resources = NativeTeardownResources(
                 tapID: tapID,
                 aggregateDeviceID: aggregateDeviceID,
-                ioProcID: ioProcID
+                ioProcID: ioProcID,
+                diagnostics: nativeStartupDiagnostics
             )
             tapID = AudioObjectID(kAudioObjectUnknown)
             tapUUID = nil
             aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
             ioProcID = nil
+            nativeStartupDiagnostics = nil
             isRunning = false
             return (resources, true)
         }
         guard let (resources, wasRunning) = claimed else {
             return
+        }
+        if let diagnostics = resources.diagnostics {
+            endStartupDiagnostics(diagnostics)
         }
 
         if wasRunning {
@@ -1507,7 +1667,8 @@ final class CoreAudioProcessTapSystemAudioSource: @unchecked Sendable {
                     : AudioObjectID(kAudioObjectUnknown),
                 ioProcID: remainingPolicy.hasIOCallback
                     ? resources.ioProcID
-                    : nil
+                    : nil,
+                diagnostics: resources.diagnostics
             ),
             firstError: firstError
         )

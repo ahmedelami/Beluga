@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.elamin.opensteamer.TapStartupDiagnostic</string>
+  <key>CFBundleExecutable</key><string>TapStartupProbe</string>
+  <key>CFBundleName</key><string>Beluga Tap Startup Diagnostic</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.2</string>
+  <key>LSUIElement</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Opt-in virtual microphone startup diagnostic; only callback metadata is retained.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Opt-in system process tap startup diagnostic; audio bytes are never read or saved.</string>
+</dict></plist>
