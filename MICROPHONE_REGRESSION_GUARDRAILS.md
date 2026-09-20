@@ -34,6 +34,11 @@ do not relabel wired as built-in or add an unnegotiated key that old hosts rejec
 Local diagnostics carry the separate wired flag. Real headset/adapter capture and
 playback, unplug/replug and reconnect remain physical-device evidence boundaries.
 
+Headset media-button support belongs only in the existing MediaPlayer command gate.
+Resolve Play/Pause from current authorized Mac playback state and forward an explicit
+command; do not rebuild RemoteIO, select an input/output, alter microphone intent,
+or relax interruption/private-route-loss policy to make accessory buttons work.
+
 ## Required checks for microphone-affecting code changes
 
 Run the complete signed Simulator audio suites, not only the test that motivated the edit.

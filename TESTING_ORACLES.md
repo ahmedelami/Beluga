@@ -162,6 +162,18 @@ artifact with a real headset for cold connect, mic on/off, unplug/replug and rec
 
 ## Native media controls release boundary
 
+Headset Play/Pause must register `togglePlayPauseCommand` alongside the explicit
+commands. Resolve its direction under the dispatch gate's lock from the same
+authorized Mac item: playing means Pause; paused/stopped means Play. Require that
+direction's capability, not either capability, and preserve the resulting absolute
+command through delayed actor/network work. Never infer direction from local playout,
+optimistically flip metadata, add a wire toggle, or change microphone/audio routing.
+Cover background-thread dispatch, native target registration and availability, all
+playback/capability combinations, and owner/item/negotiation/transport replacement.
+Registration-removal and reversed-direction mutations must fail their respective
+behavioral tests. Actual wired and wireless accessory delivery still requires the
+matching iPhone build and real button presses; simulated gate dispatch is not that proof.
+
 Thumbnail decoration must remain independent of command delivery. Cover legacy/malformed
 optional artwork decoding, current-source reference binding, immediate metadata/controls while
 loading stalls, and owner/context/negotiation replacement rejecting late results. The actual
