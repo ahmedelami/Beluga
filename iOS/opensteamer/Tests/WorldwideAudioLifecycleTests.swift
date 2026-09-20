@@ -23076,6 +23076,247 @@ private actor AudioManualContinuationStepper {
 
 @MainActor
 final class RemoteMediaCommandDispatchGateTests: XCTestCase {
+    func testHeadsetToggleResolvesEveryPlaybackStateUsingOnlyItsRequiredCapability() {
+        for playbackState in [WebRTCRemoteMediaPlaybackState.playing, .paused, .stopped] {
+            for canPlay in [false, true] {
+                for canPause in [false, true] {
+                    let gate = RemoteMediaCommandDispatchGate()
+                    let owner = RemoteMediaCommandOwnerToken()
+                    let recorder = LockedRemoteMediaCommandRecorder()
+                    let item = makeRemoteMediaItem(
+                        contextID: "headset", playbackState: playbackState,
+                        canPlay: canPlay, canPause: canPause
+                    )
+                    gate.claim(owner: owner) { recorder.append($0) }
+                    gate.update(owner: owner, state: makeReceivedState(item: item, revision: 7),
+                                transportIsReady: true)
+                    let expectedCommand: WebRTCRemoteMediaCommand =
+                        playbackState == .playing ? .pause : .play
+                    let permitted = playbackState == .playing ? canPause : canPlay
+
+                    XCTAssertEqual(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause), permitted,
+                                   "\(playbackState), play=\(canPlay), pause=\(canPause)")
+                    XCTAssertEqual(recorder.values.map(\.command), permitted ? [expectedCommand] : [])
+                    XCTAssertTrue(recorder.values.allSatisfy {
+                        $0.contextID == "headset" && $0.revision == 7
+                            && $0.dispatch.state.update.item?.playbackState == playbackState
+                    })
+                }
+            }
+        }
+    }
+
+    func testHeadsetToggleRejectsUnownedMissingItemUnreadyAndZeroRevisionState() {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        let item = makeRemoteMediaItem(contextID: "headset")
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        gate.claim(owner: owner) { recorder.append($0) }
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        gate.update(owner: owner, state: makeReceivedState(item: item), transportIsReady: false)
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        gate.update(owner: owner, state: makeReceivedState(item: nil), transportIsReady: true)
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        gate.update(owner: owner, state: makeReceivedState(item: item, revision: 0),
+                    transportIsReady: true)
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        XCTAssertTrue(recorder.values.isEmpty)
+        gate.update(owner: owner, state: makeReceivedState(item: item), transportIsReady: true)
+        XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        XCTAssertEqual(recorder.values.map(\.command), [.pause])
+    }
+
+    func testHeadsetToggleReplacementOwnerRejectsRetiredStateAndAuthority() throws {
+        let gate = RemoteMediaCommandDispatchGate()
+        let retiredOwner = RemoteMediaCommandOwnerToken()
+        let currentOwner = RemoteMediaCommandOwnerToken()
+        let retiredRecorder = LockedRemoteMediaCommandRecorder()
+        let currentRecorder = LockedRemoteMediaCommandRecorder()
+        let retiredState = makeReceivedState(item: makeRemoteMediaItem(contextID: "retired"))
+        gate.claim(owner: retiredOwner) { retiredRecorder.append($0) }
+        gate.update(owner: retiredOwner, state: retiredState, transportIsReady: true)
+        XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        let queued = try XCTUnwrap(retiredRecorder.values.first?.dispatch)
+
+        gate.claim(owner: currentOwner) { currentRecorder.append($0) }
+        XCTAssertFalse(queued.authorization.isValid)
+        XCTAssertFalse(gate.update(owner: retiredOwner, state: retiredState, transportIsReady: true))
+        XCTAssertFalse(gate.release(owner: retiredOwner))
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        gate.update(owner: currentOwner,
+                    state: makeReceivedState(item: makeRemoteMediaItem(
+                        contextID: "current", playbackState: .paused, canPause: false
+                    )), transportIsReady: true)
+        XCTAssertFalse(gate.update(owner: retiredOwner, state: retiredState, transportIsReady: true))
+        XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        XCTAssertEqual(retiredRecorder.values.map(\.command), [.pause])
+        XCTAssertEqual(currentRecorder.values.map(\.command), [.play])
+        XCTAssertEqual(currentRecorder.values.first?.contextID, "current")
+        XCTAssertTrue(gate.release(owner: currentOwner))
+        XCTAssertFalse(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+    }
+
+    func testHeadsetToggleOffMainAdmissionFreezesCommandBeforePlaybackStateChanges() async throws {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        let playing = makeReceivedState(item: makeRemoteMediaItem(contextID: "same"),
+                                        revision: 8, negotiation: negotiation)
+        let paused = makeReceivedState(item: makeRemoteMediaItem(
+            contextID: "same", playbackState: .paused
+        ), revision: 9, negotiation: negotiation)
+        gate.claim(owner: owner) { dispatch in
+            recorder.append(dispatch)
+            // A synchronous sender can observe newer metadata before the callback returns.
+            gate.update(owner: owner, state: paused, transportIsReady: true)
+        }
+        defer { gate.release(owner: owner) }
+        gate.update(owner: owner, state: playing, transportIsReady: true)
+        let admission: (accepted: Bool, wasMainThread: Bool) = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: (
+                    accepted: gate.dispatch(RemoteMediaCommandIntent.togglePlayPause),
+                    wasMainThread: Thread.isMainThread
+                ))
+            }
+        }
+        XCTAssertTrue(admission.accepted)
+        XCTAssertFalse(admission.wasMainThread)
+        let first = try XCTUnwrap(recorder.values.first?.dispatch)
+        XCTAssertEqual(first.command, .pause)
+        XCTAssertEqual(first.state.update.item?.playbackState, .playing)
+        XCTAssertEqual(first.state.update.revision, 8)
+        XCTAssertTrue(first.authorization.isValid)
+
+        XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        XCTAssertEqual(recorder.values.map(\.command), [.pause, .play])
+        XCTAssertEqual(recorder.values.last?.revision, 9)
+        XCTAssertEqual(first.command, .pause, "A queued press must remain an absolute command")
+    }
+
+    func testHeadsetToggleDoesNotInventPlaybackStateBetweenPresses() {
+        let gate = RemoteMediaCommandDispatchGate()
+        let owner = RemoteMediaCommandOwnerToken()
+        let recorder = LockedRemoteMediaCommandRecorder()
+        gate.claim(owner: owner) { recorder.append($0) }
+        gate.update(owner: owner, state: makeReceivedState(item: makeRemoteMediaItem(
+            contextID: "paused", playbackState: .paused, canPause: false
+        )), transportIsReady: true)
+        XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+        XCTAssertEqual(recorder.values.map(\.command), [.play, .play])
+        XCTAssertEqual(recorder.values.map(\.revision), [1, 1])
+    }
+
+    func testHeadsetToggleQueuedAuthorityIsRevokedAtEveryReplacementBoundary() throws {
+        for boundary in ["transport", "clear", "source", "negotiation", "capabilities", "release"] {
+            let gate = RemoteMediaCommandDispatchGate()
+            let owner = RemoteMediaCommandOwnerToken()
+            let recorder = LockedRemoteMediaCommandRecorder()
+            let negotiation = WebRTCRemoteMediaAuthorization()
+            let item = makeRemoteMediaItem(contextID: "same")
+            gate.claim(owner: owner) { recorder.append($0) }
+            gate.update(owner: owner,
+                        state: makeReceivedState(item: item, revision: 8, negotiation: negotiation),
+                        transportIsReady: true)
+            XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+            let queued = try XCTUnwrap(recorder.values.first?.dispatch)
+            switch boundary {
+            case "transport":
+                gate.update(owner: owner, state: nil, transportIsReady: false)
+                gate.update(owner: owner,
+                            state: makeReceivedState(item: item, revision: 9, negotiation: negotiation),
+                            transportIsReady: true)
+            case "clear":
+                gate.update(owner: owner,
+                            state: makeReceivedState(item: nil, revision: 9, negotiation: negotiation),
+                            transportIsReady: true)
+            case "source":
+                gate.update(owner: owner, state: makeReceivedState(
+                    item: makeRemoteMediaItem(contextID: "replacement"), revision: 9,
+                    negotiation: negotiation), transportIsReady: true)
+            case "negotiation":
+                gate.update(owner: owner, state: makeReceivedState(item: item, revision: 9),
+                            transportIsReady: true)
+            case "capabilities":
+                gate.update(owner: owner, state: makeReceivedState(
+                    item: makeRemoteMediaItem(contextID: "same", canPause: false), revision: 9,
+                    negotiation: negotiation), transportIsReady: true)
+            default:
+                XCTAssertTrue(gate.release(owner: owner))
+            }
+            var delivered = 0
+            XCTAssertThrowsError(try queued.authorization.withValidAuthorization { delivered += 1 }, boundary)
+            XCTAssertEqual(delivered, 0, boundary)
+            if boundary == "transport" {
+                XCTAssertTrue(gate.dispatch(RemoteMediaCommandIntent.togglePlayPause))
+                let fresh = try XCTUnwrap(recorder.values.last?.dispatch)
+                try fresh.authorization.withValidAuthorization { delivered += 1 }
+                XCTAssertEqual(delivered, 1)
+            }
+        }
+    }
+
+    func testNativeHeadsetToggleAvailabilityUsesPlaybackStateAndExactCapability() {
+        let coordinator = BackgroundPlaybackCoordinator(installNativeCommandTargets: false)
+        let owner = coordinator.claimRemoteMediaCommandSender { _ in }
+        defer { coordinator.releaseRemoteMediaCommandSender(owner: owner); coordinator.clear() }
+        coordinator.setRemoteMediaTransportReady(true, owner: owner)
+        var revision: UInt64 = 1
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        for playbackState in [WebRTCRemoteMediaPlaybackState.playing, .paused, .stopped] {
+            for canPlay in [false, true] {
+                for canPause in [false, true] {
+                    coordinator.publishRemoteMedia(makeReceivedState(item: makeRemoteMediaItem(
+                        contextID: "headset", playbackState: playbackState,
+                        canPlay: canPlay, canPause: canPause
+                    ), revision: revision, negotiation: negotiation), owner: owner)
+                    XCTAssertEqual(MPRemoteCommandCenter.shared().togglePlayPauseCommand.isEnabled,
+                                   playbackState == .playing ? canPause : canPlay,
+                                   "\(playbackState), play=\(canPlay), pause=\(canPause)")
+                    revision += 1
+                }
+            }
+        }
+        coordinator.setRemoteMediaTransportReady(false, owner: owner)
+        XCTAssertFalse(MPRemoteCommandCenter.shared().togglePlayPauseCommand.isEnabled)
+    }
+
+    func testNativeHeadsetToggleTargetIsInstalledAlongsideExplicitCommands() {
+        let coordinator = BackgroundPlaybackCoordinator.shared
+        let center = MPRemoteCommandCenter.shared()
+        for command in [center.togglePlayPauseCommand, center.playCommand, center.pauseCommand,
+                        center.nextTrackCommand, center.previousTrackCommand] {
+            XCTAssertTrue(coordinator.debugHasNativeCommandTarget(command))
+        }
+    }
+
+    func testNativeHeadsetToggleRejectsOlderAndDuplicatePlaybackSnapshots() {
+        let coordinator = BackgroundPlaybackCoordinator(installNativeCommandTargets: false)
+        let owner = coordinator.claimRemoteMediaCommandSender { _ in }
+        defer { coordinator.releaseRemoteMediaCommandSender(owner: owner); coordinator.clear() }
+        let negotiation = WebRTCRemoteMediaAuthorization()
+        coordinator.setRemoteMediaTransportReady(true, owner: owner)
+        coordinator.publishRemoteMedia(makeReceivedState(item: makeRemoteMediaItem(
+            contextID: "current", canPause: false
+        ), revision: 9, negotiation: negotiation), owner: owner)
+        XCTAssertFalse(MPRemoteCommandCenter.shared().togglePlayPauseCommand.isEnabled)
+        for revision in [UInt64(8), UInt64(9)] {
+            coordinator.publishRemoteMedia(makeReceivedState(item: makeRemoteMediaItem(
+                contextID: "stale", playbackState: .paused, canPause: false
+            ), revision: revision, negotiation: negotiation), owner: owner)
+            XCTAssertFalse(MPRemoteCommandCenter.shared().togglePlayPauseCommand.isEnabled)
+            XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[
+                MPNowPlayingInfoPropertyExternalContentIdentifier] as? String, "current")
+        }
+        coordinator.publishRemoteMedia(makeReceivedState(item: makeRemoteMediaItem(
+            contextID: "current", playbackState: .paused, canPause: false
+        ), revision: 10, negotiation: negotiation), owner: owner)
+        XCTAssertTrue(MPRemoteCommandCenter.shared().togglePlayPauseCommand.isEnabled)
+    }
+
     func testAllFourCommandsRequireExactReadyPublishedContext() {
         let gate = RemoteMediaCommandDispatchGate()
         let owner = RemoteMediaCommandOwnerToken()
@@ -23350,7 +23591,6 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         _ = BackgroundPlaybackCoordinator.shared
         let commandCenter = MPRemoteCommandCenter.shared()
         let unsupportedCommands: [MPRemoteCommand] = [
-            commandCenter.togglePlayPauseCommand,
             commandCenter.stopCommand,
             commandCenter.enableLanguageOptionCommand,
             commandCenter.disableLanguageOptionCommand,
@@ -23489,14 +23729,14 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         for playing in [true, false] {
             coordinator.publishLiveStream(serverName: "private host name", isPlaying: playing)
             let center = MPNowPlayingInfoCenter.default()
-            XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+            XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Beluga")
             XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
             XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
             XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
             XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyExternalContentIdentifier])
             XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, playing ? 1 : 0)
             XCTAssertEqual(center.playbackState, playing ? .playing : .paused)
-            assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+            assertNativeMediaControls(play: false, pause: false, next: false, previous: false, toggle: false)
         }
     }
 
@@ -23528,7 +23768,7 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         // These controls reflect Mac playback, never authorize local Resume Audio.
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1)
         XCTAssertEqual(center.playbackState, .playing)
-        assertNativeMediaControls(play: true, pause: true, next: true, previous: true)
+        assertNativeMediaControls(play: true, pause: true, next: true, previous: true, toggle: true)
         let replacement = WebRTCRemoteMediaItem(
             contextID: "second", sourceName: "Browser", title: "Second",
             playbackState: .paused, playbackRate: 0,
@@ -23543,13 +23783,13 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0)
         XCTAssertEqual(center.playbackState, .paused)
-        assertNativeMediaControls(play: true, pause: false, next: false, previous: false)
+        assertNativeMediaControls(play: true, pause: false, next: false, previous: false, toggle: true)
         coordinator.clearRemoteMedia(owner: owner)
-        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Beluga")
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
         XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
-        assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+        assertNativeMediaControls(play: false, pause: false, next: false, previous: false, toggle: false)
     }
 
     func testNativeRecoveryAndOwnerReplacementCannotRestoreLiveOrStaleControls() {
@@ -23559,13 +23799,13 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         let oldState = makeReceivedState(item: makeRemoteMediaItem(contextID: "old-owner"))
         coordinator.publishRemoteMedia(oldState, owner: oldOwner)
         coordinator.setRemoteMediaTransportReady(true, owner: oldOwner)
-        assertNativeMediaControls(play: true, pause: true, next: true, previous: true)
+        assertNativeMediaControls(play: true, pause: true, next: true, previous: true, toggle: true)
 
         coordinator.setRemoteMediaTransportReady(false, owner: oldOwner)
-        assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+        assertNativeMediaControls(play: false, pause: false, next: false, previous: false, toggle: false)
         XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         coordinator.clearRemoteMedia(owner: oldOwner)
-        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Beluga")
         XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
 
         let currentOwner = coordinator.claimRemoteMediaCommandSender { _ in }
@@ -23592,25 +23832,26 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0)
         XCTAssertEqual(center.playbackState, .paused)
         XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
-        assertNativeMediaControls(play: true, pause: false, next: false, previous: true)
+        assertNativeMediaControls(play: true, pause: false, next: false, previous: true, toggle: true)
 
         coordinator.publishRemoteMedia(makeReceivedState(item: nil, revision: 2, negotiation: negotiation), owner: currentOwner)
-        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "opensteamer")
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "Beluga")
         XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         XCTAssertNil(center.nowPlayingInfo?[MPMediaItemPropertyPlaybackDuration])
         XCTAssertNil(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime])
-        assertNativeMediaControls(play: false, pause: false, next: false, previous: false)
+        assertNativeMediaControls(play: false, pause: false, next: false, previous: false, toggle: false)
     }
 
     private func assertNativeMediaControls(
-        play: Bool, pause: Bool, next: Bool, previous: Bool,
+        play: Bool, pause: Bool, next: Bool, previous: Bool, toggle: Bool,
         file: StaticString = #filePath, line: UInt = #line
     ) {
         let center = MPRemoteCommandCenter.shared()
         XCTAssertEqual(
             [center.playCommand.isEnabled, center.pauseCommand.isEnabled,
-             center.nextTrackCommand.isEnabled, center.previousTrackCommand.isEnabled],
-            [play, pause, next, previous], file: file, line: line
+             center.nextTrackCommand.isEnabled, center.previousTrackCommand.isEnabled,
+             center.togglePlayPauseCommand.isEnabled],
+            [play, pause, next, previous, toggle], file: file, line: line
         )
     }
 
@@ -23645,17 +23886,20 @@ final class RemoteMediaCommandDispatchGateTests: XCTestCase {
 
     private func makeRemoteMediaItem(
         contextID: String,
-        canSkipForward: Bool = true
+        canSkipForward: Bool = true,
+        playbackState: WebRTCRemoteMediaPlaybackState = .playing,
+        canPlay: Bool = true,
+        canPause: Bool = true
     ) -> WebRTCRemoteMediaItem {
         WebRTCRemoteMediaItem(
             contextID: contextID,
             sourceName: "Music",
             title: "Track",
-            playbackState: .playing,
-            playbackRate: 1,
+            playbackState: playbackState,
+            playbackRate: playbackState == .playing ? 1 : 0,
             capabilities: WebRTCRemoteMediaCapabilities(
-                canPlay: true,
-                canPause: true,
+                canPlay: canPlay,
+                canPause: canPause,
                 canSkipForward: canSkipForward,
                 canSkipBackward: true
             )

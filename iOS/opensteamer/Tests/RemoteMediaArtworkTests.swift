@@ -547,6 +547,7 @@ final class RemoteMediaArtworkTests: XCTestCase {
         let commands = MPRemoteCommandCenter.shared()
         XCTAssertEqual(commands.playCommand.isEnabled, play, file: file, line: line)
         XCTAssertEqual(commands.pauseCommand.isEnabled, pause, file: file, line: line)
+        XCTAssertEqual(commands.togglePlayPauseCommand.isEnabled, play || pause, file: file, line: line)
         XCTAssertEqual(commands.nextTrackCommand.isEnabled, play || pause, file: file, line: line)
         XCTAssertEqual(commands.previousTrackCommand.isEnabled, play || pause, file: file, line: line)
     }

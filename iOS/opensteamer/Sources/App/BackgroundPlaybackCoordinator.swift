@@ -53,6 +53,26 @@ struct RemoteMediaCommandDispatch: Sendable {
 
 typealias RemoteMediaCommandSender = @Sendable (RemoteMediaCommandDispatch) -> Void
 
+/// Accessory buttons may send a toggle rather than the Lock Screen's explicit play/pause.
+/// Resolve it from the admitted Mac item, never local audio state or a later actor-hop snapshot.
+enum RemoteMediaCommandIntent: Sendable {
+    case explicit(WebRTCRemoteMediaCommand)
+    case togglePlayPause
+
+    func permittedCommand(for item: WebRTCRemoteMediaItem) -> WebRTCRemoteMediaCommand? {
+        let command: WebRTCRemoteMediaCommand
+        switch self {
+        case .explicit(let explicit): command = explicit
+        case .togglePlayPause:
+            command = switch item.playbackState {
+            case .playing: .pause
+            case .paused, .stopped: .play
+            }
+        }
+        return item.capabilities.permits(command) ? command : nil
+    }
+}
+
 /// Process-local authority for the one worldwide session allowed to mutate the process-global
 /// MediaPlayer command center. A superseded view model can still drain delayed callbacks, but its
 /// token can no longer replace metadata, reopen commands, or release a newer owner.
@@ -130,11 +150,15 @@ final class RemoteMediaCommandDispatchGate: @unchecked Sendable {
     }
 
     func dispatch(_ command: WebRTCRemoteMediaCommand) -> Bool {
+        dispatch(RemoteMediaCommandIntent.explicit(command))
+    }
+
+    func dispatch(_ intent: RemoteMediaCommandIntent) -> Bool {
         let admitted: (RemoteMediaCommandSender, RemoteMediaCommandDispatch)? = lock.withLock {
             guard transportIsReady,
                   let state,
                   let item = state.update.item,
-                  item.capabilities.permits(command),
+                  let command = intent.permittedCommand(for: item),
                   state.update.revision > 0,
                   let authorization,
                   authorization.isValid,
@@ -368,11 +392,12 @@ final class BackgroundPlaybackCoordinator {
 
     private func installCommandTargetsIfNeeded() {
         guard commandTargets.isEmpty else { return }
-        let mappings: [(MPRemoteCommand, WebRTCRemoteMediaCommand)] = [
-            (commandCenter.playCommand, .play),
-            (commandCenter.pauseCommand, .pause),
-            (commandCenter.nextTrackCommand, .nextTrack),
-            (commandCenter.previousTrackCommand, .previousTrack)
+        let mappings: [(MPRemoteCommand, RemoteMediaCommandIntent)] = [
+            (commandCenter.playCommand, .explicit(.play)),
+            (commandCenter.pauseCommand, .explicit(.pause)),
+            (commandCenter.togglePlayPauseCommand, .togglePlayPause),
+            (commandCenter.nextTrackCommand, .explicit(.nextTrack)),
+            (commandCenter.previousTrackCommand, .explicit(.previousTrack))
         ]
         for (nativeCommand, command) in mappings {
             let gate = commandGate
@@ -382,7 +407,6 @@ final class BackgroundPlaybackCoordinator {
             commandTargets.append((nativeCommand, target))
         }
         // These controls have no negotiated Mac-side semantic and must never appear as no-op UI.
-        commandCenter.togglePlayPauseCommand.isEnabled = false
         commandCenter.stopCommand.isEnabled = false
         commandCenter.changePlaybackPositionCommand.isEnabled = false
         commandCenter.skipForwardCommand.isEnabled = false
@@ -414,11 +438,21 @@ final class BackgroundPlaybackCoordinator {
         let ready = remoteMediaTransportIsReady && remoteMediaCommandSender != nil
         commandCenter.playCommand.isEnabled = ready && (capabilities?.canPlay ?? false)
         commandCenter.pauseCommand.isEnabled = ready && (capabilities?.canPause ?? false)
+        commandCenter.togglePlayPauseCommand.isEnabled = ready
+            && remoteMediaUpdate?.item.flatMap {
+                RemoteMediaCommandIntent.togglePlayPause.permittedCommand(for: $0)
+            } != nil
         commandCenter.nextTrackCommand.isEnabled =
             ready && (capabilities?.canSkipForward ?? false)
         commandCenter.previousTrackCommand.isEnabled =
             ready && (capabilities?.canSkipBackward ?? false)
     }
+
+    #if DEBUG
+    func debugHasNativeCommandTarget(_ command: MPRemoteCommand) -> Bool {
+        commandTargets.contains { $0.0 === command }
+    }
+    #endif
 }
 
 extension BackgroundPlaybackCoordinator: TransitionBackgroundTaskCoordinating {}
