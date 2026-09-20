@@ -18,6 +18,71 @@ import XCTest
 /// revocation rules; the physical-device test remains the hardware RemoteIO oracle.
 @MainActor
 final class WebRTCAudioPlaybackSessionTests: XCTestCase {
+    func testWiredMicrophoneNativeSelectionAndEveryTransactionBoundary() throws {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let result = harness.debugWiredMicrophoneRoutePolicyForTesting()
+        var expected = Set([
+            "headsetPreserved", "usbPreserved", "noMicHeadphonesUsesBuiltin", "a2dpUsesBuiltin",
+            "availableUSBNotSelected", "noBuiltinNoSelection", "mismatchedHeadsetRejected",
+            "mismatchedUSBRejected", "multipleInputsRejected", "multipleOutputsRejected",
+            "emptyInputUIDRejected", "emptyOutputUIDRejected",
+        ].map { "selection.\($0)" })
+        expected.formUnion([
+            "sameUIDWrongTypeRejected", "sameTypeWrongUIDRejected", "unsupportedHFPRejected",
+            "wiredPairRequired", "multipleInputsRejected",
+        ].map { "identity.\($0)" })
+        expected.formUnion([
+            "wiredCurrentDoesNotWrite", "wiredDriftDoesNotWrite", "builtinFallbackWrites",
+            "currentBuiltinDoesNotWrite", "absentTargetDoesNotWrite",
+        ].map { "mutation.\($0)" })
+        for route in ["builtin", "headset", "usb"] {
+            for boundary in ["converged", "prepared", "starting", "consumed", "freshReopen",
+                             "typeAndUIDRejectedAcrossStates", "changedOutputRejected",
+                             "proofKindExact", "clearRetiresProofAndTarget"] {
+                expected.insert("transaction.\(route).\(boundary)")
+            }
+        }
+        expected.insert("nativeRemainedQuiescent")
+        XCTAssertEqual(Set(result.keys), expected)
+        for key in expected.sorted() {
+            XCTAssertTrue(try XCTUnwrap(result[key], key).boolValue, key)
+        }
+    }
+
+    func testWiredMicrophoneProofStaysDistinctAndRouteLossClosesCapture() {
+        let harness = WebRTCIOSPlayoutRecoveryTestHarness()
+        defer { _ = harness.debugTerminateForTesting() }
+        let authorization = WebRTCIOSMicrophoneAuthorization()
+        harness.debugMarkHealthyPlayoutForTesting()
+        harness.debugSetCaptureRouteWiredMicrophoneForTesting(true)
+        XCTAssertFalse(harness.diagnostics.captureRouteIsBuiltInMicrophone)
+        XCTAssertFalse(harness.diagnostics.captureRouteIsWiredMicrophone)
+        XCTAssertTrue(harness.setMicrophoneAuthorizationForTesting(authorization))
+        XCTAssertTrue(harness.debugPublishCurrentMicrophoneAuthorizationForTesting())
+        let admitted = harness.diagnostics
+        XCTAssertFalse(admitted.captureRouteIsBuiltInMicrophone)
+        XCTAssertTrue(admitted.captureRouteIsWiredMicrophone)
+        XCTAssertGreaterThan(admitted.captureRouteProofGeneration, 0)
+        if harness.debugBeginRealtimeAdmissionForTesting() {
+            harness.debugEndRealtimeAdmissionForTesting()
+        } else {
+            XCTFail("The freshly admitted wired route must allow realtime capture.")
+        }
+
+        harness.debugMarkRouteLossForTesting()
+        XCTAssertFalse(harness.diagnostics.captureRouteIsBuiltInMicrophone)
+        XCTAssertFalse(harness.diagnostics.captureRouteIsWiredMicrophone)
+        XCTAssertEqual(harness.diagnostics.captureRouteProofGeneration, 0)
+        XCTAssertTrue(harness.diagnostics.microphoneDeviceGateClosedAndDrained)
+        XCTAssertTrue(harness.diagnostics.explicitResumeRequired)
+        XCTAssertFalse(harness.debugBeginRealtimeAdmissionForTesting())
+        harness.debugSetCaptureRouteWiredMicrophoneForTesting(true)
+        XCTAssertFalse(harness.diagnostics.captureRouteIsWiredMicrophone,
+                       "Replugging a headset must not revive its retired capture proof.")
+        XCTAssertFalse(harness.debugBeginRealtimeAdmissionForTesting())
+    }
+
     func testPackagedDynamicFrameworkRetriesItsRealCustomAudioDevice() throws {
         #if !targetEnvironment(simulator)
         throw XCTSkip("This byte-bound artifact smoke check uses Xcode's unmodified Simulator framework; physical RemoteIO has a separate oracle.")

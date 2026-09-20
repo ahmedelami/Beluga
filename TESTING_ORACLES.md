@@ -144,6 +144,22 @@ authority and stores scalar measurements only. Two fresh launches passed on the 
 iPhone15 with effective long-form sharing. This does not exercise the production view
 model, a Mac consumer, worldwide traversal, actual remote-command delivery or TestFlight.
 
+## Wired iPhone audio boundary
+
+Exercise the production native input selector and route-transaction matcher for
+HeadsetMic/Headphones and USBAudio/USBAudio, built-in with speakers/A2DP/headphones
+without input, absent/ambiguous inputs, wrong output, and unknown/HFP ports. Require
+exact type and UID through convergence and capture publication, exclusive factual
+built-in/wired bits and a fresh proof generation. Replacing a type while reusing a
+UID must fail; an input appearing in the inventory is not a selected-route proof.
+Independently restore built-in-only admission and remove type/UID fencing and require
+the respective behavioral assertions to fail. Swift sender statistics and lifecycle
+proof must accept wired only with unchanged privacy, transport, raw processing and
+generation guards. Rust's category/sharing target contract is unchanged by port kind.
+Do not modify v1 wire keys without negotiation with deployed hosts. A Simulator pass
+does not prove adapter capabilities or acoustic output: require the matching iPhone
+artifact with a real headset for cold connect, mic on/off, unplug/replug and reconnect.
+
 ## Native media controls release boundary
 
 Thumbnail decoration must remain independent of command delivery. Cover legacy/malformed

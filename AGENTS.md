@@ -122,6 +122,11 @@ manual IP addresses, router configuration, or public TCP ports.
   microphone capture remains functional. This narrow profile requires the exact
   `.playAndRecord` / `.default` / DefaultToSpeaker|AllowBluetoothA2DP tuple and all
   existing raw-RemoteIO, route, permission, authorization, and generation proof.
+  Preserve a selected wired headset/USB duplex input with its exact type and UID
+  and pinned output, rather than forcing built-in input. Only proven built-in or
+  wired routes may satisfy microphone admission; keep their diagnostic flags distinct.
+  Speaker/A2DP and headphones without a mic retain the built-in fallback. Private-route
+  loss still requires explicit resume and must never leak playback to speakers.
   Authorized hosted-call playback still requires effective `.default`; output-only
   playback still requires effective `.longFormAudio`. Preserve requested and observed
   values separately throughout native/Swift/Rust transactions and diagnostics. Never

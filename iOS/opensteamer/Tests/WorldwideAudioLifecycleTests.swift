@@ -206,6 +206,40 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         }
     }
 
+    func testWiredMicrophoneOracleRequiresFreshExclusiveRouteAndPrivacyAuthority() {
+        let peer = NSObject()
+        let authorization = NSObject()
+        for builtIn in [false, true] {
+            for wired in [false, true] {
+                for proof in [UInt64(0), 13] {
+                    for invalid in ["none", "intent", "permission", "transport", "authorization", "recording"] {
+                        let statistics = rawMicrophoneSenderStatisticsForTests(
+                            sample: 1, recordingGeneration: 31,
+                            captureRouteIsBuiltInMicrophone: builtIn,
+                            captureRouteIsWiredMicrophone: wired,
+                            captureRouteProofGeneration: proof,
+                            authorizationIsValid: invalid != "authorization",
+                            approvedRecordingGeneration: invalid == "recording" ? 32 : 31
+                        )
+                        let sample = WorldwideRawMicrophoneProofSample(
+                            sessionGeneration: UUID(), peerIdentity: ObjectIdentifier(peer),
+                            transportAuthorizationGeneration: UUID(), audioPolicyGeneration: UUID(),
+                            authorizationIdentity: ObjectIdentifier(authorization),
+                            authenticatedPairedSession: true,
+                            microphoneIntentIsCurrent: invalid != "intent",
+                            microphonePermissionGranted: invalid != "permission",
+                            callIsActive: false, transportIsHealthy: invalid != "transport",
+                            statistics: statistics
+                        )
+                        XCTAssertEqual(WorldwideRawMicrophoneOracleEvaluator.hasValidState(sample),
+                                       builtIn != wired && proof > 0 && invalid == "none",
+                                       "builtIn=\(builtIn) wired=\(wired) proof=\(proof) invalid=\(invalid)")
+                    }
+                }
+            }
+        }
+    }
+
     func testLifecycleArmedTargetsAcceptOnlyTheirSupportedEffectiveSharingPolicies() throws {
         for input in [false, true] {
             for observedPolicy in [-1, 0, 1, 2, 3, 97] {
@@ -9956,6 +9990,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         var nextSample: UInt64 = 1
         let captureRouteIsBuiltInMicrophone =
             AudioLockedValue(true)
+        let captureRouteIsWiredMicrophone = AudioLockedValue(false)
         let captureRouteProofGeneration =
             AudioLockedValue<UInt64>(13)
         var disableAttemptCount = 0
@@ -9993,6 +10028,8 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                     recordingGeneration: recordingGeneration,
                     captureRouteIsBuiltInMicrophone:
                         captureRouteIsBuiltInMicrophone.value,
+                    captureRouteIsWiredMicrophone:
+                        captureRouteIsWiredMicrophone.value,
                     captureRouteProofGeneration:
                         captureRouteProofGeneration.value
                 )
@@ -10052,7 +10089,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             )
         XCTAssertNil(
             session.viewModel.worldwideRawMicrophoneOracle,
-            "A non-built-in live capture route must revoke the published raw microphone oracle."
+            "A route with neither supported input proof must revoke the published raw microphone oracle."
         )
 
         captureRouteIsBuiltInMicrophone.set(true)
@@ -10089,6 +10126,19 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
             session.viewModel.worldwideRawMicrophoneOracle,
             "The rotated exact route proof may publish only after a fresh two-sample continuity window."
         )
+        captureRouteIsBuiltInMicrophone.set(false)
+        captureRouteIsWiredMicrophone.set(true)
+        captureRouteProofGeneration.set(15)
+        await session.viewModel.debugRefreshRawMicrophoneOracleForTests(from: session.peer)
+        XCTAssertNil(session.viewModel.worldwideRawMicrophoneOracle,
+                     "Wired replacement needs its own continuity baseline.")
+        await session.viewModel.debugRefreshRawMicrophoneOracleForTests(from: session.peer)
+        let wiredOracle = try XCTUnwrap(session.viewModel.worldwideRawMicrophoneOracle)
+        XCTAssertFalse(wiredOracle.captureRouteIsBuiltInMicrophone)
+        XCTAssertTrue(wiredOracle.captureRouteIsWiredMicrophone)
+        XCTAssertEqual(wiredOracle.captureRouteProofGeneration, 15)
+        XCTAssertTrue(wiredOracle.accessibilityValue.contains("|captureBuiltInMic=0"),
+                      "The legacy built-in-only physical receipt must not mislabel wired input.")
         XCTAssertTrue(session.fixture.remoteAudio.isEnabled)
         let audioPolicyGenerationBeforeCall =
             session.viewModel.debugAudioPolicyGeneration
@@ -20984,6 +21034,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
         counterSample: UInt64? = nil,
         recordingGeneration: UInt64,
         captureRouteIsBuiltInMicrophone: Bool = true,
+        captureRouteIsWiredMicrophone: Bool = false,
         captureRouteProofGeneration: UInt64 = 13,
         routeSharingPolicyIsDefault: Bool = true,
         routeSharingPolicyIsLongFormAudio: Bool = false,
@@ -21024,6 +21075,7 @@ final class WorldwideAudioLifecycleTests: XCTestCase {
                 inputBusEnabled: true,
                 captureRouteIsBuiltInMicrophone:
                     captureRouteIsBuiltInMicrophone,
+                captureRouteIsWiredMicrophone: captureRouteIsWiredMicrophone,
                 captureRouteProofGeneration:
                     captureRouteProofGeneration,
                 outputBusEnabled: true,

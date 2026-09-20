@@ -109,6 +109,16 @@ public enum WebRTCIOSOrdinaryRawMicrophonePolicy {
     }
 }
 
+/// The native transaction pins one supported input type/UID and its output route.
+/// These factual route bits must be exclusive; neither substitutes for that proof.
+public enum WebRTCIOSRawMicrophoneRoutePolicy {
+    public nonisolated static func matches(
+        builtIn: Bool, wired: Bool, proofGeneration: UInt64
+    ) -> Bool {
+        proofGeneration > 0 && builtIn != wired
+    }
+}
+
 /// Release-safe ownership, processing, topology, and native-delivery state for the exact current
 /// iPhone microphone sender. Native sender/track identifiers and object identities remain private
 /// to `WebRTCPeer`; this projection carries only ephemeral generations and bounded state.
@@ -138,6 +148,7 @@ public struct WebRTCIPhoneMicrophoneSenderDiagnostics: Equatable, Sendable {
     public let inputBusEnabled: Bool
     /// True only when native live-route diagnostics saw exactly the built-in iPhone microphone.
     public let captureRouteIsBuiltInMicrophone: Bool
+    public var captureRouteIsWiredMicrophone: Bool = false
     /// Ephemeral native exact-route publication generation; rotates across every revalidation.
     public let captureRouteProofGeneration: UInt64
     public let outputBusEnabled: Bool
@@ -159,6 +170,14 @@ public struct WebRTCIPhoneMicrophoneSenderDiagnostics: Equatable, Sendable {
     public let realtimeAdmissionCount: UInt64
     public let deliveryCallbackCount: UInt64
     public let deliveredFrameCount: UInt64
+
+    public var captureRouteIsSupportedMicrophone: Bool {
+        WebRTCIOSRawMicrophoneRoutePolicy.matches(
+            builtIn: captureRouteIsBuiltInMicrophone,
+            wired: captureRouteIsWiredMicrophone,
+            proofGeneration: captureRouteProofGeneration
+        )
+    }
 
     public var ordinaryRawMicrophonePolicyMatches: Bool {
         WebRTCIOSOrdinaryRawMicrophonePolicy.matches(

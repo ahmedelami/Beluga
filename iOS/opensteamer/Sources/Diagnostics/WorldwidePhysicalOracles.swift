@@ -351,7 +351,7 @@ enum WorldwideRawMicrophoneOracleEvaluator {
               sender.modeIsDefault,
               sender.usesRemoteIO,
               sender.inputBusEnabled,
-              sender.captureRouteIsBuiltInMicrophone,
+              sender.captureRouteIsSupportedMicrophone,
               sender.captureRouteProofGeneration > 0,
               sender.outputBusEnabled,
               !sender.categoryOptionsAreEmpty,
@@ -440,7 +440,11 @@ enum WorldwideRawMicrophoneOracleEvaluator {
               previousSender.approvedRecordingGeneration
                 == currentSender.approvedRecordingGeneration,
               previousSender.captureRouteProofGeneration
-                == currentSender.captureRouteProofGeneration else {
+                == currentSender.captureRouteProofGeneration,
+              previousSender.captureRouteIsBuiltInMicrophone
+                == currentSender.captureRouteIsBuiltInMicrophone,
+              previousSender.captureRouteIsWiredMicrophone
+                == currentSender.captureRouteIsWiredMicrophone else {
             return .bindingChanged
         }
 
@@ -638,6 +642,7 @@ struct WorldwideRawMicrophoneOracleSnapshot: Equatable, Sendable {
     let recordingGeneration: UInt64
     let approvedRecordingGeneration: UInt64
     let captureRouteIsBuiltInMicrophone: Bool
+    let captureRouteIsWiredMicrophone: Bool
     let captureRouteProofGeneration: UInt64
     let realtimeAdmissionCount: UInt64
     let deliveryCallbackCount: UInt64
@@ -678,6 +683,7 @@ struct WorldwideRawMicrophoneOracleSnapshot: Equatable, Sendable {
             sender.approvedRecordingGeneration
         captureRouteIsBuiltInMicrophone =
             sender.captureRouteIsBuiltInMicrophone
+        captureRouteIsWiredMicrophone = sender.captureRouteIsWiredMicrophone
         captureRouteProofGeneration =
             sender.captureRouteProofGeneration
         realtimeAdmissionCount = sender.realtimeAdmissionCount
@@ -733,7 +739,7 @@ struct WorldwideRawMicrophoneOracleSnapshot: Equatable, Sendable {
         fields.append("deviceOpen=1")
         fields.append("authorizationOpen=1")
         fields.append("senderScoped=1")
-        fields.append("captureBuiltInMic=1")
+        fields.append("captureBuiltInMic=\(captureRouteIsBuiltInMicrophone ? 1 : 0)")
         return fields.joined(separator: "|")
     }
 }
@@ -906,6 +912,10 @@ struct WorldwideRawMicrophoneContinuityTracker {
                 == currentSender.approvedRecordingGeneration
             && previousSender.captureRouteProofGeneration
                 == currentSender.captureRouteProofGeneration
+            && previousSender.captureRouteIsBuiltInMicrophone
+                == currentSender.captureRouteIsBuiltInMicrophone
+            && previousSender.captureRouteIsWiredMicrophone
+                == currentSender.captureRouteIsWiredMicrophone
     }
 
     private static func isExactCaptureRouteProofRotation(
