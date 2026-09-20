@@ -7,13 +7,10 @@ import RemoteSessionCore
 
 /// A per-fixture UDP path. Only numeric endpoints emitted by the two fixture peers
 /// are admitted; the two public sockets are bound to loopback and ephemeral ports.
+/// Unlimited serialization retains fixed-delay behavior, except that the configured
+/// queue-age bound now also drops packets held by a stalled dispatch callback.
 final class StartupVideoDatagramRelay: @unchecked Sendable {
-    enum Side: Int, Sendable {
-        case host = 0
-        case viewer = 1
-
-        var opposite: Side { self == .host ? .viewer : .host }
-    }
+    typealias Side = StartupVideoDatagramScheduler.Direction
 
     enum Failure: Error {
         case invalidConfiguration
@@ -29,6 +26,18 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
         var forwardedDatagrams: UInt64 = 0
         var forwardedBytes: UInt64 = 0
         var droppedDatagrams: UInt64 = 0
+        var configuredBitsPerSecond: UInt64?
+        var pendingDatagrams = 0
+        var pendingBytes = 0
+        var maximumPendingBytes = 0
+        var overflowDatagrams: UInt64 = 0
+        var expiredDatagrams: UInt64 = 0
+        var backpressureDatagrams: UInt64 = 0
+        var serializationDelayNanoseconds: UInt64 = 0
+        var maximumSerializationDelayNanoseconds: UInt64 = 0
+        var maximumDeliveryLatenessNanoseconds: UInt64 = 0
+        var maximumReleaseBatchDatagrams = 0
+        var maximumReleaseBatchBytes = 0
     }
 
     struct Snapshot: Sendable {
@@ -41,6 +50,9 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
         let pendingDatagrams: Int
         let pendingBytes: Int
         let maximumPendingBytes: Int
+        let maximumDeliveryLatenessNanoseconds: UInt64
+        let maximumReleaseBatchDatagrams: Int
+        let maximumReleaseBatchBytes: Int
         let errorCount: UInt64
         let stopped: Bool
     }
@@ -55,14 +67,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
         }
     }
 
-    private struct PendingDatagram {
-        let deadline: UInt64
-        let from: Side
-        let bytes: Data
-    }
-
     private let queue = DispatchQueue(label: "Beluga.StartupVideoDatagramRelay")
-    private let delayNanoseconds: UInt64
     private let localAddresses: Set<UInt32>
     private let descriptors: [Int32]
     private let advertisedPorts: [UInt16]
@@ -71,10 +76,11 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
     private var endpoints: [Endpoint?] = [nil, nil]
     private var descriptionSeen = [false, false]
     private var counters = [DirectionCounters(), DirectionCounters()]
-    private var pending: [PendingDatagram] = []
-    private var pendingHead = 0
-    private var pendingBytes = 0
-    private var maximumPendingBytes = 0
+    private var scheduler: StartupVideoDatagramScheduler
+    private var releaseMeasurements = StartupVideoDatagramReleaseMeasurements()
+    private var directionalReleaseMeasurements = [
+        StartupVideoDatagramReleaseMeasurements(), StartupVideoDatagramReleaseMeasurements(),
+    ]
     private var rejectedSourceDatagrams: UInt64 = 0
     private var filteredCandidates: UInt64 = 0
     private var rewrittenCandidates: UInt64 = 0
@@ -83,14 +89,26 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
     private var stopped = false
     private var activeSources = 2
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
-    private static let maximumQueuedBytes = 4 * 1_024 * 1_024
-    private static let maximumQueuedDatagrams = 4_096
 
-    init(oneWayDelayMilliseconds: Int = 50, dropAll: Bool = false) throws {
-        guard (0...500).contains(oneWayDelayMilliseconds) else {
+    init(
+        oneWayDelayMilliseconds: Int = 50,
+        dropAll: Bool = false,
+        hostToViewerBitsPerSecond: UInt64? = nil,
+        viewerToHostBitsPerSecond: UInt64? = nil,
+        maximumQueuedBytes: Int = 4 * 1_024 * 1_024,
+        maximumQueueAgeMilliseconds: Int = 2_000
+    ) throws {
+        guard (0...500).contains(oneWayDelayMilliseconds),
+              (1...10_000).contains(maximumQueueAgeMilliseconds) else {
             throw Failure.invalidConfiguration
         }
-        delayNanoseconds = UInt64(oneWayDelayMilliseconds) * 1_000_000
+        scheduler = try StartupVideoDatagramScheduler(
+            oneWayDelayNanoseconds: UInt64(oneWayDelayMilliseconds) * 1_000_000,
+            hostToViewerBitsPerSecond: hostToViewerBitsPerSecond,
+            viewerToHostBitsPerSecond: viewerToHostBitsPerSecond,
+            maximumQueuedBytes: maximumQueuedBytes,
+            maximumQueueAgeNanoseconds: UInt64(maximumQueueAgeMilliseconds) * 1_000_000
+        )
         self.dropAll = dropAll
         localAddresses = try Self.localIPv4Addresses()
         let first = try Self.makeSocket()
@@ -121,7 +139,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
             readSources.append(source)
         }
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.setEventHandler { [weak self] in self?.forwardDueDatagrams() }
+        timer.setEventHandler { [weak self] in self?.forwardDueDatagrams(generation: 0) }
         timer.schedule(deadline: .distantFuture)
         self.timer = timer
         for source in readSources { source.resume() }
@@ -157,18 +175,31 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
     func snapshot() -> Snapshot {
         queue.sync {
             Snapshot(
-                hostToViewer: counters[Side.host.rawValue],
-                viewerToHost: counters[Side.viewer.rawValue],
+                hostToViewer: directionCounters(from: .host),
+                viewerToHost: directionCounters(from: .viewer),
                 mappedSideCount: endpoints.compactMap { $0 }.count,
                 rejectedSourceDatagrams: rejectedSourceDatagrams,
                 filteredCandidates: filteredCandidates,
                 rewrittenCandidates: rewrittenCandidates,
-                pendingDatagrams: pending.count - pendingHead,
-                pendingBytes: pendingBytes,
-                maximumPendingBytes: maximumPendingBytes,
+                pendingDatagrams: scheduler.pendingDatagrams,
+                pendingBytes: scheduler.pendingBytes,
+                maximumPendingBytes: scheduler.maximumPendingBytes,
+                maximumDeliveryLatenessNanoseconds: releaseMeasurements.maximumDeliveryLatenessNanoseconds,
+                maximumReleaseBatchDatagrams: releaseMeasurements.maximumReleaseBatchDatagrams,
+                maximumReleaseBatchBytes: releaseMeasurements.maximumReleaseBatchBytes,
                 errorCount: errorCount,
                 stopped: stopped
             )
+        }
+    }
+
+    /// Changes only this fixture's UDP payload serialization capacity. Both
+    /// directions retain independent clocks; nil restores fixed-delay-only mode.
+    func setBandwidth(bitsPerSecond: UInt64?, from side: Side) throws {
+        try queue.sync {
+            guard !stopped else { throw Failure.stopped }
+            try scheduler.setBandwidth(bitsPerSecond, from: side, at: DispatchTime.now().uptimeNanoseconds)
+            scheduleNext()
         }
     }
 
@@ -193,7 +224,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
                 self.stopWaiters.append(continuation)
                 guard !self.stopped else { return }
                 self.stopped = true
-                self.discardPending()
+                self.discardPending(stop: true)
                 self.timer?.cancel()
                 for source in self.readSources { source.cancel() }
             }
@@ -297,6 +328,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
 
     private func receive(on advertisedSide: Side) {
         guard !stopped else { return }
+        forwardDueDatagrams(generation: scheduler.generation)
         defer { scheduleNext() }
         let from = advertisedSide.opposite
         let descriptor = descriptors[advertisedSide.rawValue]
@@ -325,29 +357,23 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
             }
             counters[from.rawValue].receivedDatagrams += 1
             counters[from.rawValue].receivedBytes += UInt64(count)
-            guard !dropAll, endpoints[advertisedSide.rawValue] != nil,
-                  pending.count - pendingHead < Self.maximumQueuedDatagrams,
-                  pendingBytes + count <= Self.maximumQueuedBytes else {
+            guard !dropAll, endpoints[advertisedSide.rawValue] != nil else {
                 counters[from.rawValue].droppedDatagrams += 1
                 continue
             }
-            pending.append(PendingDatagram(
-                deadline: DispatchTime.now().uptimeNanoseconds + delayNanoseconds,
-                from: from,
-                bytes: Data(buffer.prefix(count))
-            ))
-            pendingBytes += count
-            maximumPendingBytes = max(maximumPendingBytes, pendingBytes)
+            scheduler.enqueue(Data(buffer.prefix(count)), from: from,
+                              at: DispatchTime.now().uptimeNanoseconds)
         }
     }
 
-    private func forwardDueDatagrams() {
+    private func forwardDueDatagrams(generation: UInt64) {
         guard !stopped, !dropAll else { return }
         let now = DispatchTime.now().uptimeNanoseconds
-        while pendingHead < pending.count, pending[pendingHead].deadline <= now {
-            let datagram = pending[pendingHead]
-            pendingHead += 1
-            pendingBytes -= datagram.bytes.count
+        var batch = StartupVideoDatagramReleaseMeasurements.Batch()
+        var directionalBatches = [
+            StartupVideoDatagramReleaseMeasurements.Batch(), StartupVideoDatagramReleaseMeasurements.Batch(),
+        ]
+        for datagram in scheduler.takeDue(at: now, generation: generation) {
             let destination = datagram.from.opposite
             guard var address = endpoints[destination.rawValue]?.address else {
                 counters[datagram.from.rawValue].droppedDatagrams += 1
@@ -355,6 +381,14 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
             }
             // Emit from the socket advertised for the original sender. The
             // receiver therefore sees only the relay as its remote ICE endpoint.
+            // Count attempts conservatively, including sendto backpressure. Each
+            // timer/read-source flush is one batch; this never changes pacing.
+            let sendTime = DispatchTime.now().uptimeNanoseconds
+            batch.recordAttempt(byteCount: datagram.bytes.count,
+                                deliveryDeadline: datagram.deliveryDeadline, at: sendTime)
+            directionalBatches[datagram.from.rawValue].recordAttempt(
+                byteCount: datagram.bytes.count, deliveryDeadline: datagram.deliveryDeadline, at: sendTime
+            )
             let count = datagram.bytes.withUnsafeBytes { bytes in
                 withUnsafePointer(to: &address) { pointer in
                     pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -367,34 +401,54 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
                 counters[datagram.from.rawValue].forwardedDatagrams += 1
                 counters[datagram.from.rawValue].forwardedBytes += UInt64(count)
             } else {
+                if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    scheduler.recordBackpressure(from: datagram.from)
+                }
                 errorCount += 1
                 counters[datagram.from.rawValue].droppedDatagrams += 1
             }
         }
-        if pendingHead > 0 {
-            pending.removeFirst(pendingHead)
-            pendingHead = 0
+        releaseMeasurements.record(batch)
+        for index in directionalBatches.indices {
+            directionalReleaseMeasurements[index].record(directionalBatches[index])
         }
         scheduleNext()
     }
 
     private func scheduleNext() {
-        if pendingHead < pending.count {
-            timer?.schedule(deadline: DispatchTime(uptimeNanoseconds: pending[pendingHead].deadline),
+        if let deadline = scheduler.nextDeadline {
+            let generation = scheduler.generation
+            timer?.setEventHandler { [weak self] in self?.forwardDueDatagrams(generation: generation) }
+            timer?.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline),
                             leeway: .microseconds(100))
         } else {
             timer?.schedule(deadline: .distantFuture)
         }
     }
 
-    private func discardPending() {
-        for datagram in pending.dropFirst(pendingHead) {
-            counters[datagram.from.rawValue].droppedDatagrams += 1
-        }
-        pending.removeAll(keepingCapacity: false)
-        pendingHead = 0
-        pendingBytes = 0
+    private func discardPending(stop: Bool = false) {
+        scheduler.discardPending(stop: stop)
         timer?.schedule(deadline: .distantFuture)
+    }
+
+    private func directionCounters(from side: Side) -> DirectionCounters {
+        var result = counters[side.rawValue]
+        let scheduled = scheduler.counters(from: side)
+        result.droppedDatagrams += scheduled.droppedDatagrams
+        result.configuredBitsPerSecond = scheduled.configuredBitsPerSecond
+        result.pendingDatagrams = scheduled.pendingDatagrams
+        result.pendingBytes = scheduled.pendingBytes
+        result.maximumPendingBytes = scheduled.maximumPendingBytes
+        result.overflowDatagrams = scheduled.overflowDatagrams
+        result.expiredDatagrams = scheduled.expiredDatagrams
+        result.backpressureDatagrams = scheduled.backpressureDatagrams
+        result.serializationDelayNanoseconds = scheduled.serializationDelayNanoseconds
+        result.maximumSerializationDelayNanoseconds = scheduled.maximumSerializationDelayNanoseconds
+        let release = directionalReleaseMeasurements[side.rawValue]
+        result.maximumDeliveryLatenessNanoseconds = release.maximumDeliveryLatenessNanoseconds
+        result.maximumReleaseBatchDatagrams = release.maximumReleaseBatchDatagrams
+        result.maximumReleaseBatchBytes = release.maximumReleaseBatchBytes
+        return result
     }
 
     private static func numericIPv4(_ value: String) -> in_addr? {

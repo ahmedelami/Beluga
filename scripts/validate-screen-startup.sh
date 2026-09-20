@@ -28,6 +28,8 @@ REQUIRED_CLASSES = %w[
   WebRTCTransportTests.WebRTCScreenVideoStatisticsReportTests
   WebRTCTransportTests.WebRTCRoundTripTimeObservationTests
   WebRTCTransportTests.WebRTCStatisticsParserTests
+  WebRTCTransportTests.WebRTCVideoStartupStatisticsTests
+  CaptureServerTests.StartupVideoDatagramSchedulerTests
 ].freeze
 # Renaming or deleting a pinned safety method requires intentional gate review.
 REQUIRED_METHODS = %w[
@@ -49,6 +51,19 @@ NATIVE_METHODS = %w[
   CaptureServerTests.WebRTCStartupClarityExperimentTests/testDenseProductionPolicyDelayedNetworkWithDynamicFrameRateCharacterization
 ].freeze
 NATIVE_OPT_IN = 'OPENSTEAMER_RUN_STARTUP_CLARITY_EXPERIMENT'
+CAPACITY_METHODS = %w[
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedAmpleColdStill
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedAmpleWarmStill
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedWeakColdStill
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedWeakWarmStill
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedAmpleColdMoving
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedAmpleWarmMoving
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedWeakColdMoving
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedWeakWarmMoving
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedAmpleShapedMoving
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedWeakShapedMoving
+  CaptureServerTests.WebRTCStartupClarityExperimentTests/testSerializedMovingCapacityDropAndRecovery
+].freeze
 
 def fail_gate(message)
   raise RuntimeError, message
@@ -207,10 +222,12 @@ options = { native: false, jobs: 1, timeout: 900 }
 seen = Set.new
 usage = <<~HELP
   Usage: DEVELOPER_DIR=/reviewed/Xcode.app/Contents/Developer \
-    scripts/validate-screen-startup.sh --scratch-path /dedicated/startup-build [--jobs 1|2] [--native] [--timeout-seconds 1..3600]
+    scripts/validate-screen-startup.sh --scratch-path /dedicated/startup-build [--jobs 1|2] [--native] [--capacity-experiment] [--timeout-seconds 1..3600]
 
   Builds/discovers once, then runs the deterministic startup manifest. --native also
   runs blackout and delayed dynamic-FPS methods in separate fresh processes.
+  --capacity-experiment additionally characterizes the serialized-link matrix in three
+  fresh-process rounds. It includes --native; characterization is not production acceptance.
   Existing scratch caches are reused; fresh logs, method manifests, and available xUnit files
   are retained in SCRATCH/validation-runs. Source identity is checked between phases.
   Coordinate with other tasks: do not run another build concurrently or share scratch.
@@ -230,6 +247,9 @@ begin
     case argument
     when '--native'
       options[:native] = true
+    when '--capacity-experiment'
+      options[:native] = true
+      options[:capacity] = true
     when '--scratch-path', '--jobs', '--timeout-seconds'
       value = ARGV.shift
       fail_gate("missing value for #{argument}") if value.nil? || value.start_with?('--')
@@ -291,13 +311,25 @@ begin
   if options[:native]
     NATIVE_METHODS.each { |id| fail_gate("required native method missing from discovery: #{id}") unless discovered.include?(id) }
   end
+  if options[:capacity]
+    CAPACITY_METHODS.each { |id| fail_gate("required capacity method missing from discovery: #{id}") unless discovered.include?(id) }
+  end
   File.write(File.join(evidence, 'test-manifest.json'), JSON.pretty_generate(
-    deterministic: selected, native: options[:native] ? NATIVE_METHODS : [], jobs: options[:jobs], source_sha256: expected_source
+    deterministic: selected, native: options[:native] ? NATIVE_METHODS : [],
+    capacity: options[:capacity] ? CAPACITY_METHODS : [], capacity_rounds: options[:capacity] ? 3 : 0,
+    jobs: options[:jobs], source_sha256: expected_source
   ))
   phases = [['deterministic', selected, environment]]
   if options[:native]
     NATIVE_METHODS.each_with_index do |id, index|
       phases << ["native-#{index + 1}", [id], environment.merge(NATIVE_OPT_IN => '1')]
+    end
+  end
+  if options[:capacity]
+    3.times do |round|
+      CAPACITY_METHODS.each_with_index do |id, index|
+        phases << ["capacity-#{round + 1}-#{index + 1}", [id], environment.merge(NATIVE_OPT_IN => '1')]
+      end
     end
   end
   phases.each do |label, methods, phase_environment|

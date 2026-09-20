@@ -120,6 +120,20 @@ final class WebRTCScreenVideoStatisticsReportTests: XCTestCase {
         }
     }
 
+    func testAudioReplacementPreservesVideoDiagnosticsAndNativeCollectionIdentity() {
+        let snapshot = populatedSnapshot(route: nil)
+        let replacement = WebRTCAudioStatistics(bytes: 91, packets: 7)
+        let copied = snapshot.replacingInboundAudio(with: replacement)
+
+        XCTAssertEqual(copied.inboundAudio, replacement)
+        XCTAssertEqual(copied.outboundVideo, snapshot.outboundVideo)
+        XCTAssertEqual(copied.inboundVideo, snapshot.inboundVideo)
+        XCTAssertEqual(copied.collectedAt, snapshot.collectedAt)
+        XCTAssertEqual(copied.collectionSequence, snapshot.collectionSequence)
+        XCTAssertEqual(copied.roundTripTimeObservation, snapshot.roundTripTimeObservation)
+        XCTAssertNil(copied.route)
+    }
+
     private func populatedSnapshot(route: WebRTCICERouteDiagnostics?) -> WebRTCStatisticsSnapshot {
         WebRTCStatisticsSnapshot(
             collectedAt: Date(timeIntervalSince1970: 123),
@@ -151,7 +165,15 @@ final class WebRTCScreenVideoStatisticsReportTests: XCTestCase {
             framesPerSecond: Double(seed) * 5,
             frameWidth: Int(seed) * 540,
             frameHeight: Int(seed) * 960,
-            framesEncodedOrDecoded: seed * 30
+            framesEncodedOrDecoded: seed * 30,
+            keyFramesEncoded: seed + 1,
+            totalEncodeTime: Double(seed) * 0.08,
+            hugeFramesSent: seed + 2,
+            qpSum: seed * 300,
+            nackCount: seed + 3,
+            pliCount: seed + 4,
+            qualityLimitationReason: seed == 1 ? .bandwidth : .cpu,
+            targetBitrate: Double(seed) * 1_000_000
         )
     }
 

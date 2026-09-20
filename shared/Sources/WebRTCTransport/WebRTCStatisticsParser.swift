@@ -686,7 +686,22 @@ enum WebRTCStatisticsParser {
             framesEncodedOrDecoded: unsigned(
                 outbound ? "framesEncoded" : "framesDecoded",
                 in: record.values
-            )
+            ),
+            keyFramesEncoded: outbound
+                ? strictUnsigned("keyFramesEncoded", in: record.values) : nil,
+            totalEncodeTime: outbound
+                ? strictNonnegativeDouble("totalEncodeTime", in: record.values) : nil,
+            hugeFramesSent: outbound
+                ? strictUnsigned("hugeFramesSent", in: record.values) : nil,
+            qpSum: strictUnsigned("qpSum", in: record.values),
+            nackCount: strictUnsigned("nackCount", in: record.values),
+            pliCount: strictUnsigned("pliCount", in: record.values),
+            qualityLimitationReason: outbound
+                ? string("qualityLimitationReason", in: record.values).flatMap {
+                    WebRTCVideoQualityLimitationReason(rawValue: $0)
+                } : nil,
+            targetBitrate: outbound
+                ? strictNonnegativeDouble("targetBitrate", in: record.values) : nil
         )
     }
 

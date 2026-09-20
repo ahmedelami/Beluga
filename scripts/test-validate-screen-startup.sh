@@ -13,6 +13,7 @@ runner_source = File.read(source)
 required = runner_source[/REQUIRED_CLASSES = %w\[(.*?)\]/m, 1].split
 pinned_methods = runner_source[/REQUIRED_METHODS = %w\[(.*?)\]/m, 1].split
 native = runner_source[/NATIVE_METHODS = %w\[(.*?)\]/m, 1].split
+capacity = runner_source[/CAPACITY_METHODS = %w\[(.*?)\]/m, 1].split
 raise 'invariant sequence class is absent from the gate' unless required.include?('CaptureServerTests.WorldwideScreenStartupInvariantSequenceTests')
 raise 'expected the two explicit native methods' unless native.length == 2
 
@@ -35,7 +36,7 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
   FileUtils.mkdir_p(File.join(developer, 'Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk'))
   extra = 'CaptureServerTests.WorldwideScreenStartupAdditionalRegressionTests/testFutureCoverage'
   unrelated = 'CaptureServerTests.UnrelatedTests/testNotSelected'
-  all_methods = required.map { |class_name| class_name + '/testFixture' } + pinned_methods + native + [extra, unrelated]
+  all_methods = required.map { |class_name| class_name + '/testFixture' } + pinned_methods + native + capacity + [extra, unrelated]
   manifest = File.join(temporary, 'fake-methods.json')
   File.write(manifest, JSON.generate(all_methods))
   File.write(swift, <<~'FAKE')
@@ -53,6 +54,7 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
       methods.reject! { |id| id.include?('testShowKeepsExistingTrafficCeilingsButStartsWithFullPixels') } if mode == 'missing_method'
       methods.reject! { |id| id.include?('testConfiguredCapAndSourceFPSMatrixGivesUncertaintyNoAuthority') } if mode == 'missing_sequence_method'
       methods.reject! { |id| id.include?('testDelayedNetworkBlackout') } if mode == 'missing_native'
+      methods.reject! { |id| id.include?('testSerializedWeakColdStill') } if mode == 'missing_capacity'
       if mode == 'source_change'
         File.open(ENV.fetch('STARTUP_GATE_FAKE_SOURCE'), 'a') { |file| file.puts '// changed while compiling' }
       end
@@ -153,6 +155,7 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
   run.call('missing_method', expected_failure: 'required safety method missing')
   run.call('missing_sequence_method', expected_failure: 'required safety method missing')
   run.call('missing_native', native_enabled: true, expected_failure: 'required native method missing')
+  run.call('missing_capacity', extra_args: ['--capacity-experiment'], expected_failure: 'required capacity method missing')
   run.call('compile_failure', expected_failure: 'discover-and-build exited unsuccessfully')
   run.call('nonzero', expected_failure: 'deterministic exited unsuccessfully')
   run.call('native_nonzero', native_enabled: true, expected_failure: 'native-1 exited unsuccessfully')
@@ -221,6 +224,16 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
   calls.drop(2).zip(native).each do |call, method|
     selection = Regexp.new(call['argv'].fetch(call['argv'].index('--filter') + 1))
     assert(all_methods.select { |id| selection.match?(id) } == [method], 'native phase did not select exactly its required method')
+  end
+  calls, = run.call('success', extra_args: ['--capacity-experiment'])
+  expected = native + capacity * 3
+  assert(calls.length == 2 + expected.length, 'capacity matrix must run three fresh-process rounds')
+  assert(calls.map { |call| call['pid'] }.uniq.length == calls.length, 'capacity methods shared a process')
+  assert(calls.take(2).all? { |call| call['native'].nil? }, 'native opt-in leaked into capacity build/default')
+  calls.drop(2).zip(expected).each do |call, method|
+    selection = Regexp.new(call['argv'].fetch(call['argv'].index('--filter') + 1))
+    assert(all_methods.select { |id| selection.match?(id) } == [method], 'capacity phase selected wrong method')
+    assert(call['native'] == '1' && call['argv'].include?('--skip-build'), 'capacity phase must use opt-in same-invocation artifact')
   end
   puts "screen-startup runner self-tests: PASS (#{cases} scenarios; fake Swift only)"
 end

@@ -53,6 +53,14 @@ public struct WebRTCICERouteDiagnostics: Codable, Equatable, Sendable {
     }
 }
 
+/// The native encoder's bounded reason category, not a diagnosis of Internet congestion.
+public enum WebRTCVideoQualityLimitationReason: String, Codable, Sendable {
+    case none
+    case cpu
+    case bandwidth
+    case other
+}
+
 /// Stable outbound or inbound video counters extracted from a native statistics report.
 public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
     public let bytes: UInt64?
@@ -63,6 +71,19 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
     public let frameWidth: Int?
     public let frameHeight: Int?
     public let framesEncodedOrDecoded: UInt64?
+    /// Encoder-only fields stay nil when absent or on an inbound report. These cumulative
+    /// counters do not identify individual frame sizes or grant adaptation permission.
+    public let keyFramesEncoded: UInt64?
+    public let totalEncodeTime: Double?
+    public let hugeFramesSent: UInt64?
+    /// Native QP totals describe encoded frames outbound and decoded frames inbound.
+    public let qpSum: UInt64?
+    /// Feedback received outbound or sent inbound; these are not packet-loss counts.
+    public let nackCount: UInt64?
+    public let pliCount: UInt64?
+    public let qualityLimitationReason: WebRTCVideoQualityLimitationReason?
+    /// Native encoder target in bits per second, not measured path capacity.
+    public let targetBitrate: Double?
 
     public init(
         bytes: UInt64? = nil,
@@ -72,7 +93,15 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
         framesPerSecond: Double? = nil,
         frameWidth: Int? = nil,
         frameHeight: Int? = nil,
-        framesEncodedOrDecoded: UInt64? = nil
+        framesEncodedOrDecoded: UInt64? = nil,
+        keyFramesEncoded: UInt64? = nil,
+        totalEncodeTime: Double? = nil,
+        hugeFramesSent: UInt64? = nil,
+        qpSum: UInt64? = nil,
+        nackCount: UInt64? = nil,
+        pliCount: UInt64? = nil,
+        qualityLimitationReason: WebRTCVideoQualityLimitationReason? = nil,
+        targetBitrate: Double? = nil
     ) {
         self.bytes = bytes
         self.packets = packets
@@ -82,6 +111,14 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
         self.frameWidth = frameWidth
         self.frameHeight = frameHeight
         self.framesEncodedOrDecoded = framesEncodedOrDecoded
+        self.keyFramesEncoded = keyFramesEncoded
+        self.totalEncodeTime = totalEncodeTime
+        self.hugeFramesSent = hugeFramesSent
+        self.qpSum = qpSum
+        self.nackCount = nackCount
+        self.pliCount = pliCount
+        self.qualityLimitationReason = qualityLimitationReason
+        self.targetBitrate = targetBitrate
     }
 }
 
