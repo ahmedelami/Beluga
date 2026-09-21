@@ -2704,7 +2704,8 @@ actor WorldwideScreenService {
                     captureSource != nil
                         && automaticScreenMediaResumeContext == nil
                         && screenVideoAdaptationFastStatisticsAreAvailable
-                        && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil,
+                        && (screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil
+                            || screenVideoAdaptationPolicy.spatialRecoveryIsTrialActive),
                     at: now
                 )
             }
@@ -2882,6 +2883,14 @@ actor WorldwideScreenService {
                 outboundVideoTotalPacketSendDelaySeconds:
                     snapshot.outboundVideo?.totalPacketSendDelay,
                 nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
+                spatialRecoveryFrames: snapshot.outboundVideo.flatMap { video in
+                    guard let frames = video.framesEncodedOrDecoded,
+                          let width = video.frameWidth, let height = video.frameHeight,
+                          let source = captureVideoBaseDimensions else { return nil }
+                    return WorldwideScreenSpatialRecoveryFrameEvidence(
+                        encodedFrames: frames, encodedWidth: width, encodedHeight: height,
+                        sourceWidth: source.width, sourceHeight: source.height)
+                },
                 diagnostics: { floorDiagnostics = $0 }
             )
         } else {
@@ -2890,7 +2899,13 @@ actor WorldwideScreenService {
                     peerGeneration: sourcePeerGeneration,
                     isCaptureActive: isCaptureActive
                 )
-            guard changedRecommendation != nil else { return }
+            // A failed retirement leaves native limits at the previous value. Retry that
+            // outstanding reconciliation even when the next report is also absent.
+            guard changedRecommendation != nil
+                    || appliedScreenVideoRecommendation != proposedPolicy.currentRecommendation else {
+                screenVideoAdaptationPolicy = proposedPolicy
+                return
+            }
         }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
@@ -2968,6 +2983,8 @@ actor WorldwideScreenService {
                 + (proposedPolicy.startupSpatialModeIsActive ? "active"
                     : (proposedPolicy.startupSpatialModeIsDisproved
                         ? "disproved" : "inactive"))
+                + " spatialRecovery=\(proposedPolicy.spatialRecoveryPhase)"
+                + " spatialRecoveryAttempt=\(proposedPolicy.spatialRecoveryAttemptCount)"
                 + " queuePressureSamples=\(proposedPolicy.queuePressureSampleCount) "
                 + "bweKbps="
                 + (snapshot?.availableOutgoingBitrate.map {
@@ -3039,16 +3056,28 @@ actor WorldwideScreenService {
 
             var attemptConsumption = screenVideoAdaptationPolicy
             attemptConsumption.retainFloorRecoveryAttemptConsumption(from: proposedPolicy)
+            attemptConsumption.retainSpatialRecoveryAttemptConsumption(from: proposedPolicy)
             if attemptConsumption != screenVideoAdaptationPolicy {
                 // The attempt belongs to this Show even if native apply is later superseded.
                 screenVideoAdaptationPolicy = attemptConsumption
                 screenVideoAdaptationPolicyRevision &+= 1
                 applyingPolicyRevision = screenVideoAdaptationPolicyRevision
             }
+            let applicationDeadline = proposedPolicy.spatialRecoveryDeadline
+            let expirationFallback = proposedPolicy.recommendation(for: proposedPolicy.currentTier)
             do {
-                let senderUpdate = try await sourcePeer.applyScreenVideoEncodingLimits(
-                    recommendation.webRTCLimits
+                let nativeResult = try await WorldwideScreenBoundedNativeApplication.apply(
+                    deadline: applicationDeadline,
+                    now: { .now },
+                    apply: { try await sourcePeer.applyScreenVideoEncodingLimits(recommendation.webRTCLimits) },
+                    rollback: {
+                        try await sourcePeer.replaceScreenVideoEncodingUpdateIfCurrent(
+                            $0, with: expirationFallback.webRTCLimits)
+                    }
                 )
+                guard case let .applied(senderUpdate) = nativeResult else {
+                    throw WebRTCTransportError.nativeFailure("Spatial recovery expired during native application; reconcile the retained tier.")
+                }
                 guard peer === sourcePeer,
                       peerGeneration == sourcePeerGeneration,
                       screenVideoAdaptationPolicyRevision
@@ -3081,6 +3110,21 @@ actor WorldwideScreenService {
                     }
                     return
                 }
+                let applicationResumedAt = ContinuousClock.now
+                _ = proposedPolicy.expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: sourcePeerGeneration,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: applicationResumedAt
+                )
+                proposedPolicy.markSpatialRecoveryApplied(at: applicationResumedAt)
+                if proposedPolicy.currentRecommendation != recommendation {
+                    // Either proposal deadline may expire before the service actor resumes.
+                    // Never publish expired caps, geometry, or FPS as an accepted application.
+                    appliedScreenVideoRecommendation = nil
+                    _ = try await sourcePeer.replaceScreenVideoEncodingUpdateIfCurrent(
+                        senderUpdate, with: proposedPolicy.currentRecommendation.webRTCLimits)
+                    throw WebRTCTransportError.nativeFailure("Encoding proposal expired before its service commit; reconcile the retained tier.")
+                }
                 if appliedScreenVideoRecommendation?.maximumFramesPerSecond
                     != recommendation.maximumFramesPerSecond {
                     capturer.adaptOutput(
@@ -3107,22 +3151,27 @@ actor WorldwideScreenService {
                         + "evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular")"
                 )
             } catch {
-                guard peer === sourcePeer,
-                      peerGeneration == sourcePeerGeneration,
-                      screenVideoAdaptationPolicyRevision
-                        == applyingPolicyRevision,
-                      captureSource === source,
-                      captureSink === sink,
-                      self.captureAuthorization === captureAuthorization,
-                      self.captureForwardingAuthorization === forwardingAuthorization,
-                      captureAuthorization.isValid,
-                      forwardingAuthorization.isValid,
-                      sink.allowsActiveUse(authorizedBy: forwardingAuthorization),
-                      captureVideoBaseDimensions == baseDimensions else {
+                // An ambiguous failure needs a fresh native proof only for this exact owner.
+                guard WorldwideScreenNativeApplicationCache.invalidateIfCurrent(
+                    &appliedScreenVideoRecommendation,
+                    expectedPolicyRevision: applyingPolicyRevision,
+                    currentPolicyRevision: screenVideoAdaptationPolicyRevision,
+                    otherOwnersAreCurrent:
+                        peer === sourcePeer
+                        && peerGeneration == sourcePeerGeneration
+                        && captureSource === source
+                        && captureSink === sink
+                        && self.captureAuthorization === captureAuthorization
+                        && self.captureForwardingAuthorization === forwardingAuthorization
+                        && captureAuthorization.isValid
+                        && forwardingAuthorization.isValid
+                        && sink.allowsActiveUse(authorizedBy: forwardingAuthorization)
+                        && captureVideoBaseDimensions == baseDimensions
+                ) else {
                     return
                 }
                 logger.error(
-                    "Worldwide screen video adaptation held its previous tier: "
+                    "Worldwide screen video adaptation needs native reconciliation: "
                         + error.localizedDescription
                 )
                 logger.debug(
@@ -3133,11 +3182,17 @@ actor WorldwideScreenService {
                 let cancelledFloorRecoveryProbe =
                     screenVideoAdaptationPolicy.floorRecoveryProbeIsActive
                         && proposedPolicy.floorRecoveryProbeWasCancelled
+                // Another terminal policy transition below may commit this proposal in full.
+                // It must not also install a recovery whose native geometry was rejected.
+                _ = proposedPolicy.expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: sourcePeerGeneration, isCaptureActive: isCaptureActive)
+                proposedPolicy.rejectPendingSpatialRecoveryApplication()
                 screenVideoAdaptationPolicy
                     .retainStartupSpatialModeTerminalState(from: proposedPolicy)
                 screenVideoAdaptationPolicy.retainFloorRecoveryAttemptConsumption(
                     from: proposedPolicy
                 )
+                screenVideoAdaptationPolicy.retainSpatialRecoveryTerminalState(from: proposedPolicy)
                 if cancelledFloorRecoveryProbe
                     || (capacityProbeOnly
                         && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil
@@ -3152,6 +3207,17 @@ actor WorldwideScreenService {
                     screenVideoAdaptationPolicyRevision &+= 1
                 } else {
                     screenVideoAdaptationPolicyRevision &+= 1
+                }
+                if let applicationDeadline, ContinuousClock.now >= applicationDeadline,
+                   screenVideoAdaptationPolicy.spatialRecoveryDeadline == nil {
+                    // Expiry before native entry can leave an earlier trial installed, and
+                    // failed rollback is unknown. Make one immediate current-owner correction.
+                    // The retained terminal state has no deadline, so this cannot recurse on
+                    // the expired attempt if the corrective native application also fails.
+                    await adaptScreenVideoForNetworkConditions(
+                        nil, sourcePeer: sourcePeer, sourcePeerGeneration: sourcePeerGeneration,
+                        expectedPolicyRevision: screenVideoAdaptationPolicyRevision,
+                        allowsAutomaticResume: false)
                 }
                 return
             }

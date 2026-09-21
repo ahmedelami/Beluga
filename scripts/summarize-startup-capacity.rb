@@ -5,8 +5,14 @@ require 'json'
 
 abort 'usage: ruby scripts/summarize-startup-capacity.rb ABSOLUTE_GATE_EVIDENCE_DIRECTORY' unless ARGV.length == 1 && ARGV[0].start_with?('/')
 directory = File.realpath(ARGV[0])
-rows = Dir.glob(File.join(directory, 'capacity-*-*.results.json')).sort_by do |path|
-  File.basename(path).scan(/\d+/).map(&:to_i)
+manifest_path = File.join(directory, 'test-manifest.json')
+manifest = File.file?(manifest_path) ? JSON.parse(File.read(manifest_path)) : {}
+expected_phases = manifest.fetch('capacity', []).length * manifest.fetch('capacity_rounds', 0) +
+  manifest.fetch('spatial_recovery', []).length * manifest.fetch('spatial_recovery_rounds', 0)
+result_paths = Dir.glob(File.join(directory, 'capacity-*-*.results.json')) +
+  Dir.glob(File.join(directory, 'spatial-recovery-*-*.results.json'))
+rows = result_paths.sort_by do |path|
+  [File.basename(path).start_with?('capacity-') ? 0 : 1, *File.basename(path).scan(/\d+/).map(&:to_i)]
 end.map do |result_path|
   result = JSON.parse(File.read(result_path))
   abort "invalid phase result: #{result_path}" unless result.fetch('passed').length == 1
@@ -20,7 +26,14 @@ end.map do |result_path|
   trace = record.fetch('trace')
   sharp = ->(frame) { frame.fetch('width') == 1080 && frame.fetch('height') == 1920 && frame.fetch('contrast') > 0.9 }
   first_sharp = frames.find(&sharp)
-  ending = record.fetch('capacityDropAndRecovery') ? 16_000.0 : 12_000.0
+  ending = record.fetch('observationDurationMs') { record.fetch('capacityDropAndRecovery') ? 16_000.0 : 12_000.0 }
+  restored_at = record['restoredAtMs']
+  recovered = restored_at && frames.find { |frame| frame['elapsedMs'] >= restored_at && sharp.call(frame) }
+  next_drop = record.fetch('capacityChanges', []).find { |change| change['stage'] == 3 }
+  recovered_interval_end = next_drop ? next_drop.fetch('mutationStartedMs') : ending
+  recovered_blurry_frames = recovered && frames.count do |frame|
+    frame['elapsedMs'] >= recovered['elapsedMs'] && frame['elapsedMs'] < recovered_interval_end && !sharp.call(frame)
+  end
   blurry_after_sharp = frames.each_with_index.sum do |frame, index|
     next 0.0 unless first_sharp && frame['elapsedMs'] >= first_sharp['elapsedMs'] && !sharp.call(frame)
     [0.0, (frames[index + 1]&.fetch('elapsedMs') || ending) - frame['elapsedMs']].max
@@ -34,6 +47,26 @@ end.map do |result_path|
   warmup_observed_frames = record.fetch('warmup').map { |entry| entry['encodedFrames'] }
   {
     phase: File.basename(log, '.log'), test: result['passed'].first.split('/').last,
+    spatial_recovery_enabled: record['spatialRecoveryEnabled'],
+    spatial_recovery_required: record['requiresSpatialRecovery'],
+    second_capacity_drop: record['secondCapacityDrop'],
+    observation_duration_ms: ending,
+    capacity_changes: record['capacityChanges'],
+    restoration_lower_bound_ms: restored_at,
+    recovery_first_sharp_ms: recovered && recovered['elapsedMs'],
+    recovery_latency_upper_bound_ms: recovered && recovered['elapsedMs'] - restored_at,
+    recovery_deadline_ms: record['recoveryDeadlineMs'],
+    required_sustained_recovery_ms: record['requiredSustainedRecoveryMs'],
+    requires_sharp_until_next_capacity_drop: record['requiresSharpUntilNextCapacityDrop'],
+    recovered_interval_end_ms: recovered_interval_end,
+    blurry_recovered_frames_before_next_drop: recovered_blurry_frames,
+    final_spatial_recovery_phase: trace.last['spatialRecoveryPhase'],
+    final_spatial_recovery_attempt_count: trace.last['spatialRecoveryAttemptCount'],
+    final_tier: trace.last['tier'],
+    final_current_total_cap_bps: trace.last['currentTotalCapBps'],
+    final_ordinary_total_cap_bps: trace.last['ordinaryTotalCapBps'],
+    final_rtt_disposition: trace.last['rttDisposition'],
+    maximum_policy_ordinary_packet_delay_ms: trace.map { |entry| entry['lastOrdinaryPacketDelayMs'] }.compact.max,
     first_frame_ms: record['firstFrameFromCaptureMs'], first_sharp_ms: first_sharp&.fetch('elapsedMs'),
     first_frame_from_ready_ms: record['firstFrameFromTransportReadyMs'],
     blurry_after_first_sharp_ms: blurry_after_sharp,
@@ -53,4 +86,4 @@ end.map do |result_path|
     warmup_missing_encoder_samples: warmup_observed_frames.count(nil)
   }
 end
-puts JSON.pretty_generate(completed_phases: rows.length, expected_phases: 33, rows: rows)
+puts JSON.pretty_generate(completed_phases: rows.length, expected_phases: expected_phases, rows: rows)

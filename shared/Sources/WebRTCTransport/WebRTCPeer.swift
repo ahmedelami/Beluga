@@ -3638,6 +3638,35 @@ public actor WebRTCPeer {
 
     #if DEBUG && os(macOS)
     @TaskLocal private static var useHeadlessMacViewerAudioForTesting = false
+    private final class NativeConfigurationHooks: @unchecked Sendable {
+        let make: @Sendable () throws -> LKRTCConfiguration
+        let verify: @Sendable (LKRTCPeerConnection) throws -> Void
+        let makeFactory: (@Sendable (any LKRTCVideoEncoderFactory, any LKRTCVideoDecoderFactory) throws -> LKRTCPeerConnectionFactory)?
+        private let lock = NSLock()
+        private var used = false
+        private var retired = false
+
+        init(make: @escaping @Sendable () throws -> LKRTCConfiguration,
+             verify: @escaping @Sendable (LKRTCPeerConnection) throws -> Void,
+             makeFactory: (@Sendable (any LKRTCVideoEncoderFactory, any LKRTCVideoDecoderFactory) throws -> LKRTCPeerConnectionFactory)?) {
+            self.make = make
+            self.verify = verify
+            self.makeFactory = makeFactory
+        }
+
+        func admitOnce() throws {
+            try lock.withLock {
+                guard !used, !retired else {
+                    throw WebRTCTransportError.nativeFailure("Expired or reused native construction hook")
+                }
+                used = true
+            }
+        }
+
+        func retire() { lock.withLock { retired = true } }
+    }
+    @TaskLocal private static var nativeConfigurationHooksForTesting: NativeConfigurationHooks?
+    @TaskLocal private static var startupPacingExperimentTokenForTesting: UUID?
     #endif
     #if DEBUG && os(iOS)
     @TaskLocal private static var noHardwareIOSHostAudioDeviceForTesting:
@@ -3933,6 +3962,17 @@ public actor WebRTCPeer {
 
     /// Builds the native factory, role-appropriate audio device, media tracks, and control lane.
     public init(configuration: WebRTCTransportConfiguration) throws {
+        #if DEBUG && os(macOS)
+        try WebRTCRuntime.pacingAdmission.admit(
+            role: configuration.role, topology: configuration.mediaTopology,
+            token: Self.startupPacingExperimentTokenForTesting)
+        if let hooks = Self.nativeConfigurationHooksForTesting {
+            guard configuration.role == .host, configuration.mediaTopology == .videoControlOnly else {
+                throw WebRTCTransportError.invalidRole
+            }
+            try hooks.admitOnce()
+        }
+        #endif
         #if os(iOS)
         var constructionRetirementHandle:
             WebRTCIOSAudioDeviceRetirementHandle? = nil
@@ -4059,7 +4099,8 @@ public actor WebRTCPeer {
                 nativeFactory = customFactory
             } else {
                 stereoAudioDevice = nil
-                nativeFactory = LKRTCPeerConnectionFactory(
+                nativeFactory = try Self.nativeConfigurationHooksForTesting?.makeFactory?(encoderFactory, decoderFactory)
+                    ?? LKRTCPeerConnectionFactory(
                     audioDeviceModuleType: .audioEngine,
                     bypassVoiceProcessing: true,
                     encoderFactory: encoderFactory,
@@ -4236,7 +4277,12 @@ public actor WebRTCPeer {
         }
         #endif
 
+        #if DEBUG && os(macOS)
+        let nativeConfiguration = try Self.nativeConfigurationHooksForTesting?.make()
+            ?? LKRTCConfiguration()
+        #else
         let nativeConfiguration = LKRTCConfiguration()
+        #endif
         nativeConfiguration.iceServers = configuration.iceServers.map {
             LKRTCIceServer(
                 urlStrings: $0.urls,
@@ -4274,6 +4320,18 @@ public actor WebRTCPeer {
         ) else {
             throw WebRTCTransportError.peerConnectionCreationFailed
         }
+        #if DEBUG && os(macOS)
+        do {
+            try Self.nativeConfigurationHooksForTesting?.verify(nativePeer)
+        } catch {
+            proxy.close()
+            nativePeer.close()
+            eventPair.continuation.finish()
+            screenClientDiagnosticsEventPair.continuation.finish()
+            probeEventPair.continuation.finish()
+            throw error
+        }
+        #endif
         peerConnection = nativePeer
 
         #if os(iOS)
@@ -5338,6 +5396,60 @@ public actor WebRTCPeer {
     }
     #endif
     #if os(macOS)
+    nonisolated static func withStartupPacingExperimentForTesting<Result>(
+        factor: WebRTCStartupPacingFactor,
+        selectedTest: String,
+        observeEstimator: Bool = false,
+        holdDelayGrowthInALR: Bool = false,
+        skipProbesBelowCurrentEstimate: Bool = false,
+        defaultPacingCohort: Bool = false,
+        probeDurationExperiment: WebRTCStartupProbeDurationExperiment? = nil,
+        observeEncoderBoundary: Bool = false,
+        operation: () async throws -> Result
+    ) async throws -> Result {
+        try WebRTCStartupPacingExperimentOptIn.validate(
+            selectedTest: selectedTest, arguments: ProcessInfo.processInfo.arguments,
+            environment: ProcessInfo.processInfo.environment, factor: factor, observeEstimator: observeEstimator,
+            holdDelayGrowthInALR: holdDelayGrowthInALR,
+            skipProbesBelowCurrentEstimate: skipProbesBelowCurrentEstimate,
+            defaultPacingCohort: defaultPacingCohort,
+            probeDurationExperiment: probeDurationExperiment,
+            observeEncoderBoundary: observeEncoderBoundary)
+        let token = try WebRTCRuntime.pacingAdmission.reserve(factor: factor,
+            observeEstimator: observeEstimator, holdDelayGrowthInALR: holdDelayGrowthInALR,
+            skipProbesBelowCurrentEstimate: skipProbesBelowCurrentEstimate,
+            probeDurationExperiment: probeDurationExperiment)
+        defer { WebRTCRuntime.pacingAdmission.retire(token: token) }
+        return try await $startupPacingExperimentTokenForTesting.withValue(token, operation: operation)
+    }
+
+    func inspectVideoControlOnlyNativePeerForTesting<Result: Sendable>(
+        _ inspect: @Sendable (LKRTCPeerConnection) throws -> Result
+    ) throws -> Result {
+        guard mediaTopology == .videoControlOnly, !isClosed else {
+            throw WebRTCTransportError.invalidRole
+        }
+        return try inspect(peerConnection)
+    }
+
+    /// Call-scoped, audio-free native experiments. Neither hook escapes construction.
+    nonisolated static func makeVideoControlOnlyHostForTesting(
+        configuration: WebRTCTransportConfiguration,
+        makeNativeConfiguration: @escaping @Sendable () throws -> LKRTCConfiguration,
+        verifyCreatedPeer: @escaping @Sendable (LKRTCPeerConnection) throws -> Void,
+        makeNativeFactory: (@Sendable (any LKRTCVideoEncoderFactory, any LKRTCVideoDecoderFactory) throws -> LKRTCPeerConnectionFactory)? = nil
+    ) throws -> WebRTCPeer {
+        guard configuration.role == .host, configuration.mediaTopology == .videoControlOnly else {
+            throw WebRTCTransportError.invalidRole
+        }
+        let hooks = NativeConfigurationHooks(make: makeNativeConfiguration,
+            verify: verifyCreatedPeer, makeFactory: makeNativeFactory)
+        defer { hooks.retire() }
+        return try $nativeConfigurationHooksForTesting.withValue(hooks) {
+            try WebRTCPeer(configuration: configuration)
+        }
+    }
+
     nonisolated static func makeHeadlessViewerForTesting(
         configuration: WebRTCTransportConfiguration
     ) throws -> WebRTCPeer {
@@ -8136,6 +8248,21 @@ public actor WebRTCPeer {
                 update.previousMaximumTotalRTPBitrateBps
         }
         screenVideoEncodingUpdateGeneration &+= 1
+        return true
+    }
+
+    /// Replaces one still-current speculative update with a caller-owned fallback without an
+    /// actor reentrancy point between rollback and fallback application. A newer native sender
+    /// mutation makes the opaque update stale and leaves that newer state untouched.
+    @discardableResult
+    public func replaceScreenVideoEncodingUpdateIfCurrent(
+        _ update: WebRTCScreenVideoEncodingUpdate,
+        with fallbackLimits: WebRTCScreenVideoEncodingLimits
+    ) throws -> Bool {
+        guard try rollbackScreenVideoEncodingUpdateIfCurrent(update) else {
+            return false
+        }
+        _ = try applyScreenVideoEncodingLimits(fallbackLimits)
         return true
     }
 
@@ -13224,13 +13351,19 @@ enum ControlChannelMessage: Codable, Equatable, Sendable {
 }
 
 private enum WebRTCRuntime {
+    #if DEBUG && os(macOS)
+    static let pacingAdmission = WebRTCStartupPacingAdmission()
+    #endif
     static let isInitialized: Bool = {
         guard LKRTCInitializeSSL() else { return false }
         #if os(macOS)
         // Tiny screencast packets must not leave an already-budgeted probe waiting for 200 bytes.
-        LKRTCPeerConnectionFactory.configureFieldTrials(
-            "WebRTC-Bwe-ProbingBehavior/min_packet_size:0/"
-        )
+        #if DEBUG
+        guard let startupTrials = pacingAdmission.frozenConfiguration else { return false }
+        LKRTCPeerConnectionFactory.configureFieldTrials(startupTrials)
+        #else
+        LKRTCPeerConnectionFactory.configureFieldTrials(WebRTCMacStartupFieldTrials.baseline)
+        #endif
         WebRTCNativeProbeDiagnostics.start()
         #endif
         return true

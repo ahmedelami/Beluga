@@ -53,6 +53,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
         let maximumDeliveryLatenessNanoseconds: UInt64
         let maximumReleaseBatchDatagrams: Int
         let maximumReleaseBatchBytes: Int
+        let trafficTiming: StartupVideoDatagramTrafficMeasurements?
         let errorCount: UInt64
         let stopped: Bool
     }
@@ -78,6 +79,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
     private var counters = [DirectionCounters(), DirectionCounters()]
     private var scheduler: StartupVideoDatagramScheduler
     private var releaseMeasurements = StartupVideoDatagramReleaseMeasurements()
+    private var trafficTiming: StartupVideoDatagramTrafficMeasurements?
     private var directionalReleaseMeasurements = [
         StartupVideoDatagramReleaseMeasurements(), StartupVideoDatagramReleaseMeasurements(),
     ]
@@ -96,7 +98,8 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
         hostToViewerBitsPerSecond: UInt64? = nil,
         viewerToHostBitsPerSecond: UInt64? = nil,
         maximumQueuedBytes: Int = 4 * 1_024 * 1_024,
-        maximumQueueAgeMilliseconds: Int = 2_000
+        maximumQueueAgeMilliseconds: Int = 2_000,
+        collectTrafficTiming: Bool = false
     ) throws {
         guard (0...500).contains(oneWayDelayMilliseconds),
               (1...10_000).contains(maximumQueueAgeMilliseconds) else {
@@ -110,6 +113,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
             maximumQueueAgeNanoseconds: UInt64(maximumQueueAgeMilliseconds) * 1_000_000
         )
         self.dropAll = dropAll
+        trafficTiming = collectTrafficTiming ? StartupVideoDatagramTrafficMeasurements() : nil
         localAddresses = try Self.localIPv4Addresses()
         let first = try Self.makeSocket()
         let second: (descriptor: Int32, port: UInt16)
@@ -187,6 +191,7 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
                 maximumDeliveryLatenessNanoseconds: releaseMeasurements.maximumDeliveryLatenessNanoseconds,
                 maximumReleaseBatchDatagrams: releaseMeasurements.maximumReleaseBatchDatagrams,
                 maximumReleaseBatchBytes: releaseMeasurements.maximumReleaseBatchBytes,
+                trafficTiming: trafficTiming,
                 errorCount: errorCount,
                 stopped: stopped
             )
@@ -397,11 +402,13 @@ final class StartupVideoDatagramRelay: @unchecked Sendable {
                     }
                 }
             }
+            let sendError = count < 0 ? errno : 0
+            trafficTiming?.recordSendResult(datagram, sentByteCount: count, at: sendTime)
             if count == datagram.bytes.count {
                 counters[datagram.from.rawValue].forwardedDatagrams += 1
                 counters[datagram.from.rawValue].forwardedBytes += UInt64(count)
             } else {
-                if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if count < 0 && (sendError == EAGAIN || sendError == EWOULDBLOCK) {
                     scheduler.recordBackpressure(from: datagram.from)
                 }
                 errorCount += 1

@@ -240,7 +240,12 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
                 ".expireApplicationLimitedProbeWithoutReport("
             )
         )
-        XCTAssertTrue(adaptation.contains("guard changedRecommendation != nil else { return }"))
+        // Missing reports may also reconcile an unproven/failed native retirement. The
+        // deadline/rollback behavioral tests cover that exception; ordinary media-health
+        // ordering above remains unchanged by this supplementary wiring assertion.
+        XCTAssertTrue(adaptation.contains("guard changedRecommendation != nil"))
+        XCTAssertTrue(adaptation.contains(
+            "|| appliedScreenVideoRecommendation != proposedPolicy.currentRecommendation else {"))
     }
 
     func testSuspensionInvalidationRequiresFreshOrderedShowWithoutLocalReactivation() throws {
@@ -812,8 +817,10 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
                 separatedBy:
                     "screenVideoAdaptationPolicyRevision\n                        == applyingPolicyRevision"
             ).count - 1,
-            2
+            1
         )
+        XCTAssertTrue(adaptation.contains("expectedPolicyRevision: applyingPolicyRevision"))
+        XCTAssertTrue(adaptation.contains("currentPolicyRevision: screenVideoAdaptationPolicyRevision"))
         XCTAssertTrue(
             adaptation.contains("screenVideoAdaptationPolicyRevision &+= 1")
         )
@@ -844,6 +851,54 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
                 "currentRouteRevision == expectedRouteRevision"
             )
         )
+    }
+
+    func testNativeFailureInvalidationIsOwnedAndStaleRollbackCannotWriteCache() throws {
+        let adaptation = try serviceSlice(
+            after: "    private func adaptScreenVideoForNetworkConditions(",
+            before: "    private func beginAutomaticScreenMediaResumeIfPossible("
+        )
+        let staleBranch = try XCTUnwrap(adaptation.range(of: "nativeApply=stale"))
+        let markApplied = try XCTUnwrap(adaptation.range(
+            of: "proposedPolicy.markSpatialRecoveryApplied(at: applicationResumedAt)",
+            range: staleBranch.upperBound..<adaptation.endIndex
+        ))
+        let staleRollback = String(adaptation[staleBranch.lowerBound..<markApplied.lowerBound])
+        XCTAssertTrue(staleRollback.contains("rollbackScreenVideoEncodingUpdateIfCurrent("))
+        XCTAssertFalse(staleRollback.contains("appliedScreenVideoRecommendation"))
+        XCTAssertFalse(staleRollback.contains("WorldwideScreenNativeApplicationCache"))
+
+        let accepted = try XCTUnwrap(adaptation.range(of: "nativeApply=accepted"))
+        let failureCatch = try XCTUnwrap(adaptation.range(
+            of: "            } catch {",
+            range: accepted.upperBound..<adaptation.endIndex
+        ))
+        let reconcileLog = try XCTUnwrap(adaptation.range(
+            of: "Worldwide screen video adaptation needs native reconciliation:",
+            range: failureCatch.upperBound..<adaptation.endIndex
+        ))
+        let failureAdmission = String(adaptation[failureCatch.upperBound..<reconcileLog.lowerBound])
+        XCTAssertTrue(failureAdmission.contains("guard WorldwideScreenNativeApplicationCache.invalidateIfCurrent("))
+        XCTAssertTrue(failureAdmission.contains("&appliedScreenVideoRecommendation"))
+        XCTAssertTrue(failureAdmission.contains("expectedPolicyRevision: applyingPolicyRevision"))
+        XCTAssertTrue(failureAdmission.contains("currentPolicyRevision: screenVideoAdaptationPolicyRevision"))
+        for owner in [
+            "peer === sourcePeer",
+            "peerGeneration == sourcePeerGeneration",
+            "captureSource === source",
+            "captureSink === sink",
+            "self.captureAuthorization === captureAuthorization",
+            "self.captureForwardingAuthorization === forwardingAuthorization",
+            "captureAuthorization.isValid",
+            "forwardingAuthorization.isValid",
+            "sink.allowsActiveUse(authorizedBy: forwardingAuthorization)",
+            "captureVideoBaseDimensions == baseDimensions",
+        ] {
+            XCTAssertTrue(failureAdmission.contains(owner), "Missing resumed application owner: \(owner)")
+        }
+        XCTAssertFalse(failureAdmission.contains("appliedScreenVideoRecommendation = nil"))
+        XCTAssertFalse(failureAdmission.contains("await "))
+        XCTAssertTrue(failureAdmission.contains("return"))
     }
 
     func testAutomaticResumeKeepsFastAdaptationBlockedThroughEncoderRestore()

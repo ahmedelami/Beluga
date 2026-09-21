@@ -687,6 +687,16 @@ enum WebRTCStatisticsParser {
                 outbound ? "framesEncoded" : "framesDecoded",
                 in: record.values
             ),
+            framesReceived: outbound
+                ? nil : strictUnsigned("framesReceived", in: record.values),
+            framesDropped: outbound
+                ? nil : strictUnsigned("framesDropped", in: record.values),
+            jitterBufferDelay: outbound
+                ? nil : strictNonnegativeDouble("jitterBufferDelay", in: record.values),
+            jitterBufferEmittedCount: outbound
+                ? nil : strictUnsigned("jitterBufferEmittedCount", in: record.values),
+            totalDecodeTime: outbound
+                ? nil : strictNonnegativeDouble("totalDecodeTime", in: record.values),
             keyFramesEncoded: outbound
                 ? strictUnsigned("keyFramesEncoded", in: record.values) : nil,
             totalEncodeTime: outbound

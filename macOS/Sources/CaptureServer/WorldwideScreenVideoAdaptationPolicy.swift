@@ -310,6 +310,151 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     // Unknown RTT from malformed data must never acquire this bounded wait permission.
     // Keep the sequence and mutation oracles in SCREEN_STARTUP_REGRESSION_GUARDRAILS.md.
     private var startupSparseProbeDeadline: ContinuousClock.Instant?
+    private struct SpatialRecoverySparseProbe: Equatable, Sendable {
+        let peer: UInt64
+        let show: UInt64
+        let attempt: UInt64
+        let origin: WorldwideScreenVideoAdaptationTier
+        let deadline: ContinuousClock.Instant
+    }
+    private var spatialRecoverySparseProbe: SpatialRecoverySparseProbe?
+    private let spatialRecoveryEnabled: Bool
+    private var spatialRecovery = WorldwideScreenSpatialRecovery()
+    // Positive geometry proof spans ordinary reports; fast negative polling must
+    // not consume packets from that interval or lend its own health to it.
+    private var spatialRecoveryOrdinaryPacketSample: CapacityProbeSample?
+    private var spatialRecoveryFastPacketSample: CapacityProbeSample?
+    private var spatialRecoveryLastSequence: UInt64?
+    private var spatialRecoveryLastTimestamp: Double?
+    private var spatialRecoverySoftPressureAt: ContinuousClock.Instant?
+
+    var spatialRecoveryIsTrialActive: Bool { spatialRecovery.isTrialActive }
+    var spatialRecoveryPhase: String { spatialRecovery.phase.rawValue }
+    var spatialRecoveryAttemptCount: UInt64 { spatialRecovery.attempt }
+    var spatialRecoveryDeadline: ContinuousClock.Instant? { spatialRecovery.deadline }
+    private var spatialRecoveryCanOwnDiscoveryHold: Bool {
+        // Discovery may need to survive a telemetry gap before pixels qualify.
+        // This owns only an existing ordinary probe, not a geometry attempt or
+        // startup permission. Disabled candidates retain their original behavior.
+        spatialRecoveryEnabled && !startupSpatialModeIsActive
+            && spatialRecovery.isArmed && spatialRecovery.phase != .cooldown
+            && floorRecoveryVisibilityIsActive
+            && peerGeneration != nil && peerGeneration == spatialRecovery.peerGeneration
+            && floorRecoveryShowEpoch != nil && floorRecoveryShowEpoch == spatialRecovery.showEpoch
+            && applicationLimitedProbeOriginTier != nil && applicationLimitedProbeDeadline != nil
+    }
+    var spatialRecoverySparseProbeIsHolding: Bool {
+        guard let hold = spatialRecoverySparseProbe,
+              spatialRecoveryCanOwnDiscoveryHold else { return false }
+        return hold.peer == peerGeneration && hold.peer == spatialRecovery.peerGeneration
+            && hold.show == floorRecoveryShowEpoch && hold.show == spatialRecovery.showEpoch
+            && hold.attempt == spatialRecovery.attempt
+            && hold.origin == applicationLimitedProbeOriginTier
+            && hold.deadline == applicationLimitedProbeDeadline
+    }
+
+    mutating func markSpatialRecoveryApplied(at now: ContinuousClock.Instant = .now) {
+        spatialRecovery.markApplied(at: now)
+    }
+
+    mutating func rejectPendingSpatialRecoveryApplication(at now: ContinuousClock.Instant = .now) {
+        spatialRecovery.rejectPendingApplication(at: now)
+    }
+
+    mutating func retainSpatialRecoveryAttemptConsumption(from observed: Self) {
+        spatialRecovery.retainAttemptConsumption(from: observed.spatialRecovery)
+        retainSpatialRecoveryIdentity(from: observed)
+    }
+
+    mutating func retainSpatialRecoveryTerminalState(from observed: Self) {
+        spatialRecovery.retainTerminalState(from: observed.spatialRecovery)
+        retainSpatialRecoveryIdentity(from: observed)
+    }
+
+    private mutating func retainSpatialRecoveryIdentity(from observed: Self) {
+        guard peerGeneration == observed.peerGeneration,
+              floorRecoveryShowEpoch == observed.floorRecoveryShowEpoch else { return }
+        if let sequence = observed.spatialRecoveryLastSequence {
+            spatialRecoveryLastSequence = max(spatialRecoveryLastSequence ?? 0, sequence)
+        }
+        if let timestamp = observed.spatialRecoveryLastTimestamp {
+            spatialRecoveryLastTimestamp = max(spatialRecoveryLastTimestamp ?? 0, timestamp)
+        }
+    }
+
+    private mutating func retireSpatialRecovery(at now: ContinuousClock.Instant) {
+        spatialRecoverySparseProbe = nil
+        spatialRecovery.observe(
+            at: now, eligible: false, pressure: true, capacityBps: nil,
+            requiredCapacityBps: requiredOutgoingBitrateBps(for: currentTier),
+            healthyRTTAdvancedAt: nil, packetEvidence: .unavailable, frames: nil, allowsTrial: false)
+    }
+
+    private mutating func observeSpatialRecoveryPacketQueue(
+        packets: UInt64?, delay: Double?, fast: Bool = false
+    ) -> WorldwideScreenSpatialRecoveryPacketEvidence {
+        let baseline = fast
+            ? (spatialRecoveryFastPacketSample ?? spatialRecoveryOrdinaryPacketSample)
+            : spatialRecoveryOrdinaryPacketSample
+        var validation = self
+        validation.lastOutboundVideoPacketsSent = baseline?.packetsSent
+        validation.lastOutboundVideoTotalPacketSendDelaySeconds =
+            baseline?.totalPacketSendDelaySeconds
+        let observation = validation.packetQueueObservationSinceLastSample(
+            packetsSent: packets, totalPacketSendDelaySeconds: delay)
+        // Keep the validator's sanitized baseline: malformed input clears it and
+        // must not become the starting point of a later apparently healthy delta.
+        let nextSample = CapacityProbeSample(
+            packetsSent: validation.lastOutboundVideoPacketsSent,
+            totalPacketSendDelaySeconds: validation.lastOutboundVideoTotalPacketSendDelaySeconds)
+        if fast {
+            spatialRecoveryFastPacketSample = nextSample
+        } else {
+            spatialRecoveryOrdinaryPacketSample = nextSample
+        }
+        switch observation {
+        case let .measured(value): return .measured(value)
+        case .noNewPackets: return .noNewPackets
+        case .unavailableOrReset:
+            spatialRecoverySparseProbe = nil
+            // A reset or malformed report invalidates the other lane's old
+            // counter epoch too; neither may bridge old positive witnesses.
+            if fast {
+                spatialRecoveryOrdinaryPacketSample = nil
+            } else {
+                spatialRecoveryFastPacketSample = nil
+            }
+            spatialRecovery.clearWitnesses()
+            return .unavailable
+        }
+    }
+
+    /// Preserve bounded rejection diagnostics without letting a stale report mutate any
+    /// queue baseline, RTT lease, trial, or quality decision in the live reducer.
+    private func recordRejectedSpatialTimestamp(
+        packets: UInt64?, delay: Double?, rtt: Double?,
+        observation: WebRTCRoundTripTimeObservation?, at now: ContinuousClock.Instant,
+        diagnostics: inout WorldwideScreenFloorRecoveryDiagnostics
+    ) {
+        diagnostics.identity = .rejectedTimestamp
+        diagnostics.reason = .rejectedTimestamp
+        var preview = self
+        let queue = preview.packetQueueObservationSinceLastSample(
+            packetsSent: packets, totalPacketSendDelaySeconds: delay)
+        switch queue {
+        case let .measured(value):
+            diagnostics.queueKind = .measured
+            diagnostics.queueMicroseconds = WorldwideScreenFloorRecoveryDiagnostics
+                .boundedMicroseconds(seconds: value)
+        case .noNewPackets: diagnostics.queueKind = .noNewPackets
+        case .unavailableOrReset: diagnostics.queueKind = .unavailableOrReset
+        }
+        let evidence = preview.consumeRoundTripTimeEvidence(
+            current: validRoundTripTime(rtt), observation: observation ?? .unavailable,
+            observedAt: now)
+        diagnostics.roundTripTimeDisposition = preview.roundTripTimeDisposition
+        diagnostics.roundTripTimeAllowsUpgrade = evidence.allowsUpgrade
+    }
 
     var startupSpatialModeIsActive: Bool {
         guard !startupSpatialModeIsDisproved,
@@ -330,8 +475,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
 
     init(
         configuredTotalRTPBitrateBps: Int,
-        baseFramesPerSecond: Int
+        baseFramesPerSecond: Int,
+        spatialRecoveryEnabled: Bool = true
     ) {
+        self.spatialRecoveryEnabled = spatialRecoveryEnabled
         self.configuredTotalRTPBitrateBps = min(
             Int(UInt32.max),
             max(1, configuredTotalRTPBitrateBps)
@@ -364,12 +511,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         guard applicationLimitedProbeOriginTier != nil,
               let applicationLimitedProbeMaximumTotalRTPBitrateBps else {
-            return applyingStartupSpatialMode(to: ordinaryRecommendation)
+            return applyingFullPixelMode(to: ordinaryRecommendation)
         }
         // A capacity probe raises libwebrtc's peer-wide BWE ceiling in bounded steps. Geometry
         // changes require separate ordinary-report qualification. This path can extend a native
         // probe without requiring ALR; the requested budget retains its existing 2x bound.
-        return applyingStartupSpatialMode(to: WorldwideScreenVideoEncodingRecommendation(
+        return applyingFullPixelMode(to: WorldwideScreenVideoEncodingRecommendation(
             tier: currentTier,
             maximumBitrateBps: maximumTierVideoBitrateBps,
             maximumTotalRTPBitrateBps:
@@ -381,10 +528,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         ))
     }
 
-    private func applyingStartupSpatialMode(
+    private func applyingFullPixelMode(
         to recommendation: WorldwideScreenVideoEncodingRecommendation
     ) -> WorldwideScreenVideoEncodingRecommendation {
-        guard startupSpatialModeIsActive else { return recommendation }
+        guard startupSpatialModeIsActive
+                || spatialRecovery.isTrialActive || spatialRecovery.isActive else {
+            return recommendation
+        }
         let ordinaryFPS = recommendation.maximumFramesPerSecond
         let initialFPS = min(WorldwideScreenVideoAdaptationTier.survival.framesPerSecond,
                              ordinaryFPS)
@@ -450,6 +600,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     mutating func bind(toPeerGeneration generation: UInt64) -> Bool {
         guard peerGeneration != generation else { return false }
         clearStartupSpatialMode()
+        spatialRecovery = WorldwideScreenSpatialRecovery()
+        spatialRecoverySparseProbe = nil
+        spatialRecoveryOrdinaryPacketSample = nil
+        spatialRecoveryFastPacketSample = nil
+        spatialRecoveryLastSequence = nil
+        spatialRecoveryLastTimestamp = nil
+        spatialRecoverySoftPressureAt = nil
         peerGeneration = generation
         currentTier = Self.initialTier(
             configuredTotalRTPBitrateBps: configuredTotalRTPBitrateBps
@@ -481,7 +638,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         return true
     }
 
-    mutating func beginFloorRecoveryVisibility(peerGeneration generation: UInt64, showEpoch: UInt64) {
+    mutating func beginFloorRecoveryVisibility(
+        peerGeneration generation: UInt64, showEpoch: UInt64,
+        at now: ContinuousClock.Instant = .now
+    ) {
         bind(toPeerGeneration: generation)
         guard showEpoch > 0, showEpoch > (floorRecoveryShowEpoch ?? 0) else { return }
         endFloorRecoveryVisibility()
@@ -493,6 +653,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             peerGeneration: generation,
             showEpoch: showEpoch
         )
+        if spatialRecoveryEnabled,
+           requiredOutgoingBitrateBps(for: .full) <= Double(configuredTotalRTPBitrateBps) {
+            spatialRecovery.begin(peerGeneration: generation, showEpoch: showEpoch, at: now)
+        }
     }
 
     mutating func activateFloorRecoveryVisibility(peerGeneration generation: UInt64, showEpoch: UInt64) {
@@ -503,6 +667,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
 
     mutating func endFloorRecoveryVisibility() {
         clearStartupSpatialMode()
+        spatialRecovery.end()
+        spatialRecoverySparseProbe = nil
+        spatialRecoveryOrdinaryPacketSample = nil
+        spatialRecoveryFastPacketSample = nil
+        spatialRecoverySoftPressureAt = nil
         floorRecoveryVisibilityIsReserved = false
         floorRecoveryVisibilityIsActive = false
         floorRecoveryFirstWitness = nil
@@ -529,7 +698,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
 
     /// Clears latency history when ICE invalidates the selected path, while retaining the
     /// conservative quality tier learned for this peer lifetime.
-    mutating func invalidateSelectedRoute() {
+    mutating func invalidateSelectedRoute(at now: ContinuousClock.Instant = .now) {
+        retireSpatialRecovery(at: now)
         let replacedSelectedRoute = selectedRoute != nil
         selectedRoute = nil
         if replacedSelectedRoute {
@@ -605,10 +775,37 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         startupSparseProbeDeadline = deadline
     }
 
+    /// Missing an entire selected-pair slice may hold an already-owned budget,
+    /// never create capacity, renew RTT, or revive the separately disproved startup mode.
+    private mutating func observeSpatialRecoverySelectedPairGap(
+        route: WebRTCICERouteDiagnostics?, bandwidth: Double?, rtt: Double?,
+        observation: WebRTCRoundTripTimeObservation?, queueIsObservable: Bool,
+        priorPrimaryWasHealthy: Bool, at now: ContinuousClock.Instant
+    ) {
+        guard spatialRecoveryCanOwnDiscoveryHold,
+              let peer = peerGeneration, peer == spatialRecovery.peerGeneration,
+              let show = floorRecoveryShowEpoch, show == spatialRecovery.showEpoch,
+              let origin = applicationLimitedProbeOriginTier,
+              let deadline = applicationLimitedProbeDeadline, now < deadline,
+              route == nil, bandwidth == nil, rtt == nil, observation == .unavailable,
+              queueIsObservable,
+              priorPrimaryWasHealthy || spatialRecoverySparseProbeIsHolding,
+              let advancedAt = lastRoundTripTimeAdvancement,
+              advancedAt <= now,
+              advancedAt.duration(to: now) <= Self.roundTripTimeObservationValidity else {
+            spatialRecoverySparseProbe = nil
+            return
+        }
+        spatialRecoverySparseProbe = SpatialRecoverySparseProbe(
+            peer: peer, show: show, attempt: spatialRecovery.attempt,
+            origin: origin, deadline: deadline)
+    }
+
     /// Revokes RTT health synchronously at Hide, even if Show arrives before an inactive stats
     /// report. Preserve peer-owned identity/order and the path reference; only advancement can
     /// reauthorize RTT health. The service's statistics epoch owns partial-window reset/fencing.
-    mutating func invalidateRoundTripTimeObservation() {
+    mutating func invalidateRoundTripTimeObservation(at now: ContinuousClock.Instant = .now) {
+        retireSpatialRecovery(at: now)
         startupSparseProbeDeadline = nil
         floorRecoveryFirstWitness = nil
         if applicationLimitedProbeConfirmedTier != nil {
@@ -623,6 +820,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     /// from being combined with a later sample. Stable route baselines and any already-applied
     /// probe remain intact; only incomplete evidence windows are discarded.
     mutating func resetIncompleteEvidenceWindow() {
+        spatialRecoverySparseProbe = nil
+        spatialRecovery.clearWitnesses()
+        spatialRecoveryOrdinaryPacketSample = nil
+        spatialRecoveryFastPacketSample = nil
+        spatialRecoverySoftPressureAt = nil
         floorRecoveryFirstWitness = nil
         capacityProbeSample = nil
         capacityProbeBandwidthHighWatermark = nil
@@ -653,6 +855,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         outboundVideoPacketsSent: UInt64? = nil,
         outboundVideoTotalPacketSendDelaySeconds: Double? = nil,
         nativeReportTimestampMicroseconds: Double? = nil,
+        spatialRecoveryFrames: WorldwideScreenSpatialRecoveryFrameEvidence? = nil,
         observedAt: ContinuousClock.Instant = .now,
         diagnostics: ((WorldwideScreenFloorRecoveryDiagnostics) -> Void)? = nil
     ) -> WorldwideScreenVideoEncodingRecommendation? {
@@ -681,6 +884,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             $0.duration(to: observedAt)
         }
         if requireRoundTripTimeObservation, collectionSequence == nil {
+            spatialRecovery.clearWitnesses()
             evaluation.identity = .rejectedOrder
             evaluation.reason = .rejectedOrder
             floorRecoveryFirstWitness = nil
@@ -700,6 +904,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         if let collectionSequence {
             if let lastCapacityProbeCollectionSequence,
                collectionSequence <= lastCapacityProbeCollectionSequence {
+                spatialRecovery.clearWitnesses()
                 evaluation.identity = .rejectedOrder
                 evaluation.reason = .rejectedOrder
                 floorRecoveryFirstWitness = nil
@@ -712,6 +917,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             }
             if let lastConsumedCollectionSequence,
                collectionSequence <= lastConsumedCollectionSequence {
+                spatialRecovery.clearWitnesses()
                 evaluation.identity = .rejectedOrder
                 evaluation.reason = .rejectedOrder
                 floorRecoveryFirstWitness = nil
@@ -730,6 +936,24 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             lastConsumedCollectionSequence = collectionSequence
         }
         capacityProbeGrowthIsVetoed = false
+        if spatialRecovery.isArmed, requireRoundTripTimeObservation,
+           (collectionSequence.map { $0 <= (spatialRecoveryLastSequence ?? 0) } != false
+            || nativeReportTimestampMicroseconds.map {
+                !$0.isFinite || $0 <= (spatialRecoveryLastTimestamp ?? 0)
+            } != false) {
+            spatialRecovery.clearWitnesses()
+            if collectionSequence.map({ $0 <= (spatialRecoveryLastSequence ?? 0) }) == true {
+                evaluation.identity = .rejectedOrder
+                evaluation.reason = .rejectedOrder
+            } else {
+                recordRejectedSpatialTimestamp(
+                    packets: outboundVideoPacketsSent, delay: outboundVideoTotalPacketSendDelaySeconds,
+                    rtt: currentRoundTripTimeSeconds, observation: roundTripTimeObservation,
+                    at: observedAt, diagnostics: &evaluation)
+            }
+            return expireApplicationLimitedProbeWithoutReport(
+                peerGeneration: generation, isCaptureActive: isCaptureActive, observedAt: observedAt)
+        }
         let floorRecoveryReportIsFresh = consumeFloorRecoveryReportIdentity(
             sequence: collectionSequence,
             timestamp: nativeReportTimestampMicroseconds,
@@ -737,9 +961,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         evaluation.identity = floorRecoveryReportIsFresh ? .fresh
             : (requireRoundTripTimeObservation ? .rejectedTimestamp : .rejectedOrder)
-        if startupSpatialModeIsActive,
+        if startupSpatialModeIsActive || spatialRecovery.isArmed,
            requireRoundTripTimeObservation,
            !floorRecoveryReportIsFresh {
+            spatialRecovery.clearWitnesses()
+            recordRejectedSpatialTimestamp(
+                packets: outboundVideoPacketsSent, delay: outboundVideoTotalPacketSendDelaySeconds,
+                rtt: currentRoundTripTimeSeconds, observation: roundTripTimeObservation,
+                at: observedAt, diagnostics: &evaluation)
             evaluation.reason = .rejectedTimestamp
             // During the speculative full-pixel startup window, the native report identity is
             // the evidence boundary for every network signal, not only floor recovery. A newer
@@ -764,6 +993,24 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         }
         let previousRecommendation = currentRecommendation
         let previousTier = currentTier
+        let recoveryWasActive = spatialRecovery.isTrialActive || spatialRecovery.isActive
+        let recoveryQueue = spatialRecovery.isArmed && floorRecoveryReportIsFresh
+            ? observeSpatialRecoveryPacketQueue(
+                packets: outboundVideoPacketsSent,
+                delay: outboundVideoTotalPacketSendDelaySeconds) : .unavailable
+        observeSpatialRecoverySelectedPairGap(
+            route: selectedRoute, bandwidth: availableOutgoingBitrateBps,
+            rtt: currentRoundTripTimeSeconds, observation: roundTripTimeObservation,
+            queueIsObservable: recoveryQueue != .unavailable,
+            priorPrimaryWasHealthy: nativeRoundTripTimeHealth == .healthy, at: observedAt)
+        let recoveryRouteChanged = selectedRoute.map { route in
+            self.selectedRoute.map { $0 != route } ?? false
+        } ?? false
+        if spatialRecovery.isArmed, floorRecoveryReportIsFresh {
+            spatialRecoveryLastSequence = collectionSequence
+            spatialRecoveryLastTimestamp = nativeReportTimestampMicroseconds
+        }
+        spatialRecovery.expire(at: observedAt)
         let startupSpatialModeWasActive = startupSpatialModeIsActive
         let hadPromotionCapacityContinuity = promotionCapacityContinuity != nil
         updatePromotionCapacityContinuity(
@@ -797,6 +1044,33 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         } else if startupSpatialModeIsActive, currentTier == .full {
             clearStartupSpatialMode()
         }
+        if !isCaptureActive || isAutomaticallySuspended {
+            spatialRecovery.end()
+        } else if spatialRecovery.isArmed, requireRoundTripTimeObservation,
+                  floorRecoveryReportIsFresh {
+            let rttIsCurrent = selectedRoute != nil && selectedRoute == self.selectedRoute
+                && nativeRoundTripTimeHealth == .healthy
+                && lastRoundTripTimeAdvancement.map {
+                    let age = $0.duration(to: observedAt)
+                    return age >= .zero && age <= Self.roundTripTimeObservationValidity
+                } == true
+            spatialRecovery.observe(
+                at: observedAt,
+                eligible: floorRecoveryVisibilityIsActive && !startupSpatialModeIsActive,
+                pressure: lastSampleHasLatencyPressure || recoveryRouteChanged
+                    || currentTier.rawValue > previousTier.rawValue,
+                capacityBps: availableOutgoingBitrateBps,
+                requiredCapacityBps: requiredOutgoingBitrateBps(for: currentTier),
+                healthyRTTAdvancedAt: rttIsCurrent ? lastRoundTripTimeAdvancement : nil,
+                packetEvidence: recoveryQueue,
+                frames: spatialRecoveryFrames,
+                allowsTrial: currentTier != .full
+                    && currentTier.rawValue <= WorldwideScreenVideoAdaptationTier.survival.rawValue
+            )
+            // Geometry recovery does not create bitrate authority or cancel an existing
+            // ordinary probe. Its original ceiling, deadline and pressure guards still own
+            // capacity; contracting that ceiling here can manufacture a pacer backlog.
+        }
         let startupSpatialRecommendationChanged =
             startupSpatialModeWasActive != startupSpatialModeIsActive
         // Cap expiry/shrink must reach the sender even when no visible tier changed.
@@ -804,6 +1078,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
               changedRecommendation != nil
                 || startupSpatialRecommendationChanged
                 || (hadPromotionCapacityContinuity
+                    && currentRecommendation != previousRecommendation)
+                || ((recoveryWasActive || spatialRecovery.isTrialActive || spatialRecovery.isActive)
                     && currentRecommendation != previousRecommendation) else {
             return nil
         }
@@ -865,6 +1141,56 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             evaluation.reason = .expired
             return expired
         }
+        // Recovery owns an independent negative lane even when no bitrate discovery probe
+        // exists. Fast observations may retire pixels, never admit/confirm them or renew RTT.
+        var recoveryReportIsFresh = false
+        if spatialRecovery.isTrialActive || spatialRecovery.isActive || spatialRecoveryCanOwnDiscoveryHold,
+           let sequence = collectionSequence,
+           sequence > (lastConsumedCollectionSequence ?? 0),
+           sequence > (lastCapacityProbeCollectionSequence ?? 0),
+           sequence > (spatialRecoveryLastSequence ?? 0),
+           let timestamp = nativeReportTimestampMicroseconds, timestamp.isFinite,
+           timestamp > max(floorRecoveryLastRegularTimestamp ?? 0,
+                           max(capacityProbeNativeReportTimestamp ?? 0,
+                               spatialRecoveryLastTimestamp ?? 0)) {
+            recoveryReportIsFresh = true
+            spatialRecoveryLastSequence = sequence
+            spatialRecoveryLastTimestamp = timestamp
+            let packetEvidence = observeSpatialRecoveryPacketQueue(
+                packets: outboundVideoPacketsSent, delay: outboundVideoTotalPacketSendDelaySeconds,
+                fast: true)
+            let queue: Double?
+            if case let .measured(delay) = packetEvidence { queue = delay } else { queue = nil }
+            let softPressure = queue.map { $0 > Self.maximumAveragePacketSendDelaySeconds } == true
+            let confirmedSoftPressure = softPressure && spatialRecoverySoftPressureAt.map {
+                let age = $0.duration(to: observedAt)
+                return age > .zero && age <= Self.lowDelayPacketQueueObservationValidity
+            } == true
+            spatialRecoverySoftPressureAt = softPressure ? observedAt : nil
+            var recoveryValidation = self
+            let rtt = recoveryValidation.consumeRoundTripTimeEvidence(
+                current: validRoundTripTime(currentRoundTripTimeSeconds),
+                observation: roundTripTimeObservation ?? .unavailable, observedAt: observedAt)
+            let routeChanged = selectedRoute.map { route in
+                self.selectedRoute.map { $0 != route } ?? false
+            } ?? false
+            let capacityCollapsed = availableOutgoingBitrateBps.map {
+                $0.isFinite && $0 > 0
+                    && $0 < applicationLimitedProbeCollapseThreshold(for: currentTier)
+            } == true
+            if rtt.hasFreshPressure || routeChanged || capacityCollapsed || confirmedSoftPressure
+                || queue.map({ $0 >= Self.immediateAveragePacketSendDelaySeconds }) == true {
+                retireSpatialRecovery(at: observedAt)
+                if let origin = applicationLimitedProbeOriginTier {
+                    failApplicationLimitedProbe(revertingTo: origin)
+                }
+                if rtt.hasFreshPressure || routeChanged {
+                    roundTripTimeObservationFence = recoveryValidation.roundTripTimeObservationFence
+                    revokeRoundTripTimeHealth()
+                }
+                return currentRecommendation
+            }
+        }
         guard let origin = applicationLimitedProbeOriginTier,
               let currentCeiling = applicationLimitedProbeMaximumTotalRTPBitrateBps,
               let collectionSequence,
@@ -889,6 +1215,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             let age = $0.duration(to: observedAt)
             return age >= .zero && age <= Self.roundTripTimeObservationValidity
         } ?? false
+        let recoveryPrimaryWasHealthy = nativeRoundTripTimeHealth == .healthy
         // Positive fast observations advance only the identity fence, never the ordinary
         // reference or health lease. Negative identities must poison subsequent ordinary use.
         var validation = self
@@ -934,6 +1261,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             case .measured, .noNewPackets: queueIsObservable = true
             case .unavailableOrReset: queueIsObservable = false
             }
+            observeSpatialRecoverySelectedPairGap(
+                route: selectedRoute, bandwidth: availableOutgoingBitrateBps,
+                rtt: currentRoundTripTimeSeconds, observation: roundTripTimeObservation,
+                queueIsObservable: queueIsObservable && recoveryReportIsFresh,
+                priorPrimaryWasHealthy: recoveryPrimaryWasHealthy, at: observedAt)
             if startupSpatialModeIsActive {
                 var negativeReason: WorldwideScreenCapacityProbeDiagnostics.Reason?
                 if let selectedRoute, let previousRoute = self.selectedRoute,
@@ -955,9 +1287,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     return currentRecommendation
                 }
             }
-            if startupSpatialModeIsActive,
-               startupSparseProbeDeadline != nil,
-               startupSparseProbeDeadline == applicationLimitedProbeDeadline,
+            if (startupSpatialModeIsActive
+                && startupSparseProbeDeadline != nil
+                && startupSparseProbeDeadline == applicationLimitedProbeDeadline)
+                || spatialRecoverySparseProbeIsHolding,
                primaryRTTLeaseIsCurrent, baseline != nil, queueIsObservable,
                !rtt.hasFreshPressure,
                roundTripTimeObservation == .unavailable,
@@ -988,9 +1321,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             failApplicationLimitedProbe(revertingTo: origin)
             return currentRecommendation
         }
-        let awaitsOrdinaryRTTRequalification = startupSpatialModeIsActive
+        let awaitsOrdinaryRTTRequalification = ((startupSpatialModeIsActive
             && startupSparseProbeDeadline != nil
-            && startupSparseProbeDeadline == applicationLimitedProbeDeadline
+            && startupSparseProbeDeadline == applicationLimitedProbeDeadline)
+            || spatialRecoverySparseProbeIsHolding)
             && nativeRoundTripTimeHealth == .unknown
             && roundTripTimeDisposition == .unavailable
             && validation.roundTripTimeDisposition == .freshHealthy
@@ -1111,9 +1445,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return
         }
         capacityProbeNativeReportTimestamp = timestamp
-        if startupSpatialModeIsActive,
-           startupSparseProbeDeadline != nil,
-           startupSparseProbeDeadline == applicationLimitedProbeDeadline,
+        if (startupSpatialModeIsActive
+            && startupSparseProbeDeadline != nil
+            && startupSparseProbeDeadline == applicationLimitedProbeDeadline)
+            || spatialRecoverySparseProbeIsHolding,
            availableOutgoingBitrateBps == nil {
             // Selected-pair omission does not erase the separately collected sender counters.
             // Keep only their delta baseline for negative queue checks, never capacity proof.
@@ -1333,6 +1668,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     )
                     lastSampleHasPositiveSuspensionPressure = false
                     return isCaptureActive ? currentRecommendation : nil
+                } else if spatialRecoverySparseProbeIsHolding {
+                    // A validated whole-pair gap spends wall-clock lease time,
+                    // not report-count grace. Cadence jitter must not manufacture
+                    // an earlier cap contraction; pressure and expiry above win.
+                    capacityProbeGrowthIsVetoed = true
+                    lastSampleHasPositiveSuspensionPressure = false
+                    return nil
                 } else if applicationLimitedProbeGraceSamplesRemaining > 1 {
                     applicationLimitedProbeGraceSamplesRemaining -= 1
                     lastSampleHasPositiveSuspensionPressure = false
@@ -1816,6 +2158,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return nil
         }
         let previousRecommendation = currentRecommendation
+        spatialRecovery.expire(at: observedAt)
         if let continuity = promotionCapacityContinuity,
            observedAt >= continuity.deadline {
             promotionCapacityContinuity = nil
@@ -2259,7 +2602,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         availableOutgoingBitrateBps: Double,
         observedAt: ContinuousClock.Instant
     ) -> Bool {
-        guard let probeTier = originTier.nextHigherQuality,
+        guard !spatialRecovery.isTrialActive,
+              let probeTier = originTier.nextHigherQuality,
               requiredOutgoingBitrateBps(for: probeTier)
                 <= Double(configuredTotalRTPBitrateBps) else {
             return false
@@ -2461,6 +2805,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     private mutating func resetPathMeasurements() {
+        spatialRecoverySparseProbe = nil
         floorRecoveryFirstWitness = nil
         applicationLimitedProbeConfirmedTier = nil
         applicationLimitedProbeQualificationObservedAt = nil
@@ -2503,6 +2848,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     private mutating func resetQueueEvidenceForTierTransition() {
+        spatialRecoverySparseProbe = nil
         floorRecoveryFirstWitness = nil
         capacityProbeSample = nil
         capacityProbeBandwidthHighWatermark = nil

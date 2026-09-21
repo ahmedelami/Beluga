@@ -441,7 +441,510 @@ Equality permits initial bounded discovery only, never repeated capacity growth 
 visible promotion. Retain exact-value trend and admission-reason diagnostics as
 proposal evidence separate from native acceptance and client presentation.
 
+### Post-congestion full-pixel recovery
+
+`WorldwideScreenSpatialRecoveryTests`, `WorldwideScreenSpatialRecoveryPolicyTests` and
+`WorldwideScreenSpatialRecoveryIntegrationTests` must preserve a separate exact-peer/Show
+recovery after startup disproof. Survival-or-better capacity may qualify low-FPS full pixels
+without reviving startup or raising bitrate ceilings. Require fresh post-adverse RTT,
+advancing native identity, measured packet progress and two separated ordinary witnesses.
+Admission queue delay is at most 20 ms. After native application only, actual advancing
+full-source encoded frames may confirm geometry with delay at most 100 ms; this is not
+capacity permission. Genuine pressure, route replacement and source-size changes still win.
+Typed unchanged-frame/no-packet evidence must never manufacture a witness or renew its clock;
+missing, malformed, reset and reordered counters cannot supply positive proof.
+
+Keep the absolute 3-second trial deadline through native suspension and service-actor resume,
+and preserve 15/30/60-second capped retry backoff with fresh qualification. Existing ordinary
+capacity probes keep their independently authorized caps and original deadlines; the spatial
+trial cannot create another probe. Recheck an earlier capacity-probe expiry before publishing
+an otherwise valid spatial proposal. The deadline bounds accepted publication, not the
+duration of an uninterruptible native call. `WorldwideScreenBoundedNativeApplicationTests`
+must cover late application and unproven rollback. `WorldwideScreenNativeApplicationCacheTests`
+must preserve successor state across suspended stale same-peer failures and still invalidate
+current-owner failures. `WebRTCScreenVideoEncodingReplacementTests` must prove compound fallback
+is conditional on the exact current native update. Service source-wiring checks supplement,
+not replace, these behavioral boundaries.
+
+Before or after geometry admission, an exact whole selected-pair gap in recovery-enabled
+discovery may preserve an independently owned probe, never supply capacity or geometry evidence.
+Bind this hold to peer, Show, recovery attempt, probe origin and original deadline, and
+require the previous ordinary RTT lease plus independently observable sender counters.
+Fresh fast health cannot renew that lease or grow the cap before ordinary requalification.
+Malformed/partial/cached reports, expired leases/deadlines, real route/BWE/queue pressure
+and lifecycle replacement must still reject or retire the hold. Startup disproof remains
+terminal and separate. Exercise both ordinary and fast gap entry and their handoff,
+including discovery while recovery is still observing and has not acquired geometry authority.
+
+Run `scripts/validate-screen-startup.sh --scratch-path /absolute/dedicated/cache
+--spatial-recovery-experiment` with the reviewed `DEVELOPER_DIR`. In three fresh-process rounds,
+`WebRTCStartupClarityExperimentTests` compares recovery disabled/enabled on moving 8→0.8→8 Mbps
+transport, then adds enabled second-drop and steady ample/weak controls. Enabled recovery must
+first show actual degraded decoded pixels, then full 1080×1920 and all contrast scores >0.9
+within 4 seconds of the actual restore. Require at least 2 seconds with eight changed-content
+observations and no later blurry frame through the next actual drop or observation end.
+Second pressure must cause appropriate degradation without capture blackout. Preserve source
+submission bounds, phase-marker plus dense pixel-change evidence, relay integrity and the
+original native exact-pixel/blackout oracles. Disabled recovery is characterization, not a
+required recovery success. Never widen deadlines or ignore a later relapse to bless a candidate.
+Mutation evidence must separately reject renewed deadlines, fake/neutral frame confirmation,
+relaxed admission, inherited probe authority and stale cache/fallback ownership. The test map
+and commands are requirements, not claims of a passing gate, release readiness or deployment.
+
+### Isolated probe-duration comparison
+
+The separate native-controller FIFO sweep compares 15/25/40/100 ms at 8 Mbps and
+600 kbps with three fixed tail distortions. Its 24 passing cases and matching
+baseline-preserving Configuration-group variant show controller sensitivity and
+consumption, not real pacer transmission or a historical startup cause. The
+duration-off and FIFO-bypass mutants fail the native-request/serialization guards
+before transmitting the rejected cases. Do not call that overuse-detector coverage.
+
+The separate 15 ms control / 40 ms candidate media pair must retain the original
+50 ms delayed, dynamic-FPS, cursor-only workload, with SDK-default pacing, ALR hold
+and probe skip in both arms. Exact fresh-process selectors and a distinct pinned
+observer owner keep it default-off. `StartupVideoProbeDurationWitnessTests` requires
+valid host/time/native-error evidence and the first two actual created requests:
+IDs 1/2, rates 900000/905041, five probes, and byte minima 1688/1697 or 4500/4525.
+Never search later matching requests or infer sent bytes from these minima.
+Admission, loader and workload tests plus all eight witness methods are pinned in
+the contributor gate. Preserve exact selector, byte comparison, accepted-duration
+and native-evidence mutation oracles. Run the predeclared pair once, stop on failure
+and retain its results separately from every previous RED and required native gate.
+Even a passing initial pair is not pressure/recovery, physical or release acceptance.
+
+The following moving-weak duration pair uses its own exact selectors and strict
+800 kbps / 2 ms / twelve-second moving profile. Its independent validator tests
+reject every Boolean and numeric workload substitution; admission tests reject
+crossed duration arms, missing authority and borrowed cohort selectors. Keep
+assertion-failing motion, capacity and selector mutations. The strict runner
+requires both native-budget and capacity projections, actual sharp decoded
+frames, final FPS >=4, at least twenty source submissions and the fixture's
+existing continuity/blackout/native-lifetime assertions. A pass remains a weak
+steady-link result, not recovered-motion, genuine-overuse or deployment proof.
+
+The separate moving-recovery pair selects
+`testNativeEstimatorALRProbeDuration15MovingRecoveryControl` and
+`testNativeEstimatorALRProbeDuration40MovingRecoveryCandidate`. Both require
+recovery in the same sixteen-second, dynamic-FPS moving workload: 8 → 0.8 → 8 Mbps
+outbound / 8 Mbps return, 2 ms one-way, scheduled drop at 4 seconds and restore
+at 8 seconds. Keep SDK-default pacing, factor 1, held ALR growth, probe skip,
+zero warmup, no initial shaping, no second drop and both timing collectors.
+
+Pin all three `StartupVideoProbeDurationMovingRecoveryProfileTests` methods:
+`testBothDurationArmsAcceptOnlyTheFixedMovingRecoveryProfile`,
+`testEveryBooleanProfileDriftIsRejectedIndependently` and
+`testNumericAndOptionalProfileDriftIsRejectedIndependently`; also pin the three
+`WebRTCStartupPacingAdmissionTests` methods
+`testProbeDurationMovingRecoverySelectionsRequireMatchingArm`,
+`testProbeDurationMovingRecoverySelectionsRejectLegacyAndMultipleSelections` and
+`testProbeDurationMovingRecoverySelectionsRequireCompleteFlagsAndOwnCohort`.
+Keep all seven class/method omission cases and require assertion failures from
+selector, Boolean-profile and numeric-profile mutations, not compile failures.
+
+Require actual degraded decoded pixels between applied drop and restore, then
+full-pixel sharp recovery within four seconds of actual restore. Starting at the
+first sharp frame—not a later convenient frame—the fixed two-second window must
+contain eight genuine content changes, gaps at most 500 ms and a boundary frame
+within 500 ms of its end, with no subsequent blur. Preserve native request-budget,
+host/time/error, source/decoder continuity, blackout, receiver-drain and balanced
+lifetime oracles. Missing degradation leaves recovery unexercised and cannot
+qualify the pair; it is not by itself a product regression or permission to force
+blur. This pair is separate from the ordinary native gate and the historical
+second-drop test, and supplies no promotion or deployment proof on its own.
+
+`testNativeEncoderBoundaryMovingRecoveryDiagnostic` is a separate test-only
+control15 observation, not an additional ordinary native-gate method. Its own
+default-off flag requires the exact selector, factor 1, estimator observer,
+ALR hold+skip and no default-pacing cohort. Its profile delegates unchanged to the
+moving-recovery workload and rejects every other duration. A fixed six-second
+capture-relative trace records bounded encoder-boundary scalars without retaining
+raw frames or encoded payloads; it does not change the sixteen-second workload.
+Pin all eleven `StartupVideoEncoderBoundaryTraceTests`, three
+`StartupVideoEncoderBoundaryProfileTests` and three encoder-diagnostic admission
+methods, with seventeen independent missing-method scenarios. Preserve assertion
+mutations for fixed-window admission, native return forwarding, callback generation
+and exact selection. A structurally valid empty trace is not positive flow evidence:
+require actual input/output events for such claims, and never infer decoder delivery
+or sharp cadence from encoder completion. Existing actual-pixel, recovery-window,
+blackout, receiver-drain and native-lifetime oracles remain independently required.
+
+The process-owned native encoder log projection adds no frame or peer attribution.
+Require its ten exact-format, width, window, overflow, clock, scope and retirement
+tests, plus the four callback-rejection tests preserving original input identity
+and old/current generations through release or invalidation. Their fourteen new
+missing-method cases must remain fail-closed. The log allowlist retains only numeric
+and enum payloads from the pinned H.264 source, distinguishing submission failures,
+completion failures, drops and property outcomes. It stores at most 512 events,
+with pre-arm configuration and a fixed six-second capture window; retirement must
+not unregister the process-lifetime SDK sink or append late events. Native errors
+do not invalidate structural collection, and structural validity/absent messages
+do not prove positive encoder flow. Bound pre-arm metadata independently against
+the first actual encode input before correlation. No raw SDK text, media buffers
+or inferred per-frame identity may enter this projection. Preserve diagnostic 1's
+RED outcome and all independent pixel/cadence/blackout/lifetime requirements.
+
 ## Execution and Claim Boundary
+
+The opt-in native pacing bridge is an isolated debugging artifact, not a production
+dependency. Require exact loaded-framework path/hash/UUID and bridge hash before
+private access. Observe the actual new peer's GetConfiguration, require a contradictory
+expectation to fail, and recheck ordinary configuration afterward. Admission tests reject
+audio/viewer topology before factory work; lifecycle tests retain the rejected native
+peer and observe it closed, then verify ordinary construction after success and failure.
+Artifact mismatch must produce the identity error before dynamic loading. Deliberately
+removing close/hash/readback checks must fail those receiving-boundary oracles. These
+checks do not establish scheduling improvement, ABI compatibility with other artifacts,
+duplex audio safety or release readiness. Failed actual-pixel trials cannot be replaced
+by configuration readbacks or lower RTT alone.
+
+Fixed pacing-factor trials must freeze the entire existing field-trial baseline before
+the first factory in a fresh, exactly selected, audio-free process. Admission binds one
+host and viewer to a TaskLocal token and never reopens after retirement. Require native
+worker IDs independently read from those actual factories, post-binding/capture numeric
+BWE-to-pacer pairs on the host worker, the complete unchanged ALR tuple, and received
+rates matching the factor against the logged pre-pushback estimate. Configuration text
+and process-scoped ALR logs alone do not prove consumption. Unknown worker identity,
+contradictory factors, ambiguous timestamps/pairing, malformed data or overflow cannot
+yield success. Mutation tests must reject audio admission, altered XCTest selection,
+unknown host attribution and intent substituted for a numeric rate match. Each factor
+trial still needs its own actual decoded-pixel oracle; safety gates and lower RTT do not
+override a failed clarity run.
+
+Native estimator observation is a separate control-factor diagnostic with both opt-ins,
+one exact observer XCTest selection and a fresh audio-free process. The pinned bridge
+must intercept the real host initializer, retain the ordinary controller delegate and
+bind events to the actual host worker and environment. Construction without a controller
+or events proves only construction. Hook tests must independently exercise synchronous
+reentry and delayed TaskLocal child reuse after success and throw, reject wrong topology
+before factory work, and preserve ordinary construction outside the scope. Keep the
+observer owner alive through native close and verify balanced logger destruction after
+the final callbacks.
+
+`StartupVideoNativeEstimatorSnapshotTests` requires schema 2 and rejects schema 1,
+JSON over 1 MiB,
+more than 2048 events, missing or nonunit factory/controller counts, invalid lifetimes,
+fields or sequence, wrong worker/environment, clock regression and native error counters.
+Exactly two advancing post-capture delay events remain insufficient; require three, with
+ties excluded from distinct proof. Validate pre-capture events but exclude them from the
+witness. Unknown event payloads are counted and discarded; no raw SDK text is retained.
+Report first post-capture delay overuse separately and do not require overuse to verify
+observability. A loss-named update carrying cached Q8 fraction loss or a reset packet
+accumulator does not prove absence of network loss or an independent loss-driven change.
+
+The shared event sequence also accepts `probeCreated`, `probeSuccess`, `probeFailure`
+and `alrState` under the same worker, clock and capacity checks. Creation/success require
+positive Int32 bitrate and cluster ID; failure requires an ID and reason 0 through 2
+with no bitrate. Only creation permits positive UInt32 minimum-probe and byte counts.
+ALR requires Boolean `inAlr`, no bitrate and no other payload fields; every other kind
+forbids that Boolean. Opposite fields and values outside these widths fail closed.
+Probe/ALR counters never satisfy delay-event proof. A created request is not delivery
+proof, repeated successes for one ID are distinct result observations rather than
+distinct clusters, and matching results/requests are not required. Native ALR entry/exit
+must be read from its event, not inferred from send rate. Retain pre-capture validation
+without borrowing its events as post-capture evidence.
+
+The source-bound `estimator-native-weak-1.log` diagnostic verifies 116 advancing delay
+events, 40 post-capture loss-named events and 44 pacing matches. Delay overuse precedes
+policy disproof, but the unchanged pixel/FPS oracle fails with seven blurred frames and
+3.5 final fps. Clean native teardown is separate evidence: zero live loggers, one created,
+one destroyed and zero lifetime failures. Thirty-three focused admission/hook/model
+tests and 61 fake-runner scenarios pass at this checkpoint. Four separately compiled
+mutants fail assertions for a two-sample witness, missing controller creation, wrong host
+attribution and synchronous hook reuse; both changed source files are restored to their
+exact prior hashes. The restored `startup-20260920-17612-rgewp4` gate passes 512
+deterministic methods and both original native cases without skips; all 333 covered
+source-file hashes remain unchanged. This does not replace the failed recovery matrix.
+See `SPATIAL_RECOVERY_EXPERIMENT.md` for exact artifact identities
+and timing. Neither temporal order nor this failed run establishes burst causality,
+authorizes a weaker guard, or proves a deployed improvement.
+
+The richer schema-2 cohort uses one unchanged source and bridge for three fixed controls
+under `pacer-bridge.xjZwtL/PROBE_OBSERVATION_COHORT.md`. Native observation verifies in all
+three, with zero unknown/invalid/dropped events or lifetime errors and clean balanced
+teardown. Actual-pixel outcomes remain separate: run 1 passes with zero blurred frames
+and 5 fps; run 2 fails with nine blurred frames and 3.5 fps; run 3 fails with twelve
+blurred frames despite 4.5 fps. In both failed runs, delay overuse precedes the next
+observed probe request and follows the preceding result by 3,878.838 and 2,809.285 ms.
+This does not establish a periodic-probe burst cause or justify the proposed 60-second
+ALR-interval trial. At that cohort checkpoint, 45 focused safety tests and 63 fake-runner
+scenarios passed. The later receiving-model mutations for borrowed delay proof, missing
+ALR membership and failure-event bitrate produced four, one and four assertion failures
+and exact source restoration, as recorded in `ALR_GROWTH_HOLD_TRIAL.md`. They do not
+constitute native-producer mutation coverage. Preserve every cohort outcome and earlier
+failure; no production behavior, cap or guard was relaxed.
+
+The bounded ALR-growth-hold candidate adds exactly
+`WebRTC-DontIncreaseDelayBasedBweInAlr/Enabled/` to the DEBUG/macOS frozen control-factor
+configuration. Require an estimator observer and its own exact, explicitly opted-in
+fresh-process XCTest selection; neither ordinary pacing nor baseline observer methods
+may lend their admission. A distinct retained native owner requires the exact flag at
+actual controller creation, while the baseline owner requires it absent. Preserve SDK
+delegation, environment identity, schema-2 clocks/host attribution, three advancing delay
+samples and balanced logger lifetime. No live reconfiguration or native global setter
+is allowed. Probe updates and genuine overuse decreases remain separate observations.
+
+The initial `alr-growth-hold-native-weak-1.log` and `.log.result.json` record an unchanged
+source-bound pass: first frame 356.919 ms, 49/49 sharp frames, zero blur, final 5 fps,
+eight advancing delay events, verified pacing and balanced teardown. Source is
+`79c337f9689fe1d6482ea0467172a74c71bcd7e72e4797c5c26ce9f837576f19`; bridge is
+`7abb982c86cf24bced2bd0b65b1e9a6dd9eced114a928327d318e66d23cf5b3c`.
+A 4,872.181-ms interval held sender BWE at 758,659 bps with 24 sharp changed frames,
+20 encoded-frame increments, 244 packets and 287,025 forwarded relay bytes advancing;
+probe 7 later raised the estimate while still in ALR. This is behavior consistent with
+the hold, not direct native branch-hit proof. The absence of overuse means this run
+does not prove the response to real pressure, broad recovery or a production fix.
+
+Before matrix additions, 54 focused tests and 65 fake-runner scenarios passed. Two
+additional admission mutants compiled: borrowed selection caused two assertion failures,
+and missing observer admission caused three assertion failures plus one unexpected
+error. The field-trial source was restored to its prior SHA-256 prefix `a98884cf`;
+count only the assertion failures as mutation evidence. The hold's predeclared matrix
+was three fresh-process rounds of disabled recovery, enabled recovery, second drop,
+ample and weak, in that order. It is terminal and failed: 11 passes then round 3 enabled
+recovery failed, completing 12/15 cases; round 3 second drop, ample and weak did not run.
+All twelve receipts preserve source
+`2dae8d4953d050cc62e82217b3cf90b780af4c7de87b74c9a401d3f2b3f783b4` and unchanged bridge
+`7abb982c86cf24bced2bd0b65b1e9a6dd9eced114a928327d318e66d23cf5b3c`, with unchanged
+source. Retain `alr-growth-hold-matrix-1.result.json` and every case log/receipt; no
+partial-matrix pass, rerun-until-green or substitution of the initial pass is acceptable.
+
+Rounds 1 and 2 recovered sharp pixels in 437.546/1,840.457 ms for enabled recovery and
+389.990/2,304.937 ms for second drop, with no recovered-interval relapse and actual
+second-drop degradation. Both ample controls were all sharp at 13 fps; both weak
+controls were all sharp at 5 fps. Disabled cases passed characterization, not recovery.
+Round 3 enabled recovery had nil actual shadow divergence and no recovered sharp frame,
+ending at 1 fps despite verified current native estimator/pacing snapshots; nine
+post-restoration 90×160 motion frames confirm delivery without detail recovery. Its throwing
+recovered-frame assertion runs close in the catch but skips the relay-blackout check and
+final native teardown snapshot/marker. No marker exists: neither balanced teardown nor
+blackout proof may be borrowed from earlier cases or inferred from close execution.
+
+The failed trace stalls at BWE 192,627 then 181,925 bps while floor total/video caps remain
+486,001/99,360 bps; periodic requests are 198,720 bps, twice the video cap. Even twice
+those BWE values or the requested probe rate cannot reach the total-cap recovery
+qualification. Pinned `probe_controller.cc:552–561,597–600` limits requests to the lesser of the
+maximum rate and twice total allocation, disabling further probing at that cap. The
+matching measured requests support this mechanism as a source-backed inference, not a
+logged native allocated-rate value. The observed stall rejects promotion, without
+permission to weaken guards or raise ceilings. All processes are terminal; no further
+trial or fix is claimed.
+
+The separate ordinary gate `startup-20260920-33592-js07xn` passed 531 deterministic
+methods and native case 1, but native case 2 failed one startup-detail assertion without
+the hold flag selected: width 1080 fell to 134 at 1,152.93 ms, then 270, before recovering
+to 1080 at 3,494.21 ms. Final 51.5 fps cannot erase intermediate blur. All 333 covered
+files were independently rehashed with no changes, preserving gate source identity
+`2e38959358038ee949b4ccb27f2d40e9a5ee2a927632526cc793d0c843e368d3`; its 65 fake-runner
+scenarios passed separately. This is a failed full native gate and a release blocker,
+not a restored-gate pass. The failed hold matrix is a separate blocker. Historical
+green gates do not supersede this result; no deployment, commit or push was performed.
+
+The subsequent probe-cap candidate adds only the exact
+`WebRTC-Bwe-ProbingConfiguration/skip_if_est_larger_than_fraction_of_max:1.0,skip_max_allocated_scale:2.0/`
+group to the held control observer configuration. Default-off admission requires its
+original five exact `testNativeEstimatorALRProbeCap` matrix methods, plus the separate
+`testNativeEstimatorALRProbeCapRecoveryCadenceDiagnostic` selection, both opt-ins, a fresh video-only
+process and the distinct native owner. The receiver diagnostic is not a sixth matrix
+case. Reject preexisting groups and borrowed hold-only
+selections. Preserve all native evidence, pressure, reserve, cap, Show, deadline and
+pixel/FPS assertions. SDK behavior is a strict comparison of `min(BWE, network upper)`
+against `min(peer maximum, 2 * positive allocation)`; zero allocation uses peer maximum.
+Equality and a low network upper estimate do not skip. A skipped `RequestProbe` still
+consumes the five-second recovery-request cooldown. Configuration or absent events alone
+cannot prove that the periodic ALR predicate executed.
+
+`ALR_PROBE_CAP_TRIAL.md`, initial log/receipt
+`alr-probe-cap-native-enabled-recovery-1.log`, matrix receipt
+`alr-probe-cap-matrix-1.result.json` and corrected summary
+`alr-probe-cap-matrix-1.summary-2.json` are retained in the same scratch directory.
+Initial sharp recovery passed after 352.771 ms (first frame 341.715 ms), without the exact
+earlier floor-cap opportunity. Initial and matrix receipts preserve unchanged source
+`81dd4fcac0e66420bfea0b321558b6333f8bb5d2f6c2baec27d3eb7ea3fdfe65` and bridge
+`91c9c4c698f3859bebb09c280f89e6043481efbe76d25c6da9fe259a0f50bb47`.
+
+The fixed matrix stopped after six passes and round 2 enabled-recovery failure: 7/15
+completed, eight unrun. Its sole failed assertion was the pacing witness, whose reason
+was `outOfOrderHostEvidence` with seven events. Actual pixels recovered after 2,924.163 ms,
+with 66 changed observations, no recovered-interval relapse and final 12.5 fps. Native
+estimator verification, blackout and balanced logger teardown completed. Record each
+of those boundaries separately: pixel recovery does not excuse a failed native witness.
+The matrix remains red and cannot be promoted, partially certified or retried until green;
+its as-run witness failure and the independent ordinary-gate failure remain recorded.
+All seven rejected events were native millisecond timestamp equalities, not decreases,
+with strictly advancing callbacks; the SDK can publish changed pushback with unchanged
+estimate in one millisecond. The corrected receiving model now checks sequential tied
+pairs numerically and counts them only as `tiedPairs`, never additional independent
+matches. It retains three distinct advancing native timestamps, strictly advancing
+callbacks and all provenance guards. At that checkpoint no fresh full native matrix
+with the corrected witness had run; the original matrix stays red. This failed case entered the exact floor but exited
+by 8,588.312 ms before its nominal next periodic opportunity at 9,756.193 ms; the earlier
+hold-only failure had that opportunity inside its floor interval. Neither this timing
+confound nor the initial no-floor pass proves a live skip-branch hit.
+
+Before the correction, 61 focused tests (20 admission, eight hook, four bridge, 29 model) and 67 fake-runner
+scenarios passed. The candidate-selection and missing-hold Swift mutants each compiled
+and produced five assertion failures, zero unexpected errors, followed by exact restoration
+of field-trial SHA-256 `403c3b99228620133bec26853ee95cb8e288fea2b1c7c9b84a8ec68218d4b12b`.
+The corrected checkpoint passed 82 focused tests (the prior 61 plus 21 pacing-witness
+tests) and 69 fake scenarios in `alr-probe-cap-tied-witness-focused-1.log` and
+`alr-probe-cap-tied-witness-gate-selftest-1.log`. Independent compiled strict-ms,
+allowed-regression, counted-ties and duplicate-callback mutants produced respectively
+9/3/4/8 assertion failures across 2/1/1/1 tests, all with zero unexpected errors. Their
+`pacing-tied-witness-mutation-*-1.log` files and exact restored identities are retained:
+witness `72b6bdd74b3bbc94537d00ff684342d2be730dda5a2c01a1fb51e03668b8f354`, tests
+`17e486589bf1890bc630067bf98132fb7da2f8792617fcdfadd550e9f47ebdf5`.
+This validates receiving behavior, not by itself a fresh native matrix, the ordinary
+startup gate or execution of the periodic floor-trap predicate.
+The separate actual-framework `ProbeCapControllerSmoke.mm` passed all seven predicate
+cases; forcing configuration off compiled and failed its expected probe-count assertion
+in case 2. Its unchanged framework identity is independently checked by the harness.
+Source/binary/mutant identities are respectively
+`bae0f689f971427f63fd4cfd6803ff960c1d5dcb4aa136936f3583f720ccb9ad`,
+`0f8d144ec0169606c00c5f2861f0ceaffa91a5681077326e951dce78d771500e`, and
+`6179fd48d2388150e86b7c89f3210c4411b39cae9e99f9e4fbc4e7f60cb701d1`.
+Compile log 1's missing-field warnings-as-errors failure was corrected with a named
+`ProcessInterval`; normal compile log 2 and mutant compile log 1 succeeded. Only the
+runtime assertion failure is mutation evidence. These controller cases verify the common
+predicate and equality/network-upper boundaries, not a periodic ALR episode, transport,
+decoded pixels or preserved overuse behavior. No production rollout, commit or push is
+claimed; all earlier red results remain release blockers.
+
+The separately predeclared corrected-witness cohort is now terminal. Its initial
+enabled-recovery trial passed with 3,080.764-ms sharp recovery and final 13 fps. Matrix 2
+then passed seven cases and failed round 2 second drop: 8/15 completed, seven unrun.
+`alr-probe-cap-matrix-2.result.json` remains authoritative; the new
+`alr-probe-cap-matrix-2.summary-1.json` is only its descriptive derived projection.
+Initial and completed matrix receipts preserve unchanged source
+`edcaba4212ee66e20821c044a5088c63fb1709e8028e29f22908356c273ad3ce` and bridge
+`91c9c4c698f3859bebb09c280f89e6043481efbe76d25c6da9fe259a0f50bb47`.
+
+The failed second-drop case first recovered sharp pixels at 8,785.787 ms, 719.290 ms
+after actual restoration. The next sharp frame at 9,691.261 ms left a 905.473-ms gap,
+violating the 500-ms sustained-cadence limit. The fixed first-sharp two-second window
+held eight sharp frames but only seven changed transitions, below the required eight;
+its timely boundary does not cure either defect. All 56 recovered frames remained
+sharp with 55 changes overall and final 5 fps, but a later healthy span cannot replace
+the first window. Source submissions around the gap continued at roughly 200 ms;
+individual-frame pipeline attribution remains unavailable in this projection.
+
+Because the same fixed-window predicate never qualified, no actual second capacity
+drop occurred. The sustained assertion failed and the absent second-drop unwrap threw.
+Active native estimator/pacing witnesses verified (27 advancing delay events, 55
+independent pacing matches, 24 tied pairs), but the throw bypassed relay blackout and
+the final post-close logger snapshot/marker. Catch-path close is not balanced-teardown
+proof. The first seven cases' successful later checks cannot be borrowed by this case.
+
+Round 1 enabled recovery did provide the requested timing opportunity: ALR true and
+the exact 486,001/99,360-bps floor still present at 7,580.047 and 8,081.763 ms, after
+the preceding probe's nominal 7,525.961-ms periodic deadline, with advancing traffic.
+That is not direct internal allocation/network-upper/controller-state or branch-hit
+proof. Preserve that useful observation, the failed cadence contract, every previous
+red receipt and the independently red ordinary gate. No passed-matrix, promotion,
+deployment or relaxed-oracle claim follows. See the corrected cohort plan and
+`SPATIAL_RECOVERY_EXPERIMENT.md` for the complete fixed-case accounting.
+
+The later actual-framework periodic oracle is separate from those media receipts.
+`ProbeCapPeriodicALRFeedbackSmoke.mm` exercises the real GoogCC controller, actual
+ALR detector and periodic process path, not a copied skip predicate. Keep immutable
+paired hold-only/hold-plus-skip trials, peer 486,001 bps, reserve 320,000 bps and
+allocation 166,001 → 99,360 → 166,001. Genuinely submitted synthetic ordinary packets
+receive fixed send+25-ms receipts and send+50-ms feedback, with no forced BWE/RTT or
+fabricated probe results. Both cases enter ALR at 425 ms with native BWE 308,030 bps.
+At 5,425 ms hold-only requests 198,720 bps and candidate requests none; at 5,450 ms
+the restored allocation permits a useful 332,002-bps candidate request. Both complete
+104 sent/received/feedback records and balanced logger lifetimes. A separately compiled
+config-off mutant fails the candidate's exact periodic probe-count assertion while
+the control passes and native ALR/feedback are present. The normal source and binary
+remain unchanged. Preserve the first no-feedback revision's failed estimate assertion;
+it was rejected before periodic eligibility, not silently made green.
+`PERIODIC_ALR_FEEDBACK_ORACLE.md` pins all source/binary/log identities and the bounded
+20-second wall/10-second CPU execution. This verifies requests, not probe delivery,
+feedback-induced floor collapse, real overuse, media or product health. The original
+seven-case actual-controller harness still supplies equality/network-upper coverage.
+
+Keep SDK-default production pacing (40 ms with no configuration override) separate
+from the diagnostic 20-ms hold/skip media and periodic fixtures. The observer-only
+`baseline-estimator-native-delayed-1.log` uses the original delayed dynamic fixture
+without a capacity experiment and passes sharp pixels, 51 fps, 24 advancing native
+delay events, 15 pacing pairs, blackout and balanced teardown. Its unchanged source
+is `62abc9b00a2b56041b192655da5cf91ae45d09c0d571848c5e5dc6892268109e`; bridge remains
+`91c9c4c698f3859bebb09c280f89e6043481efbe76d25c6da9fe259a0f50bb47`.
+Its first two ordinary estimates of 888,571 bps do not reproduce the red ordinary
+gate's 656,555-bps startup. The explicit control trial is configuration-equivalent
+to SDK defaults, not timing-equivalent or byte-identical. This diagnostic pass, and
+its preceding 83 focused tests/70 fake scenarios, do not certify the ordinary gate.
+
+Receiver cadence diagnostics must retain bounded video-only inbound counters and
+monotonic request/completion clocks, without adding timers, blocking host sampling or
+feeding policy. Reject malformed values, outbound attribution, saturation and late
+retired completions; do not coerce missing values to zero. Preserve the original
+renderer received-time and pixel oracle while separately recording callback entry,
+conversion duration and RTP timestamp. Aggregate receive/decode progression is not a
+per-frame encoder/packet/display join. The single separately selected
+`recovery-cadence-native-1.log` passed under source
+`cda852c92d3209ce2ea9cad6e97ed1e112e51901be5b99eee06fe97295e11de5` and the same bridge:
+436.596-ms sharp recovery from the conservative restore-start boundary,
+11 sharp first-window frames/10 changes, 303.742-ms maximum
+recovered gap, actual second-drop degradation, final 5 fps, 39 retained receiver
+records and verified native/blackout/balanced-teardown evidence. It did not reproduce
+the old 905.473-ms gap; added collection can perturb timing. This is a passing
+collection diagnostic, not a media fix or a new matrix case. The preceding 126 focused
+tests/72 fake scenarios, compiled receiver mutants with 1/8/3/4 assertion failures
+and restored 27-test pass are separately pinned in `RECOVERY_CADENCE_DIAGNOSTIC.md`.
+Every earlier red receipt and every unrun matrix case keeps its original status.
+
+The separately declared SDK-default-selection cohort compares seven exact cases in
+each of three rounds: paired original delayed control/candidate, weak, disabled
+recovery, enabled recovery, second drop and ample. It leaves the burst override
+absent and preserves the exact ALR candidate groups and all product guards. Moving
+cases add receiver collection with retire/drain before final viewer statistics;
+they are not a timing-identical comparison to the old 20-ms recordings. Native
+default-selection and numeric factor/estimator verification are not consumed-40-ms
+proof. The 40-ms value is source-derived and all 20 completed receipts explicitly
+record `runtime_window_readback: false`.
+
+`default-pacing-cohort-1.result.json` is terminal RED: 19 passes, then round 3
+second-drop failure, leaving round 3 ample unrun (20/21 complete). All receipts
+preserve source `c029f1720d7fcde07e60514309707418d99a072264169c20621719a59a5d778c` and
+bridge `91c9c4c698f3859bebb09c280f89e6043481efbe76d25c6da9fe259a0f50bb47`; no timeout
+or retry occurred. All delayed controls/candidates passed without reproducing old
+startup blur. The failed case recovered sharp pixels in conservative 377.358 ms,
+passed sustained cadence, and actually began its second drop at 14,005.081 ms.
+All 30 later decoded frames remained full size through 19,889.630 ms, failing the
+unchanged second-pressure degradation assertion. This is not the prior 905-ms
+first-window failure. Active estimator/pacing, receiver collection, blackout and
+balanced teardown verified independently; they cannot waive that assertion or
+identify the cause of the missing spatial decrease.
+Native overuse reduced BWE to 482,502 bps then returned to normal with low adjacent
+ordinary queue/RTT samples. This does not establish sustained overload or a policy
+defect requiring forced blur. Preserve the RED receipt while distinguishing the
+second-pressure contract through bounded replay and independent evidence.
+
+Before the cohort, the contributor gate passed 563 required deterministic methods
+and the fake runner passed 75 scenarios. Separately compiled final-drain,
+default-admission, default-profile and delayed-workload mutants failed 1/8/2/2
+assertions, with zero unexpected errors; exact restoration passed 53 focused tests.
+`RECEIVER_MUTATION_EVIDENCE.md` distinguishes gate-manifest identity from the runner's
+different path-set hash. `DEFAULT_PACING_ALR_PROBE_CAP_COHORT.md` records case values
+and receipt/log hashes. Preserve this RED and every historical RED. None proves
+runtime 40-ms consumption, default-on flags, a product fix, promotion or deployment.
+
+Subsequent deterministic second-pressure replays pass for transient retention,
+persistent post-expiry downgrade and independent fresh-pressure retirement. Their
+46/3/6/11-assertion mutants are restored; gate `startup-20260920-97276-10o8s41` passes
+566 required methods and the fake runner passes 78 scenarios. The native RED is
+not amended by those policy-only witnesses. Scratch `SECOND_PRESSURE_REPLAY_EVIDENCE.md`
+records source identities and the limits of the synthetic cumulative counters.
+
+Scratch `PROBE_DURATION_FEEDBACK_ORACLE.md` records four actual-framework cases:
+15/100-ms common duration, each with zero or 4,055-us final-arrival extension.
+Native probe success, normal delay estimate and returned target agree at
+905,038/905,038/656,554/869,165 bps. All records and logger lifetimes balance; a
+duration-off mutant fails both long cases. Traffic rises from 1,729 to 11,362 bytes.
+This proves first-delivered-probe susceptibility only. It does not establish the
+cause of a historical startup sample, actual pacer consumption, full two-cluster
+startup, a startup-only flag, real congestion behavior or a deployable fix.
 
 - `swift test` covers the deterministic protocol, security, transport waveform, mutation, Mac
   artifact, and validation-driver contracts.

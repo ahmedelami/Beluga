@@ -203,6 +203,179 @@ final class WebRTCVideoStartupStatisticsTests: XCTestCase {
         }
     }
 
+    func testParsesOptionalReceiverDiagnosticsOnlyFromInboundVideo() throws {
+        let snapshot = WebRTCStatisticsParser.parse(records: [
+            record(values: receiverValues),
+            record(id: "screen-in", type: "inbound-rtp", values: receiverValues),
+        ], collectionSequence: 74)
+        let video = try XCTUnwrap(snapshot.inboundVideo)
+
+        XCTAssertEqual(snapshot.collectionSequence, 74)
+        XCTAssertNil(snapshot.route)
+        XCTAssertNil(snapshot.availableOutgoingBitrate)
+        XCTAssertEqual(video.bytes, 120_000)
+        XCTAssertEqual(video.packets, 100)
+        XCTAssertEqual(video.framesEncodedOrDecoded, 6)
+        XCTAssertEqual(video.framesReceived, 9)
+        XCTAssertEqual(video.framesDropped, 2)
+        XCTAssertEqual(video.jitterBufferDelay, 0.75)
+        XCTAssertEqual(video.jitterBufferEmittedCount, 7)
+        XCTAssertEqual(video.totalDecodeTime, 0.048)
+        XCTAssertEqual(video.qpSum, 192)
+        XCTAssertNil(video.keyFramesEncoded)
+        XCTAssertNil(video.totalEncodeTime)
+        XCTAssertNil(video.targetBitrate)
+        let outbound = try XCTUnwrap(snapshot.outboundVideo)
+        assertReceiverFieldsAbsent(outbound)
+        XCTAssertEqual(outbound.framesEncodedOrDecoded, 12)
+        XCTAssertEqual(outbound.totalEncodeTime, 0.072)
+    }
+
+    func testAbsentReceiverDiagnosticsAndLegacyJSONRemainUnknown() throws {
+        let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: [
+            record(type: "inbound-rtp", values: [
+                "kind": "video", "framesDecoded": NSNumber(value: 4),
+            ]),
+        ]).inboundVideo)
+        XCTAssertEqual(video.framesEncodedOrDecoded, 4)
+        assertReceiverFieldsAbsent(video)
+        assertReceiverFieldsAbsent(WebRTCVideoStatistics())
+        let legacy = try JSONDecoder().decode(
+            WebRTCVideoStatistics.self,
+            from: Data(#"{"bytes":100,"packets":5,"framesEncodedOrDecoded":2}"#.utf8)
+        )
+        XCTAssertEqual(legacy.framesEncodedOrDecoded, 2)
+        assertReceiverFieldsAbsent(legacy)
+    }
+
+    func testReceiverDiagnosticsRoundTripWithoutChangingUnits() throws {
+        let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: [
+            record(type: "inbound-rtp", values: receiverValues),
+        ]).inboundVideo)
+        let roundTrip = try JSONDecoder().decode(
+            WebRTCVideoStatistics.self,
+            from: JSONEncoder().encode(video)
+        )
+        XCTAssertEqual(roundTrip, video)
+        XCTAssertEqual(roundTrip.framesReceived, 9)
+        XCTAssertEqual(roundTrip.framesDropped, 2)
+        XCTAssertEqual(roundTrip.jitterBufferDelay, 0.75)
+        XCTAssertEqual(roundTrip.jitterBufferEmittedCount, 7)
+        XCTAssertEqual(roundTrip.totalDecodeTime, 0.048)
+    }
+
+    func testReceiverCounterDiagnosticsRejectMalformedValuesIndependently() throws {
+        let counters: [(String, KeyPath<WebRTCVideoStatistics, UInt64?>)] = [
+            ("framesReceived", \.framesReceived),
+            ("framesDropped", \.framesDropped),
+            ("jitterBufferEmittedCount", \.jitterBufferEmittedCount),
+        ]
+        let malformed: [Any] = [
+            NSNull(), "12", NSNumber(value: true), NSNumber(value: -1),
+            NSNumber(value: 1.5), NSNumber(value: Double.nan),
+            NSNumber(value: Double.infinity), NSNumber(value: -Double.infinity),
+            NSNumber(value: UInt64.max), NSNumber(value: 9_007_199_254_740_992.0),
+        ]
+        for (key, path) in counters {
+            for badValue in malformed {
+                var values = receiverValues
+                values[key] = badValue
+                let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: [
+                    record(type: "inbound-rtp", values: values),
+                ]).inboundVideo)
+                XCTAssertNil(video[keyPath: path], "\(key): \(badValue)")
+                XCTAssertEqual(video.jitterBufferDelay, 0.75)
+                XCTAssertEqual(video.totalDecodeTime, 0.048)
+                XCTAssertEqual(video.framesEncodedOrDecoded, 6)
+                XCTAssertEqual(video.packets, 100)
+            }
+            let valid: [NSNumber] = [
+                NSNumber(value: UInt64(0)), NSNumber(value: 0.0),
+                NSNumber(value: 12.0), NSNumber(value: Int64.max),
+            ]
+            for value in valid {
+                var values = receiverValues
+                values[key] = value
+                let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: [
+                    record(type: "inbound-rtp", values: values),
+                ]).inboundVideo)
+                XCTAssertEqual(video[keyPath: path], value.uint64Value, key)
+            }
+        }
+    }
+
+    func testReceiverDoubleDiagnosticsRequireBoundedNonnegativeFiniteNumbers() throws {
+        let doubles: [(String, KeyPath<WebRTCVideoStatistics, Double?>)] = [
+            ("jitterBufferDelay", \.jitterBufferDelay),
+            ("totalDecodeTime", \.totalDecodeTime),
+        ]
+        let malformed: [Any] = [
+            NSNull(), "12", NSNumber(value: true), NSNumber(value: -0.001),
+            NSNumber(value: Double.nan), NSNumber(value: Double.infinity),
+            NSNumber(value: -Double.infinity), NSNumber(value: 1_000_000_001.0),
+        ]
+        for (key, path) in doubles {
+            for badValue in malformed {
+                var values = receiverValues
+                values[key] = badValue
+                let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: [
+                    record(type: "inbound-rtp", values: values),
+                ]).inboundVideo)
+                XCTAssertNil(video[keyPath: path], "\(key): \(badValue)")
+                XCTAssertEqual(video.framesReceived, 9)
+                XCTAssertEqual(video.framesDropped, 2)
+                XCTAssertEqual(video.jitterBufferEmittedCount, 7)
+                XCTAssertEqual(video.packets, 100)
+            }
+            for value in [0.0, 0.125, 1_000_000_000.0] {
+                var values = receiverValues
+                values[key] = NSNumber(value: value)
+                let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: [
+                    record(type: "inbound-rtp", values: values),
+                ]).inboundVideo)
+                XCTAssertEqual(video[keyPath: path], value, key)
+            }
+        }
+    }
+
+    func testReceiverDiagnosticsNeverSelectRepairOrAnAmbiguousSecondVideoStream() throws {
+        var primary = receiverValues
+        primary["codecId"] = "h264-codec"
+        var repair = receiverValues
+        repair["codecId"] = "rtx-codec"
+        repair["framesReceived"] = NSNumber(value: 999)
+        repair["jitterBufferDelay"] = NSNumber(value: 999)
+        let records = [
+            record(type: "inbound-rtp", values: primary),
+            record(id: "screen-rtx", type: "inbound-rtp", values: repair),
+            record(id: "h264-codec", type: "codec", values: ["mimeType": "video/H264"]),
+            record(id: "rtx-codec", type: "codec", values: ["mimeType": "video/rtx"]),
+        ]
+        for ordered in [records, Array(records.reversed())] {
+            let video = try XCTUnwrap(WebRTCStatisticsParser.parse(records: ordered).inboundVideo)
+            XCTAssertEqual(video.framesReceived, 9)
+            XCTAssertEqual(video.jitterBufferDelay, 0.75)
+
+            let ambiguous = ordered + [
+                record(id: "second-video", type: "inbound-rtp", values: receiverValues),
+            ]
+            XCTAssertNil(WebRTCStatisticsParser.parse(records: ambiguous).inboundVideo)
+        }
+    }
+
+    private var receiverValues: [String: Any] {
+        populatedValues.merging([
+            "bytesReceived": NSNumber(value: 120_000),
+            "packetsReceived": NSNumber(value: 100),
+            "framesDecoded": NSNumber(value: 6),
+            "framesReceived": NSNumber(value: 9),
+            "framesDropped": NSNumber(value: 2),
+            "jitterBufferDelay": NSNumber(value: 0.75),
+            "jitterBufferEmittedCount": NSNumber(value: 7),
+            "totalDecodeTime": NSNumber(value: 0.048),
+        ], uniquingKeysWith: { _, new in new })
+    }
+
     private var populatedValues: [String: Any] {
         [
             "kind": "video",
@@ -242,5 +415,17 @@ final class WebRTCVideoStartupStatisticsTests: XCTestCase {
         XCTAssertNil(video.pliCount, file: file, line: line)
         XCTAssertNil(video.qualityLimitationReason, file: file, line: line)
         XCTAssertNil(video.targetBitrate, file: file, line: line)
+    }
+
+    private func assertReceiverFieldsAbsent(
+        _ video: WebRTCVideoStatistics,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertNil(video.framesReceived, file: file, line: line)
+        XCTAssertNil(video.framesDropped, file: file, line: line)
+        XCTAssertNil(video.jitterBufferDelay, file: file, line: line)
+        XCTAssertNil(video.jitterBufferEmittedCount, file: file, line: line)
+        XCTAssertNil(video.totalDecodeTime, file: file, line: line)
     }
 }

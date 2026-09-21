@@ -43,6 +43,7 @@ final class WebRTCScreenVideoStatisticsReportTests: XCTestCase {
 
         XCTAssertEqual(restored.snapshot, snapshot.restoringRouteIfNeeded(route))
         XCTAssertEqual(restored.snapshot.route, route)
+        XCTAssertEqual(restored.snapshot.inboundVideo, snapshot.inboundVideo)
         XCTAssertEqual(restored.nativeSnapshot, snapshot)
         XCTAssertNil(restored.nativeSnapshot.route)
         XCTAssertEqual(
@@ -166,6 +167,11 @@ final class WebRTCScreenVideoStatisticsReportTests: XCTestCase {
             frameWidth: Int(seed) * 540,
             frameHeight: Int(seed) * 960,
             framesEncodedOrDecoded: seed * 30,
+            framesReceived: seed * 31,
+            framesDropped: seed + 5,
+            jitterBufferDelay: Double(seed) * 0.25,
+            jitterBufferEmittedCount: seed * 29,
+            totalDecodeTime: Double(seed) * 0.04,
             keyFramesEncoded: seed + 1,
             totalEncodeTime: Double(seed) * 0.08,
             hugeFramesSent: seed + 2,

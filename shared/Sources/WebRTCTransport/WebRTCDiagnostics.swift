@@ -71,6 +71,13 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
     public let frameWidth: Int?
     public let frameHeight: Int?
     public let framesEncodedOrDecoded: UInt64?
+    /// Receive-only cumulative diagnostics; times are seconds, not per-frame latency.
+    /// These fields do not grant adaptation permission.
+    public let framesReceived: UInt64?
+    public let framesDropped: UInt64?
+    public let jitterBufferDelay: Double?
+    public let jitterBufferEmittedCount: UInt64?
+    public let totalDecodeTime: Double?
     /// Encoder-only fields stay nil when absent or on an inbound report. These cumulative
     /// counters do not identify individual frame sizes or grant adaptation permission.
     public let keyFramesEncoded: UInt64?
@@ -94,6 +101,11 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
         frameWidth: Int? = nil,
         frameHeight: Int? = nil,
         framesEncodedOrDecoded: UInt64? = nil,
+        framesReceived: UInt64? = nil,
+        framesDropped: UInt64? = nil,
+        jitterBufferDelay: Double? = nil,
+        jitterBufferEmittedCount: UInt64? = nil,
+        totalDecodeTime: Double? = nil,
         keyFramesEncoded: UInt64? = nil,
         totalEncodeTime: Double? = nil,
         hugeFramesSent: UInt64? = nil,
@@ -111,6 +123,11 @@ public struct WebRTCVideoStatistics: Codable, Equatable, Sendable {
         self.frameWidth = frameWidth
         self.frameHeight = frameHeight
         self.framesEncodedOrDecoded = framesEncodedOrDecoded
+        self.framesReceived = framesReceived
+        self.framesDropped = framesDropped
+        self.jitterBufferDelay = jitterBufferDelay
+        self.jitterBufferEmittedCount = jitterBufferEmittedCount
+        self.totalDecodeTime = totalDecodeTime
         self.keyFramesEncoded = keyFramesEncoded
         self.totalEncodeTime = totalEncodeTime
         self.hugeFramesSent = hugeFramesSent
