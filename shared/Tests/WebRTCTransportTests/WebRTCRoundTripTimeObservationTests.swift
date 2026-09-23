@@ -213,6 +213,11 @@ final class WebRTCRoundTripTimeObservationTests: XCTestCase {
             route: route,
             currentRoundTripTime: 0.05,
             roundTripTimeObservation: observation,
+            selectedCandidatePairOutbound: WebRTCSelectedCandidatePairOutboundDiagnostics(
+                selectedCandidatePairFingerprint: String(repeating: "a", count: 64),
+                payloadBytesSent: 1_234,
+                availableOutgoingBitrateBps: 1_500_000
+            ),
             availableOutgoingBitrate: 1_500_000,
             jitter: 0.001,
             outboundVideo: WebRTCVideoStatistics(bytes: 400, packets: 40),

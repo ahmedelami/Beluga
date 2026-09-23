@@ -27,6 +27,8 @@ REQUIRED_CLASSES = %w[
   CaptureServerTests.WorldwideRemoteInputScaleTransitionTests
   WebRTCTransportTests.WebRTCScreenVideoStatisticsReportTests
   WebRTCTransportTests.WebRTCRoundTripTimeObservationTests
+  WebRTCTransportTests.WebRTCSelectedCandidatePairOutboundDiagnosticsTests
+  WebRTCTransportTests.WebRTCWholePeerStatisticsRouteRevisionTests
   WebRTCTransportTests.WebRTCStatisticsParserTests
   WebRTCTransportTests.WebRTCVideoStartupStatisticsTests
   CaptureServerTests.StartupVideoDatagramSchedulerTests
@@ -53,6 +55,11 @@ REQUIRED_CLASSES = %w[
   CaptureServerTests.StartupVideoNativeEncoderLogObserverTests
   CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests
 ].freeze
+# Pin the two visibility-token loopback methods without selecting every unrelated peer test.
+STANDALONE_METHODS = %w[
+  WebRTCTransportTests.WebRTCPeerLoopbackTests/testScreenVideoEncodingLimitsRejectSupersededVisibilityRequestBeforeNativeMutation
+  WebRTCTransportTests.WebRTCPeerLoopbackTests/testScreenVideoEncodingLimitsAcceptExactVisibilityRequestID
+].freeze
 # Renaming or deleting a pinned safety method requires intentional gate review.
 REQUIRED_METHODS = %w[
   CaptureServerTests.WorldwideScreenSpatialRecoveryPolicyTests/testRecordedTransientLowCapacityRetainsAcceptedSurvivalPixelsUntilProbeExpiryAndRebound
@@ -65,6 +72,16 @@ REQUIRED_METHODS = %w[
   CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testFreshFastRTTAfterMalformedOrdinaryReportStillFailsClosed
   CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testFreshFastRTTBridgeCannotOutlivePrimaryLeaseOrProbeDeadline
   CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testRejectedNativeApplyRetainsOnlyExactShowTerminalDisproof
+  CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testCorrectiveNativeReconciliationRevokesWitnessMintedByUnknownConfiguration
+  CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testFastProbeBandwidthCollapseDoesNotBlockDemandGeometryRearm
+  CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testFastImmediateQueueAfterDemandDisproofSurvivesGeometryRebuild
+  CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testMutableDiagnosticCauseCannotVetoDemandGeometryRearm
+  CaptureServerTests.WorldwideScreenStartupSpatialPolicyTests/testAcceptedOriginRestoreKeepsFreshFailedProbeWitnessForNonQLRDemand
+  CaptureServerTests.WorldwideRemoteInputScaleTransitionTests/testSuccessorShowGateRejectsOrdinaryAdaptationAndStaleCleanup
+  CaptureServerTests.WorldwideRemoteInputScaleTransitionTests/testShowTransitionGateAndNativeVisibilityTokenAreWiredAtMutationBoundaries
+  CaptureServerTests.WorldwideRemoteInputScaleTransitionTests/testExpiredNativeFallbackFencesReportReservedBeforeFallback
+  CaptureServerTests.WorldwideRemoteInputScaleTransitionTests/testFailedAutomaticResumeFencesTemporarySenderBeforeReleasingActor
+  WebRTCTransportTests.WebRTCWholePeerStatisticsRouteRevisionTests/testWholePeerReportIsRejectedAfterRouteRevisionChanges
   CaptureServerTests.WorldwideScreenStartupInvariantSequenceTests/testSeededSequencesPreserveNonFPSStateAcrossSourceFrameRates
   CaptureServerTests.WorldwideScreenStartupInvariantSequenceTests/testConfiguredCapAndSourceFPSMatrixGivesUncertaintyNoAuthority
   CaptureServerTests.WorldwideScreenStartupInvariantSequenceTests/testProbeExpiryAndStaleInterleavingCannotResurrectBudgetOrBlurShow
@@ -481,11 +498,13 @@ begin
   REQUIRED_CLASSES.each do |class_name|
     fail_gate("required test class missing from discovery: #{class_name}") unless discovered.any? { |id| id.start_with?(class_name + '/') }
   end
-  REQUIRED_METHODS.each do |id|
+  (REQUIRED_METHODS + STANDALONE_METHODS).each do |id|
     fail_gate("required safety method missing from discovery: #{id}") unless discovered.include?(id)
   end
   selected = discovered.select do |id|
-    REQUIRED_CLASSES.include?(id.split('/').first) || id.start_with?('CaptureServerTests.WorldwideScreenStartup')
+    REQUIRED_CLASSES.include?(id.split('/').first) ||
+      id.start_with?('CaptureServerTests.WorldwideScreenStartup') ||
+      STANDALONE_METHODS.include?(id)
   end.sort
   fail_gate('empty deterministic selection') if selected.empty?
   if options[:native]

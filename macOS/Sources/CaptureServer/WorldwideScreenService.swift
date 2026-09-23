@@ -489,6 +489,27 @@ actor WorldwideScreenService {
         let recoveryEpoch: UInt64
     }
 
+    /// A successor Show owns sender setup until Active ACK or fail-closed cleanup. Ordinary
+    /// statistics may be collected during that async transition, but cannot mutate its policy
+    /// or install native limits before the Show owner finishes.
+    struct ShowAdaptationGate: Equatable, Sendable {
+        private(set) var pendingVisibilityEpoch: UInt64?
+
+        mutating func begin(_ epoch: UInt64) {
+            pendingVisibilityEpoch = epoch
+        }
+
+        func permits(ownerEpoch: UInt64?) -> Bool {
+            pendingVisibilityEpoch == nil || pendingVisibilityEpoch == ownerEpoch
+        }
+
+        mutating func finish(_ epoch: UInt64) {
+            if pendingVisibilityEpoch == epoch {
+                pendingVisibilityEpoch = nil
+            }
+        }
+    }
+
     /// Finishes once the consume-once media rendezvous has been fully torn down.
     nonisolated let completion: AsyncStream<Void>
 
@@ -902,6 +923,8 @@ actor WorldwideScreenService {
     private var recoveryProofAcknowledgementInFlight: PendingRecoveryProofRequest?
     private var recoveryProofAuthorization: WebRTCControlAuthorization?
     private var screenVisibilityCommandEpoch: UInt64 = 0
+    private var screenVisibilityRequestID: UInt64?
+    private var showAdaptationGate = ShowAdaptationGate()
     private var screenMediaSuspension =
         WorldwideScreenMediaSuspensionCoordinator()
     private var lastScreenClientDiagnosticsReceiptUptime: TimeInterval?
@@ -942,6 +965,10 @@ actor WorldwideScreenService {
     private var captureVideoBaseDimensions: ScreenVideoPixelDimensions?
     private var appliedScreenVideoRecommendation:
         WorldwideScreenVideoEncodingRecommendation?
+    /// Advances only after an exact-owner native sender application is accepted. A successor
+    /// Show uses this receipt to prove that its forced transaction actually ran even when the
+    /// desired recommendation already matched the cache.
+    private var screenVideoNativeApplicationGeneration: UInt64 = 0
     private var audioSource: SystemAudioCaptureSource?
     private var audioSink: WorldwideSystemAudioSampleSink?
     private var audioAuthorization: WebRTCAudioAuthorization?
@@ -2350,10 +2377,9 @@ actor WorldwideScreenService {
         case .routeChanged(let route):
             logger.info("Worldwide WebRTC route: \(route.kind.rawValue)")
             let policyBeforeRouteEvent = screenVideoAdaptationPolicy
+            advanceScreenVideoStatisticsEpoch(using: sourcePeer)
             screenVideoAdaptationPolicyRevision &+= 1
             screenVideoAdaptationPolicy.invalidateSelectedRoute()
-            screenVideoAdaptationEvidenceLane = nil
-            screenVideoAdaptationLastEvidenceTime = nil
             logger.debug(
                 "Worldwide screen startup boundary event=routeChanged "
                     + "peerGeneration=\(sourcePeerGeneration) showEpoch=\(screenVisibilityCommandEpoch) "
@@ -2477,7 +2503,8 @@ actor WorldwideScreenService {
                     || !screenVideoAdaptationFastStatisticsAreAvailable
             if wholePeerReportWasCollected,
                screenVideoAdaptationFreshnessFence.admits(snapshot),
-               ordinaryFallbackOwnsVideoPolicy {
+               ordinaryFallbackOwnsVideoPolicy,
+               showAdaptationGate.pendingVisibilityEpoch == nil {
                 let expectedPolicyRevision =
                     prepareScreenVideoAdaptationEvidence(
                         from: .ordinaryFallback
@@ -2490,7 +2517,8 @@ actor WorldwideScreenService {
                     allowsAutomaticResume: true
                 )
             } else if !wholePeerReportWasCollected,
-                      ordinaryFallbackOwnsVideoPolicy {
+                      ordinaryFallbackOwnsVideoPolicy,
+                      showAdaptationGate.pendingVisibilityEpoch == nil {
                 // The microphone-health event still fires when the native whole-peer request is
                 // busy or times out. Missing telemetry is not transport evidence; it may only
                 // expire an already-raised, time-bounded application-limited video probe.
@@ -2721,6 +2749,9 @@ actor WorldwideScreenService {
                 // and cause a second back-to-back encoder transition from pre-restoration data.
                 continue
             }
+            guard showAdaptationGate.pendingVisibilityEpoch == nil else {
+                continue
+            }
 
             let expectedPolicyRevision =
                 screenVideoAdaptationPolicyRevision
@@ -2753,6 +2784,7 @@ actor WorldwideScreenService {
                // metadata. Only this native report's route may reset adaptation ownership.
                case let snapshot = report.nativeSnapshot,
                screenVideoAdaptationFreshnessFence.admits(snapshot),
+               showAdaptationGate.pendingVisibilityEpoch == nil,
                screenVisibilityCommandEpoch == expectedVisibilityEpoch,
                captureSource === expectedCaptureSource,
                captureAuthorization === expectedCaptureAuthorization,
@@ -2825,7 +2857,9 @@ actor WorldwideScreenService {
         expectedPolicyRevision: UInt64,
         allowsAutomaticResume: Bool,
         nativeReportTimestampMicroseconds: Double? = nil,
-        capacityProbeOnly: Bool = false
+        capacityProbeOnly: Bool = false,
+        forceNativeReconciliation: Bool = false,
+        showTransitionOwnerEpoch: UInt64? = nil
     ) async {
         // Marker and real-frame RTP deltas are valid only while the exact sender configuration
         // remains frozen. The bounded probe owns its temporary ceiling; the first statistics
@@ -2833,8 +2867,12 @@ actor WorldwideScreenService {
         guard automaticScreenMediaResumeContext == nil,
               peer === sourcePeer,
               peerGeneration == sourcePeerGeneration,
+              showAdaptationGate.permits(ownerEpoch: showTransitionOwnerEpoch),
               screenVideoAdaptationPolicyRevision
                 == expectedPolicyRevision else {
+            return
+        }
+        guard let expectedScreenVisibilityRequestID = screenVisibilityRequestID else {
             return
         }
         let forwardingAuthorization = captureForwardingAuthorization
@@ -2847,7 +2885,18 @@ actor WorldwideScreenService {
             } == true
         guard isCaptureActive || allowsAutomaticResume else { return }
 
-        var proposedPolicy = screenVideoAdaptationPolicy
+        let nativeSenderRequiresReconciliation =
+            WorldwideScreenNativeApplicationCache.requiresNativeReconciliation(
+                applied: appliedScreenVideoRecommendation,
+                desired: screenVideoAdaptationPolicy.currentRecommendation,
+                force: forceNativeReconciliation
+            )
+        var proposedPolicy = nativeSenderRequiresReconciliation
+            ? WorldwideScreenNativeApplicationCache
+                .policyForSenderConfigurationReconciliation(
+                    screenVideoAdaptationPolicy
+                )
+            : screenVideoAdaptationPolicy
         var capacityDiagnostics: WorldwideScreenCapacityProbeDiagnostics?
         var floorDiagnostics: WorldwideScreenFloorRecoveryDiagnostics?
         let changedRecommendation:
@@ -2882,6 +2931,24 @@ actor WorldwideScreenService {
                 outboundVideoPacketsSent: snapshot.outboundVideo?.packets,
                 outboundVideoTotalPacketSendDelaySeconds:
                     snapshot.outboundVideo?.totalPacketSendDelay,
+                outboundVideoBytesSent: snapshot.outboundVideo?.bytes,
+                outboundVideoFramesEncoded:
+                    snapshot.outboundVideo?.framesEncodedOrDecoded,
+                outboundVideoKeyFramesEncoded:
+                    snapshot.outboundVideo?.keyFramesEncoded,
+                outboundVideoTargetBitrateBps:
+                    snapshot.outboundVideo?.targetBitrate,
+                outboundAudioTargetBitrateBps:
+                    snapshot.outboundAudio?.targetBitrate,
+                outboundVideoQualityLimitationReason:
+                    snapshot.outboundVideo?.qualityLimitationReason,
+                selectedPairFingerprint: snapshot.selectedCandidatePairOutbound?
+                    .selectedCandidatePairFingerprint,
+                selectedPairBytesSent: snapshot.selectedCandidatePairOutbound?
+                    .payloadBytesSent,
+                selectedPairAvailableOutgoingBitrateBps:
+                    snapshot.selectedCandidatePairOutbound?
+                        .availableOutgoingBitrateBps,
                 nativeReportTimestampMicroseconds: nativeReportTimestampMicroseconds,
                 spatialRecoveryFrames: snapshot.outboundVideo.flatMap { video in
                     guard let frames = video.framesEncodedOrDecoded,
@@ -2902,10 +2969,17 @@ actor WorldwideScreenService {
             // A failed retirement leaves native limits at the previous value. Retry that
             // outstanding reconciliation even when the next report is also absent.
             guard changedRecommendation != nil
-                    || appliedScreenVideoRecommendation != proposedPolicy.currentRecommendation else {
+                    || nativeSenderRequiresReconciliation else {
                 screenVideoAdaptationPolicy = proposedPolicy
                 return
             }
+        }
+        if nativeSenderRequiresReconciliation {
+            // This report was collected before the corrective native write. The first fence
+            // above prevents it from completing an old demand window; this second fence keeps
+            // it from becoming the seed of the newly applied sender configuration.
+            proposedPolicy = WorldwideScreenNativeApplicationCache
+                .policyForSenderConfigurationReconciliation(proposedPolicy)
         }
         let recommendation = changedRecommendation
             ?? proposedPolicy.currentRecommendation
@@ -2983,6 +3057,45 @@ actor WorldwideScreenService {
                 + (proposedPolicy.startupSpatialModeIsActive ? "active"
                     : (proposedPolicy.startupSpatialModeIsDisproved
                         ? "disproved" : "inactive"))
+                + " startupSpatialBandwidthDisposition="
+                + proposedPolicy.startupSpatialBandwidthDisposition.rawValue
+                + " startupSpatialBandwidthProofSampleCount="
+                + "\(proposedPolicy.startupSpatialBandwidthProofSampleCount)"
+                + " startupSpatialDemandIntervals="
+                + "\(proposedPolicy.startupSpatialBandwidthDemandIntervalCount)"
+                + " startupSpatialVideoSendBps="
+                + (proposedPolicy.startupSpatialBandwidthVideoSendBitrateBps.map {
+                    String(format: "%.0f", $0)
+                } ?? "unknown")
+                + " startupSpatialPairSendBps="
+                + (proposedPolicy.startupSpatialBandwidthPairSendBitrateBps.map {
+                    String(format: "%.0f", $0)
+                } ?? "unknown")
+                + " startupSpatialAverageAvailableOutgoingBps="
+                + (proposedPolicy
+                    .startupSpatialBandwidthAverageAvailableOutgoingBitrateBps.map {
+                        String(format: "%.0f", $0)
+                    } ?? "unknown")
+                + " startupSpatialAverageVideoTargetBps="
+                + (proposedPolicy
+                    .startupSpatialBandwidthAverageVideoTargetBitrateBps.map {
+                        String(format: "%.0f", $0)
+                    } ?? "unknown")
+                + " startupSpatialAverageAggregateTargetBps="
+                + (proposedPolicy
+                    .startupSpatialBandwidthAverageAggregateTargetBitrateBps.map {
+                        String(format: "%.0f", $0)
+                    } ?? "unknown")
+                + " startupSpatialBandwidthLimitedIntervals="
+                + "\(proposedPolicy.startupSpatialBandwidthLimitedIntervalCount)"
+                + " startupSpatialSameShowProbeWitness="
+                + (proposedPolicy
+                    .startupSpatialHasCurrentShowBelowReserveProbeWitness
+                    ? "true" : "false")
+                + " lastDowngradeCause="
+                + (proposedPolicy.lastDowngradeCause?.rawValue ?? "none")
+                + " startupSpatialModeDisproofCause="
+                + (proposedPolicy.startupSpatialModeDisproofCause?.rawValue ?? "none")
                 + " spatialRecovery=\(proposedPolicy.spatialRecoveryPhase)"
                 + " spatialRecoveryAttempt=\(proposedPolicy.spatialRecoveryAttemptCount)"
                 + " queuePressureSamples=\(proposedPolicy.queuePressureSampleCount) "
@@ -3019,6 +3132,20 @@ actor WorldwideScreenService {
                 + (snapshot?.outboundVideo?.framesPerSecond.map {
                     String(format: "%.1f", $0)
                 } ?? "unknown")
+                + " outboundVideoBytes="
+                + (snapshot?.outboundVideo?.bytes.map(String.init) ?? "unknown")
+                + " outboundVideoFramesEncoded="
+                + (snapshot?.outboundVideo?.framesEncodedOrDecoded.map(String.init)
+                    ?? "unknown")
+                + " outboundVideoKeyFramesEncoded="
+                + (snapshot?.outboundVideo?.keyFramesEncoded.map(String.init)
+                    ?? "unknown")
+                + " outboundVideoTargetBitrateBps="
+                + (snapshot?.outboundVideo?.targetBitrate.map {
+                    String(format: "%.0f", $0)
+                } ?? "unknown")
+                + " outboundVideoQualityLimitationReason="
+                + (snapshot?.outboundVideo?.qualityLimitationReason?.rawValue ?? "unknown")
                 + " evidenceLane=\(capacityProbeOnly ? "capacityOnly" : "regular")"
         )
         guard isCaptureActive else {
@@ -3044,7 +3171,7 @@ actor WorldwideScreenService {
         }
         var applyingPolicyRevision = expectedPolicyRevision
         if changedRecommendation != nil
-            || appliedScreenVideoRecommendation != recommendation {
+            || nativeSenderRequiresReconciliation {
             guard let source = captureSource,
                   let sink = captureSink,
                   let captureAuthorization,
@@ -3069,7 +3196,13 @@ actor WorldwideScreenService {
                 let nativeResult = try await WorldwideScreenBoundedNativeApplication.apply(
                     deadline: applicationDeadline,
                     now: { .now },
-                    apply: { try await sourcePeer.applyScreenVideoEncodingLimits(recommendation.webRTCLimits) },
+                    apply: {
+                        try await sourcePeer.applyScreenVideoEncodingLimits(
+                            recommendation.webRTCLimits,
+                            expectedScreenVisibilityRequestID:
+                                expectedScreenVisibilityRequestID
+                        )
+                    },
                     rollback: {
                         try await sourcePeer.replaceScreenVideoEncodingUpdateIfCurrent(
                             $0, with: expirationFallback.webRTCLimits)
@@ -3097,12 +3230,41 @@ actor WorldwideScreenService {
                         "Worldwide screen capacity nativeApply=stale "
                             + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision)"
                     )
+                    let nativeApplicationGenerationBeforeRollback =
+                        screenVideoNativeApplicationGeneration
                     do {
-                        _ = try await sourcePeer
+                        let didRollback = try await sourcePeer
                             .rollbackScreenVideoEncodingUpdateIfCurrent(
                                 senderUpdate
                             )
+                        if didRollback,
+                           self.peer === sourcePeer,
+                           peerGeneration == sourcePeerGeneration,
+                           screenVideoNativeApplicationGeneration
+                            == nativeApplicationGenerationBeforeRollback {
+                            // The stale proposal briefly owned the native sender. Its rollback
+                            // is another configuration write; buffered reports from that period
+                            // cannot seed the current policy, and its old cache is unproven.
+                            appliedScreenVideoRecommendation = nil
+                            advanceScreenVideoStatisticsEpoch(using: sourcePeer)
+                            screenVideoAdaptationPolicy
+                                .resetForSenderConfigurationEpoch()
+                            screenVideoAdaptationPolicyRevision &+= 1
+                        }
                     } catch {
+                        if self.peer === sourcePeer,
+                           peerGeneration == sourcePeerGeneration,
+                           screenVideoNativeApplicationGeneration
+                            == nativeApplicationGenerationBeforeRollback {
+                            // No newer accepted service-native transaction owns the cache. A
+                            // throwing stale rollback leaves the sender ambiguous, so force the
+                            // current lifecycle to reconcile instead of trusting old equality.
+                            appliedScreenVideoRecommendation = nil
+                            advanceScreenVideoStatisticsEpoch(using: peer)
+                            screenVideoAdaptationPolicy
+                                .resetForSenderConfigurationEpoch()
+                            screenVideoAdaptationPolicyRevision &+= 1
+                        }
                         logger.error(
                             "Worldwide screen video stale-update rollback failed: "
                                 + error.localizedDescription
@@ -3125,6 +3287,20 @@ actor WorldwideScreenService {
                         senderUpdate, with: proposedPolicy.currentRecommendation.webRTCLimits)
                     throw WebRTCTransportError.nativeFailure("Encoding proposal expired before its service commit; reconcile the retained tier.")
                 }
+                // A buffered whole-peer request may have begun while the old native limits were
+                // still installed. Fence its sequence before publishing this accepted mutation,
+                // and require proof to restart under the exact applied sender configuration.
+                advanceScreenVideoStatisticsEpoch(using: sourcePeer)
+                if nativeSenderRequiresReconciliation {
+                    // Unknown native state means the pre-write report could not prove which
+                    // raised ceiling was actually installed. Even a witness minted by that
+                    // report is ineligible to survive the corrective write.
+                    proposedPolicy.resetForSenderConfigurationEpoch()
+                } else {
+                    proposedPolicy.resetForAcceptedSenderConfigurationEpoch(
+                        previouslyCommitted: screenVideoAdaptationPolicy
+                    )
+                }
                 if appliedScreenVideoRecommendation?.maximumFramesPerSecond
                     != recommendation.maximumFramesPerSecond {
                     capturer.adaptOutput(
@@ -3136,6 +3312,7 @@ actor WorldwideScreenService {
                     )
                 }
                 appliedScreenVideoRecommendation = recommendation
+                screenVideoNativeApplicationGeneration &+= 1
                 logger.debug(
                     "Worldwide screen capacity nativeApply=accepted "
                         + "peerGeneration=\(sourcePeerGeneration) policyRevision=\(applyingPolicyRevision) "
@@ -3187,27 +3364,30 @@ actor WorldwideScreenService {
                 _ = proposedPolicy.expireApplicationLimitedProbeWithoutReport(
                     peerGeneration: sourcePeerGeneration, isCaptureActive: isCaptureActive)
                 proposedPolicy.rejectPendingSpatialRecoveryApplication()
-                screenVideoAdaptationPolicy
-                    .retainStartupSpatialModeTerminalState(from: proposedPolicy)
-                screenVideoAdaptationPolicy.retainFloorRecoveryAttemptConsumption(
-                    from: proposedPolicy
-                )
-                screenVideoAdaptationPolicy.retainSpatialRecoveryTerminalState(from: proposedPolicy)
-                if cancelledFloorRecoveryProbe
+                let commitEntireProposal = cancelledFloorRecoveryProbe
                     || (capacityProbeOnly
                         && screenVideoAdaptationPolicy.applicationLimitedProbeOriginTier != nil
-                        && proposedPolicy.applicationLimitedProbeOriginTier == nil) {
-                    // A failed cap reduction must not erase a terminal floor or fast negative.
-                    screenVideoAdaptationPolicy = proposedPolicy
-                    screenVideoAdaptationPolicyRevision &+= 1
-                } else if capacityProbeOnly {
-                    screenVideoAdaptationPolicy.retainCapacityProbeObservationIdentity(
-                        from: proposedPolicy
+                        && proposedPolicy.applicationLimitedProbeOriginTier == nil)
+                // A failed cap reduction must not erase a terminal floor or fast negative. The
+                // pure seam selects that final state before sanitizing startup authority, so a
+                // later full-proposal assignment cannot resurrect an incomplete proof.
+                var reconciledPolicy = WorldwideScreenNativeApplicationCache
+                    .reconciledPolicyAfterCurrentOwnerFailure(
+                        current: screenVideoAdaptationPolicy,
+                        proposed: proposedPolicy,
+                        commitEntireProposal: commitEntireProposal,
+                        capacityProbeOnly: capacityProbeOnly
                     )
-                    screenVideoAdaptationPolicyRevision &+= 1
-                } else {
-                    screenVideoAdaptationPolicyRevision &+= 1
-                }
+                // The failed operation may have installed a proposal and then rolled it back or
+                // replaced it with the deadline fallback before returning here. A whole-peer
+                // request can reserve its sequence during that transient native configuration and
+                // publish after this catch, so policy revision alone is not an evidence fence.
+                // Preserve exact same-Show path witnesses selected by the failure seam, but restart
+                // every cumulative/threshold window under the final sender configuration.
+                advanceScreenVideoStatisticsEpoch(using: sourcePeer)
+                reconciledPolicy.resetIncompleteEvidenceWindow()
+                screenVideoAdaptationPolicy = reconciledPolicy
+                screenVideoAdaptationPolicyRevision &+= 1
                 if let applicationDeadline, ContinuousClock.now >= applicationDeadline,
                    screenVideoAdaptationPolicy.spatialRecoveryDeadline == nil {
                     // Expiry before native entry can leave an earlier trial installed, and
@@ -3295,13 +3475,19 @@ actor WorldwideScreenService {
             // link is still congested.
             let probeFramesPerSecond = 10
             if recommendation.maximumFramesPerSecond < probeFramesPerSecond {
+                guard let expectedScreenVisibilityRequestID =
+                    screenVisibilityRequestID else {
+                    throw WorldwideScreenServiceError.transportUnavailable
+                }
                 let probeUpdate = try await sourcePeer.applyScreenVideoEncodingLimits(
                     WebRTCScreenVideoEncodingLimits(
                         maximumBitrateBps: recommendation.maximumBitrateBps,
                         maximumFramesPerSecond: probeFramesPerSecond,
                         scaleResolutionDownBy:
                             recommendation.scaleResolutionDownBy
-                    )
+                    ),
+                    expectedScreenVisibilityRequestID:
+                        expectedScreenVisibilityRequestID
                 )
                 guard peer === sourcePeer,
                       peerGeneration == sourcePeerGeneration,
@@ -3327,6 +3513,7 @@ actor WorldwideScreenService {
                 )
                 // The probe ceiling is temporary and must be restored after final presentation.
                 appliedScreenVideoRecommendation = nil
+                screenVideoNativeApplicationGeneration &+= 1
             }
 
             let boundary = try await source.performSampleDeliveryBarrier {
@@ -3432,20 +3619,33 @@ actor WorldwideScreenService {
         automaticScreenMediaResumeTimeoutTask = nil
     }
 
-    /// Fences native requests at sender restoration or Hide and discards partial threshold
-    /// evidence from the preceding encoder/visibility epoch.
-    private func beginPostResumeScreenVideoAdaptationEpoch() {
-        if let peer {
+    /// Advances the native request-sequence boundary after a lifecycle or sender mutation. Whole-
+    /// peer statistics are buffered events rather than revision-bound callbacks, so policy
+    /// revision alone cannot reject a request that began before this boundary.
+    private func advanceScreenVideoStatisticsEpoch(using sourcePeer: WebRTCPeer?) {
+        if let sourcePeer {
             screenVideoAdaptationFreshnessFence.beginPostResumeEpoch(
                 minimumCollectionSequence:
-                    peer.minimumNextStatisticsCollectionSequence()
+                    sourcePeer.minimumNextStatisticsCollectionSequence()
             )
         } else {
             screenVideoAdaptationFreshnessFence.reset()
         }
-        screenVideoAdaptationPolicy.resetIncompleteEvidenceWindow()
         screenVideoAdaptationEvidenceLane = nil
         screenVideoAdaptationLastEvidenceTime = nil
+    }
+
+    /// Fences native requests at a new Show, sender restoration, Hide, or a framebuffer rebuild and
+    /// discards partial threshold evidence from the preceding encoder/visibility epoch.
+    private func beginPostResumeScreenVideoAdaptationEpoch(
+        rearmDemandProvenSpatialAuthority: Bool = false
+    ) {
+        advanceScreenVideoStatisticsEpoch(using: peer)
+        if rearmDemandProvenSpatialAuthority {
+            screenVideoAdaptationPolicy.resetForCaptureGeometryEpoch()
+        } else {
+            screenVideoAdaptationPolicy.resetForSenderConfigurationEpoch()
+        }
         screenVideoAdaptationPolicyRevision &+= 1
     }
 
@@ -3517,6 +3717,10 @@ actor WorldwideScreenService {
         let failureDiagnostic = screenMediaSuspension.diagnosticSnapshot
         screenVideoAdaptationPolicy.automaticResumeAttemptFailed()
         screenVideoAdaptationPolicyRevision &+= 1
+        // A raised marker/probe ceiling may already have changed the native sender. A whole-peer
+        // request begun under that temporary configuration must not become ordinary evidence
+        // after this exact failure releases its resume context.
+        beginPostResumeScreenVideoAdaptationEpoch()
         await sourcePeer.cancelScreenMediaResumeProbe(
             attemptID: attemptID,
             reason: reason
@@ -3968,8 +4172,14 @@ actor WorldwideScreenService {
             return
         }
         do {
+            guard let expectedScreenVisibilityRequestID =
+                screenVisibilityRequestID else {
+                throw WorldwideScreenServiceError.transportUnavailable
+            }
             let senderUpdate = try await sourcePeer.applyScreenVideoEncodingLimits(
-                recommendation.webRTCLimits
+                recommendation.webRTCLimits,
+                expectedScreenVisibilityRequestID:
+                    expectedScreenVisibilityRequestID
             )
             guard peer === sourcePeer,
                   peerGeneration == sourcePeerGeneration,
@@ -4004,6 +4214,7 @@ actor WorldwideScreenService {
                 )
             )
             appliedScreenVideoRecommendation = recommendation
+            screenVideoNativeApplicationGeneration &+= 1
             beginPostResumeScreenVideoAdaptationEpoch()
             automaticScreenMediaResumeContext = nil
         } catch {
@@ -4100,15 +4311,21 @@ actor WorldwideScreenService {
             if screenVisibilityCommandEpoch == 0 {
                 screenVisibilityCommandEpoch = 1
             }
+            screenVisibilityRequestID = request.id
             if request.command == .showScreen {
+                showAdaptationGate.begin(screenVisibilityCommandEpoch)
                 screenVideoAdaptationPolicy.beginFloorRecoveryVisibility(
                     peerGeneration: peerGeneration,
                     showEpoch: screenVisibilityCommandEpoch
                 )
+                // A whole-peer report collected for the predecessor Show can already be queued
+                // behind this control event. Advance the native collection boundary before any
+                // reused-source sender reconciliation so it cannot seed the new Show's proof.
+                beginPostResumeScreenVideoAdaptationEpoch()
             } else {
                 screenVideoAdaptationPolicy.endFloorRecoveryVisibility()
+                screenVideoAdaptationPolicyRevision &+= 1
             }
-            screenVideoAdaptationPolicyRevision &+= 1
             // Visibility commands own the serial control lane immediately. A deferred key-frame
             // acknowledgement must yield before Hide stops capture or Show starts a new generation.
             keyFrameControlTask?.cancel()
@@ -4116,6 +4333,14 @@ actor WorldwideScreenService {
         }
         let visibilityCommandEpoch = screenVisibilityCommandEpoch
         let visibilityPeerGeneration = peerGeneration
+        let gatedShowEpoch: UInt64? = request.command == .showScreen
+            ? visibilityCommandEpoch : nil
+        defer {
+            if let gatedShowEpoch {
+                // A superseded Show must never release its successor's gate.
+                showAdaptationGate.finish(gatedShowEpoch)
+            }
+        }
 
         if request.command == .showScreen,
            screenMediaSuspension.activeScreenRequestID != nil {
@@ -4229,6 +4454,9 @@ actor WorldwideScreenService {
                     logger.error("Worldwide screen authorization changed during Active acknowledgement")
                     return
                 }
+                // Active ACK changes RTP encoding activity after the pre-ACK quality write.
+                // Requests begun between those mutations cannot seed the active sender epoch.
+                beginPostResumeScreenVideoAdaptationEpoch()
                 if self.peer === peer,
                    peerGeneration == visibilityPeerGeneration,
                    screenVisibilityCommandEpoch == visibilityCommandEpoch {
@@ -6990,11 +7218,31 @@ actor WorldwideScreenService {
         guard screenCaptureStartupOwnerIsCurrent(owner) else {
             throw CancellationError()
         }
+        let activeSourceBeforeStart = screenCaptureIsActivelyForwarding
+            ? captureSource
+            : nil
+        let activeAuthorizationBeforeStart = screenCaptureIsActivelyForwarding
+            ? captureForwardingAuthorization
+            : nil
         do {
             let authorization = try await startScreenCapture(
                 requiredDisplayID: requiredDisplayID
             )
             guard screenCaptureStartupOwnerIsCurrent(owner) else {
+                throw CancellationError()
+            }
+            let reusedActiveCapture = activeSourceBeforeStart.map {
+                captureSource === $0
+            } == true && activeAuthorizationBeforeStart.map {
+                authorization === $0
+            } == true
+            try await reconcileCurrentScreenVideoRecommendationBeforeActiveUse(
+                owner: owner,
+                forceNativeApplication: reusedActiveCapture
+            )
+            guard screenCaptureStartupOwnerIsCurrent(owner),
+                  appliedScreenVideoRecommendation
+                    == screenVideoAdaptationPolicy.currentRecommendation else {
                 throw CancellationError()
             }
             return authorization
@@ -7019,6 +7267,47 @@ actor WorldwideScreenService {
                 remainingRetries: remainingRetries - 1,
                 owner: owner
             )
+        }
+    }
+
+    /// A successor Show may reuse an already-forwarding source after re-arming full pixels. Do
+    /// not return its authorization toward Active ACK until native sender state matches that new
+    /// policy. The no-report adaptation path owns exact token checks, stale-write rollback, cache
+    /// publication, capturer FPS, and sender-epoch evidence fencing.
+    private func reconcileCurrentScreenVideoRecommendationBeforeActiveUse(
+        owner: ScreenCaptureStartupOwner,
+        forceNativeApplication: Bool
+    ) async throws {
+        guard screenCaptureStartupOwnerIsCurrent(owner),
+              let sourcePeer = peer else {
+            throw CancellationError()
+        }
+        guard forceNativeApplication
+                || appliedScreenVideoRecommendation
+                != screenVideoAdaptationPolicy.currentRecommendation else {
+            return
+        }
+        let sourcePeerGeneration = peerGeneration
+        let expectedPolicyRevision = screenVideoAdaptationPolicyRevision
+        let expectedNativeApplicationGeneration =
+            screenVideoNativeApplicationGeneration
+        await adaptScreenVideoForNetworkConditions(
+            nil,
+            sourcePeer: sourcePeer,
+            sourcePeerGeneration: sourcePeerGeneration,
+            expectedPolicyRevision: expectedPolicyRevision,
+            allowsAutomaticResume: false,
+            forceNativeReconciliation: forceNativeApplication,
+            showTransitionOwnerEpoch: owner.visibilityCommandEpoch
+        )
+        guard screenCaptureStartupOwnerIsCurrent(owner),
+              peer === sourcePeer,
+              peerGeneration == sourcePeerGeneration,
+              screenVideoNativeApplicationGeneration
+                != expectedNativeApplicationGeneration,
+              appliedScreenVideoRecommendation
+                == screenVideoAdaptationPolicy.currentRecommendation else {
+            throw WorldwideScreenServiceError.transportUnavailable
         }
     }
 
@@ -7141,12 +7430,22 @@ actor WorldwideScreenService {
             )
             let encodingRecommendation =
                 screenVideoAdaptationPolicy.currentRecommendation
+            guard let expectedScreenVisibilityRequestID =
+                screenVisibilityRequestID else {
+                throw WorldwideScreenServiceError.transportUnavailable
+            }
             let senderUpdate: WebRTCScreenVideoEncodingUpdate?
             do {
                 senderUpdate = try await peer.applyScreenVideoEncodingLimits(
-                    encodingRecommendation.webRTCLimits
+                    encodingRecommendation.webRTCLimits,
+                    expectedScreenVisibilityRequestID:
+                        expectedScreenVisibilityRequestID
                 )
             } catch {
+                if let transportError = error as? WebRTCTransportError,
+                   case .staleControlRequest = transportError {
+                    throw error
+                }
                 senderUpdate = nil
                 logger.error(
                     "Worldwide screen video retained its native sender limits at startup: "
@@ -7175,6 +7474,12 @@ actor WorldwideScreenService {
             }
             if senderUpdate != nil {
                 appliedScreenVideoRecommendation = encodingRecommendation
+                screenVideoNativeApplicationGeneration &+= 1
+                beginPostResumeScreenVideoAdaptationEpoch()
+            } else {
+                // The direct write was ambiguous for this exact source owner. A retired source's
+                // equal-looking cache is not proof; the pre-ACK reconciliation must retry.
+                appliedScreenVideoRecommendation = nil
             }
             captureDisplayID = format.displayID
             captureAuthoritativeDisplayBounds = format.authoritativeDisplayBounds
@@ -7396,6 +7701,12 @@ actor WorldwideScreenService {
             visibilityCommandEpoch: visibilityCommandEpoch,
             peerGeneration: renegotiationPeerGeneration,
             recoveryEpoch: renegotiationRecoveryEpoch
+        )
+        // A rebuilt framebuffer is a new encoder-evidence epoch even though the acknowledged
+        // Show and RTP sender survive. Fence requests already in flight and discard partial
+        // demand windows before the old source can stop or the new geometry can publish frames.
+        beginPostResumeScreenVideoAdaptationEpoch(
+            rearmDemandProvenSpatialAuthority: true
         )
         defer {
             if let pendingSink = screenFormatRenegotiation.finish(owner: sink) {

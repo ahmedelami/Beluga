@@ -105,6 +105,9 @@ enum WebRTCStatisticsParser {
             record.type == "remote-inbound-rtp"
                 && mediaKind(in: record.values) == "audio"
         }
+        let selectedPairOutbound = selectedCandidatePairOutboundDiagnostics(
+            in: selectedPair
+        )
 
         return WebRTCStatisticsSnapshot(
             collectionSequence: collectionSequence,
@@ -113,9 +116,11 @@ enum WebRTCStatisticsParser {
                 double("currentRoundTripTime", in: $0.values)
             },
             roundTripTimeObservation: roundTripTimeObservation(in: selectedPair),
-            availableOutgoingBitrate: selectedPair.flatMap {
-                double("availableOutgoingBitrate", in: $0.values)
-            },
+            selectedCandidatePairOutbound: selectedPairOutbound,
+            availableOutgoingBitrate: selectedPairOutbound?.availableOutgoingBitrateBps
+                ?? selectedPair.flatMap {
+                    double("availableOutgoingBitrate", in: $0.values)
+                },
             jitter: inboundVideo.flatMap { double("jitter", in: $0.values) },
             outboundVideo: outboundVideo.map {
                 videoStatistics(record: $0, outbound: true)
@@ -541,8 +546,7 @@ enum WebRTCStatisticsParser {
         in selectedPair: WebRTCStatisticsRecord?
     ) -> WebRTCRoundTripTimeObservation {
         guard let selectedPair,
-              !selectedPair.id.isEmpty,
-              selectedPair.id.utf8.prefix(513).count <= 512,
+              let fingerprint = selectedCandidatePairFingerprint(selectedPair),
               let current = strictNonnegativeDouble(
                   "currentRoundTripTime",
                   in: selectedPair.values,
@@ -561,9 +565,6 @@ enum WebRTCStatisticsParser {
               ) else {
             return .unavailable
         }
-        let fingerprint = SHA256.hash(data: Data(selectedPair.id.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
         return .measurement(
             WebRTCRoundTripTimeMeasurement(
                 selectedCandidatePairFingerprint: fingerprint,
@@ -571,6 +572,42 @@ enum WebRTCStatisticsParser {
                 responsesReceived: responses
             )
         )
+    }
+
+    private static func selectedCandidatePairOutboundDiagnostics(
+        in selectedPair: WebRTCStatisticsRecord?
+    ) -> WebRTCSelectedCandidatePairOutboundDiagnostics? {
+        guard let selectedPair,
+              let fingerprint = selectedCandidatePairFingerprint(selectedPair),
+              let payloadBytesSent = strictUnsigned(
+                  "bytesSent",
+                  in: selectedPair.values,
+                  maximumValue: .max
+              ),
+              let availableOutgoingBitrateBps = strictNonnegativeDouble(
+                  "availableOutgoingBitrate",
+                  in: selectedPair.values,
+                  maximumValue: .infinity
+              ) else {
+            return nil
+        }
+        return WebRTCSelectedCandidatePairOutboundDiagnostics(
+            selectedCandidatePairFingerprint: fingerprint,
+            payloadBytesSent: payloadBytesSent,
+            availableOutgoingBitrateBps: availableOutgoingBitrateBps
+        )
+    }
+
+    private static func selectedCandidatePairFingerprint(
+        _ selectedPair: WebRTCStatisticsRecord
+    ) -> String? {
+        guard !selectedPair.id.isEmpty,
+              selectedPair.id.utf8.prefix(513).count <= 512 else {
+            return nil
+        }
+        return SHA256.hash(data: Data(selectedPair.id.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private static func selectedCandidatePair(
@@ -674,7 +711,9 @@ enum WebRTCStatisticsParser {
         outbound: Bool
     ) -> WebRTCVideoStatistics {
         WebRTCVideoStatistics(
-            bytes: unsigned(outbound ? "bytesSent" : "bytesReceived", in: record.values),
+            bytes: outbound
+                ? strictUnsigned("bytesSent", in: record.values)
+                : unsigned("bytesReceived", in: record.values),
             packets: unsigned(outbound ? "packetsSent" : "packetsReceived", in: record.values),
             packetsLost: signed("packetsLost", in: record.values),
             totalPacketSendDelay: outbound
@@ -683,10 +722,9 @@ enum WebRTCStatisticsParser {
             framesPerSecond: double("framesPerSecond", in: record.values),
             frameWidth: integer("frameWidth", in: record.values),
             frameHeight: integer("frameHeight", in: record.values),
-            framesEncodedOrDecoded: unsigned(
-                outbound ? "framesEncoded" : "framesDecoded",
-                in: record.values
-            ),
+            framesEncodedOrDecoded: outbound
+                ? strictUnsigned("framesEncoded", in: record.values)
+                : unsigned("framesDecoded", in: record.values),
             framesReceived: outbound
                 ? nil : strictUnsigned("framesReceived", in: record.values),
             framesDropped: outbound

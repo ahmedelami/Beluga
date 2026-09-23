@@ -14,6 +14,104 @@ This file is a handoff record, not a release approval.
 - The work below is diagnostic/experimental. No candidate was installed on the Mac host, uploaded to TestFlight, deployed to production, or validated on the user's iPhone as a release.
 - Do not describe passing deterministic tests or a passing isolated native run as proof of a production fix.
 
+## 2026-09-23 temporal-first startup adaptation candidate
+
+This handoff records the source candidate developed on top of `eeb63f1`.
+It is intentionally **not installed or deployed**. Its purpose is to prevent an early,
+sender-censored bandwidth estimate from producing the visible clear -> blurry -> clear
+startup dip while retaining bounded spatial downscaling for independently demonstrated
+congestion.
+
+- Raw BWE may immediately reduce bitrate and FPS, but it cannot shrink startup pixels by
+  itself. Reaching the full temporal tier also does not clear this guard: spatial authority
+  remains latent and bound to the exact peer and Show until independent pressure, a complete
+  bandwidth proof, or a lifecycle boundary retires it.
+- Bandwidth receives spatial authority only from four fresh regular post-seed reports spanning
+  at least two seconds under one stable sender recommendation and one atomic selected
+  candidate-pair tuple: fingerprint, payload bytes sent, and available outgoing bitrate. The
+  primary video send rate must reach at least 80% of the native-time-weighted video target,
+  selected-pair send rate must reach at least 80% of the native-time-weighted same-pair BWE,
+  and selected-pair byte delta must be at least the primary-video byte delta. Aggregate
+  audio-plus-video target is diagnostic only and cannot grant spatial authority.
+- Primary outbound-video `bytesSent` and `framesEncoded` are strict unsigned-integer progress
+  counters. Negative, fractional, or Boolean `NSNumber` values are rejected independently,
+  without erasing a valid sibling field, so malformed progress cannot participate in demand
+  proof.
+- Demand progress must use one homogeneous key-frame telemetry mode for the complete window.
+  When the counter is present, at least two progress intervals must include non-key frames;
+  when it is absent for the whole window, all four intervals must advance bytes and encoded
+  frames. Counter appearance/disappearance, regression, or an impossible key-frame delta
+  greater than the frame delta resets the proof. A completed load proof still needs an
+  independent path-limitation witness: four consecutive `qualityLimitationReason == bandwidth`
+  intervals or a failed below-reserve capacity probe bound to the same Show and selected pair.
+  The latter can mint exact spatial authority only when the current report carries a coherent
+  atomic pair identity and pair BWE, and that pair BWE exactly matches the admitted top-level
+  BWE. A missing tuple or mismatched BWE may conservatively latch peer-wide probe failure, but
+  cannot authorize spatial downscaling.
+- A sender recommendation transition or a material BWE recovery (at least 32 kbps and 10%)
+  above any running proof-window low-water mark restarts the complete proof. This explicitly
+  rejects a U-shaped estimate that falls and then recovers before proof completes. A material
+  recovery also invalidates a same-Show failed-probe witness.
+- Native screen-video mutations now enforce and read back
+  `LKRTCDegradationPreference.maintainResolution`; limit, activity, and rollback writes
+  repair either `nil` or conflicting native drift. Product-owned
+  `scaleResolutionDownBy` remains the explicit spatial escape hatch after proof.
+- Fresh RTT inflation, confirmed queue pressure, route-metadata replacement, and an atomic
+  selected-pair fingerprint replacement remain immediate spatial negatives. The atomic pair
+  identity is checked even when RTT telemetry is missing, so a real pair replacement cannot
+  hide behind an absent RTT sample. Missing or partial pair diagnostics fail closed and cannot
+  assemble bandwidth proof. A fresh hard negative at the exact capacity-probe deadline is
+  evaluated before expiry. Raw fast-lane BWE can cancel speculative capacity but cannot shrink
+  startup pixels.
+- Regular diagnostics now record typed bandwidth-proof disposition/counts, video and
+  selected-pair send rates, native-time-weighted pair BWE, video and aggregate targets,
+  consecutive native bandwidth-limitation intervals, downgrade/disproof cause, and raw
+  outbound byte/frame/key-frame/target and quality-limitation fields. These are observability
+  fields, not additional authority.
+- After a failed or ambiguous native apply, reconciliation runs after the service chooses its
+  final retained-policy branch. It resets incomplete startup demand proof for the exact owner,
+  imports no positive authority from the rejected recommendation, and preserves a same-owner
+  material-recovery revocation of an exact failed-probe witness. The broader peer-wide probe
+  failure latch intentionally remains conservative.
+- Sender-configuration boundaries now fence both policy evidence and native collection sequence:
+  accepted sender writes, a fallback after an expired or ambiguous native write, a live
+  framebuffer rebuild, a reused-source successor Show, Active ACK, and a failed automatic
+  resume cannot consume statistics requested under preceding limits. A newly minted exact
+  failed-probe witness survives only its own accepted origin restoration; a carried witness
+  never crosses an unrelated sender write.
+- A successor Show blocks ordinary adaptation through its pre-ACK transition. Every Mac-host
+  native limit write carries the latest Show/Hide request ID, which the peer checks before
+  changing sender state; an older queued write cannot land after the successor request is
+  received. The forced reused-source recommendation is applied before Active ACK. Whole-peer
+  statistics also carry their route revision, so a callback begun on a retired route cannot
+  republish an older route event.
+- Rebuilding capture geometry may re-arm full pixels only when the exact Show was retired by
+  demand proof tied to the old geometry. A later genuine RTT/queue/route negative upgrades
+  that terminal reason and survives the rebuild. A raw fast-lane BWE collapse can cancel an
+  inflated probe ceiling but cannot convert old-geometry demand proof into persistent path
+  authority.
+- The legacy cold-floor suite now explicitly crosses a real 250 ms queue-pressure boundary
+  before testing post-startup floor recovery, so it no longer accidentally treats the new
+  full-pixel overlay as a legacy audio-priority floor.
+
+Current source/test evidence:
+
+- Post-edit focused Mac-host startup/lifecycle selection passed 112/112, every Mac-host
+  XCTest whose name contains `WorldwideScreen` passed 465/465, and the selected shared
+  parser/route-revision/native-limit/peer-visibility checks passed 15/15. The final
+  source-sealed contributor gate passed 701/701 deterministic methods and 2/2 isolated
+  native startup checks without skips. Evidence:
+  `/Volumes/t7/beluga-startup-policy-validation.tVHm3P/validation-runs/startup-20260923-4496-1kjai7h`.
+  Do not reuse the earlier 44/44, 434/434, or older sealed-gate receipt for this candidate.
+- An unfiltered package run is not claimed green: independent stale migration trust-anchor
+  and microphone-contract literals remain, and one pre-existing resume-probe loopback test
+  reproducibly reports a task-cancellation failure. Keep those baseline blockers separate
+  from this candidate's focused and sealed evidence.
+
+At this source-validation checkpoint, no Mac host install/restart, TestFlight upload,
+production deployment, or physical iPhone observation had been performed. Passing
+source and native gates is not proof that the user's live startup dip is fixed.
+
 ## What was measured
 
 ### Startup burst characterization
@@ -158,4 +256,8 @@ installed state.
 
 ## Bottom line
 
-The experiments produced useful diagnosis and regression guards, but **no candidate made the production cut**. The current branch is not evidence that the user's live clear–blurry–clear behavior is fixed.
+The earlier experiments produced useful diagnosis and regression guards, but **no earlier
+candidate made the production cut**. The 2026-09-23 temporal-first source candidate
+passed its focused and source-sealed deterministic/native gates. At this checkpoint it
+remained uninstalled, undeployed, and physically unverified. Source evidence alone is
+still not proof that the user's live clear–blurry–clear behavior is fixed.

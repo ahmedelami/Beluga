@@ -693,6 +693,105 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         )
     }
 
+    func testScreenVideoEncodingLimitsRejectSupersededVisibilityRequestBeforeNativeMutation()
+        async throws {
+        let host = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .host,
+                iceServers: [],
+                maximumVideoBitrate: 12_000_000
+            )
+        )
+        defer {
+            Task { await host.close(reason: .normal) }
+        }
+
+        let priorRequestID: UInt64 = 71
+        let latestRequestID: UInt64 = 72
+        let installedLimits = WebRTCScreenVideoEncodingLimits(
+            maximumBitrateBps: 1_962_240,
+            maximumFramesPerSecond: 20,
+            scaleResolutionDownBy: 2
+        )
+        await host.setLatestReceivedScreenVisibilityRequestIDForTesting(
+            priorRequestID
+        )
+        _ = try await host.applyScreenVideoEncodingLimits(
+            installedLimits,
+            expectedScreenVisibilityRequestID: priorRequestID
+        )
+
+        // Model the next ordered Show/Hide arriving while the service still owns the old event.
+        await host.setLatestReceivedScreenVisibilityRequestIDForTesting(
+            latestRequestID
+        )
+        let staleLimits = WebRTCScreenVideoEncodingLimits(
+            maximumBitrateBps: 280_320,
+            maximumFramesPerSecond: 5,
+            scaleResolutionDownBy: 4,
+            maximumTotalRTPBitrateBps: 1_000_000
+        )
+        do {
+            _ = try await host.applyScreenVideoEncodingLimits(
+                staleLimits,
+                expectedScreenVisibilityRequestID: priorRequestID
+            )
+            XCTFail("A superseded Show/Hide request must not mutate native limits.")
+        } catch let error as WebRTCTransportError {
+            XCTAssertEqual(error, .staleControlRequest(priorRequestID))
+        }
+
+        let retainedLimits = await host.screenVideoEncodingLimitsForTesting()
+        XCTAssertEqual(retainedLimits, installedLimits)
+        let retainedTotalRTPCeiling =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(retainedTotalRTPCeiling, 12_000_000)
+    }
+
+    func testScreenVideoEncodingLimitsAcceptExactVisibilityRequestID()
+        async throws {
+        let host = try WebRTCPeer(
+            configuration: WebRTCTransportConfiguration(
+                role: .host,
+                iceServers: [],
+                maximumVideoBitrate: 12_000_000
+            )
+        )
+        defer {
+            Task { await host.close(reason: .normal) }
+        }
+
+        let latestRequestID: UInt64 = 81
+        let expectedLimits = WebRTCScreenVideoEncodingLimits(
+            maximumBitrateBps: 747_520,
+            maximumFramesPerSecond: 10,
+            scaleResolutionDownBy: 3,
+            maximumTotalRTPBitrateBps: 2_000_000
+        )
+        await host.setLatestReceivedScreenVisibilityRequestIDForTesting(
+            latestRequestID
+        )
+        _ = try await host.applyScreenVideoEncodingLimits(
+            expectedLimits,
+            expectedScreenVisibilityRequestID: latestRequestID
+        )
+
+        let appliedLimits = await host.screenVideoEncodingLimitsForTesting()
+        XCTAssertEqual(
+            appliedLimits,
+            WebRTCScreenVideoEncodingLimits(
+                maximumBitrateBps: expectedLimits.maximumBitrateBps,
+                maximumFramesPerSecond:
+                    expectedLimits.maximumFramesPerSecond,
+                scaleResolutionDownBy:
+                    expectedLimits.scaleResolutionDownBy
+            )
+        )
+        let appliedTotalRTPCeiling =
+            await host.maximumTotalRTPBitrateBpsForTesting()
+        XCTAssertEqual(appliedTotalRTPCeiling, 2_000_000)
+    }
+
     func testScreenVideoEncodingLimitsApplyAtomicallyAndFailClosed() async throws {
         let host = try WebRTCPeer(
             configuration: WebRTCTransportConfiguration(
@@ -750,11 +849,19 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         var firstUpdate: WebRTCScreenVideoEncodingUpdate?
         let expectedVideoPriority = WebRTCScreenVideoPrioritySnapshot(
             bitratePriorities: [0.5],
-            networkPriorityRawValues: [LKRTCPriority.low.rawValue]
+            networkPriorityRawValues: [LKRTCPriority.low.rawValue],
+            degradationPreferenceRawValue:
+                LKRTCDegradationPreference.maintainResolution.rawValue
         )
         let initialVideoPriority = await host
             .screenVideoPriorityForTesting()
         XCTAssertEqual(initialVideoPriority, expectedVideoPriority)
+        let clearedInitialDegradationPreference = await host
+            .setScreenVideoDegradationPreferenceRawValueForTesting(nil)
+        XCTAssertTrue(
+            clearedInitialDegradationPreference,
+            "The regression setup must prove native nil drift before a limit mutation."
+        )
         for profile in profiles {
             let update = try await host.applyScreenVideoEncodingLimits(profile)
             firstUpdate = firstUpdate ?? update
@@ -788,6 +895,12 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         let loweredTotalRTPCeiling =
             await host.maximumTotalRTPBitrateBpsForTesting()
         XCTAssertEqual(loweredTotalRTPCeiling, 2_000_000)
+        let clearedRollbackDegradationPreference = await host
+            .setScreenVideoDegradationPreferenceRawValueForTesting(nil)
+        XCTAssertTrue(
+            clearedRollbackDegradationPreference,
+            "The rollback regression setup must prove native nil drift."
+        )
         let currentRollback = try await host
             .rollbackScreenVideoEncodingUpdateIfCurrent(
                 reversibleUpdate
@@ -850,6 +963,38 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
         XCTAssertEqual(totalRTPCeilingAfterCapRejection, 12_000_000)
 
         _ = try await host.setScreenVideoEncodingActive(true)
+        let clearedActivityDegradationPreference = await host
+            .setScreenVideoDegradationPreferenceRawValueForTesting(nil)
+        XCTAssertTrue(
+            clearedActivityDegradationPreference,
+            "The regression setup must prove native nil drift before an activity mutation."
+        )
+        let activityUpdate = try await host.setScreenVideoEncodingActive(false)
+        let inactiveActivity = await host
+            .screenVideoEncodingActivityForTesting()
+        XCTAssertEqual(inactiveActivity, [false])
+        let priorityAfterActivityMutation = await host
+            .screenVideoPriorityForTesting()
+        XCTAssertEqual(priorityAfterActivityMutation, expectedVideoPriority)
+        let driftedActivityRollbackDegradationPreference = await host
+            .setScreenVideoDegradationPreferenceRawValueForTesting(
+                LKRTCDegradationPreference.maintainFramerate.rawValue
+            )
+        XCTAssertTrue(
+            driftedActivityRollbackDegradationPreference,
+            "The activity rollback regression setup must prove conflicting native drift."
+        )
+        let activityRollback = try await host
+            .rollbackScreenVideoEncodingActivityUpdateIfCurrent(
+                activityUpdate
+            )
+        XCTAssertTrue(activityRollback)
+        let activeAfterActivityRollback = await host
+            .screenVideoEncodingActivityForTesting()
+        XCTAssertEqual(activeAfterActivityRollback, [true])
+        let priorityAfterActivityRollback = await host
+            .screenVideoPriorityForTesting()
+        XCTAssertEqual(priorityAfterActivityRollback, expectedVideoPriority)
         let activeBeforeTransportUncertainty = await host
             .screenVideoEncodingActivityForTesting()
         XCTAssertEqual(activeBeforeTransportUncertainty, [true])
@@ -2937,6 +3082,19 @@ final class WebRTCPeerLoopbackTests: XCTestCase {
             )
             return
         }
+
+        let negotiatedVideoPriority = await host
+            .screenVideoPriorityForTesting()
+        XCTAssertEqual(
+            negotiatedVideoPriority,
+            WebRTCScreenVideoPrioritySnapshot(
+                bitratePriorities: [0.5],
+                networkPriorityRawValues: [LKRTCPriority.low.rawValue],
+                degradationPreferenceRawValue:
+                    LKRTCDegradationPreference.maintainResolution.rawValue
+            ),
+            "A full offer/answer exchange must retain the fixed screen-video degradation preference."
+        )
 
         let prospectiveCallChallenge = WebRTCMacHostedCallChallenge(
             sequence: 1,

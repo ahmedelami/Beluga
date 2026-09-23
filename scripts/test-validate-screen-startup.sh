@@ -12,6 +12,7 @@ source = File.join(File.dirname(File.realpath(ARGV.shift)), 'validate-screen-sta
 runner_source = File.read(source)
 required = runner_source[/REQUIRED_CLASSES = %w\[(.*?)\]/m, 1].split
 pinned_methods = runner_source[/REQUIRED_METHODS = %w\[(.*?)\]/m, 1].split
+standalone_methods = runner_source[/STANDALONE_METHODS = %w\[(.*?)\]/m, 1].split
 native = runner_source[/NATIVE_METHODS = %w\[(.*?)\]/m, 1].split
 capacity = runner_source[/CAPACITY_METHODS = %w\[(.*?)\]/m, 1].split
 spatial_recovery = runner_source[/SPATIAL_RECOVERY_METHODS = %w\[(.*?)\]/m, 1].split
@@ -25,6 +26,7 @@ raise 'encoder boundary profile class is absent from the gate' unless required.i
 raise 'native encoder log observer class is absent from the gate' unless required.include?('CaptureServerTests.StartupVideoNativeEncoderLogObserverTests')
 raise 'QP hook admission class is absent from the gate' unless required.include?('CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests')
 raise 'expected the two explicit native methods' unless native.length == 2
+raise 'expected two visibility-token loopback methods' unless standalone_methods.length == 2 && standalone_methods.uniq.length == 2
 raise 'estimator diagnostic entered the ordinary native gate' if native.any? { |id| id.include?('Estimator') }
 raise 'expected five distinct spatial recovery methods' unless spatial_recovery.length == 5 && spatial_recovery.uniq.length == 5
 
@@ -68,7 +70,7 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
     CaptureServerTests.WebRTCStartupClarityExperimentTests/testNativeEstimatorALRProbeDuration40MovingRecoveryCandidate
     CaptureServerTests.WebRTCStartupClarityExperimentTests/testNativeEncoderBoundaryMovingRecoveryDiagnostic
   ]
-  all_methods = required.map { |class_name| class_name + '/testFixture' } + pinned_methods + native + capacity + spatial_recovery + observer_native + [extra, unrelated]
+  all_methods = required.map { |class_name| class_name + '/testFixture' } + pinned_methods + standalone_methods + native + capacity + spatial_recovery + observer_native + [extra, unrelated]
   manifest = File.join(temporary, 'fake-methods.json')
   File.write(manifest, JSON.generate(all_methods))
   File.write(swift, <<~'FAKE')
@@ -164,6 +166,7 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingSealedPreloadedArtifactIsRejected' } if mode == 'missing_qp_seal'
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testStartupArmRequiresSameEligibilityAndPreloadedSeal' } if mode == 'missing_qp_startup_arm'
       methods.reject! { |id| id.include?('testShowKeepsExistingTrafficCeilingsButStartsWithFullPixels') } if mode == 'missing_method'
+      methods.reject! { |id| id == 'WebRTCTransportTests.WebRTCPeerLoopbackTests/testScreenVideoEncodingLimitsRejectSupersededVisibilityRequestBeforeNativeMutation' } if mode == 'missing_visibility_token_method'
       methods.reject! { |id| id.include?('testConfiguredCapAndSourceFPSMatrixGivesUncertaintyNoAuthority') } if mode == 'missing_sequence_method'
       methods.reject! { |id| id.include?('testExactlyTwoAdvancingDelayEventsCannotVerify') } if mode == 'missing_estimator_method'
       methods.reject! { |id| id.include?('testProbeOnlyEventsAndProbeAfterTwoDelaySamplesCannotVerify') } if mode == 'missing_probe_witness_method'
@@ -370,6 +373,7 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
   run.call('missing_qp_seal', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingSealedPreloadedArtifactIsRejected')
   run.call('missing_qp_startup_arm', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testStartupArmRequiresSameEligibilityAndPreloadedSeal')
   run.call('missing_method', expected_failure: 'required safety method missing')
+  run.call('missing_visibility_token_method', expected_failure: 'required safety method missing from discovery: WebRTCTransportTests.WebRTCPeerLoopbackTests/testScreenVideoEncodingLimitsRejectSupersededVisibilityRequestBeforeNativeMutation')
   run.call('missing_sequence_method', expected_failure: 'required safety method missing')
   run.call('missing_estimator_method', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoNativeEstimatorSnapshotTests/testExactlyTwoAdvancingDelayEventsCannotVerify')
   run.call('missing_probe_witness_method', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoNativeEstimatorSnapshotTests/testProbeOnlyEventsAndProbeAfterTwoDelaySamplesCannotVerify')

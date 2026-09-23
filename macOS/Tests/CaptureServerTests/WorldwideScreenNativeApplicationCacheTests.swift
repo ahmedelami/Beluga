@@ -3,6 +3,30 @@ import XCTest
 
 /// Exercises the production invalidation seam across real actor suspensions, not a host session.
 final class WorldwideScreenNativeApplicationCacheTests: XCTestCase {
+    func testForcedReconciliationIsRequiredEvenWhenCacheAlreadyMatches() {
+        XCTAssertFalse(
+            WorldwideScreenNativeApplicationCache.requiresNativeReconciliation(
+                applied: initialRecommendation,
+                desired: initialRecommendation,
+                force: false
+            )
+        )
+        XCTAssertTrue(
+            WorldwideScreenNativeApplicationCache.requiresNativeReconciliation(
+                applied: initialRecommendation,
+                desired: initialRecommendation,
+                force: true
+            )
+        )
+        XCTAssertTrue(
+            WorldwideScreenNativeApplicationCache.requiresNativeReconciliation(
+                applied: nil,
+                desired: initialRecommendation,
+                force: false
+            )
+        )
+    }
+
     func testStaleSamePeerApplyFailurePreservesNewerRecommendation() async {
         await assertSupersededFailure(.applyFailed)
     }

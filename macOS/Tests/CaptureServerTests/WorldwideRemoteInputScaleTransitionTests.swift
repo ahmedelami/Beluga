@@ -151,20 +151,199 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         )
     }
 
+    func testLaterSenderMutationFenceRejectsSequenceAllocatedAfterShowFence() {
+        var fence = WorldwideScreenVideoAdaptationFreshnessFence()
+        fence.beginPostResumeEpoch(minimumCollectionSequence: 41)
+        XCTAssertTrue(
+            fence.admits(WebRTCStatisticsSnapshot(collectionSequence: 41))
+        )
+
+        // Sequence 42 was allocated after the Show boundary but before the native sender write.
+        // The post-write boundary must reject it even if delivery occurs after Active ACK.
+        fence.beginPostResumeEpoch(minimumCollectionSequence: 43)
+        XCTAssertFalse(
+            fence.admits(WebRTCStatisticsSnapshot(collectionSequence: 42))
+        )
+        XCTAssertTrue(
+            fence.admits(WebRTCStatisticsSnapshot(collectionSequence: 43))
+        )
+    }
+
+    func testExpiredNativeFallbackFencesReportReservedBeforeFallback() {
+        var fence = WorldwideScreenVideoAdaptationFreshnessFence()
+        fence.beginPostResumeEpoch(minimumCollectionSequence: 52)
+
+        // This sequence was reserved while the bounded native operation could temporarily own
+        // its proposed limits. The failure path must advance beyond it before publishing the
+        // rollback/deadline fallback policy, even if delivery happens afterward.
+        let reservedDuringNativeOperation: UInt64 = 52
+        XCTAssertTrue(
+            fence.admits(
+                WebRTCStatisticsSnapshot(
+                    collectionSequence: reservedDuringNativeOperation
+                )
+            )
+        )
+
+        fence.beginPostResumeEpoch(
+            minimumCollectionSequence: reservedDuringNativeOperation + 1
+        )
+
+        XCTAssertFalse(
+            fence.admits(
+                WebRTCStatisticsSnapshot(
+                    collectionSequence: reservedDuringNativeOperation
+                )
+            )
+        )
+        XCTAssertTrue(
+            fence.admits(
+                WebRTCStatisticsSnapshot(
+                    collectionSequence: reservedDuringNativeOperation + 1
+                )
+            )
+        )
+    }
+
     func testPostResumeEpochUsesThePeerMonotonicCollectionBoundary() throws {
         let epoch = try serviceSlice(
-            after: "    private func beginPostResumeScreenVideoAdaptationEpoch() {",
+            after: "    private func advanceScreenVideoStatisticsEpoch(using sourcePeer: WebRTCPeer?) {",
             before: "    private func automaticScreenMediaResumeTimedOut("
         )
 
         XCTAssertTrue(
             epoch.contains(
-                "peer.minimumNextStatisticsCollectionSequence()"
+                "sourcePeer.minimumNextStatisticsCollectionSequence()"
             )
         )
         XCTAssertTrue(epoch.contains("minimumCollectionSequence:"))
         XCTAssertFalse(epoch.contains("Date()"))
         XCTAssertFalse(epoch.contains("collectedAt"))
+    }
+
+    func testSuccessorShowGateRejectsOrdinaryAdaptationAndStaleCleanup() {
+        var gate = WorldwideScreenService.ShowAdaptationGate()
+        XCTAssertTrue(gate.permits(ownerEpoch: nil))
+
+        gate.begin(41)
+        XCTAssertFalse(gate.permits(ownerEpoch: nil))
+        XCTAssertFalse(gate.permits(ownerEpoch: 40))
+        XCTAssertTrue(gate.permits(ownerEpoch: 41))
+
+        gate.begin(42)
+        gate.finish(41)
+        XCTAssertEqual(gate.pendingVisibilityEpoch, 42)
+        XCTAssertFalse(gate.permits(ownerEpoch: 41))
+        XCTAssertTrue(gate.permits(ownerEpoch: 42))
+
+        gate.finish(42)
+        XCTAssertNil(gate.pendingVisibilityEpoch)
+        XCTAssertTrue(gate.permits(ownerEpoch: nil))
+    }
+
+    func testFailedAutomaticResumeFencesTemporarySenderBeforeReleasingActor()
+        throws {
+        let failure = try serviceSlice(
+            after: "    private func failAutomaticScreenMediaResume(",
+            before: "    private func handleAutomaticScreenMediaEncoderProbeEvent("
+        )
+        let release = try XCTUnwrap(
+            failure.range(of: "automaticScreenMediaResumeContext = nil")
+        )
+        let restoredPolicy = try XCTUnwrap(
+            failure.range(of: "screenVideoAdaptationPolicy.automaticResumeAttemptFailed()",
+                          range: release.upperBound..<failure.endIndex)
+        )
+        let fenced = try XCTUnwrap(
+            failure.range(of: "beginPostResumeScreenVideoAdaptationEpoch()",
+                          range: restoredPolicy.upperBound..<failure.endIndex)
+        )
+        let firstAwait = try XCTUnwrap(
+            failure.range(of: "await sourcePeer.cancelScreenMediaResumeProbe(",
+                          range: fenced.upperBound..<failure.endIndex)
+        )
+        XCTAssertLessThan(fenced.lowerBound, firstAwait.lowerBound)
+    }
+
+    func testShowTransitionGateAndNativeVisibilityTokenAreWiredAtMutationBoundaries()
+        throws {
+        let handler = try serviceSlice(
+            after: "    private func handleControlRequest(_ request: WebRTCControlRequest) async {",
+            before: "    /// Re-evaluates an exact forwarding token across a bounded live display transition."
+        )
+        XCTAssertTrue(handler.contains("screenVisibilityRequestID = request.id"))
+        XCTAssertTrue(handler.contains("showAdaptationGate.begin(screenVisibilityCommandEpoch)"))
+        XCTAssertTrue(handler.contains("showAdaptationGate.finish(gatedShowEpoch)"))
+
+        let sampler = try serviceSlice(
+            after: "    private func sampleScreenVideoAdaptationStatistics(",
+            before: "    /// Applies a new sender ceiling only after the current capture and peer identities survive"
+        )
+        XCTAssertTrue(sampler.contains("showAdaptationGate.pendingVisibilityEpoch == nil"))
+
+        let adaptation = try serviceSlice(
+            after: "    private func adaptScreenVideoForNetworkConditions(",
+            before: "    private func beginAutomaticScreenMediaResumeIfPossible("
+        )
+        XCTAssertTrue(adaptation.contains(
+            "showAdaptationGate.permits(ownerEpoch: showTransitionOwnerEpoch)"
+        ))
+        XCTAssertTrue(adaptation.contains("expectedScreenVisibilityRequestID:"))
+
+        let reconciliation = try serviceSlice(
+            after: "    private func reconcileCurrentScreenVideoRecommendationBeforeActiveUse(",
+            before: "    private func screenCaptureStartupOwnerIsCurrent("
+        )
+        XCTAssertTrue(reconciliation.contains(
+            "showTransitionOwnerEpoch: owner.visibilityCommandEpoch"
+        ))
+    }
+
+    func testSuccessorShowFencesPredecessorStatisticsBeforeSenderReconciliationAndACK()
+        throws {
+        let handler = try serviceSlice(
+            after: "    private func handleControlRequest(_ request: WebRTCControlRequest) async {",
+            before: "    /// Re-evaluates an exact forwarding token across a bounded live display transition."
+        )
+        let rearm = try XCTUnwrap(
+            handler.range(of: "screenVideoAdaptationPolicy.beginFloorRecoveryVisibility(")
+        )
+        let freshnessEpoch = try XCTUnwrap(
+            handler.range(
+                of: "beginPostResumeScreenVideoAdaptationEpoch()",
+                range: rearm.upperBound..<handler.endIndex
+            )
+        )
+        let captureStart = try XCTUnwrap(
+            handler.range(
+                of: "let authorization = try await startScreenCaptureWithDisplayModeRetries()",
+                range: freshnessEpoch.upperBound..<handler.endIndex
+            )
+        )
+        let activeACK = try XCTUnwrap(
+            handler.range(
+                of: "try await peer.acknowledgeActiveControlRequestIfTransportHealthy(",
+                range: captureStart.upperBound..<handler.endIndex
+            )
+        )
+        let postACKEpoch = try XCTUnwrap(
+            handler.range(
+                of: "beginPostResumeScreenVideoAdaptationEpoch()",
+                range: activeACK.upperBound..<handler.endIndex
+            )
+        )
+        let activation = try XCTUnwrap(
+            handler.range(
+                of: "screenVideoAdaptationPolicy.activateFloorRecoveryVisibility(",
+                range: postACKEpoch.upperBound..<handler.endIndex
+            )
+        )
+
+        XCTAssertLessThan(rearm.lowerBound, freshnessEpoch.lowerBound)
+        XCTAssertLessThan(freshnessEpoch.lowerBound, captureStart.lowerBound)
+        XCTAssertLessThan(captureStart.lowerBound, activeACK.lowerBound)
+        XCTAssertLessThan(activeACK.lowerBound, postACKEpoch.lowerBound)
+        XCTAssertLessThan(postACKEpoch.lowerBound, activation.lowerBound)
     }
 
     func testEveryNativeRouteChangeInvalidatesVideoLatencyHistory() throws {
@@ -176,6 +355,11 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         XCTAssertTrue(
             routeHandler.contains(
                 "screenVideoAdaptationPolicy.invalidateSelectedRoute()"
+            )
+        )
+        XCTAssertTrue(
+            routeHandler.contains(
+                "advanceScreenVideoStatisticsEpoch(using: sourcePeer)"
             )
         )
         XCTAssertFalse(routeHandler.contains("if route.kind"))
@@ -244,8 +428,9 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         // deadline/rollback behavioral tests cover that exception; ordinary media-health
         // ordering above remains unchanged by this supplementary wiring assertion.
         XCTAssertTrue(adaptation.contains("guard changedRecommendation != nil"))
-        XCTAssertTrue(adaptation.contains(
-            "|| appliedScreenVideoRecommendation != proposedPolicy.currentRecommendation else {"))
+        XCTAssertTrue(
+            adaptation.contains("|| nativeSenderRequiresReconciliation else {")
+        )
     }
 
     func testSuspensionInvalidationRequiresFreshOrderedShowWithoutLocalReactivation() throws {
@@ -433,14 +618,44 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         let startupSenderUpdate = try XCTUnwrap(
             startup.range(of: "encodingRecommendation.webRTCLimits")
         )
+        let startupSenderEpoch = try XCTUnwrap(
+            startup.range(
+                of: "beginPostResumeScreenVideoAdaptationEpoch()",
+                range: startupSenderUpdate.upperBound..<startup.endIndex
+            )
+        )
+        let failedStartupInvalidation = try XCTUnwrap(
+            startup.range(
+                of: "} else {\n                // The direct write was ambiguous for this exact source owner.",
+                range: startupSenderEpoch.upperBound..<startup.endIndex
+            )
+        )
+        let clearedStartupCache = try XCTUnwrap(
+            startup.range(
+                of: "appliedScreenVideoRecommendation = nil",
+                range: failedStartupInvalidation.upperBound..<startup.endIndex
+            )
+        )
         let forwardingInstall = try XCTUnwrap(
             startup.range(
                 of: "sink.beginForwarding(",
-                range: startupSenderUpdate.upperBound..<startup.endIndex
+                range: clearedStartupCache.upperBound..<startup.endIndex
             )
         )
         XCTAssertLessThan(
             startupSenderUpdate.lowerBound,
+            startupSenderEpoch.lowerBound
+        )
+        XCTAssertLessThan(
+            startupSenderEpoch.lowerBound,
+            failedStartupInvalidation.lowerBound
+        )
+        XCTAssertLessThan(
+            failedStartupInvalidation.lowerBound,
+            clearedStartupCache.lowerBound
+        )
+        XCTAssertLessThan(
+            clearedStartupCache.lowerBound,
             forwardingInstall.lowerBound
         )
         XCTAssertTrue(startup.contains("width: Int32(baseDimensions.width)"))
@@ -550,7 +765,7 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
                 "currentIPhoneMicrophoneReceiverStatisticsCapture()"
             )
         )
-        XCTAssertTrue(ordinaryPeerSnapshot.contains("async let nativeSnapshotRequest"))
+        XCTAssertTrue(ordinaryPeerSnapshot.contains("async let nativeReportRequest"))
         XCTAssertTrue(
             ordinaryPeerSnapshot.contains("async let receiverStatisticsRequest")
         )
@@ -865,7 +1080,10 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         ))
         let staleRollback = String(adaptation[staleBranch.lowerBound..<markApplied.lowerBound])
         XCTAssertTrue(staleRollback.contains("rollbackScreenVideoEncodingUpdateIfCurrent("))
-        XCTAssertFalse(staleRollback.contains("appliedScreenVideoRecommendation"))
+        XCTAssertTrue(staleRollback.contains(
+            "screenVideoNativeApplicationGeneration\n                            == nativeApplicationGenerationBeforeRollback"
+        ))
+        XCTAssertTrue(staleRollback.contains("appliedScreenVideoRecommendation = nil"))
         XCTAssertFalse(staleRollback.contains("WorldwideScreenNativeApplicationCache"))
 
         let accepted = try XCTUnwrap(adaptation.range(of: "nativeApply=accepted"))
@@ -899,6 +1117,134 @@ final class WorldwideRemoteInputScaleTransitionTests: XCTestCase {
         XCTAssertFalse(failureAdmission.contains("appliedScreenVideoRecommendation = nil"))
         XCTAssertFalse(failureAdmission.contains("await "))
         XCTAssertTrue(failureAdmission.contains("return"))
+    }
+
+    func testBoundedNativeFailureFencesEvidenceBeforePublishingFallbackPolicy() throws {
+        let adaptation = try serviceSlice(
+            after: "    private func adaptScreenVideoForNetworkConditions(",
+            before: "    private func beginAutomaticScreenMediaResumeIfPossible("
+        )
+        let accepted = try XCTUnwrap(adaptation.range(of: "nativeApply=accepted"))
+        let failureCatch = try XCTUnwrap(
+            adaptation.range(
+                of: "            } catch {",
+                range: accepted.upperBound..<adaptation.endIndex
+            )
+        )
+        let failureReturn = try XCTUnwrap(
+            adaptation.range(
+                of: "                return\n            }\n        }",
+                range: failureCatch.upperBound..<adaptation.endIndex
+            )
+        )
+        let failure = String(
+            adaptation[failureCatch.lowerBound..<failureReturn.upperBound]
+        )
+        let ownership = try XCTUnwrap(
+            failure.range(
+                of: "guard WorldwideScreenNativeApplicationCache.invalidateIfCurrent("
+            )
+        )
+        let selectedFallback = try XCTUnwrap(
+            failure.range(
+                of: ".reconciledPolicyAfterCurrentOwnerFailure("
+            )
+        )
+        let freshnessEpoch = try XCTUnwrap(
+            failure.range(of: "advanceScreenVideoStatisticsEpoch(using: sourcePeer)")
+        )
+        let incompleteEvidenceReset = try XCTUnwrap(
+            failure.range(of: "reconciledPolicy.resetIncompleteEvidenceWindow()")
+        )
+        let fallbackPublication = try XCTUnwrap(
+            failure.range(of: "screenVideoAdaptationPolicy = reconciledPolicy")
+        )
+        let policyRevision = try XCTUnwrap(
+            failure.range(
+                of: "screenVideoAdaptationPolicyRevision &+= 1",
+                range: fallbackPublication.upperBound..<failure.endIndex
+            )
+        )
+
+        XCTAssertLessThan(ownership.lowerBound, selectedFallback.lowerBound)
+        XCTAssertLessThan(selectedFallback.lowerBound, freshnessEpoch.lowerBound)
+        XCTAssertLessThan(freshnessEpoch.lowerBound, incompleteEvidenceReset.lowerBound)
+        XCTAssertLessThan(incompleteEvidenceReset.lowerBound, fallbackPublication.lowerBound)
+        XCTAssertLessThan(fallbackPublication.lowerBound, policyRevision.lowerBound)
+    }
+
+    func testCacheMismatchFencesStartupEvidenceBeforeAndAfterPreWriteReport() throws {
+        let adaptation = try serviceSlice(
+            after: "    private func adaptScreenVideoForNetworkConditions(",
+            before: "    private func beginAutomaticScreenMediaResumeIfPossible("
+        )
+        let mismatch = try XCTUnwrap(
+            adaptation.range(of: "let nativeSenderRequiresReconciliation =")
+        )
+        let firstFence = try XCTUnwrap(
+            adaptation.range(
+                of: ".policyForSenderConfigurationReconciliation(",
+                range: mismatch.upperBound..<adaptation.endIndex
+            )
+        )
+        let reduction = try XCTUnwrap(
+            adaptation.range(
+                of: "changedRecommendation = proposedPolicy.update(",
+                range: firstFence.upperBound..<adaptation.endIndex
+            )
+        )
+        let secondFence = try XCTUnwrap(
+            adaptation.range(
+                of: ".policyForSenderConfigurationReconciliation(proposedPolicy)",
+                range: reduction.upperBound..<adaptation.endIndex
+            )
+        )
+        let nativeApply = try XCTUnwrap(
+            adaptation.range(
+                of: "await sourcePeer.applyScreenVideoEncodingLimits(",
+                range: secondFence.upperBound..<adaptation.endIndex
+            )
+        )
+        let acceptedEpoch = try XCTUnwrap(
+            adaptation.range(
+                of: "advanceScreenVideoStatisticsEpoch(using: sourcePeer)",
+                range: nativeApply.upperBound..<adaptation.endIndex
+            )
+        )
+        let unknownNativeBranch = try XCTUnwrap(
+            adaptation.range(
+                of: "if nativeSenderRequiresReconciliation {",
+                range: acceptedEpoch.upperBound..<adaptation.endIndex
+            )
+        )
+        let correctiveReset = try XCTUnwrap(
+            adaptation.range(
+                of: "proposedPolicy.resetForSenderConfigurationEpoch()",
+                range: unknownNativeBranch.upperBound..<adaptation.endIndex
+            )
+        )
+        let acceptedPolicyReset = try XCTUnwrap(
+            adaptation.range(
+                of: "proposedPolicy.resetForAcceptedSenderConfigurationEpoch(",
+                range: correctiveReset.upperBound..<adaptation.endIndex
+            )
+        )
+        let forcedApplyGate = try XCTUnwrap(
+            adaptation.range(
+                of: "if changedRecommendation != nil\n            || nativeSenderRequiresReconciliation {",
+                range: secondFence.upperBound..<nativeApply.lowerBound
+            )
+        )
+
+        XCTAssertLessThan(mismatch.lowerBound, firstFence.lowerBound)
+        XCTAssertLessThan(firstFence.lowerBound, reduction.lowerBound)
+        XCTAssertLessThan(reduction.lowerBound, secondFence.lowerBound)
+        XCTAssertLessThan(secondFence.lowerBound, forcedApplyGate.lowerBound)
+        XCTAssertLessThan(forcedApplyGate.lowerBound, nativeApply.lowerBound)
+        XCTAssertLessThan(nativeApply.lowerBound, acceptedEpoch.lowerBound)
+        XCTAssertLessThan(acceptedEpoch.lowerBound, unknownNativeBranch.lowerBound)
+        XCTAssertLessThan(unknownNativeBranch.lowerBound, correctiveReset.lowerBound)
+        XCTAssertLessThan(correctiveReset.lowerBound, acceptedPolicyReset.lowerBound)
     }
 
     func testAutomaticResumeKeepsFastAdaptationBlockedThroughEncoderRestore()

@@ -210,6 +210,63 @@ final class WebRTCStatisticsParserTests: XCTestCase {
         XCTAssertEqual(video.totalPacketSendDelay, 1.25)
     }
 
+    func testPrimaryOutboundVideoStrictProgressCountersRejectMalformedNSNumberValuesIndependently()
+        throws {
+        let invalidValues: [(name: String, value: NSNumber)] = [
+            ("negative", NSNumber(value: -1)),
+            ("fractional", NSNumber(value: 1.5)),
+            ("boolean", NSNumber(value: true)),
+        ]
+
+        for invalid in invalidValues {
+            let invalidBytes = try XCTUnwrap(
+                WebRTCStatisticsParser.parse(records: [
+                    WebRTCStatisticsRecord(
+                        id: "screen-video-out",
+                        type: "outbound-rtp",
+                        values: [
+                            "kind": "video",
+                            "bytesSent": invalid.value,
+                            "framesEncoded": NSNumber(value: 17),
+                        ]
+                    ),
+                ]).outboundVideo
+            )
+            XCTAssertNil(
+                invalidBytes.bytes,
+                "\(invalid.name) bytesSent must fail closed"
+            )
+            XCTAssertEqual(
+                invalidBytes.framesEncodedOrDecoded,
+                17,
+                "a malformed bytesSent must not erase valid framesEncoded"
+            )
+
+            let invalidFrames = try XCTUnwrap(
+                WebRTCStatisticsParser.parse(records: [
+                    WebRTCStatisticsRecord(
+                        id: "screen-video-out",
+                        type: "outbound-rtp",
+                        values: [
+                            "kind": "video",
+                            "bytesSent": NSNumber(value: 12_345),
+                            "framesEncoded": invalid.value,
+                        ]
+                    ),
+                ]).outboundVideo
+            )
+            XCTAssertEqual(
+                invalidFrames.bytes,
+                12_345,
+                "a malformed framesEncoded must not erase valid bytesSent"
+            )
+            XCTAssertNil(
+                invalidFrames.framesEncodedOrDecoded,
+                "\(invalid.name) framesEncoded must fail closed"
+            )
+        }
+    }
+
     func testPrimaryVideoStatisticsExcludeRTXIndependentOfRecordOrder() throws {
         let primaryCodec = WebRTCStatisticsRecord(
             id: "primary-codec",

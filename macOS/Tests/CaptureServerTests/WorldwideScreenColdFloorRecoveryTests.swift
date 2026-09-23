@@ -36,6 +36,7 @@ final class WorldwideScreenColdFloorRecoveryTests: XCTestCase {
 
     func testColdPlateauWithoutRTTProofCannotSupplyAdmissionWitnesses() {
         var fixture = ColdFloorRecoveryFixture(configuredBitrate: 50_000_000)
+        prepareLegacyFloorRecovery(&fixture)
         for milliseconds in stride(from: 0, through: 3_000, by: 500) {
             _ = fixture.ordinary(at: milliseconds, hasRTT: false)
             assertVisibleFloor(fixture.policy)
@@ -124,9 +125,9 @@ final class WorldwideScreenColdFloorRecoveryTests: XCTestCase {
         XCTAssertFalse(event.disproved, file: file, line: line)
         XCTAssertEqual(event.cooldownRemaining, 0, file: file, line: line)
         XCTAssertEqual(event.beforeTotalCapBps, 486_001, file: file, line: line)
-        XCTAssertEqual(event.previousRegularSequence, 3, file: file, line: line)
+        XCTAssertEqual(event.previousRegularSequence, 5, file: file, line: line)
         XCTAssertEqual(event.previousRegularReportMicroseconds, 2_000_000, file: file, line: line)
-        XCTAssertEqual(event.collectionSequence, scenario == .rejectedOrder ? 3 : 4, file: file, line: line)
+        XCTAssertEqual(event.collectionSequence, scenario == .rejectedOrder ? 3 : 6, file: file, line: line)
         XCTAssertEqual(event.identity, scenario == .rejectedOrder ? .rejectedOrder
                        : scenario == .rejectedTimestamp ? .rejectedTimestamp : .fresh, file: file, line: line)
 
@@ -203,7 +204,7 @@ final class WorldwideScreenColdFloorRecoveryTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        XCTAssertEqual(fixture.policy.currentTier, .survival, file: file, line: line)
+        prepareLegacyFloorRecovery(&fixture, file: file, line: line)
         XCTAssertNil(fixture.policy.roundTripTimeBaselineSeconds, file: file, line: line)
         for milliseconds in [0, 500] {
             _ = fixture.ordinary(at: milliseconds, hasRTT: false)
@@ -218,10 +219,44 @@ final class WorldwideScreenColdFloorRecoveryTests: XCTestCase {
         XCTAssertTrue(fixture.policy.roundTripTimeReferenceIsProvisional, file: file, line: line)
         XCTAssertEqual(fixture.policy.roundTripTimeObservationAge, .zero, file: file, line: line)
         XCTAssertEqual(fixture.policy.lastAveragePacketSendDelaySeconds, 0, file: file, line: line)
-        XCTAssertEqual(fixture.policy.lastConsumedCollectionSequence, 3, file: file, line: line)
+        XCTAssertEqual(fixture.policy.lastConsumedCollectionSequence, 5, file: file, line: line)
         XCTAssertFalse(fixture.policy.floorRecoveryProbeIsActive, file: file, line: line)
         XCTAssertFalse(fixture.policy.floorRecoveryAttemptConsumed, file: file, line: line)
         XCTAssertEqual(fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps, 486_001, file: file, line: line)
+    }
+
+    private func prepareLegacyFloorRecovery(
+        _ fixture: inout ColdFloorRecoveryFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(fixture.policy.currentTier, .survival, file: file, line: line)
+        let startupOverlayWasEligible = fixture.policy.startupSpatialModeIsActive
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved, file: file, line: line)
+        if startupOverlayWasEligible {
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1,
+                           "An eligible startup overlay must begin at full pixels",
+                           file: file, line: line)
+        }
+
+        // Establish an ordinary packet baseline, then cross the real immediate-queue
+        // boundary. The startup overlay must yield before these tests exercise the
+        // pre-existing audio-priority floor-recovery witness/admission contract.
+        _ = fixture.ordinary(at: -900, hasRTT: false)
+        XCTAssertEqual(fixture.policy.startupSpatialModeIsActive,
+                       startupOverlayWasEligible, file: file, line: line)
+        if startupOverlayWasEligible {
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1,
+                           file: file, line: line)
+        }
+        _ = fixture.ordinary(at: -800, hasRTT: false, queueDelay: 0.250)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive, file: file, line: line)
+        XCTAssertEqual(fixture.policy.startupSpatialModeIsDisproved,
+                       startupOverlayWasEligible, file: file, line: line)
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       startupOverlayWasEligible ? .confirmedQueuePressure : nil,
+                       file: file, line: line)
+        assertVisibleFloor(fixture.policy, file: file, line: line)
     }
 
     private func assertVisibleFloor(
@@ -274,6 +309,7 @@ private struct ColdFloorRecoveryFixture {
     var policy: WorldwideScreenVideoAdaptationPolicy
     private let origin = ContinuousClock.now
     private(set) var now = ContinuousClock.now
+    private let timelineOffsetMilliseconds = 1_000
     private var sequence: UInt64 = 0
     private var packets: UInt64 = 0
     private var totalPacketDelay = 0.0
@@ -297,7 +333,9 @@ private struct ColdFloorRecoveryFixture {
         collectionSequenceOverride: UInt64? = nil,
         diagnostics: ((WorldwideScreenFloorRecoveryDiagnostics) -> Void)? = nil
     ) -> WorldwideScreenVideoEncodingRecommendation? {
-        now = origin.advanced(by: .milliseconds(milliseconds))
+        // Leave room for the startup-overlay pressure prelude while preserving the
+        // legacy tests' logical timestamps and native-report identities.
+        now = origin.advanced(by: .milliseconds(milliseconds + timelineOffsetMilliseconds))
         sequence += 1
         if advancesPackets {
             packets += 10

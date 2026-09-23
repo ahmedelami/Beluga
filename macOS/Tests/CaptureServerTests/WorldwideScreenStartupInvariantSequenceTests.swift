@@ -5,7 +5,7 @@ import XCTest
 final class WorldwideScreenStartupInvariantSequenceTests: XCTestCase {
     func testSeededSequencesPreserveNonFPSStateAcrossSourceFrameRates() throws {
         let cases: [(seed: UInt64, terminal: StartupTerminalEvent)] = [
-            (0xC1A4_17A7_0000_0001, .bandwidthCollapse),
+            (0xC1A4_17A7_0000_0001, .demandProvenBandwidth),
             (0xC1A4_17A7_0000_0002, .immediateQueue),
             (0xC1A4_17A7_0000_0003, .routeReplacement),
         ]
@@ -25,6 +25,7 @@ final class WorldwideScreenStartupInvariantSequenceTests: XCTestCase {
             let events = uncertainty + [
                 .healthy(recoveryBandwidth),
                 .healthy(recoveryBandwidth),
+                .rawLowBandwidth,
                 .terminal(scenario.terminal),
                 .staleNegative,
                 .missing,
@@ -59,10 +60,24 @@ final class WorldwideScreenStartupInvariantSequenceTests: XCTestCase {
                     signatures.append(StartupNonFPSSignature(fixture.policy))
 
                     switch event {
-                    case .terminal(_):
+                    case let .terminal(terminal):
                         terminalObserved = true
                         XCTAssertFalse(fixture.policy.startupSpatialModeIsActive, context)
                         XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved, context)
+                        let expectedCause: WorldwideScreenVideoDowngradeCause
+                        switch terminal {
+                        case .demandProvenBandwidth: expectedCause = .demandProvenBandwidth
+                        case .immediateQueue: expectedCause = .confirmedQueuePressure
+                        case .routeReplacement: expectedCause = .selectedRouteReplacement
+                        }
+                        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                                       expectedCause, context)
+                    case .rawLowBandwidth:
+                        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive, context)
+                        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved, context)
+                        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy,
+                                       1, context)
+                        XCTAssertEqual(fixture.policy.lastDowngradeCause, .bandwidthOnly, context)
                     case .hide:
                         terminalObserved = false
                         XCTAssertFalse(fixture.policy.startupSpatialModeIsActive, context)
@@ -450,13 +465,13 @@ final class WorldwideScreenStartupInvariantSequenceTests: XCTestCase {
 }
 
 private enum StartupTerminalEvent: CustomStringConvertible {
-    case bandwidthCollapse
+    case demandProvenBandwidth
     case immediateQueue
     case routeReplacement
 
     var description: String {
         switch self {
-        case .bandwidthCollapse: return "bandwidthCollapse"
+        case .demandProvenBandwidth: return "demandProvenBandwidth"
         case .immediateQueue: return "immediateQueue"
         case .routeReplacement: return "routeReplacement"
         }
@@ -468,6 +483,7 @@ private enum StartupSequenceEvent: CustomStringConvertible {
     case missing
     case staleNegative
     case malformedRTT
+    case rawLowBandwidth
     case terminal(StartupTerminalEvent)
     case hide
     case newPeerShow
@@ -478,6 +494,7 @@ private enum StartupSequenceEvent: CustomStringConvertible {
         case .missing: return "missing"
         case .staleNegative: return "staleNegative"
         case .malformedRTT: return "malformedRTT"
+        case .rawLowBandwidth: return "rawLowBandwidth"
         case let .terminal(event): return "terminal(\(event))"
         case .hide: return "hide"
         case .newPeerShow: return "newPeerShow"
@@ -495,6 +512,18 @@ private struct StartupNonFPSSignature: Equatable {
     let startupIsDisproved: Bool
     let startupPeer: UInt64?
     let startupShow: UInt64?
+    let lastDowngradeCause: WorldwideScreenVideoDowngradeCause?
+    let startupDisproofCause: WorldwideScreenVideoDowngradeCause?
+    let startupBandwidthDisposition: WorldwideScreenStartupBandwidthDisposition
+    let startupBandwidthProofSampleCount: Int
+    let startupBandwidthDemandIntervalCount: Int
+    let startupBandwidthVideoSendBitrateBps: Double?
+    let startupBandwidthPairSendBitrateBps: Double?
+    let startupBandwidthAverageAvailableOutgoingBitrateBps: Double?
+    let startupBandwidthAverageVideoTargetBitrateBps: Double?
+    let startupBandwidthAverageAggregateTargetBitrateBps: Double?
+    let startupBandwidthLimitedIntervalCount: Int
+    let startupSameShowProbeWitness: Bool
     let probeOrigin: WorldwideScreenVideoAdaptationTier?
     let probeHasDeadline: Bool
     let probeFailureCount: Int
@@ -513,6 +542,26 @@ private struct StartupNonFPSSignature: Equatable {
         startupIsDisproved = policy.startupSpatialModeIsDisproved
         startupPeer = policy.startupSpatialModePeerGeneration
         startupShow = policy.startupSpatialModeShowEpoch
+        lastDowngradeCause = policy.lastDowngradeCause
+        startupDisproofCause = policy.startupSpatialModeDisproofCause
+        startupBandwidthDisposition = policy.startupSpatialBandwidthDisposition
+        startupBandwidthProofSampleCount = policy.startupSpatialBandwidthProofSampleCount
+        startupBandwidthDemandIntervalCount =
+            policy.startupSpatialBandwidthDemandIntervalCount
+        startupBandwidthVideoSendBitrateBps =
+            policy.startupSpatialBandwidthVideoSendBitrateBps
+        startupBandwidthPairSendBitrateBps =
+            policy.startupSpatialBandwidthPairSendBitrateBps
+        startupBandwidthAverageAvailableOutgoingBitrateBps =
+            policy.startupSpatialBandwidthAverageAvailableOutgoingBitrateBps
+        startupBandwidthAverageVideoTargetBitrateBps =
+            policy.startupSpatialBandwidthAverageVideoTargetBitrateBps
+        startupBandwidthAverageAggregateTargetBitrateBps =
+            policy.startupSpatialBandwidthAverageAggregateTargetBitrateBps
+        startupBandwidthLimitedIntervalCount =
+            policy.startupSpatialBandwidthLimitedIntervalCount
+        startupSameShowProbeWitness =
+            policy.startupSpatialHasCurrentShowBelowReserveProbeWitness
         probeOrigin = policy.applicationLimitedProbeOriginTier
         probeHasDeadline = policy.applicationLimitedProbeDeadline != nil
         probeFailureCount = policy.applicationLimitedProbeFailureCount
@@ -596,11 +645,16 @@ private struct StartupInvariantSequenceFixture {
             _ = staleNegative(after: 250)
         case .malformedRTT:
             _ = ordinaryMalformedRTT(after: 500)
+        case .rawLowBandwidth:
+            _ = ordinaryHealthy(bandwidth: 100_000, after: 500)
+            _ = ordinaryHealthy(bandwidth: 100_000, after: 500)
+            XCTAssertTrue(policy.startupSpatialModeIsActive)
+            XCTAssertFalse(policy.startupSpatialModeIsDisproved)
+            XCTAssertEqual(policy.currentRecommendation.scaleResolutionDownBy, 1)
         case let .terminal(event):
             switch event {
-            case .bandwidthCollapse:
-                _ = ordinaryHealthy(bandwidth: 100_000, after: 500)
-                _ = ordinaryHealthy(bandwidth: 100_000, after: 500)
+            case .demandProvenBandwidth:
+                applyDemandProvenBandwidthTerminalEvent()
             case .immediateQueue:
                 _ = ordinaryHealthy(
                     bandwidth: 3_600_000,
@@ -737,6 +791,44 @@ private struct StartupInvariantSequenceFixture {
         policy.activateFloorRecoveryVisibility(peerGeneration: peer, showEpoch: showEpoch)
     }
 
+    private mutating func applyDemandProvenBandwidthTerminalEvent() {
+        let target = 100_000.0
+        let reports: [(bytes: UInt64, frames: UInt64)] = [
+            (0, 0),
+            (5_625, 1),
+            (11_250, 2),
+            (16_875, 3),
+            (22_500, 4),
+        ]
+        for (index, report) in reports.enumerated() {
+            _ = ordinary(
+                bandwidth: 100_000,
+                queueDelay: 0.001,
+                rttInput: .fresh,
+                route: .direct,
+                after: 500,
+                videoBytesSent: report.bytes,
+                videoFramesEncoded: report.frames,
+                videoTargetBitrateBps: target,
+                videoQualityLimitationReason: .bandwidth
+            )
+            if index < reports.count - 1 {
+                XCTAssertTrue(
+                    policy.startupSpatialModeIsActive,
+                    "Demand-proven bandwidth must not terminate before four post-seed reports"
+                )
+                XCTAssertFalse(policy.startupSpatialModeIsDisproved)
+                XCTAssertEqual(policy.currentRecommendation.scaleResolutionDownBy, 1)
+            }
+        }
+        XCTAssertFalse(policy.startupSpatialModeIsActive)
+        XCTAssertTrue(policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(policy.startupSpatialModeDisproofCause, .demandProvenBandwidth)
+        XCTAssertEqual(policy.startupSpatialBandwidthDisposition, .confirmedLimited)
+        XCTAssertEqual(policy.startupSpatialBandwidthProofSampleCount, 4)
+        XCTAssertEqual(policy.startupSpatialBandwidthDemandIntervalCount, 4)
+    }
+
     private mutating func ordinary(
         bandwidth: Double?,
         queueDelay: Double,
@@ -744,7 +836,13 @@ private struct StartupInvariantSequenceFixture {
         route: WebRTCICERouteKind?,
         after milliseconds: Int,
         identity: StartupInvariantReportIdentity = .fresh,
-        advancesPackets: Bool = true
+        advancesPackets: Bool = true,
+        videoBytesSent: UInt64? = nil,
+        videoFramesEncoded: UInt64? = nil,
+        videoKeyFramesEncoded: UInt64? = nil,
+        videoTargetBitrateBps: Double? = nil,
+        videoQualityLimitationReason:
+            WebRTCVideoQualityLimitationReason? = nil
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         nowMilliseconds += milliseconds
         let identity = reportIdentity(identity)
@@ -764,6 +862,19 @@ private struct StartupInvariantSequenceFixture {
             selectedRoute: route.map { WebRTCICERouteDiagnostics(kind: $0) },
             outboundVideoPacketsSent: packets,
             outboundVideoTotalPacketSendDelaySeconds: totalPacketSendDelay,
+            outboundVideoBytesSent: videoBytesSent,
+            outboundVideoFramesEncoded: videoFramesEncoded,
+            outboundVideoKeyFramesEncoded: videoKeyFramesEncoded
+                ?? videoFramesEncoded.map { _ in 0 },
+            outboundVideoTargetBitrateBps: videoTargetBitrateBps,
+            outboundVideoQualityLimitationReason:
+                videoQualityLimitationReason,
+            selectedPairFingerprint: videoBytesSent != nil
+                ? String(repeating: route == .direct ? "a" : "b", count: 64)
+                : nil,
+            selectedPairBytesSent: videoBytesSent,
+            selectedPairAvailableOutgoingBitrateBps:
+                videoBytesSent != nil ? bandwidth : nil,
             nativeReportTimestampMicroseconds: identity.timestamp,
             observedAt: origin.advanced(by: .milliseconds(nowMilliseconds))
         )

@@ -324,6 +324,7 @@ struct WebRTCAudioSenderEncodingParameters: Equatable, Sendable {
 struct WebRTCScreenVideoPrioritySnapshot: Equatable, Sendable {
     let bitratePriorities: [Double]
     let networkPriorityRawValues: [Int]
+    let degradationPreferenceRawValue: Int?
 }
 
 /// Requested and native activation state for one audio-processing component.
@@ -3603,6 +3604,19 @@ enum WebRTCIPhoneMicrophoneTrackCreationPolicy {
     }
 }
 
+/// Retains the route generation captured before one asynchronous whole-peer native request.
+struct WebRTCWholePeerStatisticsRequestReport: Sendable {
+    let snapshot: WebRTCStatisticsSnapshot
+    let routeRevision: UInt64
+
+    func snapshot(
+        ifCurrentRouteRevision currentRouteRevision: UInt64
+    ) -> WebRTCStatisticsSnapshot? {
+        guard routeRevision == currentRouteRevision else { return nil }
+        return snapshot
+    }
+}
+
 /// Owns one role-specific native WebRTC connection and its ordered control/input state machines.
 ///
 /// Actor isolation serializes signaling epochs, candidate generations, replay histories, and
@@ -3628,6 +3642,8 @@ public actor WebRTCPeer {
     private static let maximumCandidateUsernameFragmentBytes = 256
     private static let systemAudioBitratePriority = 4.0
     private static let screenVideoBitratePriority = 0.5
+    private static let screenVideoDegradationPreferenceRawValue =
+        LKRTCDegradationPreference.maintainResolution.rawValue
     #if os(iOS)
     private static let iPhoneMicrophoneOutputOnlyTarget =
         WebRTCIOSOutputOnlyMicrophoneTarget(
@@ -3826,6 +3842,7 @@ public actor WebRTCPeer {
     private var sentControlRequestOrder: [UInt64] = []
     private var receivedControlAcknowledgements: [UInt64: WebRTCControlAcknowledgement] = [:]
     private var highestReceivedControlRequestID: UInt64?
+    private var latestReceivedScreenVisibilityRequestID: UInt64?
     private var receivedControlRequests: [UInt64: WebRTCControlRequest] = [:]
     private var receivedControlRequestOrder: [UInt64] = []
     private var sentControlAcknowledgements: [UInt64: WebRTCControlAcknowledgement] = [:]
@@ -8073,11 +8090,19 @@ public actor WebRTCPeer {
     /// Applies proportional, single-layer screen-video ceilings without changing the capture
     /// surface or its remote-input coordinate space.
     public func applyScreenVideoEncodingLimits(
-        _ limits: WebRTCScreenVideoEncodingLimits
+        _ limits: WebRTCScreenVideoEncodingLimits,
+        expectedScreenVisibilityRequestID: UInt64? = nil
     ) throws -> WebRTCScreenVideoEncodingUpdate {
         try ensureOpen()
         guard role == .host, let localVideoSender else {
             throw WebRTCTransportError.invalidRole
+        }
+        if let expectedScreenVisibilityRequestID,
+           expectedScreenVisibilityRequestID
+            != latestReceivedScreenVisibilityRequestID {
+            throw WebRTCTransportError.staleControlRequest(
+                expectedScreenVisibilityRequestID
+            )
         }
         let maximumAllowedBitrate = configuredMaximumVideoBitrate ?? Int.max
         let requestedMaximumTotalRTPBitrateBps =
@@ -8436,6 +8461,14 @@ public actor WebRTCPeer {
     }
 
     #if DEBUG
+    func setLatestReceivedScreenVisibilityRequestIDForTesting(
+        _ requestID: UInt64?
+    ) {
+        precondition(role == .host)
+        precondition(requestID.map { $0 > 0 } ?? true)
+        latestReceivedScreenVisibilityRequestID = requestID
+    }
+
     func screenVideoEncodingLimitsForTesting()
         -> WebRTCScreenVideoEncodingLimits? {
         localVideoSender.flatMap(Self.screenVideoEncodingLimits)
@@ -8451,15 +8484,34 @@ public actor WebRTCPeer {
 
     func screenVideoPriorityForTesting()
         -> WebRTCScreenVideoPrioritySnapshot? {
-        guard let state = localVideoSender.flatMap(
-            Self.screenVideoEncodingState
-        ) else {
+        guard let localVideoSender,
+              let state = Self.screenVideoEncodingState(
+                from: localVideoSender
+              ) else {
             return nil
         }
         return WebRTCScreenVideoPrioritySnapshot(
             bitratePriorities: state.bitratePriority,
-            networkPriorityRawValues: state.networkPriority.map(\.rawValue)
+            networkPriorityRawValues: state.networkPriority.map(\.rawValue),
+            degradationPreferenceRawValue:
+                localVideoSender.parameters.degradationPreference?.intValue
         )
+    }
+
+    /// Test-only native drift injection. Production mutations must replace either `nil` or a
+    /// conflicting value with the fixed screen-content degradation preference.
+    @discardableResult
+    func setScreenVideoDegradationPreferenceRawValueForTesting(
+        _ rawValue: Int?
+    ) -> Bool {
+        guard let localVideoSender else { return false }
+        let parameters = localVideoSender.parameters
+        parameters.degradationPreference = rawValue.map {
+            NSNumber(value: $0)
+        }
+        localVideoSender.parameters = parameters
+        return localVideoSender.parameters.degradationPreference?.intValue
+            == rawValue
     }
 
     func armScreenVideoEncoderMarkerForTesting(
@@ -8613,11 +8665,18 @@ public actor WebRTCPeer {
             encoding.bitratePriority = state.bitratePriority[index]
             encoding.networkPriority = state.networkPriority[index]
         }
+        // This is an invariant, not rollback payload. A native `nil` or drifted value must never
+        // survive any product-owned limit, activity, or rollback transaction.
+        parameters.degradationPreference = NSNumber(
+            value: screenVideoDegradationPreferenceRawValue
+        )
         sender.parameters = parameters
         guard let applied = screenVideoEncodingState(from: sender) else {
             return false
         }
         return screenVideoEncodingStatesMatch(applied, state)
+            && sender.parameters.degradationPreference?.intValue
+                == screenVideoDegradationPreferenceRawValue
     }
 
     private static func screenVideoEncodingStatesMatch(
@@ -8736,14 +8795,17 @@ public actor WebRTCPeer {
         let receiverCapture = role == .host
             ? currentIPhoneMicrophoneReceiverStatisticsCapture()
             : nil
-        async let nativeSnapshotRequest = collectNativeStatistics()
+        async let nativeReportRequest = collectNativeStatistics()
         async let receiverStatisticsRequest =
             collectIPhoneMicrophoneReceiverStatistics(
                 for: receiverCapture
             )
-        let (nativeSnapshotResult, receiverStatistics) = await (
-            nativeSnapshotRequest,
+        let (nativeReport, receiverStatistics) = await (
+            nativeReportRequest,
             receiverStatisticsRequest
+        )
+        let nativeSnapshotResult = nativeReport?.snapshot(
+            ifCurrentRouteRevision: currentRouteRevision
         )
         let wholePeerReportWasCollected = nativeSnapshotResult != nil
         let nativeSnapshot =
@@ -8811,30 +8873,38 @@ public actor WebRTCPeer {
 
     private func collectNativeStatistics(
         timeout: Duration = .seconds(1)
-    ) async -> WebRTCStatisticsSnapshot? {
+    ) async -> WebRTCWholePeerStatisticsRequestReport? {
         precondition(timeout > .zero)
         guard let requestID = wholePeerStatisticsRequestGate.begin() else {
             return nil
         }
+        let routeRevision = currentRouteRevision
         let collectionSequence =
             statisticsCollectionSequencer.reserveNextSequence()
-        return await WebRTCBoundedCallback.value(timeout: timeout) {
-            [
-                peerConnection,
-                wholePeerStatisticsRequestGate,
-                collectionSequence,
-            ] resolve in
-            peerConnection.statistics { report in
-                defer {
-                    wholePeerStatisticsRequestGate.complete(requestID)
-                }
-                resolve(
-                    WebRTCStatisticsParser.parse(
-                        report,
-                        collectionSequence: collectionSequence
+        let snapshot: WebRTCStatisticsSnapshot? =
+            await WebRTCBoundedCallback.value(timeout: timeout) {
+                [
+                    peerConnection,
+                    wholePeerStatisticsRequestGate,
+                    collectionSequence,
+                ] resolve in
+                peerConnection.statistics { report in
+                    defer {
+                        wholePeerStatisticsRequestGate.complete(requestID)
+                    }
+                    resolve(
+                        WebRTCStatisticsParser.parse(
+                            report,
+                            collectionSequence: collectionSequence
+                        )
                     )
-                )
+                }
             }
+        return snapshot.map {
+            WebRTCWholePeerStatisticsRequestReport(
+                snapshot: $0,
+                routeRevision: routeRevision
+            )
         }
     }
 
@@ -10872,6 +10942,10 @@ public actor WebRTCPeer {
         highestReceivedControlRequestID = request.id
         receivedControlRequests[request.id] = request
         receivedControlRequestOrder.append(request.id)
+        if request.command == .showScreen
+            || request.command == .hideScreen {
+            latestReceivedScreenVisibilityRequestID = request.id
+        }
         if isCoveredSuspensionHide {
             screenMediaSuspensionHideRequestID = request.id
         }
@@ -13011,6 +13085,12 @@ public actor WebRTCPeer {
             encoding.bitratePriority = screenVideoBitratePriority
             encoding.networkPriority = .low
         }
+        // Screen text must remain readable when native WebRTC performs its own CPU or
+        // bandwidth adaptation. Product-owned scaleResolutionDownBy remains the explicit
+        // spatial escape hatch after independently confirmed congestion.
+        parameters.degradationPreference = NSNumber(
+            value: screenVideoDegradationPreferenceRawValue
+        )
         sender.parameters = parameters
         guard sender.parameters.encodings.count
                 == parameters.encodings.count,
@@ -13020,9 +13100,11 @@ public actor WebRTCPeer {
                           - screenVideoBitratePriority
                   ) <= 0.000_001
                       && $0.networkPriority == .low
-              }) else {
+              }),
+              sender.parameters.degradationPreference?.intValue
+                == screenVideoDegradationPreferenceRawValue else {
             throw WebRTCTransportError.nativeFailure(
-                "WebRTC rejected the screen-video allocator priority."
+                "WebRTC rejected the screen-video allocator or maintain-resolution policy."
             )
         }
     }

@@ -109,6 +109,32 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
         XCTAssertTrue(sawIntermediate)
         XCTAssertEqual(fixture.policy.currentTier, .full)
         XCTAssertEqual(fixture.policy.currentRecommendation.maximumFramesPerSecond, 60)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                      "Full tier is not permission to forget Show-bound pixel protection")
+
+        for time in stride(from: 4_500, through: 6_500, by: 500) {
+            _ = fixture.sample(at: time, bandwidth: 100_000)
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1,
+                           "A later sender-censored estimate must remain temporal-first")
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 7_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
     }
 
     func testQualifiedModerateBandwidthDoesNotFreezeMotionAtColdStartFPS() {
@@ -145,44 +171,31 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
         }
     }
 
-    func testQualifiedSpatialFPSRetainsOnMissingBWEAndRetiresOnConfirmedPressure() {
-        for usesQueuePressure in [false, true] {
-            var fixture = SpatialFixture()
-            var plateauTime = 0
-            for time in stride(from: 0, through: 10_000, by: 500) {
-                _ = fixture.sample(at: time, bandwidth: 9_000_000)
-                plateauTime = time
-                if fixture.policy.currentTier == .high,
-                   fixture.policy.applicationLimitedProbeOriginTier == nil {
-                    break
-                }
+    func testQualifiedSpatialFPSRetainsOnMissingOrRawLowBWE() {
+        var fixture = SpatialFixture()
+        var plateauTime = 0
+        for time in stride(from: 0, through: 10_000, by: 500) {
+            _ = fixture.sample(at: time, bandwidth: 9_000_000)
+            plateauTime = time
+            if fixture.policy.currentTier == .high,
+               fixture.policy.applicationLimitedProbeOriginTier == nil {
+                break
             }
-            let qualified = fixture.policy.currentRecommendation
-            XCTAssertEqual(qualified.tier, .high)
-            XCTAssertEqual(qualified.maximumFramesPerSecond, 28)
-            XCTAssertEqual(qualified.scaleResolutionDownBy, 1)
-
-            _ = fixture.sample(at: plateauTime + 500, bandwidth: nil)
-            XCTAssertEqual(fixture.policy.currentRecommendation, qualified,
-                           "Missing BWE must neither invent more FPS nor blur qualified pixels")
-            XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
-
-            if usesQueuePressure {
-                _ = fixture.sample(at: plateauTime + 1_000,
-                                   bandwidth: 9_000_000, queueDelay: 0.250)
-            } else {
-                _ = fixture.sample(at: plateauTime + 1_000, bandwidth: 100_000)
-                _ = fixture.sample(at: plateauTime + 1_500, bandwidth: 100_000)
-            }
-
-            XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
-            XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
-            XCTAssertEqual(
-                fixture.policy.currentRecommendation,
-                fixture.policy.recommendation(for: fixture.policy.currentTier),
-                "Confirmed pressure must restore the ordinary tier geometry and FPS"
-            )
         }
+        let qualified = fixture.policy.currentRecommendation
+        XCTAssertEqual(qualified.tier, .high)
+        XCTAssertEqual(qualified.maximumFramesPerSecond, 28)
+        XCTAssertEqual(qualified.scaleResolutionDownBy, 1)
+
+        _ = fixture.sample(at: plateauTime + 500, bandwidth: nil)
+        XCTAssertEqual(fixture.policy.currentRecommendation, qualified,
+                       "Missing BWE must neither invent more FPS nor blur qualified pixels")
+        _ = fixture.sample(at: plateauTime + 1_000, bandwidth: 100_000)
+        _ = fixture.sample(at: plateauTime + 1_500, bandwidth: 100_000)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                      "Raw sender-censored BWE is not spatial pressure")
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
     }
 
     func testQualifiedSpatialFPSRespectsTheConfiguredSourceFrameRate() {
@@ -297,9 +310,13 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
             XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier, "variant \(variant)")
             XCTAssertLessThan(fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps,
                               ceiling, "Only a wholly absent selected-pair slice may hold the existing cap")
-            if variant < 2 {
+            if variant == 1 {
                 XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved,
-                              "Missing RTT cannot hide present route/BWE negatives")
+                              "Missing RTT cannot hide a present route replacement")
+            } else if variant == 0 {
+                XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                              "Fast BWE may terminate the probe, but cannot blur startup pixels")
+                XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
             }
         }
     }
@@ -440,10 +457,14 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
                 observedAt: fixture.origin.advanced(by: .milliseconds(900)))
             XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier,
                          "variant \(variant) must terminate the bounded bridge")
-            if variant < 3 {
+            if variant == 0 || variant == 2 {
                 XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved,
                               "variant \(variant) is affirmative terminal evidence")
                 XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+            } else {
+                XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                              "variant \(variant) may terminate a probe but lacks spatial authority")
+                XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
             }
         }
     }
@@ -537,13 +558,1005 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
         XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
     }
 
-    func testConfirmedBandwidthCollapseRetiresFullPixelsOnFirstShow() {
+    func testRawLowBandwidthMayReduceTemporalTierButKeepsFullPixels() {
         var fixture = SpatialFixture()
         _ = fixture.sample(at: 0, bandwidth: 100_000)
         _ = fixture.sample(at: 500, bandwidth: 100_000)
         XCTAssertEqual(fixture.policy.currentTier, .audioPriority)
-        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 12)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
         XCTAssertEqual(fixture.policy.currentRecommendation.maximumFramesPerSecond, 1)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+    }
+
+    func testBelowReserveProbeWitnessIsScopedToItsExactShow() throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000)
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertTrue(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness
+        )
+
+        fixture.policy.endFloorRecoveryVisibility()
+
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation,
+                      "Peer-wide suspension evidence may remain latched")
+        XCTAssertFalse(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness,
+            "Spatial authority must not cross a Hide/new-Show boundary"
+        )
+    }
+
+    func testBelowReserveProbeWitnessIsInvalidatedByMaterialRecovery() throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000)
+        XCTAssertTrue(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness
+        )
+
+        _ = fixture.sample(
+            at: 2_000, bandwidth: 250_000,
+            selectedPairBytesSent: 10_000)
+        XCTAssertFalse(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness,
+            "Atomic pair recovery must invalidate authority without video stats"
+        )
+
+        var videoBytes: UInt64 = 5_625
+        var pairBytes: UInt64 = 10_000
+        for index in 0..<5 {
+            if index > 0 {
+                videoBytes += 14_063
+                pairBytes += 14_063
+            }
+            _ = fixture.sample(
+                at: 2_500 + index * 500,
+                bandwidth: 250_000,
+                videoBytesSent: videoBytes,
+                videoFramesEncoded: UInt64(index + 2),
+                videoTargetBitrateBps: 250_000,
+                selectedPairBytesSent: pairBytes)
+        }
+
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness
+        )
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testBelowReserveFailureWithoutAtomicPairOnlyLatchesPeerWideAndCannotAuthorizePixels()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000,
+            selectedPairBytesSent: 0)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+
+        _ = fixture.sample(
+            at: 1_500,
+            bandwidth: 100_000,
+            omitRTTEvidence: true,
+            includeSelectedPairOutbound: false
+        )
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness,
+            "top-level BWE without an atomic same-pair tuple cannot mint spatial authority"
+        )
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                selectedPairBytesSent: UInt64(index) * 5_625
+            )
+        }
+
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testBelowReserveFailureWithMismatchedTopLevelAndAtomicBWECannotMintWitness()
+        throws {
+        var fixture = SpatialFixture()
+        let pairA = String(repeating: "a", count: 64)
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000,
+            startupPairFingerprint: pairA,
+            selectedPairBytesSent: 0,
+            selectedPairBandwidthBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+
+        _ = fixture.sample(
+            at: 1_500,
+            bandwidth: 100_000,
+            videoBytesSent: 5_625,
+            videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            startupPairFingerprint: pairA,
+            selectedPairBytesSent: 5_625,
+            selectedPairBandwidthBps: 300_000)
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness,
+            "a different atomic BWE cannot authenticate a top-level collapse"
+        )
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 5_625 + UInt64(index) * 5_625,
+                videoFramesEncoded: 1 + UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: nil,
+                startupPairFingerprint: pairA,
+                selectedPairBytesSent: 5_625 + UInt64(index) * 5_625,
+                selectedPairBandwidthBps: 100_000)
+        }
+
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testExactShowAtomicFailedProbeWitnessCanCorroborateNonQLRSaturatedDemand()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            selectedPairBytesSent: 5_625)
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 5_625 + UInt64(index) * 5_625,
+                videoFramesEncoded: 1 + UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: nil,
+                selectedPairBytesSent: 5_625 + UInt64(index) * 5_625)
+        }
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testAcceptedOriginRestoreKeepsFreshFailedProbeWitnessForNonQLRDemand()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        let previouslyCommitted = fixture.policy
+
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            selectedPairBytesSent: 5_625)
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+        fixture.policy.resetForAcceptedSenderConfigurationEpoch(
+            previouslyCommitted: previouslyCommitted
+        )
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 0)
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 5_625 + UInt64(index) * 5_625,
+                videoFramesEncoded: 1 + UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: nil,
+                selectedPairBytesSent: 5_625 + UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testCorrectiveNativeReconciliationRevokesWitnessMintedByUnknownConfiguration()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+
+        // The native cache is unknown. The service fences pre-write counters before reducing
+        // this report, but the report may still observe a failed probe under unknown limits.
+        fixture.policy = WorldwideScreenNativeApplicationCache
+            .policyForSenderConfigurationReconciliation(fixture.policy)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            selectedPairBytesSent: 5_625)
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+
+        // Corrective accepted apply cannot preserve that fresh-but-unqualified witness.
+        fixture.policy.resetForSenderConfigurationEpoch()
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 5_625 + UInt64(index) * 5_625,
+                videoFramesEncoded: 1 + UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: nil,
+                selectedPairBytesSent: 5_625 + UInt64(index) * 5_625)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testAcceptedUnrelatedSenderChangeRevokesCarriedFailedProbeWitness()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            selectedPairBytesSent: 5_625)
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+        let previouslyCommitted = fixture.policy
+
+        fixture.policy.resetForAcceptedSenderConfigurationEpoch(
+            previouslyCommitted: previouslyCommitted
+        )
+
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+    }
+
+    func testFramebufferRebuildRevokesExactProbeWitnessButPreservesPeerWideLatch()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000,
+            selectedPairBytesSent: 0)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            selectedPairBytesSent: 5_625)
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+
+        fixture.policy.resetForCaptureGeometryEpoch()
+
+        XCTAssertTrue(
+            fixture.policy.belowReserveProbeDisprovedSenderLimitation,
+            "peer-wide suspension evidence remains fail-closed across a source rebuild"
+        )
+        XCTAssertFalse(
+            fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness,
+            "the preceding geometry's failed probe cannot authorize replacement pixels"
+        )
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 5_625 + UInt64(index) * 5_625,
+                videoFramesEncoded: 1 + UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: nil,
+                selectedPairBytesSent: 5_625 + UInt64(index) * 5_625)
+        }
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testSustainedDemandProofRetiresFullPixelsOnlyOnFourthFreshReport() {
+        var fixture = SpatialFixture()
+        let target = 100_000.0
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        _ = fixture.sample(
+            at: 1_000, bandwidth: 100_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: target,
+            videoQualityLimitationReason: .bandwidth)
+
+        let reports: [(time: Int, bytes: UInt64, frames: UInt64)] = [
+            (1_500, 5_625, 1),
+            (2_000, 11_250, 2),
+            (2_500, 16_875, 3),
+            (3_000, 22_500, 4),
+        ]
+        for (index, report) in reports.enumerated() {
+            _ = fixture.sample(
+                at: report.time, bandwidth: 100_000,
+                videoBytesSent: report.bytes,
+                videoFramesEncoded: report.frames,
+                videoTargetBitrateBps: target,
+                videoQualityLimitationReason: .bandwidth)
+            if index < reports.count - 1 {
+                XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                              "Demand proof must remain bounded to four fresh reports")
+                XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+            }
+        }
+
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testBandwidthDemandProofRejectsUnexercisedTargetsAndBrokenCounters() {
+        let cases: [(
+            bandwidth: Double,
+            target: Double,
+            videoBytes: [UInt64],
+            pairBytes: [UInt64],
+            frames: [UInt64],
+            independentPressure: Bool
+        )] = [
+            // Pair load saturates BWE, but video stayed below 80% of its stated target.
+            (100_000, 100_000, [0, 2_000, 4_000, 6_000, 8_000],
+             [0, 5_625, 11_250, 16_875, 22_500], [0, 1, 2, 3, 4], true),
+            // Pair/video bytes saturate every rate gate without encoded-frame progress.
+            (100_000, 100_000, [0, 5_625, 11_250, 16_875, 22_500],
+             [0, 5_625, 11_250, 16_875, 22_500], [0, 0, 0, 0, 0], true),
+            // A regressing cumulative video counter invalidates the in-flight window.
+            (100_000, 100_000, [10_000, 15_625, 21_250, 12_000, 17_625],
+             [50_000, 55_625, 61_250, 66_875, 72_500], [0, 1, 2, 3, 4], true),
+            // Near-saturated allocator targets do not prove an independently limited path.
+            (110_000, 100_000, [0, 5_625, 11_250, 16_875, 22_500],
+             [0, 5_625, 11_250, 16_875, 22_500], [0, 1, 2, 3, 4], false),
+        ]
+        let times = [1_000, 1_500, 2_000, 2_500, 3_000]
+
+        for (caseIndex, evidence) in cases.enumerated() {
+            var fixture = SpatialFixture()
+            _ = fixture.sample(at: 0, bandwidth: evidence.bandwidth)
+            _ = fixture.sample(at: 500, bandwidth: evidence.bandwidth)
+            for sampleIndex in times.indices {
+                _ = fixture.sample(
+                    at: times[sampleIndex], bandwidth: evidence.bandwidth,
+                    videoBytesSent: evidence.videoBytes[sampleIndex],
+                    videoFramesEncoded: evidence.frames[sampleIndex],
+                    videoTargetBitrateBps: evidence.target,
+                    videoQualityLimitationReason:
+                        evidence.independentPressure ? .bandwidth : nil,
+                    selectedPairBytesSent: evidence.pairBytes[sampleIndex])
+            }
+            XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                          "invalid demand case \(caseIndex) must retain full pixels")
+            XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+        }
+    }
+
+    func testAggregateAudioTargetAloneCannotProvePathLimitation() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 120_000)
+        _ = fixture.sample(at: 500, bandwidth: 120_000)
+        let times = [1_000, 1_500, 2_000, 2_500, 3_000]
+        for index in times.indices {
+            _ = fixture.sample(
+                at: times[index], bandwidth: 120_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 90_000,
+                audioTargetBitrateBps: 30_000,
+                selectedPairBytesSent: UInt64(index) * 6_750)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testInvalidAudioTargetsAreDiagnosticsOnlyAndCannotVetoQLRProof() {
+        let invalidAudioTargets: [(name: String, value: Double?)] = [
+            ("missing-after-malformed-native-value", nil),
+            ("negative", -1),
+            ("positive-infinity", .infinity),
+            ("negative-infinity", -.infinity),
+            ("not-a-number", .nan),
+        ]
+
+        for invalidAudioTarget in invalidAudioTargets {
+            var fixture = SpatialFixture()
+            _ = fixture.sample(at: 0, bandwidth: 120_000)
+            _ = fixture.sample(at: 500, bandwidth: 120_000)
+            for index in 0..<5 {
+                _ = fixture.sample(
+                    at: 1_000 + index * 500,
+                    bandwidth: 120_000,
+                    videoBytesSent: UInt64(index) * 5_625,
+                    videoFramesEncoded: UInt64(index),
+                    videoTargetBitrateBps: 90_000,
+                    audioTargetBitrateBps: invalidAudioTarget.value,
+                    videoQualityLimitationReason: .bandwidth,
+                    selectedPairBytesSent: UInt64(index) * 6_750)
+            }
+
+            XCTAssertTrue(
+                fixture.policy.startupSpatialModeIsDisproved,
+                "\(invalidAudioTarget.name) audio target must not veto valid video/path proof"
+            )
+            XCTAssertEqual(
+                fixture.policy.startupSpatialModeDisproofCause,
+                .demandProvenBandwidth
+            )
+            XCTAssertGreaterThan(
+                fixture.policy.currentRecommendation.scaleResolutionDownBy,
+                1
+            )
+        }
+    }
+
+    func testSustainedNativeBandwidthLimitationCanCorroborateOfferedLoad() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 120_000)
+        _ = fixture.sample(at: 500, bandwidth: 120_000)
+        let times = [1_000, 1_500, 2_000, 2_500, 3_000]
+        for index in times.indices {
+            _ = fixture.sample(
+                at: times[index], bandwidth: 120_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 90_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 6_750)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthLimitedIntervalCount, 4)
+    }
+
+    func testInterruptedNativeBandwidthLimitationCannotProvePathPressure() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 120_000)
+        _ = fixture.sample(at: 500, bandwidth: 120_000)
+        let reasons: [WebRTCVideoQualityLimitationReason?] = [
+            .bandwidth, .bandwidth, nil, .bandwidth, .bandwidth,
+        ]
+        for index in reasons.indices {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 120_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 90_000,
+                videoQualityLimitationReason: reasons[index],
+                selectedPairBytesSent: UInt64(index) * 6_750)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testSelectedPairDemandProofRejectsMissingAndRegressingEvidence() {
+        enum Mutation: Equatable {
+            case missing
+            case regressing
+        }
+        for mutation in [Mutation.missing, .regressing] {
+            var fixture = SpatialFixture()
+            _ = fixture.sample(at: 0, bandwidth: 100_000)
+            _ = fixture.sample(at: 500, bandwidth: 100_000)
+            for index in 0..<5 {
+                let mutate = index == 3
+                _ = fixture.sample(
+                    at: 1_000 + index * 500,
+                    bandwidth: 100_000,
+                    videoBytesSent: UInt64(index) * 5_625,
+                    videoFramesEncoded: UInt64(index),
+                    videoTargetBitrateBps: 100_000,
+                    videoQualityLimitationReason: .bandwidth,
+                    selectedPairBytesSent: mutate && mutation == .regressing
+                        ? 1 : UInt64(index) * 5_625,
+                    includeSelectedPairOutbound: !(mutate && mutation == .missing))
+            }
+            XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                          "\(mutation) pair evidence must fail closed")
+            XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+        }
+    }
+
+    func testSelectedPairDeltaCannotTrailPrimaryVideoDelta() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: 100_000 + UInt64(index) * 5_313)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testRisingStartupBandwidthRampNeverBlurs() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        let ramp = [200_000.0, 260_000, 330_000, 420_000, 550_000]
+        var cumulativeBytes: UInt64 = 0
+        for (index, bandwidth) in ramp.enumerated() {
+            if index > 0 {
+                cumulativeBytes += UInt64(
+                    (bandwidth * 0.90 * 0.5 / 8).rounded()
+                )
+            }
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: bandwidth,
+                videoBytesSent: cumulativeBytes,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: bandwidth,
+                videoQualityLimitationReason: .bandwidth)
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1,
+                           "Rising startup BWE at sample \(index) must stay temporal-first")
+            XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        }
+    }
+
+    func testUShapedStartupBandwidthRecoveryRestartsDemandProof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        let reports: [(Int, Double, UInt64)] = [
+            (1_000, 300_000, 0),
+            (1_500, 100_000, 5_625),
+            (2_000, 100_000, 11_250),
+            (2_500, 200_000, 22_500),
+            (3_000, 250_000, 36_563),
+        ]
+        for (index, report) in reports.enumerated() {
+            _ = fixture.sample(
+                at: report.0, bandwidth: report.1,
+                videoBytesSent: report.2,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: report.1,
+                videoQualityLimitationReason: .bandwidth)
+            XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+            XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+        }
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+    }
+
+    func testTwoKeyFrameOnlyBurstsAndStaticPlateausCannotProveDemand() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        let reports: [(time: Int, bytes: UInt64, frames: UInt64, keyFrames: UInt64)] = [
+            (1_000, 0, 0, 0),
+            (1_500, 11_250, 1, 1),
+            (2_000, 11_250, 1, 1),
+            (2_500, 22_500, 2, 2),
+            (3_000, 22_500, 2, 2),
+        ]
+        var maximumDemandIntervals = 0
+        for report in reports {
+            _ = fixture.sample(
+                at: report.time, bandwidth: 100_000,
+                videoBytesSent: report.bytes,
+                videoFramesEncoded: report.frames,
+                videoKeyFramesEncoded: report.keyFrames,
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth)
+            maximumDemandIntervals = max(
+                maximumDemandIntervals,
+                fixture.policy.startupSpatialBandwidthDemandIntervalCount
+            )
+        }
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(maximumDemandIntervals, 0)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthDemandIntervalCount, 0)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testKeyFrameCounterAvailabilityChangeCannotReuseEarlierBursts() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        let reports: [(Int, UInt64, UInt64, Bool)] = [
+            (1_000, 0, 0, true),
+            (1_500, 7_500, 1, true),
+            (2_000, 15_000, 2, true),
+            (2_500, 22_500, 3, false),
+            (3_000, 30_000, 4, false),
+        ]
+        for report in reports {
+            _ = fixture.sample(
+                at: report.0, bandwidth: 100_000,
+                videoBytesSent: report.1,
+                videoFramesEncoded: report.2,
+                videoKeyFramesEncoded: report.2,
+                includeKeyFrameCounter: report.3,
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testMissingOptionalKeyFrameCounterStillAllowsCompleteDemandProof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for (index, time) in [1_000, 1_500, 2_000, 2_500, 3_000].enumerated() {
+            _ = fixture.sample(
+                at: time, bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                includeKeyFrameCounter: false,
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth)
+        }
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testRecommendationTransitionReportCannotSeedDemandProof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 100_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth)
+        _ = fixture.sample(
+            at: 500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 0)
+
+        let reports: [(time: Int, bytes: UInt64, frames: UInt64)] = [
+            (1_000, 11_250, 2),
+            (1_500, 16_875, 3),
+            (2_000, 22_500, 4),
+            (2_500, 28_125, 5),
+            (3_000, 33_750, 6),
+        ]
+        for (index, report) in reports.enumerated() {
+            _ = fixture.sample(
+                at: report.time, bandwidth: 100_000,
+                videoBytesSent: report.bytes,
+                videoFramesEncoded: report.frames,
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth)
+            if index < reports.count - 1 {
+                XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+            }
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+    }
+
+    func testFramebufferRebuildCannotCombinePartialDemandAcrossGeometry() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<3 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 2)
+
+        // The service invokes this epoch fence before stopping the old framebuffer source.
+        // RTP counters may stay monotonic across the rebuild, but their earlier deltas cannot
+        // contribute to the new geometry's proof.
+        fixture.policy.resetForCaptureGeometryEpoch()
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 0)
+
+        _ = fixture.sample(
+            at: 2_500,
+            bandwidth: 100_000,
+            videoBytesSent: 16_875,
+            videoFramesEncoded: 3,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 16_875)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 0)
+
+        for interval in 1...3 {
+            _ = fixture.sample(
+                at: 2_500 + interval * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 16_875 + UInt64(interval) * 5_625,
+                videoFramesEncoded: 3 + UInt64(interval),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: 16_875 + UInt64(interval) * 5_625)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+
+        _ = fixture.sample(
+            at: 4_500,
+            bandwidth: 100_000,
+            videoBytesSent: 39_375,
+            videoFramesEncoded: 7,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 39_375)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+    }
+
+    func testFramebufferRebuildRearmsDemandProvenPixelsAndRequiresFreshProof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+
+        fixture.policy.resetForCaptureGeometryEpoch()
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertNil(fixture.policy.startupSpatialModeDisproofCause)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 0)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+
+        _ = fixture.sample(
+            at: 3_500,
+            bandwidth: 100_000,
+            videoBytesSent: 28_125,
+            videoFramesEncoded: 5,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 28_125)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialBandwidthProofSampleCount,
+            0,
+            "the first report for the replacement geometry only seeds its proof"
+        )
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testMutableDiagnosticCauseCannotVetoDemandGeometryRearm() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       .demandProvenBandwidth)
+
+        // The display diagnostic can change independently of the terminal Show-scoped
+        // authority. Geometry rearm must use the latter, even for a carried legacy state.
+        fixture.policy.overrideLastDowngradeCauseForTesting(.bandwidthOnly)
+        XCTAssertEqual(fixture.policy.lastDowngradeCause, .bandwidthOnly)
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       .demandProvenBandwidth)
+
+        fixture.policy.resetForCaptureGeometryEpoch()
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testFastProbeBandwidthCollapseDoesNotBlockDemandGeometryRearm() throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       .demandProvenBandwidth)
+
+        var probeTime = 3_500
+        for time in stride(from: 3_500, through: 10_000, by: 500) {
+            _ = fixture.sample(at: time, bandwidth: 900_000)
+            probeTime = time
+            if fixture.policy.applicationLimitedProbeOriginTier != nil { break }
+        }
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        let raisedCap = fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps
+        _ = fixture.fastSample(at: probeTime + 200, bandwidth: 10_000)
+        XCTAssertNil(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertLessThan(fixture.policy.currentRecommendation.maximumTotalRTPBitrateBps,
+                          raisedCap)
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       .demandProvenBandwidth)
+
+        fixture.policy.resetForCaptureGeometryEpoch()
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testFastImmediateQueueAfterDemandDisproofSurvivesGeometryRebuild() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       .demandProvenBandwidth)
+
+        var probeTime = 3_500
+        for time in stride(from: 3_500, through: 10_000, by: 500) {
+            _ = fixture.sample(at: time, bandwidth: 900_000)
+            probeTime = time
+            if fixture.policy.applicationLimitedProbeOriginTier != nil { break }
+        }
+        XCTAssertNotNil(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.fastSample(at: probeTime + 200,
+                               bandwidth: 900_000,
+                               queueDelay: 0.250)
+        XCTAssertEqual(fixture.policy.startupSpatialModeDisproofCause,
+                       .confirmedQueuePressure)
+
+        fixture.policy.resetForCaptureGeometryEpoch()
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+    }
+
+    func testFramebufferRebuildCannotEraseHardPressureAfterDemandDisproof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+
+        fixture.policy.invalidateSelectedRoute()
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .selectedRouteReplacement
+        )
+        XCTAssertEqual(fixture.policy.lastDowngradeCause, .selectedRouteReplacement)
+
+        fixture.policy.resetForCaptureGeometryEpoch()
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
     }
 
     func testFreshInflatedRTTRetiresFullPixels() {
@@ -562,6 +1575,79 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
         XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
     }
 
+    func testSelectedPairFingerprintReplacementRetiresFullPixelsWhenRouteMetadataMatches() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0,
+            route: .direct,
+            pairFingerprint: String(repeating: "a", count: 64))
+        _ = fixture.sample(
+            at: 500,
+            route: .direct,
+            pairFingerprint: String(repeating: "b", count: 64))
+
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .selectedRouteReplacement
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testAtomicSelectedPairReplacementRetiresPixelsWithoutRTTEvidence() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 100_000,
+            omitRTTEvidence: true,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            startupPairFingerprint: String(repeating: "a", count: 64))
+        let changed = fixture.sample(
+            at: 500, bandwidth: 100_000,
+            omitRTTEvidence: true,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            startupPairFingerprint: String(repeating: "b", count: 64))
+
+        XCTAssertNotNil(changed)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .selectedRouteReplacement
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testImmediateQueuePressureAtProbeDeadlineStillRetiresFullPixels() throws {
+        var fixture = SpatialFixture()
+        for time in [0, 500, 1_000] {
+            _ = fixture.sample(at: time)
+        }
+        let deadline = try XCTUnwrap(
+            fixture.policy.applicationLimitedProbeDeadline
+        )
+
+        let changed = fixture.fastSample(
+            at: 4_000,
+            bandwidth: 900_000,
+            queueDelay: 0.250,
+            observedAt: deadline
+        )
+
+        XCTAssertNotNil(changed)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialModeDisproofCause,
+            .confirmedQueuePressure
+        )
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
     func testHideAndNewPeerCannotRetainSpatialStartupOwnership() {
         var fixture = SpatialFixture()
         fixture.policy.endFloorRecoveryVisibility()
@@ -573,6 +1659,21 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
         XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 4)
         fixture.policy.beginFloorRecoveryVisibility(peerGeneration: 2, showEpoch: 1)
         XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testSuccessorShowRearmsFullPixelsAfterPriorSpatialDisproof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0)
+        fixture.policy.invalidateSelectedRoute()
+        let previouslyApplied = fixture.policy.currentRecommendation
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertGreaterThan(previouslyApplied.scaleResolutionDownBy, 1)
+
+        fixture.policy.beginFloorRecoveryVisibility(peerGeneration: 1, showEpoch: 2)
+
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+        XCTAssertNotEqual(previouslyApplied, fixture.policy.currentRecommendation)
     }
 
     func testDuplicateNativeReportCannotPromoteStartupFPS() {
@@ -674,20 +1775,229 @@ final class WorldwideScreenStartupSpatialPolicyTests: XCTestCase {
         XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
     }
 
-    func testFastLaneCollapseOrImmediateQueueRetiresSpatialMode() throws {
-        for isQueue in [false, true] {
-            var fixture = SpatialFixture()
-            for time in [0, 500, 1_000] { _ = fixture.sample(at: time) }
-            _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
-            XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
-            let changed = fixture.fastSample(at: 1_200,
-                bandwidth: isQueue ? 900_000 : 100_000,
-                queueDelay: isQueue ? 0.250 : 0.001)
-            XCTAssertNotNil(changed)
-            XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
-            XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
-            XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    func testFailedNativeApplyAfterFullProposalCommitRestartsPartialDemandProof() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<3 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
         }
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 2)
+
+        var proposal = fixture
+        _ = proposal.sample(
+            at: 2_500,
+            bandwidth: 100_000,
+            videoBytesSent: 16_875,
+            videoFramesEncoded: 3,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 16_875)
+        XCTAssertEqual(proposal.policy.startupSpatialBandwidthProofSampleCount, 3)
+
+        // Exercise the service's full-proposal selection and post-selection reconciliation.
+        let committed = WorldwideScreenNativeApplicationCache
+            .reconciledPolicyAfterCurrentOwnerFailure(
+                current: fixture.policy,
+                proposed: proposal.policy,
+                commitEntireProposal: true,
+                capacityProbeOnly: false
+            )
+        XCTAssertEqual(committed.startupSpatialBandwidthProofSampleCount, 0)
+        XCTAssertEqual(committed.startupSpatialBandwidthDemandIntervalCount, 0)
+        XCTAssertEqual(committed.startupSpatialBandwidthDisposition, .awaitingEvidence)
+        proposal.policy = committed
+
+        // The next report is only a fresh seed; it cannot reuse the rejected proposal's count.
+        _ = proposal.sample(
+            at: 3_000,
+            bandwidth: 100_000,
+            videoBytesSent: 22_500,
+            videoFramesEncoded: 4,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 22_500)
+        XCTAssertEqual(proposal.policy.startupSpatialBandwidthProofSampleCount, 0)
+        XCTAssertTrue(proposal.policy.startupSpatialModeIsActive)
+
+        for interval in 1...4 {
+            _ = proposal.sample(
+                at: 3_000 + interval * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 22_500 + UInt64(interval) * 5_625,
+                videoFramesEncoded: 4 + UInt64(interval),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: 22_500 + UInt64(interval) * 5_625)
+            if interval < 4 {
+                XCTAssertTrue(
+                    proposal.policy.startupSpatialModeIsActive,
+                    "a rejected partial window cannot shorten the fresh four-interval proof"
+                )
+            }
+        }
+        XCTAssertTrue(proposal.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(
+            proposal.policy.startupSpatialModeDisproofCause,
+            .demandProvenBandwidth
+        )
+    }
+
+    func testSuccessfulCacheMismatchReconciliationRejectsThePreWriteDemandReport() {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(at: 0, bandwidth: 100_000)
+        _ = fixture.sample(at: 500, bandwidth: 100_000)
+        for index in 0..<4 {
+            _ = fixture.sample(
+                at: 1_000 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: UInt64(index) * 5_625,
+                videoFramesEncoded: UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: .bandwidth,
+                selectedPairBytesSent: UInt64(index) * 5_625)
+        }
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 3)
+
+        // The cache mismatch is known before reducing the report. Fence once so the report
+        // cannot finish the old window, then fence again after reduction so counters collected
+        // before the corrective native write cannot seed the newly applied sender epoch.
+        fixture.policy = WorldwideScreenNativeApplicationCache
+            .policyForSenderConfigurationReconciliation(fixture.policy)
+        _ = fixture.sample(
+            at: 3_000,
+            bandwidth: 100_000,
+            videoBytesSent: 22_500,
+            videoFramesEncoded: 4,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 22_500)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        fixture.policy = WorldwideScreenNativeApplicationCache
+            .policyForSenderConfigurationReconciliation(fixture.policy)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthProofSampleCount, 0)
+        XCTAssertEqual(fixture.policy.startupSpatialBandwidthDemandIntervalCount, 0)
+
+        _ = fixture.sample(
+            at: 3_500,
+            bandwidth: 100_000,
+            videoBytesSent: 28_125,
+            videoFramesEncoded: 5,
+            videoTargetBitrateBps: 100_000,
+            videoQualityLimitationReason: .bandwidth,
+            selectedPairBytesSent: 28_125)
+        XCTAssertEqual(
+            fixture.policy.startupSpatialBandwidthProofSampleCount,
+            0,
+            "the first post-apply report is only the fresh proof seed"
+        )
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testFailedNativeRecoveryProposalKeepsExactWitnessRevokedButPeerLatchConservative()
+        throws {
+        var fixture = SpatialFixture()
+        _ = fixture.sample(
+            at: 0, bandwidth: 900_000,
+            videoBytesSent: 0, videoFramesEncoded: 0,
+            videoTargetBitrateBps: 900_000)
+        _ = fixture.sample(at: 500, bandwidth: 900_000)
+        _ = fixture.sample(at: 1_000, bandwidth: 900_000)
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        _ = fixture.sample(
+            at: 1_500, bandwidth: 100_000,
+            videoBytesSent: 5_625, videoFramesEncoded: 1,
+            videoTargetBitrateBps: 100_000,
+            selectedPairBytesSent: 5_625)
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertTrue(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+
+        var proposal = fixture
+        var capProposal: WorldwideScreenVideoEncodingRecommendation?
+        for index in 0..<8 {
+            let recommendation = proposal.sample(
+                at: 2_000 + index * 500,
+                bandwidth: 500_000,
+                pingCount: UInt64(index + 2),
+                totalRTT: Double(index + 2) * 0.004,
+                selectedPairBytesSent: 28_125 + UInt64(index) * 28_125
+            )
+            if let recommendation,
+               proposal.policy.applicationLimitedProbeOriginTier != nil {
+                capProposal = recommendation
+                break
+            }
+        }
+        XCTAssertNotNil(capProposal)
+        XCTAssertNotNil(proposal.policy.applicationLimitedProbeOriginTier)
+        XCTAssertFalse(proposal.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+
+        let committed = WorldwideScreenNativeApplicationCache
+            .reconciledPolicyAfterCurrentOwnerFailure(
+                current: fixture.policy,
+                proposed: proposal.policy,
+                commitEntireProposal: false,
+                capacityProbeOnly: false
+            )
+        XCTAssertTrue(
+            committed.belowReserveProbeDisprovedSenderLimitation,
+            "a rejected recovery proposal cannot erase peer-wide suspension evidence"
+        )
+        XCTAssertFalse(
+            committed.startupSpatialHasCurrentShowBelowReserveProbeWitness,
+            "affirmative same-pair recovery must keep exact spatial authority revoked"
+        )
+        fixture.policy = committed
+
+        for index in 0..<5 {
+            _ = fixture.sample(
+                at: 3_500 + index * 500,
+                bandwidth: 100_000,
+                videoBytesSent: 5_625 + UInt64(index) * 5_625,
+                videoFramesEncoded: 1 + UInt64(index),
+                videoTargetBitrateBps: 100_000,
+                videoQualityLimitationReason: nil,
+                selectedPairBytesSent: 28_125 + UInt64(index) * 5_625)
+        }
+
+        XCTAssertTrue(fixture.policy.belowReserveProbeDisprovedSenderLimitation)
+        XCTAssertFalse(fixture.policy.startupSpatialHasCurrentShowBelowReserveProbeWitness)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testFastLaneBandwidthCollapseCannotRetireStartupPixels() throws {
+        var fixture = SpatialFixture()
+        for time in [0, 500, 1_000] { _ = fixture.sample(at: time) }
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        _ = fixture.fastSample(at: 1_200, bandwidth: 100_000)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive,
+                      "Fast BWE is a negative probe signal, not ordinary demand proof")
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertEqual(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
+    }
+
+    func testFastLaneImmediateQueuePressureStillRetiresStartupPixels() throws {
+        var fixture = SpatialFixture()
+        for time in [0, 500, 1_000] { _ = fixture.sample(at: time) }
+        _ = try XCTUnwrap(fixture.policy.applicationLimitedProbeOriginTier)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsActive)
+        let changed = fixture.fastSample(
+            at: 1_200, bandwidth: 900_000, queueDelay: 0.250)
+        XCTAssertNotNil(changed)
+        XCTAssertFalse(fixture.policy.startupSpatialModeIsActive)
+        XCTAssertTrue(fixture.policy.startupSpatialModeIsDisproved)
+        XCTAssertGreaterThan(fixture.policy.currentRecommendation.scaleResolutionDownBy, 1)
     }
 
     func testFastMissingBandwidthCannotTurnIntoAConfirmedSpatialFailure() throws {
@@ -730,9 +2040,23 @@ private struct SpatialFixture {
         at milliseconds: Int, bandwidth: Double? = 900_000,
         queueDelay: Double = 0.001, advancesPackets: Bool = true,
         rtt: Double = 0.004, pingCount: UInt64? = nil, totalRTT: Double? = nil,
+        omitRTTEvidence: Bool = false,
         route: WebRTCICERouteKind = .direct,
+        pairFingerprint: String? = nil,
         sequence sequenceOverride: UInt64? = nil, timestamp: Double? = nil,
-        omitTimestamp: Bool = false
+        omitTimestamp: Bool = false,
+        videoBytesSent: UInt64? = nil,
+        videoFramesEncoded: UInt64? = nil,
+        videoKeyFramesEncoded: UInt64? = nil,
+        includeKeyFrameCounter: Bool = true,
+        videoTargetBitrateBps: Double? = nil,
+        audioTargetBitrateBps: Double? = nil,
+        videoQualityLimitationReason:
+            WebRTCVideoQualityLimitationReason? = nil,
+        startupPairFingerprint: String? = nil,
+        selectedPairBytesSent: UInt64? = nil,
+        selectedPairBandwidthBps: Double? = nil,
+        includeSelectedPairOutbound: Bool = true
     ) -> WorldwideScreenVideoEncodingRecommendation? {
         sequence += 1
         if advancesPackets {
@@ -740,26 +2064,54 @@ private struct SpatialFixture {
             totalDelay += queueDelay * 100
         }
         let count = pingCount ?? UInt64(milliseconds / 2_500 + 1)
+        let hasSelectedPairOutbound = includeSelectedPairOutbound
+            && (videoBytesSent != nil || selectedPairBytesSent != nil)
         return policy.update(
             peerGeneration: 1, isCaptureActive: true,
             availableOutgoingBitrateBps: bandwidth,
-            currentRoundTripTimeSeconds: rtt,
-            roundTripTimeObservation: .measurement(.init(
-                selectedCandidatePairFingerprint: String(repeating: route == .direct ? "a" : "b", count: 64),
-                totalRoundTripTimeSeconds: totalRTT ?? Double(count) * rtt,
-                responsesReceived: count)),
+            currentRoundTripTimeSeconds: omitRTTEvidence ? nil : rtt,
+            roundTripTimeObservation: omitRTTEvidence ? .unavailable
+                : .measurement(.init(
+                    selectedCandidatePairFingerprint: pairFingerprint
+                        ?? String(repeating: route == .direct ? "a" : "b", count: 64),
+                    totalRoundTripTimeSeconds: totalRTT ?? Double(count) * rtt,
+                    responsesReceived: count)),
             collectionSequence: sequenceOverride ?? sequence,
             requireRoundTripTimeObservation: true,
             selectedRoute: WebRTCICERouteDiagnostics(kind: route),
             outboundVideoPacketsSent: packets,
             outboundVideoTotalPacketSendDelaySeconds: totalDelay,
+            outboundVideoBytesSent: videoBytesSent,
+            outboundVideoFramesEncoded: videoFramesEncoded,
+            outboundVideoKeyFramesEncoded: includeKeyFrameCounter
+                ? (videoKeyFramesEncoded ?? videoFramesEncoded.map { _ in 0 })
+                : nil,
+            outboundVideoTargetBitrateBps: videoTargetBitrateBps,
+            outboundAudioTargetBitrateBps: audioTargetBitrateBps,
+            outboundVideoQualityLimitationReason:
+                videoQualityLimitationReason,
+            selectedPairFingerprint: hasSelectedPairOutbound
+                ? (startupPairFingerprint ?? pairFingerprint
+                    ?? String(repeating: route == .direct ? "a" : "b", count: 64))
+                : nil,
+            selectedPairBytesSent: hasSelectedPairOutbound
+                ? (selectedPairBytesSent ?? videoBytesSent)
+                : nil,
+            selectedPairAvailableOutgoingBitrateBps:
+                hasSelectedPairOutbound
+                    ? (selectedPairBandwidthBps ?? bandwidth) : nil,
             nativeReportTimestampMicroseconds: omitTimestamp ? nil
                 : timestamp ?? 1_000_000 + Double(milliseconds) * 1_000,
             observedAt: origin.advanced(by: .milliseconds(milliseconds)))
     }
 
-    mutating func fastSample(at milliseconds: Int, bandwidth: Double?,
-                             queueDelay: Double = 0.001) -> WorldwideScreenVideoEncodingRecommendation? {
+    mutating func fastSample(
+        at milliseconds: Int,
+        bandwidth: Double?,
+        queueDelay: Double = 0.001,
+        pairFingerprint: String = String(repeating: "a", count: 64),
+        observedAt: ContinuousClock.Instant? = nil
+    ) -> WorldwideScreenVideoEncodingRecommendation? {
         sequence += 1
         packets += 100
         totalDelay += queueDelay * 100
@@ -769,7 +2121,7 @@ private struct SpatialFixture {
             availableOutgoingBitrateBps: bandwidth,
             currentRoundTripTimeSeconds: 0.004,
             roundTripTimeObservation: .measurement(.init(
-                selectedCandidatePairFingerprint: String(repeating: "a", count: 64),
+                selectedCandidatePairFingerprint: pairFingerprint,
                 totalRoundTripTimeSeconds: Double(count) * 0.004,
                 responsesReceived: count)),
             collectionSequence: sequence,
@@ -777,6 +2129,7 @@ private struct SpatialFixture {
             selectedRoute: WebRTCICERouteDiagnostics(kind: .direct),
             outboundVideoPacketsSent: packets,
             outboundVideoTotalPacketSendDelaySeconds: totalDelay,
-            observedAt: origin.advanced(by: .milliseconds(milliseconds)))
+            observedAt: observedAt
+                ?? origin.advanced(by: .milliseconds(milliseconds)))
     }
 }

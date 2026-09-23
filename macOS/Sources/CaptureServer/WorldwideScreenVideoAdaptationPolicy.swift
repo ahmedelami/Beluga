@@ -80,6 +80,24 @@ enum WorldwideScreenVideoAutomaticSuspensionDecision: Equatable, Sendable {
     case resume
 }
 
+enum WorldwideScreenVideoDowngradeCause: String, Equatable, Sendable {
+    case bandwidthOnly
+    case demandProvenBandwidth
+    case confirmedQueuePressure
+    case freshRoundTripTimeInflation
+    case selectedRouteReplacement
+    case probedCapacityCollapse
+}
+
+enum WorldwideScreenStartupBandwidthDisposition: String, Equatable, Sendable {
+    case inactive
+    case awaitingEvidence
+    case senderCensored
+    case probingDemand
+    case confirmedSufficient
+    case confirmedLimited
+}
+
 /// Converts transport capacity into a stable, single-layer screen-video encoding ceiling.
 struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private enum PacketQueueObservation: Equatable, Sendable {
@@ -107,6 +125,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
 
     private struct RoundTripTimeEvidence {
         let hasFreshPressure: Bool
+        let selectedPairWasReplaced: Bool
         let allowsUpgrade: Bool
         let permitsLegacyMissingValue: Bool
     }
@@ -136,6 +155,35 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private struct FloorRecoveryWitness: Equatable, Sendable {
         let observedAt: ContinuousClock.Instant
         let bandwidthBps: Double
+    }
+
+    private struct StartupSpatialBandwidthProofWindow: Equatable, Sendable {
+        let peerGeneration: UInt64
+        let showEpoch: UInt64
+        let baselineObservedAt: ContinuousClock.Instant
+        let recommendation: WorldwideScreenVideoEncodingRecommendation
+        let baselineAvailableOutgoingBitrateBps: Double
+        let baselineNativeTimestampMicroseconds: Double
+        let selectedPairFingerprint: String
+        let baselineVideoBytesSent: UInt64
+        let baselineSelectedPairBytesSent: UInt64
+        let baselineFramesEncoded: UInt64
+        let keyFrameCounterIsAvailable: Bool
+        var lastObservedAt: ContinuousClock.Instant
+        var lastNativeTimestampMicroseconds: Double
+        var lastVideoBytesSent: UInt64
+        var lastSelectedPairBytesSent: UInt64
+        var lastFramesEncoded: UInt64
+        var lastKeyFramesEncoded: UInt64?
+        var sampleCount: Int
+        var demandProgressIntervalCount: Int
+        var nonKeyFrameDemandIntervalCount: Int
+        var bandwidthLimitedIntervalCount: Int
+        var minimumAvailableOutgoingBitrateBps: Double
+        var bandwidthTimeIntegral: Double
+        var videoTargetBitrateTimeIntegral: Double
+        var aggregateTargetBitrateTimeIntegral: Double
+        var targetObservationSeconds: Double
     }
 
     /// The dedicated video sampler runs independently from the one-second microphone-health
@@ -179,6 +227,11 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     static let requiredMaximumSuspensionResumeProbeSampleCount =
         fallbackSampleCount(for: 64_000)
     static let requiredBandwidthOnlyDowngradeSampleCount = sampleCount(for: 1_000)
+    static let requiredStartupSpatialBandwidthProofSampleCount = sampleCount(for: 2_000)
+    private static let startupSpatialBandwidthProofDuration = Duration.seconds(2)
+    private static let startupSpatialDemandSaturationRatio = 0.80
+    private static let startupSpatialMaterialBandwidthImprovementRatio = 1.10
+    private static let startupSpatialMaterialBandwidthImprovementBps = 32_000.0
     /// Encoder reconfiguration and key-frame bursts can produce one high packet-send-delay delta
     /// even when the path is healthy. Require a second consecutive queue-pressure sample before
     /// treating queue delay as congestion; RTT inflation and bandwidth collapse remain immediate.
@@ -243,6 +296,10 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private(set) var applicationLimitedProbeCooldownSamplesRemaining = 0
     private(set) var applicationLimitedProbeFailureCount = 0
     private(set) var belowReserveProbeDisprovedSenderLimitation = false
+    private var startupSpatialBelowReserveWitnessPeerGeneration: UInt64?
+    private var startupSpatialBelowReserveWitnessShowEpoch: UInt64?
+    private var startupSpatialBelowReserveWitnessPairFingerprint: String?
+    private var startupSpatialBelowReserveWitnessBandwidthBps: Double?
     private var automaticResumeProbeRestoration:
         AutomaticResumeProbeRestoration?
     private(set) var applicationLimitedProbeOriginTier:
@@ -306,6 +363,21 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     private(set) var startupSpatialModePeerGeneration: UInt64?
     private(set) var startupSpatialModeShowEpoch: UInt64?
     private(set) var startupSpatialModeIsDisproved = false
+    private(set) var startupSpatialBandwidthDisposition:
+        WorldwideScreenStartupBandwidthDisposition = .inactive
+    private(set) var startupSpatialBandwidthProofSampleCount = 0
+    private(set) var startupSpatialBandwidthDemandIntervalCount = 0
+    private(set) var startupSpatialBandwidthVideoSendBitrateBps: Double?
+    private(set) var startupSpatialBandwidthPairSendBitrateBps: Double?
+    private(set) var startupSpatialBandwidthAverageAvailableOutgoingBitrateBps: Double?
+    private(set) var startupSpatialBandwidthAverageVideoTargetBitrateBps: Double?
+    private(set) var startupSpatialBandwidthAverageAggregateTargetBitrateBps: Double?
+    private(set) var startupSpatialBandwidthLimitedIntervalCount = 0
+    private(set) var lastDowngradeCause: WorldwideScreenVideoDowngradeCause?
+    private(set) var startupSpatialModeDisproofCause:
+        WorldwideScreenVideoDowngradeCause?
+    private var startupSpatialBandwidthProof: StartupSpatialBandwidthProofWindow?
+    private var startupSpatialSelectedPairFingerprint: String?
     // Proof of a whole selected-pair telemetry gap, scoped to the exact active trial deadline.
     // Unknown RTT from malformed data must never acquire this bounded wait permission.
     // Keep the sequence and mutation oracles in SCREEN_STARTUP_REGRESSION_GUARDRAILS.md.
@@ -535,6 +607,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 || spatialRecovery.isTrialActive || spatialRecovery.isActive else {
             return recommendation
         }
+        let startupFloor = startupSpatialModeIsActive
+            ? self.recommendation(for: .survival)
+            : recommendation
         let ordinaryFPS = recommendation.maximumFramesPerSecond
         let initialFPS = min(WorldwideScreenVideoAdaptationTier.survival.framesPerSecond,
                              ordinaryFPS)
@@ -547,9 +622,15 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         let pixelRateFPS = Int((Double(ordinaryFPS) / (scale * scale)).rounded(.down))
         return WorldwideScreenVideoEncodingRecommendation(
             tier: recommendation.tier,
-            maximumBitrateBps: recommendation.maximumBitrateBps,
+            maximumBitrateBps: max(
+                recommendation.maximumBitrateBps,
+                startupFloor.maximumBitrateBps
+            ),
             maximumTotalRTPBitrateBps:
-                recommendation.maximumTotalRTPBitrateBps,
+                max(
+                    recommendation.maximumTotalRTPBitrateBps,
+                    startupFloor.maximumTotalRTPBitrateBps
+                ),
             maximumFramesPerSecond: min(ordinaryFPS, max(initialFPS, pixelRateFPS)),
             scaleResolutionDownBy: 1
         )
@@ -703,7 +784,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         let replacedSelectedRoute = selectedRoute != nil
         selectedRoute = nil
         if replacedSelectedRoute {
-            _ = disproveStartupSpatialMode()
+            _ = disproveStartupSpatialMode(cause: .selectedRouteReplacement)
         }
         revertApplicationLimitedProbeIfActive()
         resetPathMeasurements()
@@ -725,7 +806,54 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return
         }
         startupSpatialModeIsDisproved = true
+        startupSpatialModeDisproofCause = observed.startupSpatialModeDisproofCause
+        lastDowngradeCause = observed.lastDowngradeCause
+        startupSpatialBandwidthDisposition =
+            observed.startupSpatialBandwidthDisposition
+        startupSpatialBandwidthProofSampleCount =
+            observed.startupSpatialBandwidthProofSampleCount
+        startupSpatialBandwidthDemandIntervalCount =
+            observed.startupSpatialBandwidthDemandIntervalCount
+        startupSpatialBandwidthVideoSendBitrateBps =
+            observed.startupSpatialBandwidthVideoSendBitrateBps
+        startupSpatialBandwidthPairSendBitrateBps =
+            observed.startupSpatialBandwidthPairSendBitrateBps
+        startupSpatialBandwidthAverageAvailableOutgoingBitrateBps =
+            observed.startupSpatialBandwidthAverageAvailableOutgoingBitrateBps
+        startupSpatialBandwidthAverageVideoTargetBitrateBps =
+            observed.startupSpatialBandwidthAverageVideoTargetBitrateBps
+        startupSpatialBandwidthAverageAggregateTargetBitrateBps =
+            observed.startupSpatialBandwidthAverageAggregateTargetBitrateBps
+        startupSpatialBandwidthLimitedIntervalCount =
+            observed.startupSpatialBandwidthLimitedIntervalCount
+        startupSpatialBandwidthProof = nil
         startupSparseProbeDeadline = nil
+    }
+
+    /// A failed or ambiguous native write means the sender may not own the recommendation whose
+    /// counters were being observed. Import no positive authority, but retain two fail-closed
+    /// consequences from the exact same owner: an incomplete proof is invalid, and a fresh
+    /// proposal's material-recovery revocation of an older spatial witness remains revoked.
+    /// The peer-wide suspension latch is intentionally left conservative.
+    mutating func reconcileStartupSpatialStateAfterNativeFailure(from observed: Self) {
+        guard peerGeneration == observed.peerGeneration,
+              startupSpatialModePeerGeneration
+                == observed.startupSpatialModePeerGeneration,
+              startupSpatialModeShowEpoch
+                == observed.startupSpatialModeShowEpoch,
+              floorRecoveryShowEpoch == observed.floorRecoveryShowEpoch else {
+            return
+        }
+        if startupSpatialModeIsActive {
+            resetStartupSpatialBandwidthProof(to: .awaitingEvidence)
+        }
+        if hasCurrentShowBelowReserveProbeWitness,
+           !observed.hasCurrentShowBelowReserveProbeWitness {
+            startupSpatialBelowReserveWitnessPeerGeneration = nil
+            startupSpatialBelowReserveWitnessShowEpoch = nil
+            startupSpatialBelowReserveWitnessPairFingerprint = nil
+            startupSpatialBelowReserveWitnessBandwidthBps = nil
+        }
     }
 
     private mutating func armStartupSpatialModeIfEligible(
@@ -743,13 +871,43 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         startupSpatialModePeerGeneration = generation
         startupSpatialModeShowEpoch = showEpoch
         startupSpatialModeIsDisproved = false
+        startupSpatialModeDisproofCause = nil
+        lastDowngradeCause = nil
+        resetStartupSpatialBandwidthProof(to: .awaitingEvidence)
         startupSparseProbeDeadline = nil
     }
 
     @discardableResult
-    private mutating func disproveStartupSpatialMode() -> Bool {
+    private mutating func disproveStartupSpatialMode(
+        cause: WorldwideScreenVideoDowngradeCause
+    ) -> Bool {
+        if startupSpatialModeIsDisproved,
+           startupSpatialModeDisproofCause == .demandProvenBandwidth,
+           let generation = startupSpatialModePeerGeneration,
+           let showEpoch = startupSpatialModeShowEpoch,
+           peerGeneration == generation,
+           floorRecoveryShowEpoch == showEpoch,
+           floorRecoveryVisibilityIsReserved || floorRecoveryVisibilityIsActive {
+            switch cause {
+            case .confirmedQueuePressure,
+                 .freshRoundTripTimeInflation,
+                 .selectedRouteReplacement:
+                // Preserve the terminal state but upgrade its authority: a later hard path
+                // negative must survive a geometry rebuild that may invalidate only the old
+                // offered-load proof.
+                startupSpatialModeDisproofCause = cause
+                lastDowngradeCause = cause
+            case .bandwidthOnly, .demandProvenBandwidth,
+                 .probedCapacityCollapse:
+                break
+            }
+            return false
+        }
         guard startupSpatialModeIsActive else { return false }
         startupSpatialModeIsDisproved = true
+        startupSpatialModeDisproofCause = cause
+        lastDowngradeCause = cause
+        startupSpatialBandwidthProof = nil
         startupSparseProbeDeadline = nil
         return true
     }
@@ -758,7 +916,109 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         startupSpatialModePeerGeneration = nil
         startupSpatialModeShowEpoch = nil
         startupSpatialModeIsDisproved = false
+        startupSpatialModeDisproofCause = nil
+        lastDowngradeCause = nil
+        resetStartupSpatialBandwidthProof(to: .inactive)
+        startupSpatialSelectedPairFingerprint = nil
+        startupSpatialBelowReserveWitnessPeerGeneration = nil
+        startupSpatialBelowReserveWitnessShowEpoch = nil
+        startupSpatialBelowReserveWitnessPairFingerprint = nil
+        startupSpatialBelowReserveWitnessBandwidthBps = nil
         startupSparseProbeDeadline = nil
+    }
+
+    private var hasCurrentShowBelowReserveProbeWitness: Bool {
+        belowReserveProbeDisprovedSenderLimitation
+            && startupSpatialModeIsActive
+            && startupSpatialBelowReserveWitnessPeerGeneration == peerGeneration
+            && startupSpatialBelowReserveWitnessShowEpoch == floorRecoveryShowEpoch
+            && startupSpatialBelowReserveWitnessPairFingerprint
+                == startupSpatialSelectedPairFingerprint
+    }
+
+    var startupSpatialHasCurrentShowBelowReserveProbeWitness: Bool {
+        hasCurrentShowBelowReserveProbeWitness
+    }
+
+    private mutating func setBelowReserveProbeDisprovedSenderLimitation(
+        _ value: Bool,
+        selectedPairFingerprint: String? = nil,
+        bandwidthBps: Double? = nil
+    ) {
+        belowReserveProbeDisprovedSenderLimitation = value
+        guard value else {
+            startupSpatialBelowReserveWitnessPeerGeneration = nil
+            startupSpatialBelowReserveWitnessShowEpoch = nil
+            startupSpatialBelowReserveWitnessPairFingerprint = nil
+            startupSpatialBelowReserveWitnessBandwidthBps = nil
+            return
+        }
+        guard startupSpatialModeIsActive,
+              let peerGeneration,
+              let floorRecoveryShowEpoch,
+              let selectedPairFingerprint,
+              !selectedPairFingerprint.isEmpty,
+              selectedPairFingerprint
+                == startupSpatialSelectedPairFingerprint,
+              let bandwidthBps,
+              bandwidthBps.isFinite,
+              bandwidthBps > 0,
+              bandwidthBps < requiredOutgoingBitrateBps(
+                for: .audioPriority
+              ) else {
+            return
+        }
+        startupSpatialBelowReserveWitnessPeerGeneration = peerGeneration
+        startupSpatialBelowReserveWitnessShowEpoch = floorRecoveryShowEpoch
+        startupSpatialBelowReserveWitnessPairFingerprint =
+            selectedPairFingerprint
+        startupSpatialBelowReserveWitnessBandwidthBps = bandwidthBps
+    }
+
+    private mutating func invalidateStartupBelowReserveWitnessForRecovery(
+        availableOutgoingBitrateBps: Double,
+        selectedPairFingerprint: String
+    ) {
+        guard hasCurrentShowBelowReserveProbeWitness,
+              startupSpatialBelowReserveWitnessPairFingerprint
+                == selectedPairFingerprint,
+              let witnessBandwidthBps =
+                startupSpatialBelowReserveWitnessBandwidthBps else {
+            return
+        }
+        let improvement = availableOutgoingBitrateBps - witnessBandwidthBps
+        if improvement >= Self.startupSpatialMaterialBandwidthImprovementBps,
+           availableOutgoingBitrateBps
+                >= witnessBandwidthBps
+                    * Self.startupSpatialMaterialBandwidthImprovementRatio {
+            startupSpatialBelowReserveWitnessPeerGeneration = nil
+            startupSpatialBelowReserveWitnessShowEpoch = nil
+            startupSpatialBelowReserveWitnessPairFingerprint = nil
+            startupSpatialBelowReserveWitnessBandwidthBps = nil
+        }
+    }
+
+    private mutating func resetStartupSpatialBandwidthProof(
+        to disposition: WorldwideScreenStartupBandwidthDisposition
+    ) {
+        startupSpatialBandwidthProof = nil
+        startupSpatialBandwidthDisposition = disposition
+        startupSpatialBandwidthProofSampleCount = 0
+        startupSpatialBandwidthDemandIntervalCount = 0
+        startupSpatialBandwidthVideoSendBitrateBps = nil
+        startupSpatialBandwidthPairSendBitrateBps = nil
+        startupSpatialBandwidthAverageAvailableOutgoingBitrateBps = nil
+        startupSpatialBandwidthAverageVideoTargetBitrateBps = nil
+        startupSpatialBandwidthAverageAggregateTargetBitrateBps = nil
+        startupSpatialBandwidthLimitedIntervalCount = 0
+    }
+
+    private mutating func resetIncompleteStartupSpatialBandwidthProof() {
+        guard startupSpatialModeIsActive else {
+            startupSpatialBandwidthProof = nil
+            return
+        }
+        resetStartupSpatialBandwidthProof(to: .awaitingEvidence)
     }
 
     private mutating func observeStartupSelectedPairGap(
@@ -773,6 +1033,376 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             return
         }
         startupSparseProbeDeadline = deadline
+    }
+
+    /// Selected-pair identity is an independent hard boundary even when RTT counters are absent.
+    /// Bind the first fresh atomic pair for this Show; a later fingerprint is a replacement, not
+    /// a new bandwidth-proof baseline.
+    private mutating func observeStartupSelectedPairIdentity(
+        fingerprint: String?,
+        reportIsFresh: Bool
+    ) {
+        guard startupSpatialModeIsActive,
+              reportIsFresh,
+              let fingerprint,
+              !fingerprint.isEmpty else {
+            return
+        }
+        let priorFingerprint = startupSpatialSelectedPairFingerprint
+            ?? roundTripTimeWatermark?.selectedCandidatePairFingerprint
+        if let priorFingerprint, priorFingerprint != fingerprint {
+            _ = disproveStartupSpatialMode(cause: .selectedRouteReplacement)
+            return
+        }
+        startupSpatialSelectedPairFingerprint = fingerprint
+    }
+
+    /// A startup estimate below the survival budget is ambiguous: the sender may simply be
+    /// censored by its own conservative ceiling. Preserve full pixels and spend temporal quality
+    /// first. Spatial authority requires four fresh ordinary reports spanning two seconds, with
+    /// sustained video traffic against the native video target, sustained selected-pair traffic
+    /// against same-pair BWE, qualified non-key-frame progress (or a homogeneous legacy fallback),
+    /// and an independent bandwidth-limitation witness. Any material rise from the running BWE
+    /// low-water mark restarts the complete proof so startup cannot blur immediately before
+    /// capacity recovers. Aggregate audio/video target is retained for diagnostics only.
+    /// The fast 200 ms lane never calls this reducer and therefore cannot manufacture this proof.
+    private mutating func observeStartupSpatialBandwidthEvidence(
+        peerGeneration generation: UInt64,
+        isCaptureActive: Bool,
+        reportIsFresh: Bool,
+        senderRecommendationChanged: Bool,
+        availableOutgoingBitrateBps: Double?,
+        nativeReportTimestampMicroseconds: Double?,
+        outboundVideoBytesSent: UInt64?,
+        outboundVideoFramesEncoded: UInt64?,
+        outboundVideoKeyFramesEncoded: UInt64?,
+        outboundVideoTargetBitrateBps: Double?,
+        outboundAudioTargetBitrateBps: Double?,
+        outboundVideoQualityLimitationReason:
+            WebRTCVideoQualityLimitationReason?,
+        selectedPairFingerprint: String?,
+        selectedPairBytesSent: UInt64?,
+        observedAt: ContinuousClock.Instant
+    ) {
+        guard startupSpatialModeIsActive,
+              isCaptureActive,
+              !lastSampleHasLatencyPressure else {
+            resetIncompleteStartupSpatialBandwidthProof()
+            return
+        }
+        guard !senderRecommendationChanged else {
+            // The counters in this report predate the new FPS/cap. Start the complete proof
+            // window with the next regular report, after native application is accepted.
+            resetStartupSpatialBandwidthProof(to: .senderCensored)
+            return
+        }
+        guard reportIsFresh,
+              let availableOutgoingBitrateBps,
+              availableOutgoingBitrateBps.isFinite,
+              availableOutgoingBitrateBps > 0,
+              let selectedPairFingerprint,
+              !selectedPairFingerprint.isEmpty else {
+            resetStartupSpatialBandwidthProof(to: .awaitingEvidence)
+            return
+        }
+        invalidateStartupBelowReserveWitnessForRecovery(
+            availableOutgoingBitrateBps: availableOutgoingBitrateBps,
+            selectedPairFingerprint: selectedPairFingerprint
+        )
+        let survivalDemandBps = requiredOutgoingBitrateBps(for: .survival)
+        guard availableOutgoingBitrateBps < survivalDemandBps else {
+            resetStartupSpatialBandwidthProof(to: .confirmedSufficient)
+            return
+        }
+        guard let showEpoch = floorRecoveryShowEpoch,
+              startupSpatialModePeerGeneration == generation,
+              startupSpatialModeShowEpoch == showEpoch,
+              let nativeReportTimestampMicroseconds,
+              nativeReportTimestampMicroseconds.isFinite,
+              nativeReportTimestampMicroseconds > 0,
+              let outboundVideoBytesSent,
+              let outboundVideoFramesEncoded,
+              let outboundVideoTargetBitrateBps,
+              outboundVideoTargetBitrateBps.isFinite,
+              outboundVideoTargetBitrateBps > 0,
+              let selectedPairBytesSent,
+              (outboundVideoKeyFramesEncoded.map {
+                  $0 <= outboundVideoFramesEncoded
+              } ?? true) else {
+            resetStartupSpatialBandwidthProof(to: .senderCensored)
+            return
+        }
+        guard var proof = startupSpatialBandwidthProof else {
+            startupSpatialBandwidthProof = StartupSpatialBandwidthProofWindow(
+                peerGeneration: generation,
+                showEpoch: showEpoch,
+                baselineObservedAt: observedAt,
+                recommendation: currentRecommendation,
+                baselineAvailableOutgoingBitrateBps:
+                    availableOutgoingBitrateBps,
+                baselineNativeTimestampMicroseconds:
+                    nativeReportTimestampMicroseconds,
+                selectedPairFingerprint: selectedPairFingerprint,
+                baselineVideoBytesSent: outboundVideoBytesSent,
+                baselineSelectedPairBytesSent: selectedPairBytesSent,
+                baselineFramesEncoded: outboundVideoFramesEncoded,
+                keyFrameCounterIsAvailable:
+                    outboundVideoKeyFramesEncoded != nil,
+                lastObservedAt: observedAt,
+                lastNativeTimestampMicroseconds:
+                    nativeReportTimestampMicroseconds,
+                lastVideoBytesSent: outboundVideoBytesSent,
+                lastSelectedPairBytesSent: selectedPairBytesSent,
+                lastFramesEncoded: outboundVideoFramesEncoded,
+                lastKeyFramesEncoded: outboundVideoKeyFramesEncoded,
+                sampleCount: 0,
+                demandProgressIntervalCount: 0,
+                nonKeyFrameDemandIntervalCount: 0,
+                bandwidthLimitedIntervalCount: 0,
+                minimumAvailableOutgoingBitrateBps:
+                    availableOutgoingBitrateBps,
+                bandwidthTimeIntegral: 0,
+                videoTargetBitrateTimeIntegral: 0,
+                aggregateTargetBitrateTimeIntegral: 0,
+                targetObservationSeconds: 0
+            )
+            startupSpatialBandwidthDisposition = .senderCensored
+            startupSpatialBandwidthProofSampleCount = 0
+            startupSpatialBandwidthDemandIntervalCount = 0
+            startupSpatialBandwidthVideoSendBitrateBps = nil
+            startupSpatialBandwidthPairSendBitrateBps = nil
+            startupSpatialBandwidthAverageAvailableOutgoingBitrateBps = nil
+            startupSpatialBandwidthAverageVideoTargetBitrateBps = nil
+            startupSpatialBandwidthAverageAggregateTargetBitrateBps = nil
+            startupSpatialBandwidthLimitedIntervalCount = 0
+            return
+        }
+
+        let observationGap = proof.lastObservedAt.duration(to: observedAt)
+        let keyFrameCounterAvailabilityMatches =
+            (outboundVideoKeyFramesEncoded != nil)
+                == proof.keyFrameCounterIsAvailable
+        let keyFrameCounterRegressed: Bool
+        if let current = outboundVideoKeyFramesEncoded,
+           let previous = proof.lastKeyFramesEncoded {
+            keyFrameCounterRegressed = current < previous
+        } else {
+            keyFrameCounterRegressed = false
+        }
+        guard proof.peerGeneration == generation,
+              proof.showEpoch == showEpoch,
+              proof.recommendation == currentRecommendation,
+              observationGap > .zero,
+              observationGap <= Self.lowDelayPacketQueueObservationValidity,
+              nativeReportTimestampMicroseconds
+                > proof.lastNativeTimestampMicroseconds,
+              selectedPairFingerprint == proof.selectedPairFingerprint,
+              outboundVideoBytesSent >= proof.lastVideoBytesSent,
+              selectedPairBytesSent >= proof.lastSelectedPairBytesSent,
+              outboundVideoFramesEncoded >= proof.lastFramesEncoded,
+              keyFrameCounterAvailabilityMatches,
+              !keyFrameCounterRegressed else {
+            resetStartupSpatialBandwidthProof(to: .senderCensored)
+            return
+        }
+
+        let bandwidthImprovementBps = availableOutgoingBitrateBps
+            - proof.minimumAvailableOutgoingBitrateBps
+        if bandwidthImprovementBps
+                >= Self.startupSpatialMaterialBandwidthImprovementBps,
+           availableOutgoingBitrateBps
+                >= proof.minimumAvailableOutgoingBitrateBps
+                    * Self.startupSpatialMaterialBandwidthImprovementRatio {
+            // Recovery is affirmative uncertainty, not congestion. Restart from this newer
+            // estimator level and require a complete stable window before granting spatial
+            // authority. This also catches gradual ramps relative to the original baseline.
+            startupSpatialBandwidthProof = StartupSpatialBandwidthProofWindow(
+                peerGeneration: generation,
+                showEpoch: showEpoch,
+                baselineObservedAt: observedAt,
+                recommendation: currentRecommendation,
+                baselineAvailableOutgoingBitrateBps:
+                    availableOutgoingBitrateBps,
+                baselineNativeTimestampMicroseconds:
+                    nativeReportTimestampMicroseconds,
+                selectedPairFingerprint: selectedPairFingerprint,
+                baselineVideoBytesSent: outboundVideoBytesSent,
+                baselineSelectedPairBytesSent: selectedPairBytesSent,
+                baselineFramesEncoded: outboundVideoFramesEncoded,
+                keyFrameCounterIsAvailable:
+                    outboundVideoKeyFramesEncoded != nil,
+                lastObservedAt: observedAt,
+                lastNativeTimestampMicroseconds:
+                    nativeReportTimestampMicroseconds,
+                lastVideoBytesSent: outboundVideoBytesSent,
+                lastSelectedPairBytesSent: selectedPairBytesSent,
+                lastFramesEncoded: outboundVideoFramesEncoded,
+                lastKeyFramesEncoded: outboundVideoKeyFramesEncoded,
+                sampleCount: 0,
+                demandProgressIntervalCount: 0,
+                nonKeyFrameDemandIntervalCount: 0,
+                bandwidthLimitedIntervalCount: 0,
+                minimumAvailableOutgoingBitrateBps:
+                    availableOutgoingBitrateBps,
+                bandwidthTimeIntegral: 0,
+                videoTargetBitrateTimeIntegral: 0,
+                aggregateTargetBitrateTimeIntegral: 0,
+                targetObservationSeconds: 0
+            )
+            startupSpatialBandwidthDisposition = .senderCensored
+            startupSpatialBandwidthProofSampleCount = 0
+            startupSpatialBandwidthDemandIntervalCount = 0
+            startupSpatialBandwidthVideoSendBitrateBps = nil
+            startupSpatialBandwidthPairSendBitrateBps = nil
+            startupSpatialBandwidthAverageAvailableOutgoingBitrateBps = nil
+            startupSpatialBandwidthAverageVideoTargetBitrateBps = nil
+            startupSpatialBandwidthAverageAggregateTargetBitrateBps = nil
+            startupSpatialBandwidthLimitedIntervalCount = 0
+            return
+        }
+
+        let nativeIntervalSeconds = (nativeReportTimestampMicroseconds
+            - proof.lastNativeTimestampMicroseconds) / 1_000_000
+        let frameDeltaSinceLast = outboundVideoFramesEncoded
+            - proof.lastFramesEncoded
+        let keyFrameDeltaSinceLast = outboundVideoKeyFramesEncoded.flatMap { current in
+            proof.lastKeyFramesEncoded.map { current - $0 }
+        }
+        guard keyFrameDeltaSinceLast.map({ $0 <= frameDeltaSinceLast }) ?? true else {
+            resetStartupSpatialBandwidthProof(to: .senderCensored)
+            return
+        }
+        if outboundVideoBytesSent > proof.lastVideoBytesSent,
+           frameDeltaSinceLast > 0 {
+            proof.demandProgressIntervalCount = min(
+                Int.max,
+                proof.demandProgressIntervalCount + 1
+            )
+            if let keyFrameDeltaSinceLast,
+               frameDeltaSinceLast > keyFrameDeltaSinceLast {
+                proof.nonKeyFrameDemandIntervalCount = min(
+                    Int.max,
+                    proof.nonKeyFrameDemandIntervalCount + 1
+                )
+            }
+        }
+        proof.minimumAvailableOutgoingBitrateBps = min(
+            proof.minimumAvailableOutgoingBitrateBps,
+            availableOutgoingBitrateBps
+        )
+        proof.lastObservedAt = observedAt
+        proof.lastNativeTimestampMicroseconds =
+            nativeReportTimestampMicroseconds
+        proof.lastVideoBytesSent = outboundVideoBytesSent
+        proof.lastSelectedPairBytesSent = selectedPairBytesSent
+        proof.lastFramesEncoded = outboundVideoFramesEncoded
+        proof.lastKeyFramesEncoded = outboundVideoKeyFramesEncoded
+        proof.sampleCount = min(Int.max, proof.sampleCount + 1)
+        if outboundVideoQualityLimitationReason == .bandwidth {
+            proof.bandwidthLimitedIntervalCount = min(
+                Int.max,
+                proof.bandwidthLimitedIntervalCount + 1
+            )
+        } else {
+            proof.bandwidthLimitedIntervalCount = 0
+        }
+        proof.bandwidthTimeIntegral +=
+            availableOutgoingBitrateBps * nativeIntervalSeconds
+        let diagnosticAudioTargetBitrateBps = outboundAudioTargetBitrateBps
+            .flatMap { value in
+                value.isFinite && value >= 0 ? value : nil
+            }
+        let aggregateTargetBitrateBps = outboundVideoTargetBitrateBps
+            + (diagnosticAudioTargetBitrateBps ?? 0)
+        proof.videoTargetBitrateTimeIntegral +=
+            outboundVideoTargetBitrateBps * nativeIntervalSeconds
+        proof.aggregateTargetBitrateTimeIntegral +=
+            aggregateTargetBitrateBps * nativeIntervalSeconds
+        proof.targetObservationSeconds += nativeIntervalSeconds
+        startupSpatialBandwidthProof = proof
+        startupSpatialBandwidthDisposition = .probingDemand
+        startupSpatialBandwidthProofSampleCount = proof.sampleCount
+        startupSpatialBandwidthDemandIntervalCount =
+            proof.keyFrameCounterIsAvailable
+                ? proof.nonKeyFrameDemandIntervalCount
+                : proof.demandProgressIntervalCount
+        startupSpatialBandwidthLimitedIntervalCount =
+            proof.bandwidthLimitedIntervalCount
+
+        let elapsedNativeMicroseconds = nativeReportTimestampMicroseconds
+            - proof.baselineNativeTimestampMicroseconds
+        let averageVideoTargetBitrateBps = proof.targetObservationSeconds > 0
+            ? proof.videoTargetBitrateTimeIntegral
+                / proof.targetObservationSeconds
+            : 0
+        let averageAggregateTargetBitrateBps = proof.targetObservationSeconds > 0
+            ? proof.aggregateTargetBitrateTimeIntegral
+                / proof.targetObservationSeconds
+            : 0
+        let averageAvailableOutgoingBitrateBps = proof.targetObservationSeconds > 0
+            ? proof.bandwidthTimeIntegral / proof.targetObservationSeconds
+            : 0
+        let videoBytesDelta = outboundVideoBytesSent
+            - proof.baselineVideoBytesSent
+        let selectedPairBytesDelta = selectedPairBytesSent
+            - proof.baselineSelectedPairBytesSent
+        guard selectedPairBytesDelta >= videoBytesDelta else {
+            resetStartupSpatialBandwidthProof(to: .senderCensored)
+            return
+        }
+        let framesDelta = outboundVideoFramesEncoded - proof.baselineFramesEncoded
+        let videoSendBitrateBps = elapsedNativeMicroseconds > 0
+            ? Double(videoBytesDelta) * 8_000_000
+                / elapsedNativeMicroseconds
+            : 0
+        let selectedPairSendBitrateBps = elapsedNativeMicroseconds > 0
+            ? Double(selectedPairBytesDelta) * 8_000_000
+                / elapsedNativeMicroseconds
+            : 0
+        startupSpatialBandwidthVideoSendBitrateBps =
+            videoSendBitrateBps
+        startupSpatialBandwidthPairSendBitrateBps =
+            selectedPairSendBitrateBps
+        startupSpatialBandwidthAverageAvailableOutgoingBitrateBps =
+            averageAvailableOutgoingBitrateBps
+        startupSpatialBandwidthAverageVideoTargetBitrateBps =
+            averageVideoTargetBitrateBps
+        startupSpatialBandwidthAverageAggregateTargetBitrateBps =
+            averageAggregateTargetBitrateBps
+
+        guard proof.sampleCount
+                >= Self.requiredStartupSpatialBandwidthProofSampleCount,
+              elapsedNativeMicroseconds >= 2_000_000,
+              proof.baselineObservedAt.duration(to: observedAt)
+                >= Self.startupSpatialBandwidthProofDuration else {
+            return
+        }
+        let hasQualifiedDemandIntervals = proof.keyFrameCounterIsAvailable
+            ? proof.nonKeyFrameDemandIntervalCount >= 2
+            : proof.demandProgressIntervalCount
+                >= Self.requiredStartupSpatialBandwidthProofSampleCount
+        let independentPathLimitationWasProven =
+            hasCurrentShowBelowReserveProbeWitness
+            || proof.bandwidthLimitedIntervalCount
+                >= Self.requiredStartupSpatialBandwidthProofSampleCount
+        guard videoBytesDelta > 0,
+              selectedPairBytesDelta > 0,
+              framesDelta > 0,
+              hasQualifiedDemandIntervals,
+              independentPathLimitationWasProven,
+              videoSendBitrateBps
+                >= averageVideoTargetBitrateBps
+                    * Self.startupSpatialDemandSaturationRatio,
+              selectedPairSendBitrateBps
+                >= averageAvailableOutgoingBitrateBps
+                    * Self.startupSpatialDemandSaturationRatio else {
+            resetStartupSpatialBandwidthProof(to: .senderCensored)
+            return
+        }
+
+        startupSpatialBandwidthDisposition = .confirmedLimited
+        lastDowngradeCause = .demandProvenBandwidth
+        _ = disproveStartupSpatialMode(cause: .demandProvenBandwidth)
     }
 
     /// Missing an entire selected-pair slice may hold an already-owned budget,
@@ -820,6 +1450,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     /// from being combined with a later sample. Stable route baselines and any already-applied
     /// probe remain intact; only incomplete evidence windows are discarded.
     mutating func resetIncompleteEvidenceWindow() {
+        resetIncompleteStartupSpatialBandwidthProof()
         spatialRecoverySparseProbe = nil
         spatialRecovery.clearWitnesses()
         spatialRecoveryOrdinaryPacketSample = nil
@@ -841,6 +1472,86 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         applicationLimitedProbeBestQualifiedTier = nil
     }
 
+    /// Starts a new sender/source-configuration evidence epoch. A live framebuffer rebuild can
+    /// preserve the peer, Show, selected pair, and monotonic RTP counters while changing the
+    /// encoder's geometry and application-limitation behavior. Incomplete windows therefore must
+    /// restart, and an exact-Show failed-probe witness from the preceding configuration must not
+    /// authorize spatial retirement in the replacement configuration. Keep the peer-wide
+    /// suspension latch conservative; only its configuration-scoped spatial authority is revoked.
+    mutating func resetForSenderConfigurationEpoch() {
+        resetIncompleteEvidenceWindow()
+        startupSpatialBelowReserveWitnessPeerGeneration = nil
+        startupSpatialBelowReserveWitnessShowEpoch = nil
+        startupSpatialBelowReserveWitnessPairFingerprint = nil
+        startupSpatialBelowReserveWitnessBandwidthBps = nil
+    }
+
+    /// A native write invalidates demand counters measured under the previous limits. One
+    /// exception is a failed raised-ceiling probe: its current report can establish new,
+    /// same-pair below-reserve evidence immediately before native limits revert to the origin.
+    /// Preserve only a witness newly minted by this proposal, never a carried-over witness.
+    mutating func resetForAcceptedSenderConfigurationEpoch(
+        previouslyCommitted: Self
+    ) {
+        let newlyMintedWitness = hasCurrentShowBelowReserveProbeWitness
+            && (
+                !previouslyCommitted.hasCurrentShowBelowReserveProbeWitness
+                    || startupSpatialBelowReserveWitnessPeerGeneration
+                        != previouslyCommitted.startupSpatialBelowReserveWitnessPeerGeneration
+                    || startupSpatialBelowReserveWitnessShowEpoch
+                        != previouslyCommitted.startupSpatialBelowReserveWitnessShowEpoch
+                    || startupSpatialBelowReserveWitnessPairFingerprint
+                        != previouslyCommitted.startupSpatialBelowReserveWitnessPairFingerprint
+                    || startupSpatialBelowReserveWitnessBandwidthBps
+                        != previouslyCommitted.startupSpatialBelowReserveWitnessBandwidthBps
+            )
+        let witnessPeerGeneration = startupSpatialBelowReserveWitnessPeerGeneration
+        let witnessShowEpoch = startupSpatialBelowReserveWitnessShowEpoch
+        let witnessPairFingerprint = startupSpatialBelowReserveWitnessPairFingerprint
+        let witnessBandwidthBps = startupSpatialBelowReserveWitnessBandwidthBps
+        resetForSenderConfigurationEpoch()
+        if newlyMintedWitness {
+            startupSpatialBelowReserveWitnessPeerGeneration = witnessPeerGeneration
+            startupSpatialBelowReserveWitnessShowEpoch = witnessShowEpoch
+            startupSpatialBelowReserveWitnessPairFingerprint = witnessPairFingerprint
+            startupSpatialBelowReserveWitnessBandwidthBps = witnessBandwidthBps
+        }
+    }
+
+    /// A replacement framebuffer changes the offered pixels and encoder behavior. Demand proven
+    /// for the old geometry is not authority to blur the new one, so re-arm the same Show's full
+    /// pixels and require a complete fresh proof. Hard RTT, queue, and route causes describe the
+    /// path rather than the old geometry and intentionally remain terminal.
+    mutating func resetForCaptureGeometryEpoch() {
+        resetForSenderConfigurationEpoch()
+        guard startupSpatialModeIsDisproved,
+              startupSpatialModeDisproofCause == .demandProvenBandwidth,
+              let generation = startupSpatialModePeerGeneration,
+              let showEpoch = startupSpatialModeShowEpoch,
+              peerGeneration == generation,
+              floorRecoveryShowEpoch == showEpoch,
+              floorRecoveryVisibilityIsReserved
+                || floorRecoveryVisibilityIsActive else {
+            return
+        }
+        startupSpatialModeIsDisproved = false
+        startupSpatialModeDisproofCause = nil
+        if lastDowngradeCause == .demandProvenBandwidth {
+            lastDowngradeCause = nil
+        }
+        resetStartupSpatialBandwidthProof(to: .awaitingEvidence)
+    }
+
+    #if DEBUG
+    /// Lets the regression oracle vary mutable diagnostic metadata independently of the
+    /// authoritative Show-scoped disproof reason. Production never consults this seam.
+    mutating func overrideLastDowngradeCauseForTesting(
+        _ cause: WorldwideScreenVideoDowngradeCause?
+    ) {
+        lastDowngradeCause = cause
+    }
+    #endif
+
     /// Returns a recommendation only when the current sender should apply new limits.
     mutating func update(
         peerGeneration generation: UInt64,
@@ -854,6 +1565,16 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         selectedRoute: WebRTCICERouteDiagnostics? = nil,
         outboundVideoPacketsSent: UInt64? = nil,
         outboundVideoTotalPacketSendDelaySeconds: Double? = nil,
+        outboundVideoBytesSent: UInt64? = nil,
+        outboundVideoFramesEncoded: UInt64? = nil,
+        outboundVideoKeyFramesEncoded: UInt64? = nil,
+        outboundVideoTargetBitrateBps: Double? = nil,
+        outboundAudioTargetBitrateBps: Double? = nil,
+        outboundVideoQualityLimitationReason:
+            WebRTCVideoQualityLimitationReason? = nil,
+        selectedPairFingerprint: String? = nil,
+        selectedPairBytesSent: UInt64? = nil,
+        selectedPairAvailableOutgoingBitrateBps: Double? = nil,
         nativeReportTimestampMicroseconds: Double? = nil,
         spatialRecoveryFrames: WorldwideScreenSpatialRecoveryFrameEvidence? = nil,
         observedAt: ContinuousClock.Instant = .now,
@@ -993,6 +1714,29 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         }
         let previousRecommendation = currentRecommendation
         let previousTier = currentTier
+        let startupSpatialModeWasActive = startupSpatialModeIsActive
+        let atomicSelectedPairFingerprint: String?
+        let atomicSelectedPairBytesSent: UInt64?
+        let atomicSelectedPairAvailableOutgoingBitrateBps: Double?
+        if let selectedPairFingerprint,
+           !selectedPairFingerprint.isEmpty,
+           let selectedPairBytesSent,
+           let selectedPairAvailableOutgoingBitrateBps,
+           selectedPairAvailableOutgoingBitrateBps.isFinite,
+           selectedPairAvailableOutgoingBitrateBps > 0 {
+            atomicSelectedPairFingerprint = selectedPairFingerprint
+            atomicSelectedPairBytesSent = selectedPairBytesSent
+            atomicSelectedPairAvailableOutgoingBitrateBps =
+                selectedPairAvailableOutgoingBitrateBps
+        } else {
+            atomicSelectedPairFingerprint = nil
+            atomicSelectedPairBytesSent = nil
+            atomicSelectedPairAvailableOutgoingBitrateBps = nil
+        }
+        observeStartupSelectedPairIdentity(
+            fingerprint: atomicSelectedPairFingerprint,
+            reportIsFresh: floorRecoveryReportIsFresh
+        )
         let recoveryWasActive = spatialRecovery.isTrialActive || spatialRecovery.isActive
         let recoveryQueue = spatialRecovery.isArmed && floorRecoveryReportIsFresh
             ? observeSpatialRecoveryPacketQueue(
@@ -1011,7 +1755,6 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             spatialRecoveryLastTimestamp = nativeReportTimestampMicroseconds
         }
         spatialRecovery.expire(at: observedAt)
-        let startupSpatialModeWasActive = startupSpatialModeIsActive
         let hadPromotionCapacityContinuity = promotionCapacityContinuity != nil
         updatePromotionCapacityContinuity(
             availableOutgoingBitrateBps: availableOutgoingBitrateBps,
@@ -1031,18 +1774,47 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             outboundVideoPacketsSent: outboundVideoPacketsSent,
             outboundVideoTotalPacketSendDelaySeconds:
                 outboundVideoTotalPacketSendDelaySeconds,
+            startupSpatialSelectedPairFingerprint:
+                atomicSelectedPairFingerprint,
+            startupSpatialSelectedPairAvailableOutgoingBitrateBps:
+                atomicSelectedPairAvailableOutgoingBitrateBps,
             floorRecoveryReportIsFresh: floorRecoveryReportIsFresh,
             observedAt: observedAt,
             floorDiagnostics: &evaluation
         )
+        observeStartupSpatialBandwidthEvidence(
+            peerGeneration: generation,
+            isCaptureActive: isCaptureActive,
+            reportIsFresh: floorRecoveryReportIsFresh,
+            senderRecommendationChanged:
+                currentRecommendation != previousRecommendation,
+            availableOutgoingBitrateBps:
+                atomicSelectedPairAvailableOutgoingBitrateBps,
+            nativeReportTimestampMicroseconds:
+                nativeReportTimestampMicroseconds,
+            outboundVideoBytesSent: outboundVideoBytesSent,
+            outboundVideoFramesEncoded: outboundVideoFramesEncoded,
+            outboundVideoKeyFramesEncoded: outboundVideoKeyFramesEncoded,
+            outboundVideoTargetBitrateBps: outboundVideoTargetBitrateBps,
+            outboundAudioTargetBitrateBps: outboundAudioTargetBitrateBps,
+            outboundVideoQualityLimitationReason:
+                outboundVideoQualityLimitationReason,
+            selectedPairFingerprint: atomicSelectedPairFingerprint,
+            selectedPairBytesSent: atomicSelectedPairBytesSent,
+            observedAt: observedAt
+        )
         if lastSampleHasLatencyPressure {
             promotionCapacityContinuity = nil
         }
-        if lastSampleHasLatencyPressure
-            || currentTier.rawValue > previousTier.rawValue {
-            _ = disproveStartupSpatialMode()
-        } else if startupSpatialModeIsActive, currentTier == .full {
-            clearStartupSpatialMode()
+        if lastSampleHasLatencyPressure {
+            _ = disproveStartupSpatialMode(
+                cause: lastDowngradeCause ?? .confirmedQueuePressure
+            )
+        } else if startupSpatialModeIsActive,
+                  currentTier.rawValue > previousTier.rawValue {
+            // Raw BWE still lowers bitrate and FPS immediately, but it has no spatial authority
+            // until the ordinary-report demand proof above succeeds.
+            lastDowngradeCause = .bandwidthOnly
         }
         if !isCaptureActive || isAutomaticallySuspended {
             spatialRecovery.end()
@@ -1133,14 +1905,20 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             evaluation.reason = .inactive
             return nil
         }
-        if let expired = expireApplicationLimitedProbeWithoutReport(
-            peerGeneration: generation,
-            isCaptureActive: isCaptureActive,
-            observedAt: observedAt
-        ) {
-            evaluation.reason = .expired
-            return expired
+        // A fast report still advances wall-clock lease age even when its native identity is
+        // rejected. Defer only the probe's terminal expiry so fresh hard pressure at the exact
+        // deadline can be inspected first.
+        roundTripTimeObservationAge = lastRoundTripTimeAdvancement.map {
+            $0.duration(to: observedAt)
         }
+        spatialRecovery.expire(at: observedAt)
+        if let continuity = promotionCapacityContinuity,
+           observedAt >= continuity.deadline {
+            promotionCapacityContinuity = nil
+        }
+        let probeDeadlineExpired = applicationLimitedProbeDeadline.map {
+            observedAt >= $0
+        } ?? false
         // Recovery owns an independent negative lane even when no bitrate discovery probe
         // exists. Fast observations may retire pixels, never admit/confirm them or renew RTT.
         var recoveryReportIsFresh = false
@@ -1174,19 +1952,36 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             let routeChanged = selectedRoute.map { route in
                 self.selectedRoute.map { $0 != route } ?? false
             } ?? false
+            let selectedPairWasReplaced = routeChanged
+                || rtt.selectedPairWasReplaced
             let capacityCollapsed = availableOutgoingBitrateBps.map {
                 $0.isFinite && $0 > 0
                     && $0 < applicationLimitedProbeCollapseThreshold(for: currentTier)
             } == true
-            if rtt.hasFreshPressure || routeChanged || capacityCollapsed || confirmedSoftPressure
+            if rtt.hasFreshPressure || selectedPairWasReplaced
+                || capacityCollapsed || confirmedSoftPressure
                 || queue.map({ $0 >= Self.immediateAveragePacketSendDelaySeconds }) == true {
                 retireSpatialRecovery(at: observedAt)
                 if let origin = applicationLimitedProbeOriginTier {
                     failApplicationLimitedProbe(revertingTo: origin)
                 }
-                if rtt.hasFreshPressure || routeChanged {
+                if rtt.hasFreshPressure || selectedPairWasReplaced {
                     roundTripTimeObservationFence = recoveryValidation.roundTripTimeObservationFence
                     revokeRoundTripTimeHealth()
+                }
+                if selectedPairWasReplaced {
+                    _ = disproveStartupSpatialMode(
+                        cause: .selectedRouteReplacement
+                    )
+                } else if rtt.hasFreshPressure {
+                    _ = disproveStartupSpatialMode(
+                        cause: .freshRoundTripTimeInflation
+                    )
+                } else if confirmedSoftPressure
+                    || queue.map({ $0 >= Self.immediateAveragePacketSendDelaySeconds }) == true {
+                    _ = disproveStartupSpatialMode(
+                        cause: .confirmedQueuePressure
+                    )
                 }
                 return currentRecommendation
             }
@@ -1200,6 +1995,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
               timestamp.isFinite, timestamp > 0,
               let previousTimestamp = capacityProbeNativeReportTimestamp,
               timestamp > previousTimestamp else {
+            if probeDeadlineExpired {
+                evaluation.reason = .expired
+                return expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: generation,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: observedAt
+                )
+            }
             return nil
         }
         // The native timestamp is a report identity, not an elapsed-time clock. Equal or
@@ -1229,9 +2032,16 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             observeStartupSelectedPairGap(
                 route: selectedRoute, bandwidth: availableOutgoingBitrateBps,
                 rtt: currentRoundTripTimeSeconds, observation: roundTripTimeObservation)
-            evaluation.reason = .roundTripTime
-            if rtt.hasFreshPressure {
-                _ = disproveStartupSpatialMode()
+            evaluation.reason = rtt.selectedPairWasReplaced
+                ? .routeChanged : .roundTripTime
+            if rtt.selectedPairWasReplaced {
+                _ = disproveStartupSpatialMode(
+                    cause: .selectedRouteReplacement
+                )
+            } else if rtt.hasFreshPressure {
+                _ = disproveStartupSpatialMode(
+                    cause: .freshRoundTripTimeInflation
+                )
             }
             revokeRoundTripTimeHealth()
             permitsInitialRoundTripTimeReference = false
@@ -1282,10 +2092,38 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 if let negativeReason {
                     // Missing RTT must not hide affirmative evidence from the other lanes.
                     evaluation.reason = negativeReason
-                    _ = disproveStartupSpatialMode()
+                    switch negativeReason {
+                    case .routeChanged:
+                        _ = disproveStartupSpatialMode(
+                            cause: .selectedRouteReplacement
+                        )
+                    case .immediateQueue:
+                        _ = disproveStartupSpatialMode(
+                            cause: .confirmedQueuePressure
+                        )
+                    case .bandwidthCollapse:
+                        // Fast BWE is negative-only probe evidence. It may cancel speculative
+                        // capacity, but only the ordinary two-second demand proof may shrink
+                        // startup pixels.
+                        lastDowngradeCause = .bandwidthOnly
+                    default:
+                        break
+                    }
                     failApplicationLimitedProbe(revertingTo: origin)
                     return currentRecommendation
                 }
+            }
+            if rtt.hasFreshPressure || rtt.selectedPairWasReplaced {
+                failApplicationLimitedProbe(revertingTo: origin)
+                return currentRecommendation
+            }
+            if probeDeadlineExpired {
+                evaluation.reason = .expired
+                return expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: generation,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: observedAt
+                )
             }
             if (startupSpatialModeIsActive
                 && startupSparseProbeDeadline != nil
@@ -1312,7 +2150,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         }
         if selectedRoute != self.selectedRoute {
             evaluation.reason = .routeChanged
-            _ = disproveStartupSpatialMode()
+            _ = disproveStartupSpatialMode(cause: .selectedRouteReplacement)
             // Sender-filtered stats can reveal a route change before the ordinary route event.
             // Its RTT tuple must not become new health when the next regular report reuses it.
             revokeRoundTripTimeHealth()
@@ -1332,6 +2170,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         guard let baseline,
               primaryRTTLeaseIsCurrent,
               nativeRoundTripTimeHealth == .healthy || awaitsOrdinaryRTTRequalification else {
+            if probeDeadlineExpired {
+                evaluation.reason = .expired
+                return expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: generation,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: observedAt
+                )
+            }
             evaluation.reason = .missingPrimaryEvidence
             failApplicationLimitedProbe(revertingTo: origin)
             return currentRecommendation
@@ -1354,7 +2200,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         case let .measured(delay):
             if delay >= Self.immediateAveragePacketSendDelaySeconds {
                 evaluation.reason = .immediateQueue
-                _ = disproveStartupSpatialMode()
+                _ = disproveStartupSpatialMode(cause: .confirmedQueuePressure)
                 failApplicationLimitedProbe(revertingTo: origin)
                 return currentRecommendation
             }
@@ -1369,6 +2215,14 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         guard let availableOutgoingBitrateBps,
               availableOutgoingBitrateBps.isFinite,
               availableOutgoingBitrateBps > 0 else {
+            if probeDeadlineExpired {
+                evaluation.reason = .expired
+                return expireApplicationLimitedProbeWithoutReport(
+                    peerGeneration: generation,
+                    isCaptureActive: isCaptureActive,
+                    observedAt: observedAt
+                )
+            }
             evaluation.reason = .missingBandwidth
             capacityProbeGrowthIsVetoed = true
             return nil
@@ -1378,9 +2232,19 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             WorldwideScreenCapacityProbeDiagnostics.boundedInteger(collapseThreshold)
         if availableOutgoingBitrateBps < collapseThreshold {
             evaluation.reason = .bandwidthCollapse
-            _ = disproveStartupSpatialMode()
+            lastDowngradeCause = startupSpatialModeIsActive
+                ? .bandwidthOnly
+                : .probedCapacityCollapse
             failApplicationLimitedProbe(revertingTo: origin)
             return currentRecommendation
+        }
+        if probeDeadlineExpired {
+            evaluation.reason = .expired
+            return expireApplicationLimitedProbeWithoutReport(
+                peerGeneration: generation,
+                isCaptureActive: isCaptureActive,
+                observedAt: observedAt
+            )
         }
         if awaitsOrdinaryRTTRequalification {
             if case .unavailableOrReset = queue {
@@ -1487,6 +2351,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         selectedRoute: WebRTCICERouteDiagnostics?,
         outboundVideoPacketsSent: UInt64?,
         outboundVideoTotalPacketSendDelaySeconds: Double?,
+        startupSpatialSelectedPairFingerprint: String?,
+        startupSpatialSelectedPairAvailableOutgoingBitrateBps: Double?,
         floorRecoveryReportIsFresh: Bool,
         observedAt: ContinuousClock.Instant,
         floorDiagnostics: inout WorldwideScreenFloorRecoveryDiagnostics
@@ -1499,7 +2365,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 && permitsInitialRoundTripTimeReference
             self.selectedRoute = selectedRoute
             if startupSpatialRouteWasAlreadyBound {
-                _ = disproveStartupSpatialMode()
+                _ = disproveStartupSpatialMode(cause: .selectedRouteReplacement)
             }
             revertApplicationLimitedProbeIfActive()
             resetPathMeasurements()
@@ -1541,6 +2407,8 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         // Only a fresh inflated native watermark applies additional RTT-only descent. Retained
         // unhealthy/unknown RTT still vetoes upgrades, without suppressing fresh queue pressure.
         let roundTripTimeIsInflated = roundTripTimeEvidence.hasFreshPressure
+        let selectedPairWasReplaced =
+            roundTripTimeEvidence.selectedPairWasReplaced
         let packetQueueObservation = packetQueueObservationSinceLastSample(
                 packetsSent: outboundVideoPacketsSent,
                 totalPacketSendDelaySeconds:
@@ -1631,9 +2499,18 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         } ?? roundTripTimeAllowsUpgrade
         let strictUpgradeEvidenceIsHealthy = packetQueueAllowsUpgrade
             && roundTripTimeAllowsUpgrade
-        let latencyPressure = roundTripTimeIsInflated || packetQueueIsInflated
+        let latencyPressure = roundTripTimeIsInflated
+            || selectedPairWasReplaced
+            || packetQueueIsInflated
         let latencyEvidenceIsPositivelyHealthy = !latencyPressure
             && directUpgradeEvidenceIsHealthy
+        if selectedPairWasReplaced {
+            lastDowngradeCause = .selectedRouteReplacement
+        } else if roundTripTimeIsInflated {
+            lastDowngradeCause = .freshRoundTripTimeInflation
+        } else if packetQueueIsInflated {
+            lastDowngradeCause = .confirmedQueuePressure
+        }
         lastSampleHasLatencyPressure = latencyPressure
 
         let floorRecoveryMayBegin = observeFloorRecoveryWitness(
@@ -1773,6 +2650,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         } else {
             effectiveAvailableOutgoingBitrateBps = availableOutgoingBitrateBps
         }
+        // The service publishes these from one selected-pair record. Keep the policy API
+        // fail-closed too: a synthetic or partially assembled report must not use one BWE to
+        // terminate a probe and a different BWE to mint same-pair spatial authority.
+        let startupSpatialCoherentSelectedPairBandwidthBps =
+            startupSpatialSelectedPairAvailableOutgoingBitrateBps.flatMap {
+                $0 == availableOutgoingBitrateBps ? $0 : nil
+            }
         let capacitySustainableTier = sustainableTier(
             for: effectiveAvailableOutgoingBitrateBps
         )
@@ -1784,7 +2668,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         )
         if effectiveAvailableOutgoingBitrateBps
             >= requiredAudioPriorityBitrateBps {
-            belowReserveProbeDisprovedSenderLimitation = false
+            setBelowReserveProbeDisprovedSenderLimitation(false)
             automaticResumeProbeRestoration = nil
         }
         let estimatorMayBeApplicationLimited = estimatorIsApplicationLimited(
@@ -1834,7 +2718,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     // Raising the sender ceiling removed the censoring ambiguity but the estimate
                     // stayed below the reserved floor. Preserve that evidence across backoff so a
                     // genuinely constrained path can still accumulate bounded pause pressure.
-                    belowReserveProbeDisprovedSenderLimitation = true
+                    setBelowReserveProbeDisprovedSenderLimitation(
+                        true,
+                        selectedPairFingerprint:
+                            startupSpatialSelectedPairFingerprint,
+                        bandwidthBps:
+                            startupSpatialCoherentSelectedPairBandwidthBps
+                    )
                 }
                 failApplicationLimitedProbe(revertingTo: probeOriginTier)
                 if capacitySustainableTier.rawValue > probeOriginTier.rawValue {
@@ -1860,7 +2750,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     if applicationLimitedProbeBestQualifiedTier == nil,
                        effectiveAvailableOutgoingBitrateBps
                         < requiredAudioPriorityBitrateBps {
-                        belowReserveProbeDisprovedSenderLimitation = true
+                        setBelowReserveProbeDisprovedSenderLimitation(
+                            true,
+                            selectedPairFingerprint:
+                                startupSpatialSelectedPairFingerprint,
+                            bandwidthBps:
+                                startupSpatialCoherentSelectedPairBandwidthBps
+                        )
                     }
                     finishApplicationLimitedProbe(
                         revertingTo: probeOriginTier
@@ -1949,7 +2845,13 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 if applicationLimitedProbeBestQualifiedTier == nil,
                    effectiveAvailableOutgoingBitrateBps
                     < requiredAudioPriorityBitrateBps {
-                    belowReserveProbeDisprovedSenderLimitation = true
+                    setBelowReserveProbeDisprovedSenderLimitation(
+                        true,
+                        selectedPairFingerprint:
+                            startupSpatialSelectedPairFingerprint,
+                        bandwidthBps:
+                            startupSpatialCoherentSelectedPairBandwidthBps
+                    )
                 }
                 finishApplicationLimitedProbe(revertingTo: probeOriginTier)
                 return isCaptureActive ? currentRecommendation : nil
@@ -2168,9 +3070,6 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
            observedAt >= deadline {
             finishApplicationLimitedProbe(revertingTo: originTier)
         }
-        if startupSpatialModeIsActive, currentTier == .full {
-            clearStartupSpatialMode()
-        }
         return currentRecommendation != previousRecommendation
             ? currentRecommendation
             : nil
@@ -2247,7 +3146,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             applicationLimitedProbeFailureCount:
                 applicationLimitedProbeFailureCount
         )
-        belowReserveProbeDisprovedSenderLimitation = false
+        setBelowReserveProbeDisprovedSenderLimitation(false)
         applicationLimitedUpgradeSampleCount = 0
         resetApplicationLimitedProbeBackoff()
     }
@@ -2264,8 +3163,9 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         }
         floorRecoveryProbeSeedBandwidthBps = nil
         if let restoration = automaticResumeProbeRestoration {
-            belowReserveProbeDisprovedSenderLimitation =
+            setBelowReserveProbeDisprovedSenderLimitation(
                 restoration.belowReserveProbeDisprovedSenderLimitation
+            )
             applicationLimitedProbeCooldownSamplesRemaining =
                 restoration.applicationLimitedProbeCooldownSamplesRemaining
             applicationLimitedProbeFailureCount =
@@ -2659,7 +3559,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         applicationLimitedProbeGraceSamplesRemaining = 0
         applicationLimitedProbeDeadline = nil
         applicationLimitedUpgradeSampleCount = 0
-        belowReserveProbeDisprovedSenderLimitation = false
+        setBelowReserveProbeDisprovedSenderLimitation(false)
         automaticResumeProbeRestoration = nil
         resetApplicationLimitedProbeBackoff()
         if let availableOutgoingBitrateBps,
@@ -2771,7 +3671,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         if floorRecoveryProbeIsActive {
             floorRecoveryProbeWasCancelled = true
             floorRecoveryProbeSeedBandwidthBps = nil
-            belowReserveProbeDisprovedSenderLimitation = true
+            setBelowReserveProbeDisprovedSenderLimitation(true)
         }
         currentTier = originTier
         resetQueueEvidenceForTierTransition()
@@ -2805,6 +3705,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     }
 
     private mutating func resetPathMeasurements() {
+        resetIncompleteStartupSpatialBandwidthProof()
         spatialRecoverySparseProbe = nil
         floorRecoveryFirstWitness = nil
         applicationLimitedProbeConfirmedTier = nil
@@ -2830,7 +3731,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
         applicationLimitedProbeOriginTier = nil
         applicationLimitedProbeBestQualifiedTier = nil
         applicationLimitedProbeMaximumTotalRTPBitrateBps = nil
-        belowReserveProbeDisprovedSenderLimitation = false
+        setBelowReserveProbeDisprovedSenderLimitation(false)
         automaticResumeProbeRestoration = nil
         resetApplicationLimitedProbeBackoff()
         roundTripTimeBaselineSeconds = nil
@@ -2891,6 +3792,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
     ) -> RoundTripTimeEvidence {
         let unknown = RoundTripTimeEvidence(
             hasFreshPressure: false,
+            selectedPairWasReplaced: false,
             allowsUpgrade: false,
             permitsLegacyMissingValue: false
         )
@@ -2903,6 +3805,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             if let current { updateRoundTripTimeBaseline(current) }
             return RoundTripTimeEvidence(
                 hasFreshPressure: inflated,
+                selectedPairWasReplaced: false,
                 allowsUpgrade: roundTripTimeAllowsUpgrade(current),
                 permitsLegacyMissingValue: current == nil
             )
@@ -2948,7 +3851,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     distinctHealthyRoundTripTimeReferenceCount = 0
                     roundTripTimeReferenceIsProvisional = false
                 }
-                return unknown
+                return RoundTripTimeEvidence(
+                    hasFreshPressure: false,
+                    selectedPairWasReplaced: replacedPair,
+                    allowsUpgrade: false,
+                    permitsLegacyMissingValue: false
+                )
             }
         }
 
@@ -2974,7 +3882,12 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                     distinctHealthyRoundTripTimeReferenceCount = 0
                     roundTripTimeReferenceIsProvisional = false
                 }
-                return unknown
+                return RoundTripTimeEvidence(
+                    hasFreshPressure: false,
+                    selectedPairWasReplaced: replacedPair,
+                    allowsUpgrade: false,
+                    permitsLegacyMissingValue: false
+                )
             }
         } else if !isFirstForPeer {
             revokeRoundTripTimeHealth()
@@ -3012,6 +3925,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
                 roundTripTimeDisposition = .retainedHealthy
                 return RoundTripTimeEvidence(
                     hasFreshPressure: false,
+                    selectedPairWasReplaced: false,
                     allowsUpgrade: true,
                     permitsLegacyMissingValue: false
                 )
@@ -3050,6 +3964,7 @@ struct WorldwideScreenVideoAdaptationPolicy: Equatable, Sendable {
             : (isFirstForPeer ? .provisionalHealthy : .freshHealthy)
         return RoundTripTimeEvidence(
             hasFreshPressure: inflated,
+            selectedPairWasReplaced: false,
             allowsUpgrade: !inflated,
             permitsLegacyMissingValue: false
         )

@@ -356,6 +356,27 @@ public enum WebRTCRoundTripTimeObservation: Codable, Equatable, Sendable {
     case measurement(WebRTCRoundTripTimeMeasurement)
 }
 
+/// A selected ICE pair's cumulative outbound payload-byte watermark and matching path estimate.
+///
+/// The native pair identifier is reduced to the same bounded fingerprint used by RTT evidence.
+/// Keeping the fingerprint and counter in one optional value prevents callers from combining a
+/// counter from one route with the identity of another after an ICE-pair replacement.
+public struct WebRTCSelectedCandidatePairOutboundDiagnostics: Codable, Equatable, Sendable {
+    public let selectedCandidatePairFingerprint: String
+    public let payloadBytesSent: UInt64
+    public let availableOutgoingBitrateBps: Double
+
+    public init(
+        selectedCandidatePairFingerprint: String,
+        payloadBytesSent: UInt64,
+        availableOutgoingBitrateBps: Double
+    ) {
+        self.selectedCandidatePairFingerprint = selectedCandidatePairFingerprint
+        self.payloadBytesSent = payloadBytesSent
+        self.availableOutgoingBitrateBps = availableOutgoingBitrateBps
+    }
+}
+
 /// A timestamped diagnostic snapshot across route, video, and audio statistics.
 public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
     public let collectedAt: Date
@@ -366,6 +387,8 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
     public let currentRoundTripTime: Double?
     /// Nil is reserved for older serialized snapshots and synthetic callers.
     public let roundTripTimeObservation: WebRTCRoundTripTimeObservation?
+    /// Nil when the selected pair or its cumulative outbound counter is unavailable or malformed.
+    public let selectedCandidatePairOutbound: WebRTCSelectedCandidatePairOutboundDiagnostics?
     public let availableOutgoingBitrate: Double?
     public let jitter: Double?
     public let outboundVideo: WebRTCVideoStatistics?
@@ -381,6 +404,7 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
         route: WebRTCICERouteDiagnostics? = nil,
         currentRoundTripTime: Double? = nil,
         roundTripTimeObservation: WebRTCRoundTripTimeObservation? = nil,
+        selectedCandidatePairOutbound: WebRTCSelectedCandidatePairOutboundDiagnostics? = nil,
         availableOutgoingBitrate: Double? = nil,
         jitter: Double? = nil,
         outboundVideo: WebRTCVideoStatistics? = nil,
@@ -395,6 +419,7 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
         self.route = route
         self.currentRoundTripTime = currentRoundTripTime
         self.roundTripTimeObservation = roundTripTimeObservation
+        self.selectedCandidatePairOutbound = selectedCandidatePairOutbound
         self.availableOutgoingBitrate = availableOutgoingBitrate
         self.jitter = jitter
         self.outboundVideo = outboundVideo
@@ -415,6 +440,7 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
             route: currentRoute,
             currentRoundTripTime: currentRoundTripTime,
             roundTripTimeObservation: roundTripTimeObservation,
+            selectedCandidatePairOutbound: selectedCandidatePairOutbound,
             availableOutgoingBitrate: availableOutgoingBitrate,
             jitter: jitter,
             outboundVideo: outboundVideo,
@@ -433,6 +459,7 @@ public struct WebRTCStatisticsSnapshot: Codable, Equatable, Sendable {
             route: route,
             currentRoundTripTime: currentRoundTripTime,
             roundTripTimeObservation: roundTripTimeObservation,
+            selectedCandidatePairOutbound: selectedCandidatePairOutbound,
             availableOutgoingBitrate: availableOutgoingBitrate,
             jitter: jitter,
             outboundVideo: outboundVideo,

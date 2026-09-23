@@ -83,10 +83,28 @@ final class WorldwideScreenFormatRenegotiationSupersessionTests: XCTestCase {
                 range: nativeStart.upperBound..<retry.endIndex
             )
         )
+        let senderReconciliation = try XCTUnwrap(
+            retry.range(
+                of: "try await reconcileCurrentScreenVideoRecommendationBeforeActiveUse(",
+                range: postStartCheck.upperBound..<retry.endIndex
+            )
+        )
+        let postReconciliationCheck = try XCTUnwrap(
+            retry.range(
+                of: "guard screenCaptureStartupOwnerIsCurrent(owner),",
+                range: senderReconciliation.upperBound..<retry.endIndex
+            )
+        )
+        let successfulReturn = try XCTUnwrap(
+            retry.range(
+                of: "return authorization",
+                range: postReconciliationCheck.upperBound..<retry.endIndex
+            )
+        )
         let retrySleep = try XCTUnwrap(
             retry.range(
                 of: "try await Task.sleep(for: .milliseconds(125))",
-                range: postStartCheck.upperBound..<retry.endIndex
+                range: successfulReturn.upperBound..<retry.endIndex
             )
         )
         let postSleepCheck = try XCTUnwrap(
@@ -110,7 +128,12 @@ final class WorldwideScreenFormatRenegotiationSupersessionTests: XCTestCase {
 
         XCTAssertLessThan(entryCheck.lowerBound, nativeStart.lowerBound)
         XCTAssertLessThan(nativeStart.lowerBound, postStartCheck.lowerBound)
-        XCTAssertLessThan(postStartCheck.lowerBound, retrySleep.lowerBound)
+        XCTAssertLessThan(postStartCheck.lowerBound, senderReconciliation.lowerBound)
+        XCTAssertLessThan(senderReconciliation.lowerBound, postReconciliationCheck.lowerBound)
+        XCTAssertLessThan(postReconciliationCheck.lowerBound, successfulReturn.lowerBound)
+        XCTAssertTrue(retry.contains("let reusedActiveCapture ="))
+        XCTAssertTrue(retry.contains("forceNativeApplication: reusedActiveCapture"))
+        XCTAssertLessThan(successfulReturn.lowerBound, retrySleep.lowerBound)
         XCTAssertLessThan(retrySleep.lowerBound, postSleepCheck.lowerBound)
         XCTAssertLessThan(postSleepCheck.lowerBound, recursiveStart.lowerBound)
         XCTAssertLessThan(recursiveStart.lowerBound, recursiveOwner.lowerBound)
@@ -122,6 +145,45 @@ final class WorldwideScreenFormatRenegotiationSupersessionTests: XCTestCase {
         )
         XCTAssertTrue(renegotiation.contains("let startupOwner = ScreenCaptureStartupOwner("))
         XCTAssertTrue(renegotiation.contains("owner: startupOwner"))
+    }
+
+    func testActiveCaptureReuseReconcilesNativeSenderBeforeReturningTowardActiveACK()
+        throws {
+        let source = try serviceSource()
+        let helper = try sourceSlice(
+            in: source,
+            after: "    private func reconcileCurrentScreenVideoRecommendationBeforeActiveUse(",
+            before: "    private func screenCaptureStartupOwnerIsCurrent("
+        )
+        let mismatch = try XCTUnwrap(
+            helper.range(
+                of: "appliedScreenVideoRecommendation\n                != screenVideoAdaptationPolicy.currentRecommendation"
+            )
+        )
+        let reconcile = try XCTUnwrap(
+            helper.range(
+                of: "await adaptScreenVideoForNetworkConditions(",
+                range: mismatch.upperBound..<helper.endIndex
+            )
+        )
+        let appliedPostcondition = try XCTUnwrap(
+            helper.range(
+                of: "appliedScreenVideoRecommendation\n                == screenVideoAdaptationPolicy.currentRecommendation",
+                range: reconcile.upperBound..<helper.endIndex
+            )
+        )
+
+        XCTAssertLessThan(mismatch.lowerBound, reconcile.lowerBound)
+        XCTAssertLessThan(reconcile.lowerBound, appliedPostcondition.lowerBound)
+        XCTAssertTrue(helper.contains("guard forceNativeApplication"))
+        XCTAssertTrue(helper.contains("expectedPolicyRevision: expectedPolicyRevision"))
+        XCTAssertTrue(helper.contains("allowsAutomaticResume: false"))
+        XCTAssertTrue(helper.contains("forceNativeReconciliation: forceNativeApplication"))
+        XCTAssertTrue(
+            helper.contains(
+                "screenVideoNativeApplicationGeneration\n                != expectedNativeApplicationGeneration"
+            )
+        )
     }
 
     func testCommittedResumeGeometrySupersessionConsumesPolicyRestoration() throws {
@@ -149,6 +211,46 @@ final class WorldwideScreenFormatRenegotiationSupersessionTests: XCTestCase {
 
         XCTAssertLessThan(committedBranch.lowerBound, successConsumption.lowerBound)
         XCTAssertLessThan(successConsumption.lowerBound, contextClear.lowerBound)
+    }
+
+    func testLiveFormatRebuildStartsFreshAdaptationEvidenceEpochBeforeStoppingSource()
+        throws {
+        let source = try serviceSource()
+        let method = try sourceSlice(
+            in: source,
+            after: "    private func renegotiateScreenCaptureFormat(",
+            before: "    /// A newer visibility command, peer, recovery epoch, or completed service owns any failure"
+        )
+        let owner = try XCTUnwrap(
+            method.range(of: "let startupOwner = ScreenCaptureStartupOwner(")
+        )
+        let epoch = try XCTUnwrap(
+            method.range(
+                of: "beginPostResumeScreenVideoAdaptationEpoch(\n            rearmDemandProvenSpatialAuthority: true\n        )",
+                range: owner.upperBound..<method.endIndex
+            )
+        )
+        let nativeStop = try XCTUnwrap(
+            method.range(
+                of: "try await source.stop()",
+                range: epoch.upperBound..<method.endIndex
+            )
+        )
+
+        XCTAssertLessThan(owner.lowerBound, epoch.lowerBound)
+        XCTAssertLessThan(epoch.lowerBound, nativeStop.lowerBound)
+
+        let epochMethod = try sourceSlice(
+            in: source,
+            after: "    private func advanceScreenVideoStatisticsEpoch(using sourcePeer: WebRTCPeer?) {",
+            before: "    private func automaticScreenMediaResumeTimedOut("
+        )
+        XCTAssertTrue(epochMethod.contains("minimumNextStatisticsCollectionSequence()"))
+        XCTAssertTrue(epochMethod.contains("resetForCaptureGeometryEpoch()"))
+        XCTAssertTrue(epochMethod.contains("resetForSenderConfigurationEpoch()"))
+        XCTAssertTrue(epochMethod.contains("screenVideoAdaptationEvidenceLane = nil"))
+        XCTAssertTrue(epochMethod.contains("screenVideoAdaptationLastEvidenceTime = nil"))
+        XCTAssertTrue(epochMethod.contains("screenVideoAdaptationPolicyRevision &+= 1"))
     }
 
     private func superseded(
