@@ -411,14 +411,23 @@ private enum MTLDrawablePresentationObserver {
     }
 }
 
-/// A drawable may invoke its presentation callback while the handler is being installed. Such a
-/// callback cannot prove the frame that LiveKit has not drawn yet. Keep the ticket disarmed until
-/// native drawing has returned and the renderer's frame revision is still the one we observed.
+/// A drawable may invoke its presentation callback while the handler is being installed, before
+/// LiveKit has drawn anything. Reject that callback. Once native drawing begins, a presentation
+/// callback for this drawable may race the draw return and frame-revision check; hold it until
+/// validation so an exact one-shot proof cannot be lost in that interval.
 final class WebRTCVideoPresentationTicket: @unchecked Sendable {
+    private enum Phase {
+        case registering
+        case drawing
+        case validating
+        case presentedBeforeValidation
+        case armed
+        case retired
+    }
+
     private let lock = NSLock()
     private let publish: @Sendable () -> Void
-    private var isArmed = false
-    private var isRetired = false
+    private var phase: Phase = .registering
 
     init(publish: @escaping @Sendable () -> Void) {
         self.publish = publish
@@ -426,23 +435,60 @@ final class WebRTCVideoPresentationTicket: @unchecked Sendable {
 
     func presented() {
         let shouldPublish = lock.withLock {
-            guard !isRetired else { return false }
-            isRetired = true
-            return isArmed
+            switch phase {
+            case .registering:
+                phase = .retired
+                return false
+            case .drawing, .validating:
+                phase = .presentedBeforeValidation
+                return false
+            case .presentedBeforeValidation, .retired:
+                return false
+            case .armed:
+                phase = .retired
+                return true
+            }
         }
         if shouldPublish {
             publish()
         }
     }
 
-    func finishDrawing(valid: Bool) {
+    func nativeDrawStarted() {
         lock.withLock {
-            guard !isRetired else { return }
-            if valid {
-                isArmed = true
-            } else {
-                isRetired = true
+            if case .registering = phase {
+                phase = .drawing
             }
+        }
+    }
+
+    func nativeDrawReturned() {
+        lock.withLock {
+            if case .drawing = phase {
+                phase = .validating
+            }
+        }
+    }
+
+    func finishDrawing(valid: Bool) {
+        let shouldPublish = lock.withLock {
+            guard valid else {
+                phase = .retired
+                return false
+            }
+            switch phase {
+            case .validating:
+                phase = .armed
+                return false
+            case .presentedBeforeValidation:
+                phase = .retired
+                return true
+            case .registering, .drawing, .armed, .retired:
+                return false
+            }
+        }
+        if shouldPublish {
+            publish()
         }
     }
 }
@@ -456,6 +502,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     private struct PendingFrame {
         let sequence: UInt64
         let dimensionGeneration: UInt64
+        let freshnessFenceEpoch: UInt64
         let presentationDimensions: WebRTCVideoPresentationDimensions
         let frame: LKRTCVideoFrame
         let exactMarker: ScreenVideoInBandMarkerNonce?
@@ -491,6 +538,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     private var contentSampleCount: UInt64 = 0
     private var contentChangeCount: UInt64 = 0
     private var minimumAcceptedRTPTimestamp: UInt32?
+    private var freshnessFenceEpoch: UInt64 = 0
     private var armedProofRTPTimestamps: Set<UInt32> = []
     private var recentProofObservations:
         [WebRTCVideoPresentationProofObservation] = []
@@ -542,8 +590,12 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                     != minimumAcceptedRTPTimestamp {
                     self.minimumAcceptedRTPTimestamp =
                         minimumAcceptedRTPTimestamp
+                    freshnessFenceEpoch &+= 1
+                    nativeMutationRevision &+= 1
                     pendingFrame = nil
                     lastSubmittedTimestampNanoseconds = nil
+                    recentProofObservations.removeAll()
+                    presentedMarkerHistory.removeAll()
                 }
                 armedProofRTPTimestamps = proofRTPTimestamps
                 self.retainsPresentedMarkerCandidates =
@@ -664,6 +716,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                 pendingFrame = PendingFrame(
                     sequence: nextFrameSequence,
                     dimensionGeneration: dimensionGeneration,
+                    freshnessFenceEpoch: freshnessFenceEpoch,
                     presentationDimensions: presentationDimensions,
                     frame: frame,
                     exactMarker: exactMarker
@@ -746,6 +799,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     /// frame replacement without requiring a GPU drawable in XCTest.
     func draw(
         registerPresentedHandler: ((@escaping @Sendable () -> Void) -> Bool)?,
+        afterNativeDraw: () -> Void = {},
         usingLiveKit drawUsingLiveKit: () -> Void
     ) {
         let candidate: (frame: PendingFrame, revision: UInt64)? = lock.withLock {
@@ -768,7 +822,12 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         let observesPresentation = registerPresentedHandler {
             ticket.presented()
         }
+        if observesPresentation {
+            ticket.nativeDrawStarted()
+        }
         drawUsingLiveKit()
+        ticket.nativeDrawReturned()
+        afterNativeDraw()
         let isValid = lock.withLock {
             guard observesPresentation,
                   !isInvalidated,
@@ -796,6 +855,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         ) = lock.withLock {
             guard !isInvalidated,
                   presentedFrame.dimensionGeneration == dimensionGeneration,
+                  presentedFrame.freshnessFenceEpoch == freshnessFenceEpoch,
                   presentedFrame.sequence > lastPublishedFrameSequence else {
                 return (nil, nil, nil)
             }

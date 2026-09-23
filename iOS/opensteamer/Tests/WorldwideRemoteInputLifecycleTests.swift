@@ -2445,7 +2445,11 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         )
         callbackDuringDraw?()
         XCTAssertEqual(nativeDrawCount, 2)
-        XCTAssertEqual(publication.publicationCount, 0)
+        XCTAssertEqual(
+            publication.publicationCount,
+            1,
+            "A presented drawable during native draw must publish after frame validation"
+        )
 
         renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 3_000_000))
         var callbackAfterDraw: (@Sendable () -> Void)?
@@ -2457,10 +2461,219 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
             usingLiveKit: { nativeDrawCount += 1 }
         )
         XCTAssertEqual(nativeDrawCount, 3)
-        XCTAssertEqual(publication.publicationCount, 0)
-        callbackAfterDraw?()
-        callbackAfterDraw?()
         XCTAssertEqual(publication.publicationCount, 1)
+        callbackAfterDraw?()
+        callbackAfterDraw?()
+        // The second presentation is still within ordinary-observation throttling.
+        XCTAssertEqual(publication.publicationCount, 1)
+    }
+
+    func testMetalPresentationDuringAndImmediatelyAfterNativeDrawRetainsExactProof() throws {
+        let ordinary = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let exactProof = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let renderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in ordinary.recordPublication() },
+            publishProof: { _, _ in exactProof.recordPublication() }
+        )
+
+        let duringDrawFrame = try makeRendererFrame(timestampNanoseconds: 5_000_000)
+        renderer.updateFreshnessFence(
+            minimumAcceptedRTPTimestamp: nil,
+            proofRTPTimestamps: [UInt32(bitPattern: duringDrawFrame.timeStamp)],
+            retainsPresentedMarkerCandidates: false,
+            markerProof: nil
+        )
+        renderer.renderFrame(duringDrawFrame)
+        var duringDrawCallback: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                duringDrawCallback = callback
+                return true
+            },
+            usingLiveKit: {
+                duringDrawCallback?()
+                XCTAssertEqual(exactProof.publicationCount, 0)
+            }
+        )
+        duringDrawCallback?()
+        XCTAssertEqual(exactProof.publicationCount, 1)
+        XCTAssertEqual(ordinary.publicationCount, 1)
+
+        let afterDrawProof = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let afterDrawRenderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in },
+            publishProof: { _, _ in afterDrawProof.recordPublication() }
+        )
+        let afterDrawFrame = try makeRendererFrame(timestampNanoseconds: 6_000_000)
+        afterDrawRenderer.updateFreshnessFence(
+            minimumAcceptedRTPTimestamp: nil,
+            proofRTPTimestamps: [UInt32(bitPattern: afterDrawFrame.timeStamp)],
+            retainsPresentedMarkerCandidates: false,
+            markerProof: nil
+        )
+        afterDrawRenderer.renderFrame(afterDrawFrame)
+        var afterDrawCallback: (@Sendable () -> Void)?
+        afterDrawRenderer.draw(
+            registerPresentedHandler: { callback in
+                afterDrawCallback = callback
+                return true
+            },
+            afterNativeDraw: {
+                afterDrawCallback?()
+                XCTAssertEqual(afterDrawProof.publicationCount, 0)
+            },
+            usingLiveKit: {}
+        )
+        afterDrawCallback?()
+        XCTAssertEqual(afterDrawProof.publicationCount, 1)
+    }
+
+    func testMetalBufferedPresentationCannotPublishReplacedFrame() throws {
+        let publication = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let renderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in publication.recordPublication() }
+        )
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 7_000_000))
+        let replacementFrame = try makeRendererFrame(timestampNanoseconds: 8_000_000)
+        var callback: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { presented in
+                callback = presented
+                return true
+            },
+            afterNativeDraw: {
+                callback?()
+                renderer.renderFrame(replacementFrame)
+            },
+            usingLiveKit: {}
+        )
+        callback?()
+        XCTAssertEqual(publication.publicationCount, 0)
+    }
+
+    func testArmedMetalPresentationCannotCrossFreshnessFloorChange() throws {
+        let ordinary = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let exactProof = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let renderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in ordinary.recordPublication() },
+            publishProof: { _, _ in exactProof.recordPublication() }
+        )
+        let oldFrame = try makeRendererFrame(timestampNanoseconds: 9_000_000)
+        renderer.renderFrame(oldFrame)
+        var callback: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { presented in
+                callback = presented
+                return true
+            },
+            usingLiveKit: {}
+        )
+        let oldRTP = UInt32(bitPattern: oldFrame.timeStamp)
+        renderer.updateFreshnessFence(
+            minimumAcceptedRTPTimestamp: oldRTP &+ 1,
+            proofRTPTimestamps: [oldRTP],
+            retainsPresentedMarkerCandidates: false,
+            markerProof: nil
+        )
+        callback?()
+        XCTAssertEqual(ordinary.publicationCount, 0)
+        XCTAssertEqual(exactProof.publicationCount, 0)
+
+        // A presentation cached before a later floor change must not satisfy a newly armed
+        // one-shot proof with the same RTP timestamp after that boundary.
+        renderer.updateFreshnessFence(
+            minimumAcceptedRTPTimestamp: nil,
+            proofRTPTimestamps: [],
+            retainsPresentedMarkerCandidates: false,
+            markerProof: nil
+        )
+        let recentFrame = try makeRendererFrame(timestampNanoseconds: 10_000_000)
+        renderer.renderFrame(recentFrame)
+        var recentCallback: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { presented in
+                recentCallback = presented
+                return true
+            },
+            usingLiveKit: {}
+        )
+        recentCallback?()
+        XCTAssertEqual(ordinary.publicationCount, 1)
+        renderer.updateFreshnessFence(
+            minimumAcceptedRTPTimestamp: oldRTP &+ 1,
+            proofRTPTimestamps: [UInt32(bitPattern: recentFrame.timeStamp)],
+            retainsPresentedMarkerCandidates: false,
+            markerProof: nil
+        )
+        XCTAssertEqual(exactProof.publicationCount, 0)
     }
 
     func testMetalRegistrationAndDrawDoNotHoldRendererStateLock() throws {
@@ -2513,6 +2726,7 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
                 return true
             },
             usingLiveKit: {
+                callbackAfterNativeDraw?()
                 DispatchQueue.global().async {
                     renderer.setSize(size)
                     nativeDrawMutationFinished.signal()
