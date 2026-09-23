@@ -106,6 +106,36 @@ tests, 157/157 fake-runner scenarios, and the full 642-method deterministic
 contributor gate passed without skips. Evidence for the latter is
 `/Volumes/t7/beluga-startup-burst.fkXnsz/swift-build/validation-runs/startup-20260923-38133-qqq6s3`.
 
+#### Replication result: RED
+
+The four fresh arms all passed their unchanged strict per-process receipts, but
+the predeclared aggregate acceptance failed and the investigation stopped:
+
+| Arm | First changed full-size frame | Recovery latency | Final decoded fps |
+| --- | ---: | ---: | ---: |
+| control A | 2359.830 ms | 330.178 ms | 12.5 |
+| startup A | 1235.689 ms | 388.558 ms | 13.0 |
+| startup B | 1223.774 ms | 2353.937 ms | 12.5 |
+| control B | 2372.085 ms | 2401.956 ms | 12.5 |
+
+Startup advanced the first changed full-size frame by 1124.141 ms in pair A and
+1148.311 ms in pair B, and both cadence ratios cleared the 90% floor. Pair B
+recovery was 48.020 ms faster, but pair A recovery was 58.380 ms slower. The
+predeclared rule required recovery to be no slower in both order directions, so
+the 1.5-second candidate is **not accepted**. Do not average the opposite recovery
+results, retry away this RED, or proceed to the weak-link or subsequent-pressure
+lanes from this candidate.
+
+All four arms used source identity `01e538e3...`, test binary `153a0e4a...`, QP
+hook `cd91743c...`, QP oracle `22ce0e88...`, runner `25b92d23...`, bridge
+`a0a59e41...`, and drain oracle `0dc76666...`. The independently rechecked summary
+is `/Volumes/t7/beluga-startup-burst.fkXnsz/pacer-bridge.xjZwtL/startup-qp-media-abba-6.summary.json`
+(SHA-256 `7c088b00ca3fc457c19f9457648ca8df663b4fd43380ef81e81bac53d7281e4c`).
+The active generic scratch artifact remains the reproducible sealed 1.5-second
+hook; the prior sealed 2.0-second library is preserved separately as
+`libVTQPStartupHook-2000ms-c6b4d507.dylib`. Neither artifact is production code or
+installed state.
+
 ## Evidence and reproducibility
 
 - Startup matrix evidence: `/Volumes/t7/beluga-startup-burst.fkXnsz/swift-build/validation-runs/startup-20260920-46182-103c3pe`
