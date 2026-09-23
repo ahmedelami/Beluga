@@ -512,6 +512,23 @@ actor WorldwideScreenService {
         } else {
             "unknown"
         }
+        let rendererPath = if let path = heartbeat.rendererPath {
+            " rendererEpoch=\(path.rendererEpoch)"
+                + " nativeCover=\(path.nativeCoverVisible)"
+                + " metalDelegate=\(path.metalDelegateInstalled)"
+                + " renderEntries=\(path.renderFrameEntries)"
+                + " mtkDrawEntries=\(path.mtkDrawEntries)"
+                + " nilDrawable=\(path.nilDrawable)"
+                + " producerBusy=\(path.producerBusy)"
+                + " registrarUnsupported=\(path.registrarUnsupported)"
+                + " registrarAlreadyPresented=\(path.registrarAlreadyPresented)"
+                + " registrarRegistered=\(path.registrarRegistered)"
+                + " callbackEarly=\(path.callbackEarly)"
+                + " callbackValid=\(path.callbackValid)"
+                + " callbackFenceRejected=\(path.callbackFenceRejected)"
+        } else {
+            " rendererPath=unavailable"
+        }
         return "Worldwide screen client diagnostics "
             + "seq=\(heartbeat.sequence) "
             + "screenRequestID="
@@ -540,6 +557,7 @@ actor WorldwideScreenService {
             + (heartbeat.framesPerSecond.map {
                 String(format: "%.1f", $0)
             } ?? "none")
+            + rendererPath
     }
 
     /// Adds only structural state when a pointer action fails the screen-format fence.

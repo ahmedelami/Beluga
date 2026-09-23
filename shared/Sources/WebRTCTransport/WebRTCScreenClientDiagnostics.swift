@@ -23,6 +23,65 @@ public enum WebRTCScreenClientCoverReason: String, Codable, Equatable, Sendable 
     case screenHidden
 }
 
+/// Content-free counters for one ephemeral UIKit renderer binding. The epoch changes when the
+/// view binds a new track, so a reconnect or remount cannot make old counts look current. These
+/// are path observations, not proof that the final iPhone composite contains visible pixels.
+public struct WebRTCVideoRendererPathDiagnostics: Codable, Equatable, Sendable {
+    public static let maximumEventCount: UInt64 = 1_000_000_000
+
+    public let rendererEpoch: UInt64
+    public let nativeCoverVisible: Bool
+    public let metalDelegateInstalled: Bool
+    public let renderFrameEntries: UInt64
+    public let mtkDrawEntries: UInt64
+    public let nilDrawable: UInt64
+    public let producerBusy: UInt64
+    public let registrarUnsupported: UInt64
+    public let registrarAlreadyPresented: UInt64
+    public let registrarRegistered: UInt64
+    public let callbackEarly: UInt64
+    public let callbackValid: UInt64
+    public let callbackFenceRejected: UInt64
+
+    public init(
+        rendererEpoch: UInt64,
+        nativeCoverVisible: Bool,
+        metalDelegateInstalled: Bool,
+        renderFrameEntries: UInt64 = 0,
+        mtkDrawEntries: UInt64 = 0,
+        nilDrawable: UInt64 = 0,
+        producerBusy: UInt64 = 0,
+        registrarUnsupported: UInt64 = 0,
+        registrarAlreadyPresented: UInt64 = 0,
+        registrarRegistered: UInt64 = 0,
+        callbackEarly: UInt64 = 0,
+        callbackValid: UInt64 = 0,
+        callbackFenceRejected: UInt64 = 0
+    ) {
+        self.rendererEpoch = rendererEpoch
+        self.nativeCoverVisible = nativeCoverVisible
+        self.metalDelegateInstalled = metalDelegateInstalled
+        self.renderFrameEntries = renderFrameEntries
+        self.mtkDrawEntries = mtkDrawEntries
+        self.nilDrawable = nilDrawable
+        self.producerBusy = producerBusy
+        self.registrarUnsupported = registrarUnsupported
+        self.registrarAlreadyPresented = registrarAlreadyPresented
+        self.registrarRegistered = registrarRegistered
+        self.callbackEarly = callbackEarly
+        self.callbackValid = callbackValid
+        self.callbackFenceRejected = callbackFenceRejected
+    }
+
+    public var isValid: Bool {
+        rendererEpoch > 0 && [
+            renderFrameEntries, mtkDrawEntries, nilDrawable, producerBusy,
+            registrarUnsupported, registrarAlreadyPresented, registrarRegistered,
+            callbackEarly, callbackValid, callbackFenceRejected
+        ].allSatisfy { $0 <= Self.maximumEventCount }
+    }
+}
+
 /// One bounded, content-free client heartbeat sent to the paired Mac on an isolated data channel.
 /// Pixels, digests, SDP, candidates, track IDs, SSRCs, and arbitrary strings are never carried.
 public struct WebRTCScreenClientDiagnosticsHeartbeat: Codable, Equatable, Sendable {
@@ -48,6 +107,8 @@ public struct WebRTCScreenClientDiagnosticsHeartbeat: Codable, Equatable, Sendab
     public let frameWidth: Int?
     public let frameHeight: Int?
     public let framesPerSecond: Double?
+    /// Optional so a newer iPhone remains compatible with a host that only understands v1.
+    public let rendererPath: WebRTCVideoRendererPathDiagnostics?
 
     public init(
         sequence: UInt64,
@@ -65,7 +126,8 @@ public struct WebRTCScreenClientDiagnosticsHeartbeat: Codable, Equatable, Sendab
         presentationAgeMilliseconds: UInt64? = nil,
         frameWidth: Int? = nil,
         frameHeight: Int? = nil,
-        framesPerSecond: Double? = nil
+        framesPerSecond: Double? = nil,
+        rendererPath: WebRTCVideoRendererPathDiagnostics? = nil
     ) {
         protocolVersion = Self.currentProtocolVersion
         self.sequence = sequence
@@ -84,6 +146,7 @@ public struct WebRTCScreenClientDiagnosticsHeartbeat: Codable, Equatable, Sendab
         self.frameWidth = frameWidth
         self.frameHeight = frameHeight
         self.framesPerSecond = framesPerSecond
+        self.rendererPath = rendererPath
     }
 
     public var isValid: Bool {
@@ -97,7 +160,8 @@ public struct WebRTCScreenClientDiagnosticsHeartbeat: Codable, Equatable, Sendab
               Self.validDimension(frameHeight),
               framesPerSecond.map({
                   $0.isFinite && $0 >= 0 && $0 <= Self.maximumFramesPerSecond
-              }) ?? true else {
+              }) ?? true,
+              rendererPath.map(\.isValid) ?? true else {
             return false
         }
         if liveness == .trackMissing {

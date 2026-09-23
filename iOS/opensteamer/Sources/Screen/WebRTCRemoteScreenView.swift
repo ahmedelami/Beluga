@@ -21,6 +21,7 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
         (WebRTCVideoPresentationProofObservation) -> Void = { _ in }
     var onVideoMarkerFramePresentedForProof:
         (WebRTCVideoMarkerPresentationProofObservation) -> Void = { _ in }
+    var onRendererMounted: (WebRTCRemoteVideoView) -> Void = { _ in }
     var onPresentationCoverInstalled: (UUID) -> Void = { _ in }
 
     final class Coordinator {
@@ -62,6 +63,7 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
             presentationCoverID,
             handler: onPresentationCoverInstalled
         )
+        onRendererMounted(view)
         return view
     }
 
@@ -84,6 +86,7 @@ struct WebRTCRemoteScreenView: UIViewRepresentable {
             handler: onPresentationCoverInstalled
         )
         view.setTrack(track)
+        onRendererMounted(view)
     }
 
     static func dismantleUIView(

@@ -56,13 +56,53 @@ final class WorldwideHostLifecycleTests: XCTestCase {
                 + "coverVisible=false coverReason=none inboundBytes=8192 "
                 + "inboundPackets=64 decoded=32 presented=31 contentSamples=12 "
                 + "contentChanges=4 presentationAgeMs=5250 dimensions=1280x832 "
-                + "fps=12.5"
+                + "fps=12.5 rendererPath=unavailable"
         )
         XCTAssertFalse(message.contains("trackID"))
         XCTAssertFalse(message.contains("receiverID"))
         XCTAssertFalse(message.contains("sourceID"))
         XCTAssertFalse(message.contains("SSRC"))
         XCTAssertFalse(message.contains("SDP"))
+    }
+
+    func testScreenClientDiagnosticsLogDistinguishesNativeCoverAndRendererStages() {
+        let heartbeat = WebRTCScreenClientDiagnosticsHeartbeat(
+            sequence: 10,
+            screenRequestID: 43,
+            liveness: .presentationStalled,
+            trackAttached: true,
+            coverVisible: false,
+            coverReason: .none,
+            rendererPath: WebRTCVideoRendererPathDiagnostics(
+                rendererEpoch: 91,
+                nativeCoverVisible: true,
+                metalDelegateInstalled: true,
+                renderFrameEntries: 40,
+                mtkDrawEntries: 30,
+                nilDrawable: 4,
+                producerBusy: 3,
+                registrarUnsupported: 2,
+                registrarAlreadyPresented: 1,
+                registrarRegistered: 20,
+                callbackEarly: 1,
+                callbackValid: 12,
+                callbackFenceRejected: 2
+            )
+        )
+        XCTAssertTrue(heartbeat.isValid)
+        let message = WorldwideScreenService.screenClientDiagnosticsLogMessage(
+            heartbeat,
+            hostPhase: .suspended,
+            isCorrelated: true
+        )
+        XCTAssertTrue(message.contains("coverVisible=false"))
+        XCTAssertTrue(message.contains("nativeCover=true"))
+        XCTAssertTrue(message.contains("rendererEpoch=91"))
+        XCTAssertTrue(message.contains("nilDrawable=4"))
+        XCTAssertTrue(message.contains("producerBusy=3"))
+        XCTAssertTrue(message.contains("callbackFenceRejected=2"))
+        XCTAssertFalse(message.contains("pixel"))
+        XCTAssertFalse(message.contains("digest"))
     }
 
     func testRemoteInputFormatDiagnosticReportsBoundedOriginAndGeometryState() {

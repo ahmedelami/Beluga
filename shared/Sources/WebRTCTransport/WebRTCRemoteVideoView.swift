@@ -413,6 +413,28 @@ private final class ObservedMTKViewDelegateProxy: NSObject, MTKViewDelegate, @un
 
 /// Calls the public MTLDrawable presentation callback through Objective-C dispatch because the
 /// pinned iOS SDK's Swift overlay omits the method even though the runtime protocol implements it.
+enum WebRTCVideoDrawablePresentationPreflight {
+    enum Decision: Equatable {
+        case register
+        case alreadyPresented
+        case unsupported
+    }
+
+    static func decide(
+        hasPresentedHandler: Bool,
+        presentedTime: CFTimeInterval?
+    ) -> Decision {
+        guard hasPresentedHandler else { return .unsupported }
+        // Some Metal runtimes implement the presentation callback but do not expose the newer
+        // presentedTime selector. MTKView.currentDrawable still belongs to this draw; the ticket
+        // below rejects a callback that arrives before native drawing begins.
+        if let presentedTime, presentedTime != 0 {
+            return .alreadyPresented
+        }
+        return .register
+    }
+}
+
 private enum MTLDrawablePresentationObserver {
     enum Registration: Equatable {
         case registered
@@ -439,18 +461,26 @@ private enum MTLDrawablePresentationObserver {
     ) -> Registration {
         let object = drawable as AnyObject
         guard object.responds(to: selector),
-              let implementation = object.method(for: selector),
-              object.responds(to: presentedTimeSelector),
-              let timeImplementation = object.method(for: presentedTimeSelector) else {
+              let implementation = object.method(for: selector) else {
             return .unsupported
         }
-        let readPresentedTime = unsafeBitCast(
-            timeImplementation,
-            to: ReadPresentedTime.self
-        )
-        // MTKView.currentDrawable is for this draw; a nonzero presentation time here means it
-        // was already displayed and cannot prove the frame that has not yet been submitted.
-        guard readPresentedTime(object, presentedTimeSelector) == 0 else {
+        let presentedTime: CFTimeInterval?
+        if object.responds(to: presentedTimeSelector),
+           let timeImplementation = object.method(for: presentedTimeSelector) {
+            let readPresentedTime = unsafeBitCast(
+                timeImplementation,
+                to: ReadPresentedTime.self
+            )
+            presentedTime = readPresentedTime(object, presentedTimeSelector)
+        } else {
+            presentedTime = nil
+        }
+        // If available, a nonzero presentation time rejects an old drawable. Absence of the
+        // getter alone cannot black out a valid callback-capable runtime as it did in build 83.
+        guard WebRTCVideoDrawablePresentationPreflight.decide(
+            hasPresentedHandler: true,
+            presentedTime: presentedTime
+        ) == .register else {
             return .alreadyPresented
         }
         let handler: PresentedHandler = { _ in didPresent() }
@@ -479,29 +509,45 @@ final class WebRTCVideoPresentationTicket: @unchecked Sendable {
 
     private let lock = NSLock()
     private let publish: @Sendable () -> Void
+    private let rejectEarly: @Sendable () -> Void
+    private let rejectFence: @Sendable () -> Void
     private var phase: Phase = .registering
+    private var retiredRejectsNextCallback = false
 
-    init(publish: @escaping @Sendable () -> Void) {
+    init(
+        publish: @escaping @Sendable () -> Void,
+        rejectEarly: @escaping @Sendable () -> Void = {},
+        rejectFence: @escaping @Sendable () -> Void = {}
+    ) {
         self.publish = publish
+        self.rejectEarly = rejectEarly
+        self.rejectFence = rejectFence
     }
 
     func presented() {
-        let shouldPublish = lock.withLock {
+        let result = lock.withLock {
+            () -> (publish: Bool, early: Bool, fenceRejected: Bool) in
             switch phase {
             case .registering:
                 phase = .retired
-                return false
+                return (false, true, false)
             case .drawing, .validating:
                 phase = .presentedBeforeValidation
-                return false
-            case .presentedBeforeValidation, .retired:
-                return false
+                return (false, false, false)
+            case .presentedBeforeValidation:
+                return (false, false, false)
+            case .retired:
+                let reject = retiredRejectsNextCallback
+                retiredRejectsNextCallback = false
+                return (false, false, reject)
             case .armed:
                 phase = .retired
-                return true
+                return (true, false, false)
             }
         }
-        if shouldPublish {
+        if result.early { rejectEarly() }
+        if result.fenceRejected { rejectFence() }
+        if result.publish {
             publish()
         }
     }
@@ -525,23 +571,31 @@ final class WebRTCVideoPresentationTicket: @unchecked Sendable {
     }
 
     func finishDrawing(valid: Bool) {
-        let shouldPublish = lock.withLock {
+        let result = lock.withLock { () -> (publish: Bool, rejected: Bool) in
             guard valid else {
+                let hadCallback: Bool
+                if case .presentedBeforeValidation = phase {
+                    hadCallback = true
+                } else {
+                    hadCallback = false
+                }
+                retiredRejectsNextCallback = !hadCallback
                 phase = .retired
-                return false
+                return (false, hadCallback)
             }
             switch phase {
             case .validating:
                 phase = .armed
-                return false
+                return (false, false)
             case .presentedBeforeValidation:
                 phase = .retired
-                return true
+                return (true, false)
             case .registering, .drawing, .armed, .retired:
-                return false
+                return (false, false)
             }
         }
-        if shouldPublish {
+        if result.rejected { rejectFence() }
+        if result.publish {
             publish()
         }
     }
@@ -560,6 +614,25 @@ struct WebRTCVideoPublicationFence: Equatable, Sendable {
 /// frame without delay. WebRTC and Metal callbacks can use different threads, so all state uses
 /// one lock.
 final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Sendable {
+    private struct PathCounters {
+        var renderFrameEntries: UInt64 = 0
+        var mtkDrawEntries: UInt64 = 0
+        var nilDrawable: UInt64 = 0
+        var producerBusy: UInt64 = 0
+        var registrarUnsupported: UInt64 = 0
+        var registrarAlreadyPresented: UInt64 = 0
+        var registrarRegistered: UInt64 = 0
+        var callbackEarly: UInt64 = 0
+        var callbackValid: UInt64 = 0
+        var callbackFenceRejected: UInt64 = 0
+    }
+
+    private enum PathEvent {
+        case renderFrameEntry, mtkDrawEntry, nilDrawable, producerBusy
+        case registrarUnsupported, registrarAlreadyPresented, registrarRegistered
+        case callbackEarly, callbackValid, callbackFenceRejected
+    }
+
     private struct PendingFrame {
         let sequence: UInt64
         let dimensionGeneration: UInt64
@@ -588,6 +661,11 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     /// Serializes only native producer/draw operations. Never acquire this while holding `lock`:
     /// a Metal presentation callback may need `lock` while native draw is in progress.
     private let nativeOperationLock = NSRecursiveLock()
+    /// Independent short-held lock: the Metal thread must never wait for the producer's renderer
+    /// state lock merely to count a failed native try-lock or a drawable callback.
+    private let pathCounterLock = NSLock()
+    private var pathCounters = PathCounters()
+    private let rendererEpoch = UInt64.random(in: 1...UInt64.max)
     private let redrawRetryCondition = NSCondition()
     private let reservedDrawWindowSeconds: TimeInterval
     private var pendingRedrawRetry: (@Sendable () -> Void)?
@@ -619,6 +697,52 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     private var armedMarkerProof: ScreenVideoInBandMarkerNonce?
     private var presentedMarkerHistory = WebRTCVideoPresentedMarkerHistory()
     private var isInvalidated = false
+
+    private static func increment(_ counter: inout UInt64) {
+        if counter < WebRTCVideoRendererPathDiagnostics.maximumEventCount {
+            counter += 1
+        }
+    }
+
+    private func recordPathEvent(_ event: PathEvent) {
+        pathCounterLock.withLock {
+            switch event {
+            case .renderFrameEntry: Self.increment(&pathCounters.renderFrameEntries)
+            case .mtkDrawEntry: Self.increment(&pathCounters.mtkDrawEntries)
+            case .nilDrawable: Self.increment(&pathCounters.nilDrawable)
+            case .producerBusy: Self.increment(&pathCounters.producerBusy)
+            case .registrarUnsupported: Self.increment(&pathCounters.registrarUnsupported)
+            case .registrarAlreadyPresented:
+                Self.increment(&pathCounters.registrarAlreadyPresented)
+            case .registrarRegistered: Self.increment(&pathCounters.registrarRegistered)
+            case .callbackEarly: Self.increment(&pathCounters.callbackEarly)
+            case .callbackValid: Self.increment(&pathCounters.callbackValid)
+            case .callbackFenceRejected: Self.increment(&pathCounters.callbackFenceRejected)
+            }
+        }
+    }
+
+    func pathDiagnostics(
+        nativeCoverVisible: Bool,
+        metalDelegateInstalled: Bool
+    ) -> WebRTCVideoRendererPathDiagnostics {
+        let counters = pathCounterLock.withLock { pathCounters }
+        return WebRTCVideoRendererPathDiagnostics(
+            rendererEpoch: rendererEpoch,
+            nativeCoverVisible: nativeCoverVisible,
+            metalDelegateInstalled: metalDelegateInstalled,
+            renderFrameEntries: counters.renderFrameEntries,
+            mtkDrawEntries: counters.mtkDrawEntries,
+            nilDrawable: counters.nilDrawable,
+            producerBusy: counters.producerBusy,
+            registrarUnsupported: counters.registrarUnsupported,
+            registrarAlreadyPresented: counters.registrarAlreadyPresented,
+            registrarRegistered: counters.registrarRegistered,
+            callbackEarly: counters.callbackEarly,
+            callbackValid: counters.callbackValid,
+            callbackFenceRejected: counters.callbackFenceRejected
+        )
+    }
 
     init(
         downstream: LKRTCVideoRenderer,
@@ -752,6 +876,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     }
 
     func renderFrame(_ frame: LKRTCVideoFrame?) {
+        recordPathEvent(.renderFrameEntry)
         beginNativeProducerOperation()
         defer { finishNativeOperation() }
         let invalidatedGeneration: UInt64? = lock.withLock {
@@ -882,6 +1007,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         requestPacedRedraw: @escaping @Sendable () -> Void,
         usingLiveKit drawUsingLiveKit: () -> Void
     ) {
+        if drawable == nil { recordPathEvent(.nilDrawable) }
         var alreadyPresented = false
         draw(
             registerPresentedHandler: drawable.map { drawable in
@@ -912,6 +1038,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         afterNativeDraw: () -> Void = {},
         usingLiveKit drawUsingLiveKit: () -> Void
     ) {
+        recordPathEvent(.mtkDrawEntry)
         // Arm before try-lock: if the producer releases between a failed try and retry
         // registration, that otherwise loses the only wakeup for a static marker frame.
         redrawRetryCondition.lock()
@@ -926,6 +1053,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         // UIKit. Do not let LiveKit consume this one-shot frame without a presentation handler:
         // its timestamp deduplication would then prevent a later draw from proving it.
         guard nativeOperationLock.try() else {
+            recordPathEvent(.producerBusy)
             return
         }
         defer { finishNativeOperation(completedDraw: true) }
@@ -951,16 +1079,28 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
             return
         }
 
-        let ticket = WebRTCVideoPresentationTicket { [weak self] in
-            self?.didPresent(candidate.frame)
-        }
+        let ticket = WebRTCVideoPresentationTicket(
+            publish: { [weak self] in self?.didPresent(candidate.frame) },
+            rejectEarly: { [weak self] in self?.recordPathEvent(.callbackEarly) },
+            rejectFence: { [weak self] in
+                self?.recordPathEvent(.callbackFenceRejected)
+            }
+        )
         let observesPresentation = registerPresentedHandler {
             ticket.presented()
         }
         beforeNativeDraw()
-        if !observesPresentation, retryFailedRegistration() {
-            requestRedraw?()
-            return
+        if observesPresentation {
+            recordPathEvent(.registrarRegistered)
+        } else {
+            let alreadyPresented = retryFailedRegistration()
+            recordPathEvent(
+                alreadyPresented ? .registrarAlreadyPresented : .registrarUnsupported
+            )
+            if alreadyPresented {
+                requestRedraw?()
+                return
+            }
         }
         if observesPresentation, !ticket.nativeDrawStarted() {
             // A callback during registration belongs to an already-presented drawable. Do not
@@ -1025,6 +1165,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
 
     private func didPresent(_ presentedFrame: PendingFrame) {
         let now = DispatchTime.now().uptimeNanoseconds
+        var accepted = false
         let publications: (
             ordinary: (WebRTCVideoRenderObservation, WebRTCVideoPublicationFence)?,
             proof: (WebRTCVideoPresentationProofObservation, WebRTCVideoPublicationFence)?,
@@ -1040,6 +1181,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                 return (nil, nil, nil)
             }
             lastPublishedFrameSequence = presentedFrame.sequence
+            accepted = true
             let publicationFence = WebRTCVideoPublicationFence(
                 dimensionGeneration: presentedFrame.dimensionGeneration,
                 freshnessFenceEpoch: presentedFrame.freshnessFenceEpoch
@@ -1131,6 +1273,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
             )
             return (ordinaryPublication, proofPublication, markerPublication)
         }
+        recordPathEvent(accepted ? .callbackValid : .callbackFenceRejected)
         if let publication = publications.ordinary {
             publish(publication.0, publication.1)
         }
@@ -1298,6 +1441,18 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
     /// Reports an exact decoded nonce only after that same frame's Metal drawable presents.
     public var onVideoMarkerFramePresentedForProof:
         ((WebRTCVideoMarkerPresentationProofObservation) -> Void)?
+
+    /// Read only on the diagnostics heartbeat. Exact track identity prevents a detached or
+    /// superseded binding from reporting counters for the current screen session.
+    public func rendererPathDiagnostics(
+        matching track: WebRTCRemoteVideoTrack
+    ) -> WebRTCVideoRendererPathDiagnostics? {
+        guard currentTrack === track, let observedRenderer else { return nil }
+        return observedRenderer.pathDiagnostics(
+            nativeCoverVisible: !presentationCover.isHidden,
+            metalDelegateInstalled: metalDelegateProxy != nil
+        )
+    }
 
     public override init(frame: CGRect) {
         super.init(frame: frame)

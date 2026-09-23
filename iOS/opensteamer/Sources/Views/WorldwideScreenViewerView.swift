@@ -93,6 +93,9 @@ struct WorldwideScreenViewerView: View {
                                     for: lease
                                 )
                             },
+                            onRendererMounted: { view in
+                                viewModel.screenRendererDidMount(view, for: lease)
+                            },
                             onPresentationCoverInstalled: { coverID in
                                 // The UIKit bridge has synchronously placed its opaque cover. Hop
                                 // out of UIViewRepresentable reconciliation before publishing the

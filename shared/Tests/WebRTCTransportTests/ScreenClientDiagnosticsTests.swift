@@ -93,6 +93,55 @@ final class ScreenClientDiagnosticsTests: XCTestCase {
         )
     }
 
+    func testOptionalRendererPathRoundTripsAndRejectsUnboundedCounters() throws {
+        let rendererPath = WebRTCVideoRendererPathDiagnostics(
+            rendererEpoch: 19,
+            nativeCoverVisible: true,
+            metalDelegateInstalled: true,
+            renderFrameEntries: 8,
+            mtkDrawEntries: 7,
+            nilDrawable: 2,
+            producerBusy: 1,
+            registrarUnsupported: 1,
+            registrarAlreadyPresented: 1,
+            registrarRegistered: 3,
+            callbackEarly: 1,
+            callbackValid: 1,
+            callbackFenceRejected: 1
+        )
+        let heartbeat = makeHeartbeat(rendererPath: rendererPath)
+        XCTAssertTrue(heartbeat.isValid)
+        let data = try JSONEncoder().encode(
+            ScreenClientDiagnosticsChannelMessage.heartbeat(heartbeat)
+        )
+        XCTAssertLessThan(data.count, WebRTCWireConstants.maximumScreenDiagnosticsMessageBytes)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ScreenClientDiagnosticsChannelMessage.self, from: data),
+            .heartbeat(heartbeat)
+        )
+        let wire = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertFalse(wire.contains("digest"))
+        XCTAssertFalse(wire.contains("pixel"))
+        XCTAssertFalse(wire.contains("trackID"))
+
+        XCTAssertTrue(makeHeartbeat(rendererPath: nil).isValid)
+        XCTAssertFalse(
+            makeHeartbeat(rendererPath: .init(
+                rendererEpoch: 0,
+                nativeCoverVisible: false,
+                metalDelegateInstalled: true
+            )).isValid
+        )
+        XCTAssertFalse(
+            makeHeartbeat(rendererPath: .init(
+                rendererEpoch: 1,
+                nativeCoverVisible: false,
+                metalDelegateInstalled: true,
+                producerBusy: WebRTCVideoRendererPathDiagnostics.maximumEventCount + 1
+            )).isValid
+        )
+    }
+
     func testHeartbeatValidationIsBoundedAndCoverStateIsExact() throws {
         XCTAssertFalse(makeHeartbeat(sequence: 0).isValid)
         XCTAssertFalse(
@@ -171,7 +220,8 @@ final class ScreenClientDiagnosticsTests: XCTestCase {
         contentChanges: UInt64? = 20,
         presentationAgeMilliseconds: UInt64? = 20,
         frameWidth: Int? = 1_080,
-        framesPerSecond: Double? = 30
+        framesPerSecond: Double? = 30,
+        rendererPath: WebRTCVideoRendererPathDiagnostics? = nil
     ) -> WebRTCScreenClientDiagnosticsHeartbeat {
         WebRTCScreenClientDiagnosticsHeartbeat(
             sequence: sequence,
@@ -189,7 +239,8 @@ final class ScreenClientDiagnosticsTests: XCTestCase {
             presentationAgeMilliseconds: presentationAgeMilliseconds,
             frameWidth: frameWidth,
             frameHeight: 1_920,
-            framesPerSecond: framesPerSecond
+            framesPerSecond: framesPerSecond,
+            rendererPath: rendererPath
         )
     }
 }

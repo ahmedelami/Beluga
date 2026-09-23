@@ -1663,6 +1663,8 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var latestScreenVideoRenderObservation:
         WebRTCVideoRenderObservation?
     private var latestScreenVideoPresentationUptimeNanoseconds: UInt64?
+    private weak var screenRendererDiagnosticsView: WebRTCRemoteVideoView?
+    private var screenRendererDiagnosticsLease: WorldwideScreenPresentationLease?
     private var nextScreenClientDiagnosticsSequence: UInt64 = 1
     private var audioDiagnostics = IOSAudioDiagnosticsJournal()
     private var audioClientDiagnosticsTask: Task<Void, Never>?
@@ -4180,6 +4182,17 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
 
         let snapshot = screenLivenessDiagnosticSnapshot
+        let rendererPath: WebRTCVideoRendererPathDiagnostics? = if
+            let rendererLease = screenRendererDiagnosticsLease,
+            screenPresentationIsCurrent(rendererLease),
+            let remoteVideoTrack,
+            let screenRendererDiagnosticsView {
+            screenRendererDiagnosticsView.rendererPathDiagnostics(
+                matching: remoteVideoTrack
+            )
+        } else {
+            nil
+        }
         let heartbeat = WebRTCScreenClientDiagnosticsHeartbeat(
             sequence: nextScreenClientDiagnosticsSequence,
             screenRequestID: screenRequestID,
@@ -4197,7 +4210,8 @@ final class WorldwideSessionViewModel: ObservableObject {
                 snapshot.lastPresentationAgeMilliseconds,
             frameWidth: snapshot.frameWidth,
             frameHeight: snapshot.frameHeight,
-            framesPerSecond: snapshot.framesPerSecond
+            framesPerSecond: snapshot.framesPerSecond,
+            rendererPath: rendererPath
         )
         guard heartbeat.isValid else {
             screenClientDiagnosticsDeliveryText = "Local evidence unavailable"
@@ -4245,6 +4259,15 @@ final class WorldwideSessionViewModel: ObservableObject {
         case .resuming: .resuming
         case .screenHidden: .screenHidden
         }
+    }
+
+    func screenRendererDidMount(
+        _ view: WebRTCRemoteVideoView,
+        for lease: WorldwideScreenPresentationLease
+    ) {
+        guard screenPresentationIsCurrent(lease) else { return }
+        screenRendererDiagnosticsView = view
+        screenRendererDiagnosticsLease = lease
     }
 
     private func recordScreenVideoRenderObservation(

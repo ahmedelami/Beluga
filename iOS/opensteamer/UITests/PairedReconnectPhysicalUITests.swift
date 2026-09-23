@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 /// Release gate for the exact physical failure reported from the distributed production build. The test deliberately
@@ -1374,11 +1375,31 @@ final class PairedReconnectPhysicalUITests: XCTestCase {
             "\(phase) did not sustain advancing decoded Mac frames with an authenticated Active acknowledgement and a current remote-input capability. Last observation: \(liveScreenObservation)"
         )
 
+        let onScreenChallengeSamples = try XCTUnwrap(
+            sampleOnScreenChallenge(),
+            "\(phase) could not sample the center of the actual iPhone screen video"
+        )
+        let onScreenChallengeResult = PhysicalScreenImageEvaluator.evaluate(
+            onScreenChallengeSamples
+        )
+        let onScreenChallengeAttachment = XCTAttachment(
+            string: onScreenChallengeSamples.map { sample in
+                "saturatedFraction=\(sample.saturatedFraction) averageRGB=\(sample.averageRed),\(sample.averageGreen),\(sample.averageBlue)"
+            }.joined(separator: "\n")
+        )
+        onScreenChallengeAttachment.name = "Composited iPhone video challenge evidence"
+        onScreenChallengeAttachment.lifetime = .keepAlways
+        activity.add(onScreenChallengeAttachment)
         let liveScreenAttachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         liveScreenAttachment.name =
             "test iPhone live Mac screen with authenticated input capability"
         liveScreenAttachment.lifetime = .keepAlways
         activity.add(liveScreenAttachment)
+        XCTAssertEqual(
+            onScreenChallengeResult,
+            .visibleChangingChallenge,
+            "\(phase) did not visibly present the changing colored Mac challenge on the iPhone; decoded-frame counters alone cannot prove a nonblack display. Result: \(onScreenChallengeResult)"
+        )
 
         let pixelFreshnessAttachment = XCTAttachment(
             string: "renderer=\(liveScreenEvidence.finalVideoSnapshot.rendererID) decodedFrames=\(liveScreenEvidence.finalVideoSnapshot.frameCount - liveScreenEvidence.initialVideoSnapshot.frameCount) contentSamples=\(liveScreenEvidence.finalVideoSnapshot.contentSampleCount - liveScreenEvidence.initialVideoSnapshot.contentSampleCount) distinctContentChanges=\(liveScreenEvidence.finalVideoSnapshot.contentChangeCount - liveScreenEvidence.initialVideoSnapshot.contentChangeCount) initialDigest=\(liveScreenEvidence.initialVideoSnapshot.contentDigest) finalDigest=\(liveScreenEvidence.finalVideoSnapshot.contentDigest)"
@@ -2443,6 +2464,108 @@ final class PairedReconnectPhysicalUITests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
         return nil
+    }
+
+    /// Checks final iPhone-composited pixels, not WebRTC's decoded buffer. The challenge process
+    /// places a vivid changing window at the center of every Mac display; sampling a small central
+    /// ROI avoids other desktop content and does not retain user pixels in the diagnostic record.
+    private func sampleOnScreenChallenge() -> [PhysicalScreenImageSnapshot]? {
+        let screenVideo = element("worldwideMacScreenVideo")
+        guard screenVideo.exists,
+              screenVideo.frame.width > 1,
+              screenVideo.frame.height > 1 else {
+            return nil
+        }
+        let videoFrame = screenVideo.frame
+        var samples: [PhysicalScreenImageSnapshot] = []
+        for index in 0..<4 {
+            if index > 0 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.35))
+            }
+            guard app.state == .runningForeground,
+                  let sample = sampleOnScreenChallenge(
+                    screenshot: XCUIScreen.main.screenshot().image,
+                    videoFrame: videoFrame
+                  ) else {
+                return nil
+            }
+            samples.append(sample)
+        }
+        return samples
+    }
+
+    private func sampleOnScreenChallenge(
+        screenshot: UIImage,
+        videoFrame: CGRect
+    ) -> PhysicalScreenImageSnapshot? {
+        let image: UIImage
+        if screenshot.imageOrientation == .up {
+            image = screenshot
+        } else {
+            image = UIGraphicsImageRenderer(size: screenshot.size).image { _ in
+                screenshot.draw(in: CGRect(origin: .zero, size: screenshot.size))
+            }
+        }
+        guard let sourceImage = image.cgImage,
+              image.size.width > 0,
+              image.size.height > 0 else {
+            return nil
+        }
+        let regionInPoints = CGRect(
+            x: videoFrame.midX - videoFrame.width * 0.03,
+            y: videoFrame.midY - videoFrame.height * 0.03,
+            width: videoFrame.width * 0.06,
+            height: videoFrame.height * 0.06
+        )
+        let scaleX = CGFloat(sourceImage.width) / image.size.width
+        let scaleY = CGFloat(sourceImage.height) / image.size.height
+        let imageBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: sourceImage.width,
+            height: sourceImage.height
+        )
+        let regionInPixels = CGRect(
+            x: regionInPoints.minX * scaleX,
+            y: regionInPoints.minY * scaleY,
+            width: regionInPoints.width * scaleX,
+            height: regionInPoints.height * scaleY
+        ).integral.intersection(imageBounds)
+        guard regionInPixels.width > 1,
+              regionInPixels.height > 1,
+              let croppedImage = sourceImage.cropping(to: regionInPixels) else {
+            return nil
+        }
+
+        let sampleWidth = 32
+        let sampleHeight = 32
+        var bytes = [UInt8](repeating: 0, count: sampleWidth * sampleHeight * 4)
+        let rendered = bytes.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: sampleWidth,
+                height: sampleHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: sampleWidth * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue
+            ) else {
+                return false
+            }
+            context.interpolationQuality = .high
+            context.draw(
+                croppedImage,
+                in: CGRect(x: 0, y: 0, width: sampleWidth, height: sampleHeight)
+            )
+            return true
+        }
+        guard rendered else { return nil }
+        return PhysicalScreenImageSnapshot(
+            rgba8: bytes,
+            width: sampleWidth,
+            height: sampleHeight
+        )
     }
 
     private func waitForHostAcknowledgedScreenHide(

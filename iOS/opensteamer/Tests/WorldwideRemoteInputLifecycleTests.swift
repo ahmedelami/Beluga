@@ -2396,6 +2396,131 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         XCTAssertEqual(downstream.renderedFrameCount, 0)
     }
 
+    func testMetalPresentationPreflightDoesNotRequirePresentedTimeGetter() {
+        XCTAssertEqual(
+            WebRTCVideoDrawablePresentationPreflight.decide(
+                hasPresentedHandler: true,
+                presentedTime: nil
+            ),
+            .register,
+            "A callback-capable drawable must not be blacked out because its runtime omits presentedTime."
+        )
+        XCTAssertEqual(
+            WebRTCVideoDrawablePresentationPreflight.decide(
+                hasPresentedHandler: true,
+                presentedTime: 0
+            ),
+            .register
+        )
+        XCTAssertEqual(
+            WebRTCVideoDrawablePresentationPreflight.decide(
+                hasPresentedHandler: true,
+                presentedTime: 123.5
+            ),
+            .alreadyPresented
+        )
+        XCTAssertEqual(
+            WebRTCVideoDrawablePresentationPreflight.decide(
+                hasPresentedHandler: false,
+                presentedTime: nil
+            ),
+            .unsupported
+        )
+    }
+
+    func testRendererPathDiagnosticsSeparateDrawAndCallbackFailureStages() throws {
+        let renderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in }
+        )
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 1_000_000))
+        renderer.draw(
+            drawable: nil,
+            requestRedraw: {},
+            requestPacedRedraw: {},
+            usingLiveKit: { XCTFail("A nil drawable must not consume the pending frame") }
+        )
+        renderer.draw(
+            registerPresentedHandler: { _ in false },
+            usingLiveKit: {}
+        )
+
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 2_000_000))
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                callback()
+                return true
+            },
+            usingLiveKit: { XCTFail("An early callback must not consume the frame") }
+        )
+
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 3_000_000))
+        var validCallback: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                validCallback = callback
+                return true
+            },
+            usingLiveKit: {}
+        )
+        validCallback?()
+
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 4_000_000))
+        var rejectedCallback: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                rejectedCallback = callback
+                return true
+            },
+            afterNativeDraw: {
+                rejectedCallback?()
+                renderer.invalidate()
+            },
+            usingLiveKit: {}
+        )
+
+        let snapshot = renderer.pathDiagnostics(
+            nativeCoverVisible: true,
+            metalDelegateInstalled: true
+        )
+        XCTAssertTrue(snapshot.isValid)
+        XCTAssertGreaterThan(snapshot.rendererEpoch, 0)
+        XCTAssertTrue(snapshot.nativeCoverVisible)
+        XCTAssertEqual(snapshot.renderFrameEntries, 4)
+        XCTAssertEqual(snapshot.mtkDrawEntries, 5)
+        XCTAssertEqual(snapshot.nilDrawable, 1)
+        XCTAssertEqual(snapshot.registrarUnsupported, 1)
+        XCTAssertEqual(snapshot.registrarRegistered, 3)
+        XCTAssertEqual(snapshot.callbackEarly, 1)
+        XCTAssertEqual(snapshot.callbackValid, 1)
+        XCTAssertEqual(snapshot.callbackFenceRejected, 1)
+
+        let lateRenderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in }
+        )
+        lateRenderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 5_000_000))
+        var lateCallback: (@Sendable () -> Void)?
+        lateRenderer.draw(
+            registerPresentedHandler: { callback in
+                lateCallback = callback
+                return true
+            },
+            afterNativeDraw: { lateRenderer.invalidate() },
+            usingLiveKit: {}
+        )
+        lateCallback?()
+        XCTAssertEqual(
+            lateRenderer.pathDiagnostics(
+                nativeCoverVisible: false,
+                metalDelegateInstalled: true
+            ).callbackFenceRejected,
+            1
+        )
+    }
+
     func testMetalPresentationCallbackCannotReenterRendererBeforeDraw() throws {
         let publication = VideoPresentationObservationCache(
             WebRTCVideoRenderObservation(
@@ -3102,6 +3227,13 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
             usingLiveKit: { nativeDrawCount += 1 }
         )
         XCTAssertEqual(nativeDrawCount, 0)
+        XCTAssertEqual(
+            renderer.pathDiagnostics(
+                nativeCoverVisible: false,
+                metalDelegateInstalled: true
+            ).producerBusy,
+            1
+        )
 
         let nextProducerStarted = DispatchSemaphore(value: 0)
         let nextProducerFinished = DispatchSemaphore(value: 0)
