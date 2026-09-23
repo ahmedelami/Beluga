@@ -347,12 +347,16 @@ enum WebRTCDecodedPixelDigest {
 private final class ObservedMTKViewDelegateProxy: NSObject, MTKViewDelegate, @unchecked Sendable {
     typealias DrawHandler = (
         _ drawable: (any CAMetalDrawable)?,
-        _ drawUsingLiveKit: () -> Void
+        _ drawUsingLiveKit: () -> Void,
+        _ requestRedraw: @escaping @Sendable () -> Void,
+        _ requestPacedRedraw: @escaping @Sendable () -> Void
     ) -> Void
 
     private weak var downstream: (any MTKViewDelegate)?
+    private weak var observedView: MTKView?
     private let lock = NSLock()
     private var drawHandler: DrawHandler?
+    private var redrawScheduled = false
 
     init(downstream: any MTKViewDelegate) {
         self.downstream = downstream
@@ -366,13 +370,39 @@ private final class ObservedMTKViewDelegateProxy: NSObject, MTKViewDelegate, @un
 
     func draw(in view: MTKView) {
         guard let downstream else { return }
+        observedView = view
         let drawUsingLiveKit = {
             downstream.draw(in: view)
         }
         if let drawHandler = lock.withLock({ drawHandler }) {
-            drawHandler(view.currentDrawable, drawUsingLiveKit)
+            drawHandler(
+                view.currentDrawable,
+                drawUsingLiveKit,
+                { [weak self] in self?.requestRedraw(after: .nanoseconds(0)) },
+                { [weak self] in self?.requestRedraw(after: .milliseconds(33)) }
+            )
         } else {
             drawUsingLiveKit()
+        }
+    }
+
+    private func requestRedraw(after delay: DispatchTimeInterval) {
+        // Keep the producer thread out of UIKit and out of the current delegate invocation.
+        let shouldSchedule = lock.withLock { () -> Bool in
+            guard !redrawScheduled else { return false }
+            redrawScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let isStillObserved = self.lock.withLock { () -> Bool in
+                self.redrawScheduled = false
+                return self.drawHandler != nil
+            }
+            if isStillObserved {
+                self.observedView?.draw()
+            }
         }
     }
 
@@ -384,22 +414,44 @@ private final class ObservedMTKViewDelegateProxy: NSObject, MTKViewDelegate, @un
 /// Calls the public MTLDrawable presentation callback through Objective-C dispatch because the
 /// pinned iOS SDK's Swift overlay omits the method even though the runtime protocol implements it.
 private enum MTLDrawablePresentationObserver {
+    enum Registration: Equatable {
+        case registered
+        case alreadyPresented
+        case unsupported
+    }
+
     private typealias PresentedHandler = @convention(block) (AnyObject) -> Void
     private typealias AddPresentedHandler = @convention(c) (
         AnyObject,
         Selector,
         PresentedHandler
     ) -> Void
+    private typealias ReadPresentedTime = @convention(c) (
+        AnyObject,
+        Selector
+    ) -> CFTimeInterval
     private static let selector = NSSelectorFromString("addPresentedHandler:")
+    private static let presentedTimeSelector = NSSelectorFromString("presentedTime")
 
     static func observe(
         _ drawable: any CAMetalDrawable,
         didPresent: @escaping @Sendable () -> Void
-    ) -> Bool {
+    ) -> Registration {
         let object = drawable as AnyObject
         guard object.responds(to: selector),
-              let implementation = object.method(for: selector) else {
-            return false
+              let implementation = object.method(for: selector),
+              object.responds(to: presentedTimeSelector),
+              let timeImplementation = object.method(for: presentedTimeSelector) else {
+            return .unsupported
+        }
+        let readPresentedTime = unsafeBitCast(
+            timeImplementation,
+            to: ReadPresentedTime.self
+        )
+        // MTKView.currentDrawable is for this draw; a nonzero presentation time here means it
+        // was already displayed and cannot prove the frame that has not yet been submitted.
+        guard readPresentedTime(object, presentedTimeSelector) == 0 else {
+            return .alreadyPresented
         }
         let handler: PresentedHandler = { _ in didPresent() }
         let addPresentedHandler = unsafeBitCast(
@@ -407,7 +459,7 @@ private enum MTLDrawablePresentationObserver {
             to: AddPresentedHandler.self
         )
         addPresentedHandler(object, selector, handler)
-        return true
+        return .registered
     }
 }
 
@@ -454,11 +506,13 @@ final class WebRTCVideoPresentationTicket: @unchecked Sendable {
         }
     }
 
-    func nativeDrawStarted() {
+    func nativeDrawStarted() -> Bool {
         lock.withLock {
             if case .registering = phase {
                 phase = .drawing
+                return true
             }
+            return false
         }
     }
 
@@ -493,6 +547,13 @@ final class WebRTCVideoPresentationTicket: @unchecked Sendable {
     }
 }
 
+/// Carried through the asynchronous UI hop so a floor reset can retire work that already passed
+/// the renderer's lock but has not yet been accepted by the MainActor presentation owner.
+struct WebRTCVideoPublicationFence: Equatable, Sendable {
+    let dimensionGeneration: UInt64
+    let freshnessFenceEpoch: UInt64
+}
+
 /// Forwards every decoded frame to the real Metal renderer while publishing a monotonic
 /// observation only after Core Animation reports that the exact drawable was presented. Ordinary
 /// observations are throttled, but a dimension change is published after its first presented
@@ -510,15 +571,27 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
 
     private static let minimumPublicationIntervalNanoseconds: UInt64 = 250_000_000
     private static let maximumRecentProofObservationCount = 32
+    private static let maximumReservedDrawWindowSeconds: TimeInterval = 0.020
 
     private let downstream: LKRTCVideoRenderer
     private let invalidatePresentation:
         @Sendable (UInt64, WebRTCVideoPresentationInvalidation) -> Void
-    private let publish: @Sendable (WebRTCVideoRenderObservation, UInt64) -> Void
+    private let publish:
+        @Sendable (WebRTCVideoRenderObservation, WebRTCVideoPublicationFence) -> Void
     private let publishProof:
-        @Sendable (WebRTCVideoPresentationProofObservation, UInt64) -> Void
+        @Sendable (WebRTCVideoPresentationProofObservation, WebRTCVideoPublicationFence) -> Void
     private let publishMarkerProof:
-        @Sendable (WebRTCVideoMarkerPresentationProofObservation, UInt64) -> Void
+        @Sendable (
+            WebRTCVideoMarkerPresentationProofObservation,
+            WebRTCVideoPublicationFence
+        ) -> Void
+    /// Serializes only native producer/draw operations. Never acquire this while holding `lock`:
+    /// a Metal presentation callback may need `lock` while native draw is in progress.
+    private let nativeOperationLock = NSRecursiveLock()
+    private let redrawRetryCondition = NSCondition()
+    private let reservedDrawWindowSeconds: TimeInterval
+    private var pendingRedrawRetry: (@Sendable () -> Void)?
+    private var reservedDrawUntil: Date?
     private let lock = NSLock()
     private let contentDigestSalt = UInt64.random(in: UInt64.min...UInt64.max)
     private var nextFrameSequence: UInt64 = 0
@@ -553,21 +626,27 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
             UInt64,
             WebRTCVideoPresentationInvalidation
         ) -> Void,
-        publish: @escaping @Sendable (WebRTCVideoRenderObservation, UInt64) -> Void,
+        publish: @escaping @Sendable (
+            WebRTCVideoRenderObservation,
+            WebRTCVideoPublicationFence
+        ) -> Void,
         publishProof: @escaping @Sendable (
             WebRTCVideoPresentationProofObservation,
-            UInt64
+            WebRTCVideoPublicationFence
         ) -> Void = { _, _ in },
         publishMarkerProof: @escaping @Sendable (
             WebRTCVideoMarkerPresentationProofObservation,
-            UInt64
-        ) -> Void = { _, _ in }
+            WebRTCVideoPublicationFence
+        ) -> Void = { _, _ in },
+        reservedDrawWindowSeconds: TimeInterval =
+            ObservedVideoRenderer.maximumReservedDrawWindowSeconds
     ) {
         self.downstream = downstream
         self.invalidatePresentation = invalidatePresentation
         self.publish = publish
         self.publishProof = publishProof
         self.publishMarkerProof = publishMarkerProof
+        self.reservedDrawWindowSeconds = reservedDrawWindowSeconds
         super.init()
     }
 
@@ -581,8 +660,11 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         markerProof: ScreenVideoInBandMarkerNonce?
     ) {
         let publications: (
-            rtp: [(WebRTCVideoPresentationProofObservation, UInt64)],
-            marker: (WebRTCVideoMarkerPresentationProofObservation, UInt64)?
+            rtp: [(WebRTCVideoPresentationProofObservation, WebRTCVideoPublicationFence)],
+            marker: (
+                WebRTCVideoMarkerPresentationProofObservation,
+                WebRTCVideoPublicationFence
+            )?
         ) =
             lock.withLock {
                 guard !isInvalidated else { return ([], nil) }
@@ -606,22 +688,26 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                 armedMarkerProof = markerProof
                 var matches: [(
                     WebRTCVideoPresentationProofObservation,
-                    UInt64
+                    WebRTCVideoPublicationFence
                 )] = []
+                let publicationFence = WebRTCVideoPublicationFence(
+                    dimensionGeneration: dimensionGeneration,
+                    freshnessFenceEpoch: freshnessFenceEpoch
+                )
                 for observation in recentProofObservations
                 where armedProofRTPTimestamps.remove(
                     observation.rtpTimestamp
                 ) != nil {
-                    matches.append((observation, dimensionGeneration))
+                    matches.append((observation, publicationFence))
                 }
                 let markerMatch: (
                     WebRTCVideoMarkerPresentationProofObservation,
-                    UInt64
+                    WebRTCVideoPublicationFence
                 )? = markerProof.flatMap { expected in
                     presentedMarkerHistory.latest(
                         marker: expected,
                         dimensionGeneration: dimensionGeneration
-                    ).map { ($0.observation, $0.dimensionGeneration) }
+                    ).map { ($0.observation, publicationFence) }
                 }
                 if markerMatch != nil {
                     armedMarkerProof = nil
@@ -637,6 +723,8 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     }
 
     func setSize(_ size: CGSize) {
+        beginNativeProducerOperation()
+        defer { finishNativeOperation() }
         lock.withLock {
             guard !isInvalidated else { return }
             nativeMutationRevision &+= 1
@@ -664,6 +752,8 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     }
 
     func renderFrame(_ frame: LKRTCVideoFrame?) {
+        beginNativeProducerOperation()
+        defer { finishNativeOperation() }
         let invalidatedGeneration: UInt64? = lock.withLock {
             guard !isInvalidated else { return nil }
             if let frame {
@@ -765,6 +855,14 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         }
     }
 
+    func isCurrentPublicationFence(_ fence: WebRTCVideoPublicationFence) -> Bool {
+        lock.withLock {
+            !isInvalidated
+                && dimensionGeneration == fence.dimensionGeneration
+                && freshnessFenceEpoch == fence.freshnessFenceEpoch
+        }
+    }
+
     /// Resolves a native size-delegate callback to this renderer's current generation. A delayed
     /// callback from a retired shape cannot be mistaken for the dimensions now on screen.
     func currentDimensionGeneration(matchingPresentationSize size: CGSize) -> UInt64? {
@@ -780,17 +878,25 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     /// A frame/size mutation overlapping registration or draw rejects proof conservatively.
     func draw(
         drawable: (any CAMetalDrawable)?,
+        requestRedraw: @escaping @Sendable () -> Void,
+        requestPacedRedraw: @escaping @Sendable () -> Void,
         usingLiveKit drawUsingLiveKit: () -> Void
     ) {
+        var alreadyPresented = false
         draw(
             registerPresentedHandler: drawable.map { drawable in
                 { callback in
-                    MTLDrawablePresentationObserver.observe(
+                    let registration = MTLDrawablePresentationObserver.observe(
                         drawable,
                         didPresent: callback
                     )
+                    alreadyPresented = registration == .alreadyPresented
+                    return registration == .registered
                 }
             },
+            requestRedraw: requestRedraw,
+            requestPacedRedraw: requestPacedRedraw,
+            retryFailedRegistration: { alreadyPresented },
             usingLiveKit: drawUsingLiveKit
         )
     }
@@ -799,17 +905,46 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     /// frame replacement without requiring a GPU drawable in XCTest.
     func draw(
         registerPresentedHandler: ((@escaping @Sendable () -> Void) -> Bool)?,
+        requestRedraw: (@Sendable () -> Void)? = nil,
+        requestPacedRedraw: (@Sendable () -> Void)? = nil,
+        retryFailedRegistration: () -> Bool = { false },
+        beforeNativeDraw: () -> Void = {},
         afterNativeDraw: () -> Void = {},
         usingLiveKit drawUsingLiveKit: () -> Void
     ) {
+        // Arm before try-lock: if the producer releases between a failed try and retry
+        // registration, that otherwise loses the only wakeup for a static marker frame.
+        redrawRetryCondition.lock()
+        pendingRedrawRetry = requestRedraw
+        if requestRedraw != nil {
+            reservedDrawUntil = Date().addingTimeInterval(
+                reservedDrawWindowSeconds
+            )
+        }
+        redrawRetryCondition.unlock()
+        // Never park the main/Metal thread behind a producer that might itself be waiting on
+        // UIKit. Do not let LiveKit consume this one-shot frame without a presentation handler:
+        // its timestamp deduplication would then prevent a later draw from proving it.
+        guard nativeOperationLock.try() else {
+            return
+        }
+        defer { finishNativeOperation(completedDraw: true) }
+        redrawRetryCondition.lock()
+        pendingRedrawRetry = nil
+        redrawRetryCondition.unlock()
         let candidate: (frame: PendingFrame, revision: UInt64)? = lock.withLock {
             guard !isInvalidated,
                   let pendingFrame,
-                  pendingFrame.frame.timeStampNs != lastSubmittedTimestampNanoseconds,
-                  registerPresentedHandler != nil else {
+                  pendingFrame.frame.timeStampNs != lastSubmittedTimestampNanoseconds else {
                 return nil
             }
             return (pendingFrame, nativeMutationRevision)
+        }
+        if candidate != nil, registerPresentedHandler == nil {
+            // A nil currentDrawable cannot present this candidate. LiveKit may nevertheless
+            // deduplicate its timestamp after an unobserved draw, so wait for a later drawable.
+            requestPacedRedraw?()
+            return
         }
         guard let candidate, let registerPresentedHandler else {
             drawUsingLiveKit()
@@ -822,9 +957,19 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         let observesPresentation = registerPresentedHandler {
             ticket.presented()
         }
-        if observesPresentation {
-            ticket.nativeDrawStarted()
+        beforeNativeDraw()
+        if !observesPresentation, retryFailedRegistration() {
+            requestRedraw?()
+            return
         }
+        if observesPresentation, !ticket.nativeDrawStarted() {
+            // A callback during registration belongs to an already-presented drawable. Do not
+            // consume this timestamp without proof; MTKView must supply a fresh drawable next.
+            requestRedraw?()
+            return
+        }
+        // MTKView.currentDrawable belongs to this delegate draw and does not change until the
+        // delegate returns. A callback from an earlier draw cannot legitimately arrive on it.
         drawUsingLiveKit()
         ticket.nativeDrawReturned()
         afterNativeDraw()
@@ -843,14 +988,49 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         ticket.finishDrawing(valid: isValid)
     }
 
+    private func beginNativeProducerOperation() {
+        // A failed Metal try-lock reserves one brief chance for its queued redraw before a
+        // subsequent decoder frame replaces the exact candidate. The wait is bounded, and the
+        // main thread never waits here, so an inactive UI cannot indefinitely stall decoding.
+        while true {
+            if !Thread.isMainThread {
+                redrawRetryCondition.lock()
+                if let deadline = reservedDrawUntil, deadline > Date() {
+                    _ = redrawRetryCondition.wait(until: deadline)
+                }
+                redrawRetryCondition.unlock()
+            }
+            nativeOperationLock.lock()
+            if Thread.isMainThread { return }
+            redrawRetryCondition.lock()
+            let shouldYield = reservedDrawUntil.map { $0 > Date() } ?? false
+            redrawRetryCondition.unlock()
+            if !shouldYield { return }
+            nativeOperationLock.unlock()
+        }
+    }
+
+    private func finishNativeOperation(completedDraw: Bool = false) {
+        nativeOperationLock.unlock()
+        redrawRetryCondition.lock()
+        if completedDraw {
+            reservedDrawUntil = nil
+            redrawRetryCondition.broadcast()
+        }
+        let retry = pendingRedrawRetry
+        pendingRedrawRetry = nil
+        redrawRetryCondition.unlock()
+        retry?()
+    }
+
     private func didPresent(_ presentedFrame: PendingFrame) {
         let now = DispatchTime.now().uptimeNanoseconds
         let publications: (
-            ordinary: (WebRTCVideoRenderObservation, UInt64)?,
-            proof: (WebRTCVideoPresentationProofObservation, UInt64)?,
+            ordinary: (WebRTCVideoRenderObservation, WebRTCVideoPublicationFence)?,
+            proof: (WebRTCVideoPresentationProofObservation, WebRTCVideoPublicationFence)?,
             markerProof: (
                 WebRTCVideoMarkerPresentationProofObservation,
-                UInt64
+                WebRTCVideoPublicationFence
             )?
         ) = lock.withLock {
             guard !isInvalidated,
@@ -860,6 +1040,10 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                 return (nil, nil, nil)
             }
             lastPublishedFrameSequence = presentedFrame.sequence
+            let publicationFence = WebRTCVideoPublicationFence(
+                dimensionGeneration: presentedFrame.dimensionGeneration,
+                freshnessFenceEpoch: presentedFrame.freshnessFenceEpoch
+            )
             let frame = presentedFrame.frame
             frameCount &+= 1
             let width = presentedFrame.presentationDimensions.width
@@ -883,11 +1067,11 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
             let proofPublication = armedProofRTPTimestamps.remove(
                 rtpTimestamp
             ) != nil
-                ? (proofObservation, presentedFrame.dimensionGeneration)
+                ? (proofObservation, publicationFence)
                 : nil
             var markerPublication: (
                 WebRTCVideoMarkerPresentationProofObservation,
-                UInt64
+                WebRTCVideoPublicationFence
             )?
             if retainsPresentedMarkerCandidates,
                let marker = presentedFrame.exactMarker {
@@ -908,7 +1092,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                     armedMarkerProof = nil
                     markerPublication = (
                         markerObservation,
-                        presentedFrame.dimensionGeneration
+                        publicationFence
                     )
                 }
             }
@@ -943,7 +1127,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                     contentSampleCount: contentSampleCount,
                     contentChangeCount: contentChangeCount
                 ),
-                presentedFrame.dimensionGeneration
+                publicationFence
             )
             return (ordinaryPublication, proofPublication, markerPublication)
         }
@@ -1273,9 +1457,9 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
                     )
                 }
             },
-            publish: { [weak self] observation, dimensionGeneration in
+            publish: { [weak self] observation, publicationFence in
                 presentationEventLedger.recordFormatTransitionIfAbsent(
-                    dimensionGeneration: dimensionGeneration
+                    dimensionGeneration: publicationFence.dimensionGeneration
                 )
                 Task { @MainActor [weak self] in
                     guard let self,
@@ -1283,30 +1467,31 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
                           let observedRenderer = self.observedRenderer,
                           self.presentationGenerationFence.bindingGeneration
                             == generation,
-                          observedRenderer.isCurrentDimensionGeneration(
-                              dimensionGeneration
+                          observedRenderer.isCurrentPublicationFence(
+                              publicationFence
                           ) else {
                         return
                     }
                     for event in presentationEventLedger.takeInvalidations(
-                        through: dimensionGeneration
+                        through: publicationFence.dimensionGeneration
                     ) {
                         self.onVideoPresentationInvalidated?(event.0, event.1)
                     }
                     guard
                           self.presentationGenerationFence.acceptsPublication(
                               bindingGeneration: generation,
-                              dimensionGeneration: dimensionGeneration,
+                              dimensionGeneration:
+                                  publicationFence.dimensionGeneration,
                               isCurrentRendererGeneration:
-                                  observedRenderer.isCurrentDimensionGeneration(
-                                      dimensionGeneration
+                                  observedRenderer.isCurrentPublicationFence(
+                                      publicationFence
                                   )
                           ) else {
                         return
                     }
                     let token = WebRTCVideoPresentationToken(
                         bindingGeneration: generation,
-                        dimensionGeneration: dimensionGeneration
+                        dimensionGeneration: publicationFence.dimensionGeneration
                     )
                     self.currentVideoSize = CGSize(
                         width: observation.width,
@@ -1317,30 +1502,30 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
                     self.onVideoFrameRendered?(observation, token)
                 }
             },
-            publishProof: { [weak self] observation, dimensionGeneration in
+            publishProof: { [weak self] observation, publicationFence in
                 Task { @MainActor [weak self] in
                     guard let self,
                           self.currentTrack != nil,
                           let observedRenderer = self.observedRenderer,
                           self.presentationGenerationFence.bindingGeneration
                             == generation,
-                          observedRenderer.isCurrentDimensionGeneration(
-                              dimensionGeneration
+                          observedRenderer.isCurrentPublicationFence(
+                              publicationFence
                           ) else {
                         return
                     }
                     self.onVideoFramePresentedForProof?(observation)
                 }
             },
-            publishMarkerProof: { [weak self] observation, dimensionGeneration in
+            publishMarkerProof: { [weak self] observation, publicationFence in
                 Task { @MainActor [weak self] in
                     guard let self,
                           self.currentTrack != nil,
                           let observedRenderer = self.observedRenderer,
                           self.presentationGenerationFence.bindingGeneration
                             == generation,
-                          observedRenderer.isCurrentDimensionGeneration(
-                              dimensionGeneration
+                          observedRenderer.isCurrentPublicationFence(
+                              publicationFence
                           ) else {
                         return
                     }
@@ -1355,13 +1540,16 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
             retainsPresentedMarkerCandidates: retainsPresentedMarkerCandidates,
             markerProof: markerProof
         )
-        metalDelegateProxy?.installDrawHandler { [weak observedRenderer] drawable, draw in
+        metalDelegateProxy?.installDrawHandler {
+            [weak observedRenderer] drawable, draw, retry, pacedRetry in
             guard let observedRenderer else {
                 draw()
                 return
             }
             observedRenderer.draw(
                 drawable: drawable,
+                requestRedraw: retry,
+                requestPacedRedraw: pacedRetry,
                 usingLiveKit: draw
             )
         }
