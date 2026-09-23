@@ -39,6 +39,8 @@ public struct WebRTCVideoRendererPathDiagnostics: Codable, Equatable, Sendable {
     public let registrarUnsupported: UInt64
     public let registrarAlreadyPresented: UInt64
     public let registrarRegistered: UInt64
+    /// Nil means an older client did not instrument getter availability.
+    public let presentedTimeReadable: UInt64?
     public let callbackEarly: UInt64
     public let callbackValid: UInt64
     public let callbackFenceRejected: UInt64
@@ -54,6 +56,7 @@ public struct WebRTCVideoRendererPathDiagnostics: Codable, Equatable, Sendable {
         registrarUnsupported: UInt64 = 0,
         registrarAlreadyPresented: UInt64 = 0,
         registrarRegistered: UInt64 = 0,
+        presentedTimeReadable: UInt64? = nil,
         callbackEarly: UInt64 = 0,
         callbackValid: UInt64 = 0,
         callbackFenceRejected: UInt64 = 0
@@ -68,6 +71,7 @@ public struct WebRTCVideoRendererPathDiagnostics: Codable, Equatable, Sendable {
         self.registrarUnsupported = registrarUnsupported
         self.registrarAlreadyPresented = registrarAlreadyPresented
         self.registrarRegistered = registrarRegistered
+        self.presentedTimeReadable = presentedTimeReadable
         self.callbackEarly = callbackEarly
         self.callbackValid = callbackValid
         self.callbackFenceRejected = callbackFenceRejected
@@ -79,6 +83,7 @@ public struct WebRTCVideoRendererPathDiagnostics: Codable, Equatable, Sendable {
             registrarUnsupported, registrarAlreadyPresented, registrarRegistered,
             callbackEarly, callbackValid, callbackFenceRejected
         ].allSatisfy { $0 <= Self.maximumEventCount }
+            && (presentedTimeReadable.map { $0 <= Self.maximumEventCount } ?? true)
     }
 }
 

@@ -2054,6 +2054,38 @@ final class WorldwideScreenMediaViewerSuspensionTests: XCTestCase {
 /// Focused tests for session-generation fences shared by statistics and signaling tasks.
 @MainActor
 final class WorldwideSessionGenerationFenceTests: XCTestCase {
+    func testRendererPathTextReportsEveryPresentationGateWithoutPixels() {
+        let unavailable = WorldwideSessionViewModel
+            .screenRendererPathDiagnosticLines(for: nil)
+        XCTAssertEqual(unavailable, ["Renderer path unavailable"])
+
+        let path = WebRTCVideoRendererPathDiagnostics(
+            rendererEpoch: 0x123456,
+            nativeCoverVisible: true,
+            metalDelegateInstalled: true,
+            renderFrameEntries: 220,
+            mtkDrawEntries: 18,
+            nilDrawable: 2,
+            producerBusy: 3,
+            registrarUnsupported: 4,
+            registrarAlreadyPresented: 5,
+            registrarRegistered: 6,
+            presentedTimeReadable: 7,
+            callbackEarly: 8,
+            callbackValid: 9,
+            callbackFenceRejected: 10
+        )
+        let lines = WorldwideSessionViewModel
+            .screenRendererPathDiagnosticLines(for: path)
+        XCTAssertEqual(lines.count, 4)
+        XCTAssertTrue(lines[0].contains("epoch 123456"))
+        XCTAssertTrue(lines[0].contains("delegate yes  cover yes"))
+        XCTAssertTrue(lines[1].contains("frames 220  draws 18  nil 2  busy 3"))
+        XCTAssertTrue(lines[2].contains("registered 6  old 5  unsupported 4  timeGetter=7"))
+        XCTAssertTrue(lines[3].contains("callback valid 9  early 8  fence 10"))
+        XCTAssertFalse(lines.joined().contains("pixel"))
+    }
+
     func testCancelledStatisticsStartupCannotPublishIntoReplacementSession() async throws {
         let viewModel = WorldwideSessionViewModel()
         let statisticsStarted = expectation(description: "old statistics startup suspended")

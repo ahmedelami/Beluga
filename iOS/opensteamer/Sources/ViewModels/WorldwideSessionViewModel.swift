@@ -1943,6 +1943,32 @@ final class WorldwideSessionViewModel: ObservableObject {
         screenLivenessDiagnosticSnapshot.statusText
     }
 
+    /// Current, content-free Metal path evidence for the exact screen lease and track. Reading
+    /// the renderer here also lets the iPhone show this evidence when an older Mac host ignores
+    /// the optional renderer-path field in its heartbeat.
+    var screenRendererPathDiagnosticLines: [String] {
+        Self.screenRendererPathDiagnosticLines(
+            for: currentScreenRendererPathDiagnostics
+        )
+    }
+
+    static func screenRendererPathDiagnosticLines(
+        for path: WebRTCVideoRendererPathDiagnostics?
+    ) -> [String] {
+        guard let path else { return ["Renderer path unavailable"] }
+        let epoch = String(path.rendererEpoch, radix: 16).suffix(6)
+        let timeGetter = path.presentedTimeReadable.map { String($0) } ?? "n/a"
+        return [
+            "epoch \(epoch)  delegate \(path.metalDelegateInstalled ? "yes" : "no")"
+                + "  cover \(path.nativeCoverVisible ? "yes" : "no")",
+            "frames \(path.renderFrameEntries)  draws \(path.mtkDrawEntries)"
+                + "  nil \(path.nilDrawable)  busy \(path.producerBusy)",
+            "registered \(path.registrarRegistered)  old \(path.registrarAlreadyPresented)"
+                + "  unsupported \(path.registrarUnsupported)  timeGetter=\(timeGetter)",
+            "callback valid \(path.callbackValid)  early \(path.callbackEarly)  fence \(path.callbackFenceRejected)"
+        ]
+    }
+
     var isRemoteInputAvailable: Bool {
         remoteInputCapability != nil
             && remoteInputAuthorization?.isValid == true
@@ -4182,17 +4208,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         }
 
         let snapshot = screenLivenessDiagnosticSnapshot
-        let rendererPath: WebRTCVideoRendererPathDiagnostics? = if
-            let rendererLease = screenRendererDiagnosticsLease,
-            screenPresentationIsCurrent(rendererLease),
-            let remoteVideoTrack,
-            let screenRendererDiagnosticsView {
-            screenRendererDiagnosticsView.rendererPathDiagnostics(
-                matching: remoteVideoTrack
-            )
-        } else {
-            nil
-        }
+        let rendererPath = currentScreenRendererPathDiagnostics
         let heartbeat = WebRTCScreenClientDiagnosticsHeartbeat(
             sequence: nextScreenClientDiagnosticsSequence,
             screenRequestID: screenRequestID,
@@ -4231,6 +4247,20 @@ final class WorldwideSessionViewModel: ObservableObject {
             // This best-effort lane never changes the user-visible media or control state.
             screenClientDiagnosticsDeliveryText = "Heartbeat unavailable"
         }
+    }
+
+    private var currentScreenRendererPathDiagnostics:
+        WebRTCVideoRendererPathDiagnostics? {
+        if
+            let rendererLease = screenRendererDiagnosticsLease,
+            screenPresentationIsCurrent(rendererLease),
+            let remoteVideoTrack,
+            let screenRendererDiagnosticsView {
+            return screenRendererDiagnosticsView.rendererPathDiagnostics(
+                matching: remoteVideoTrack
+            )
+        }
+        return nil
     }
 
     private static func wireLiveness(

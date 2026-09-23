@@ -442,6 +442,11 @@ private enum MTLDrawablePresentationObserver {
         case unsupported
     }
 
+    struct Observation {
+        let registration: Registration
+        let presentedTimeReadable: Bool
+    }
+
     private typealias PresentedHandler = @convention(block) (AnyObject) -> Void
     private typealias AddPresentedHandler = @convention(c) (
         AnyObject,
@@ -458,13 +463,17 @@ private enum MTLDrawablePresentationObserver {
     static func observe(
         _ drawable: any CAMetalDrawable,
         didPresent: @escaping @Sendable () -> Void
-    ) -> Registration {
+    ) -> Observation {
         let object = drawable as AnyObject
         guard object.responds(to: selector),
               let implementation = object.method(for: selector) else {
-            return .unsupported
+            return Observation(
+                registration: .unsupported,
+                presentedTimeReadable: false
+            )
         }
         let presentedTime: CFTimeInterval?
+        let presentedTimeReadable: Bool
         if object.responds(to: presentedTimeSelector),
            let timeImplementation = object.method(for: presentedTimeSelector) {
             let readPresentedTime = unsafeBitCast(
@@ -472,8 +481,10 @@ private enum MTLDrawablePresentationObserver {
                 to: ReadPresentedTime.self
             )
             presentedTime = readPresentedTime(object, presentedTimeSelector)
+            presentedTimeReadable = true
         } else {
             presentedTime = nil
+            presentedTimeReadable = false
         }
         // If available, a nonzero presentation time rejects an old drawable. Absence of the
         // getter alone cannot black out a valid callback-capable runtime as it did in build 83.
@@ -481,7 +492,10 @@ private enum MTLDrawablePresentationObserver {
             hasPresentedHandler: true,
             presentedTime: presentedTime
         ) == .register else {
-            return .alreadyPresented
+            return Observation(
+                registration: .alreadyPresented,
+                presentedTimeReadable: presentedTimeReadable
+            )
         }
         let handler: PresentedHandler = { _ in didPresent() }
         let addPresentedHandler = unsafeBitCast(
@@ -489,7 +503,10 @@ private enum MTLDrawablePresentationObserver {
             to: AddPresentedHandler.self
         )
         addPresentedHandler(object, selector, handler)
-        return .registered
+        return Observation(
+            registration: .registered,
+            presentedTimeReadable: presentedTimeReadable
+        )
     }
 }
 
@@ -622,6 +639,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         var registrarUnsupported: UInt64 = 0
         var registrarAlreadyPresented: UInt64 = 0
         var registrarRegistered: UInt64 = 0
+        var presentedTimeReadable: UInt64 = 0
         var callbackEarly: UInt64 = 0
         var callbackValid: UInt64 = 0
         var callbackFenceRejected: UInt64 = 0
@@ -630,6 +648,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     private enum PathEvent {
         case renderFrameEntry, mtkDrawEntry, nilDrawable, producerBusy
         case registrarUnsupported, registrarAlreadyPresented, registrarRegistered
+        case presentedTimeReadable
         case callbackEarly, callbackValid, callbackFenceRejected
     }
 
@@ -715,6 +734,8 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
             case .registrarAlreadyPresented:
                 Self.increment(&pathCounters.registrarAlreadyPresented)
             case .registrarRegistered: Self.increment(&pathCounters.registrarRegistered)
+            case .presentedTimeReadable:
+                Self.increment(&pathCounters.presentedTimeReadable)
             case .callbackEarly: Self.increment(&pathCounters.callbackEarly)
             case .callbackValid: Self.increment(&pathCounters.callbackValid)
             case .callbackFenceRejected: Self.increment(&pathCounters.callbackFenceRejected)
@@ -738,6 +759,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
             registrarUnsupported: counters.registrarUnsupported,
             registrarAlreadyPresented: counters.registrarAlreadyPresented,
             registrarRegistered: counters.registrarRegistered,
+            presentedTimeReadable: counters.presentedTimeReadable,
             callbackEarly: counters.callbackEarly,
             callbackValid: counters.callbackValid,
             callbackFenceRejected: counters.callbackFenceRejected
@@ -1012,10 +1034,14 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         draw(
             registerPresentedHandler: drawable.map { drawable in
                 { callback in
-                    let registration = MTLDrawablePresentationObserver.observe(
+                    let observation = MTLDrawablePresentationObserver.observe(
                         drawable,
                         didPresent: callback
                     )
+                    if observation.presentedTimeReadable {
+                        self.recordPathEvent(.presentedTimeReadable)
+                    }
+                    let registration = observation.registration
                     alreadyPresented = registration == .alreadyPresented
                     return registration == .registered
                 }

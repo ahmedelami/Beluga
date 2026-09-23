@@ -105,6 +105,7 @@ final class ScreenClientDiagnosticsTests: XCTestCase {
             registrarUnsupported: 1,
             registrarAlreadyPresented: 1,
             registrarRegistered: 3,
+            presentedTimeReadable: 4,
             callbackEarly: 1,
             callbackValid: 1,
             callbackFenceRejected: 1
@@ -138,6 +139,15 @@ final class ScreenClientDiagnosticsTests: XCTestCase {
                 nativeCoverVisible: false,
                 metalDelegateInstalled: true,
                 producerBusy: WebRTCVideoRendererPathDiagnostics.maximumEventCount + 1
+            )).isValid
+        )
+        XCTAssertFalse(
+            makeHeartbeat(rendererPath: .init(
+                rendererEpoch: 1,
+                nativeCoverVisible: false,
+                metalDelegateInstalled: true,
+                presentedTimeReadable:
+                    WebRTCVideoRendererPathDiagnostics.maximumEventCount + 1
             )).isValid
         )
     }

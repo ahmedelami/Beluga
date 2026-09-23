@@ -523,6 +523,8 @@ actor WorldwideScreenService {
                 + " registrarUnsupported=\(path.registrarUnsupported)"
                 + " registrarAlreadyPresented=\(path.registrarAlreadyPresented)"
                 + " registrarRegistered=\(path.registrarRegistered)"
+                + " presentedTimeReadable="
+                + (path.presentedTimeReadable.map(String.init) ?? "unavailable")
                 + " callbackEarly=\(path.callbackEarly)"
                 + " callbackValid=\(path.callbackValid)"
                 + " callbackFenceRejected=\(path.callbackFenceRejected)"

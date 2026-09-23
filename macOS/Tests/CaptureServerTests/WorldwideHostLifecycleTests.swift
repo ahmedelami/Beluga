@@ -84,6 +84,7 @@ final class WorldwideHostLifecycleTests: XCTestCase {
                 registrarUnsupported: 2,
                 registrarAlreadyPresented: 1,
                 registrarRegistered: 20,
+                presentedTimeReadable: 27,
                 callbackEarly: 1,
                 callbackValid: 12,
                 callbackFenceRejected: 2
@@ -100,6 +101,7 @@ final class WorldwideHostLifecycleTests: XCTestCase {
         XCTAssertTrue(message.contains("rendererEpoch=91"))
         XCTAssertTrue(message.contains("nilDrawable=4"))
         XCTAssertTrue(message.contains("producerBusy=3"))
+        XCTAssertTrue(message.contains("presentedTimeReadable=27"))
         XCTAssertTrue(message.contains("callbackFenceRejected=2"))
         XCTAssertFalse(message.contains("pixel"))
         XCTAssertFalse(message.contains("digest"))

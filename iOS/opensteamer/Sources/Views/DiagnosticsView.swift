@@ -127,6 +127,18 @@ struct DiagnosticsView: View {
                     value: worldwideViewModel.screenLivenessDiagnosticSnapshot
                         .coverState.statusText
                 )
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Renderer Path")
+                    Text(
+                        worldwideViewModel.screenRendererPathDiagnosticLines
+                            .joined(separator: "\n")
+                    )
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("worldwideScreenRendererPathDiagnostics")
             }
 
             Section("Connection Timeline") {
