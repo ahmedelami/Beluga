@@ -5,6 +5,34 @@ import Foundation
 @preconcurrency import LiveKitWebRTC
 @testable import WebRTCTransport
 
+struct StartupVideoQPHookAdmission: Equatable {
+    let requestedArm: String
+    let nativeMode: UInt32
+    let expectedStartupWindowNanoseconds: UInt64?
+
+    static func parse(_ value: String?) throws -> Self {
+        switch value {
+        case "control":
+            return Self(requestedArm: "control", nativeMode: 0,
+                        expectedStartupWindowNanoseconds: nil)
+        case "unset":
+            return Self(requestedArm: "unset", nativeMode: 1,
+                        expectedStartupWindowNanoseconds: nil)
+        case "startup":
+            return Self(requestedArm: "startup", nativeMode: 2,
+                        expectedStartupWindowNanoseconds: 2_000_000_000)
+        case "control1500":
+            return Self(requestedArm: "control1500", nativeMode: 0,
+                        expectedStartupWindowNanoseconds: 1_500_000_000)
+        case "startup1500":
+            return Self(requestedArm: "startup1500", nativeMode: 2,
+                        expectedStartupWindowNanoseconds: 1_500_000_000)
+        default:
+            throw WebRTCTransportError.nativeFailure("Unknown QP diagnostic arm")
+        }
+    }
+}
+
 /// Test-only bridge to an explicitly preloaded, sealed public-VideoToolbox hook.
 /// This does not alter the SDK binary, codec mode, settings, callback, or native result.
 /// Only sessions synchronously created by this video-only host's encoder are eligible.
@@ -24,6 +52,7 @@ final class StartupVideoQPOwnerHook: @unchecked Sendable {
     private var factoryWrapped = false
     private var finished = false
     let mode: UInt32
+    let requestedArm: String
     let artifactSHA256: String
 
     static func requested(eligible: Bool,
@@ -40,12 +69,9 @@ final class StartupVideoQPOwnerHook: @unchecked Sendable {
         #if !DEBUG
         throw WebRTCTransportError.nativeFailure("QP hook is forbidden in release tests")
         #else
-        switch environment["OPENSTEAMER_VT_QP_MODE"] {
-        case "control": mode = 0
-        case "unset": mode = 1
-        case "startup": mode = 2
-        default: throw WebRTCTransportError.nativeFailure("Unknown QP diagnostic arm")
-        }
+        let admission = try StartupVideoQPHookAdmission.parse(environment["OPENSTEAMER_VT_QP_MODE"])
+        mode = admission.nativeMode
+        requestedArm = admission.requestedArm
         guard let path = environment["OPENSTEAMER_VT_QP_HOOK_PATH"], path.hasPrefix("/"),
               environment["DYLD_INSERT_LIBRARIES"] == path,
               let expected = environment["OPENSTEAMER_VT_QP_HOOK_SHA256"],
@@ -69,10 +95,10 @@ final class StartupVideoQPOwnerHook: @unchecked Sendable {
         guard unsafeBitCast(loadedPointer, to: End.self)() == 1 else {
             throw WebRTCTransportError.nativeFailure("QP diagnostic hook did not identify itself")
         }
-        if mode == 2 {
+        if let expectedWindow = admission.expectedStartupWindowNanoseconds {
             guard let pointer = dlsym(handle, "VTQPStartupWindowNanoseconds"),
-                  unsafeBitCast(pointer, to: StartupWindow.self)() == 2_000_000_000 else {
-                throw WebRTCTransportError.nativeFailure("Startup QP hook requires the fixed two-second native admission boundary")
+                  unsafeBitCast(pointer, to: StartupWindow.self)() == expectedWindow else {
+                throw WebRTCTransportError.nativeFailure("Startup QP hook does not match the exact requested native admission boundary")
             }
         }
         artifactSHA256 = digest
@@ -127,7 +153,7 @@ final class StartupVideoQPOwnerHook: @unchecked Sendable {
         report["swiftScopeFailures"] = swiftState.1
         report["factoryWrapped"] = swiftState.2
         report["artifactSHA256"] = artifactSHA256
-        report["requestedMode"] = mode == 0 ? "control" : (mode == 1 ? "unset" : "startup")
+        report["requestedMode"] = requestedArm
         report["combinedVerified"] = report["isVerified"] as? Bool == true
             && swiftState.0 > 0 && swiftState.1 == 0 && swiftState.2
         return report

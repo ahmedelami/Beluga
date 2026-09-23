@@ -159,6 +159,8 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingStartupOptInIsRejectedBeforeLoading' } if mode == 'missing_qp_startup'
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingPacerOptInIsRejectedBeforeLoading' } if mode == 'missing_qp_pacer'
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testUnknownArmIsRejectedBeforeLoading' } if mode == 'missing_qp_arm'
+      methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testBounded1500ArmsAreExactAndRejectLookalikes' } if mode == 'missing_qp_1500_exact'
+      methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testBounded1500ArmsRequireSameEligibilityAndPreloadedSeal' } if mode == 'missing_qp_1500_seal'
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingSealedPreloadedArtifactIsRejected' } if mode == 'missing_qp_seal'
       methods.reject! { |id| id == 'CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testStartupArmRequiresSameEligibilityAndPreloadedSeal' } if mode == 'missing_qp_startup_arm'
       methods.reject! { |id| id.include?('testShowKeepsExistingTrafficCeilingsButStartsWithFullPixels') } if mode == 'missing_method'
@@ -363,6 +365,8 @@ Dir.mktmpdir('startup-runner-selftest-') do |temporary|
   run.call('missing_qp_startup', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingStartupOptInIsRejectedBeforeLoading')
   run.call('missing_qp_pacer', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingPacerOptInIsRejectedBeforeLoading')
   run.call('missing_qp_arm', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testUnknownArmIsRejectedBeforeLoading')
+  run.call('missing_qp_1500_exact', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testBounded1500ArmsAreExactAndRejectLookalikes')
+  run.call('missing_qp_1500_seal', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testBounded1500ArmsRequireSameEligibilityAndPreloadedSeal')
   run.call('missing_qp_seal', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testMissingSealedPreloadedArtifactIsRejected')
   run.call('missing_qp_startup_arm', expected_failure: 'required safety method missing from discovery: CaptureServerTests.StartupVideoQPOwnerHookAdmissionTests/testStartupArmRequiresSameEligibilityAndPreloadedSeal')
   run.call('missing_method', expected_failure: 'required safety method missing')
