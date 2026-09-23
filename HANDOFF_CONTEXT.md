@@ -3,6 +3,12 @@
 Prepared 2026-09-22 from the isolated `fix/spatial-quality-recovery` checkout.
 This file is a handoff record, not a release approval.
 
+Later live outcome: the temporal-first candidate in commit `4f53f14` was
+installed as Mac-host V88, failed the user's startup-quality goal, and was
+rolled back to the exact V86 host via V89. Read
+[STARTUP_QUALITY_V88_LIVE_DECISION.md](STARTUP_QUALITY_V88_LIVE_DECISION.md)
+before treating the source-only checkpoint below as current runtime state.
+
 ## Current source and release boundary
 
 - Branch: `fix/spatial-quality-recovery`
