@@ -411,6 +411,42 @@ private enum MTLDrawablePresentationObserver {
     }
 }
 
+/// A drawable may invoke its presentation callback while the handler is being installed. Such a
+/// callback cannot prove the frame that LiveKit has not drawn yet. Keep the ticket disarmed until
+/// native drawing has returned and the renderer's frame revision is still the one we observed.
+final class WebRTCVideoPresentationTicket: @unchecked Sendable {
+    private let lock = NSLock()
+    private let publish: @Sendable () -> Void
+    private var isArmed = false
+    private var isRetired = false
+
+    init(publish: @escaping @Sendable () -> Void) {
+        self.publish = publish
+    }
+
+    func presented() {
+        let shouldPublish = lock.withLock {
+            guard !isRetired else { return false }
+            isRetired = true
+            return isArmed
+        }
+        if shouldPublish {
+            publish()
+        }
+    }
+
+    func finishDrawing(valid: Bool) {
+        lock.withLock {
+            guard !isRetired else { return }
+            if valid {
+                isArmed = true
+            } else {
+                isRetired = true
+            }
+        }
+    }
+}
+
 /// Forwards every decoded frame to the real Metal renderer while publishing a monotonic
 /// observation only after Core Animation reports that the exact drawable was presented. Ordinary
 /// observations are throttled, but a dimension change is published after its first presented
@@ -442,6 +478,9 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     private var dimensionGeneration: UInt64 = 0
     private var presentationSize = CGSize.zero
     private var pendingFrame: PendingFrame?
+    /// Any native frame/size mutation invalidates a draw snapshot taken before that mutation.
+    /// This is only a proof fence: LiveKit still owns its native producer/draw synchronization.
+    private var nativeMutationRevision: UInt64 = 0
     private var lastSubmittedTimestampNanoseconds: Int64?
     private var lastPublishedFrameSequence: UInt64 = 0
     private var frameCount: UInt64 = 0
@@ -548,6 +587,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     func setSize(_ size: CGSize) {
         lock.withLock {
             guard !isInvalidated else { return }
+            nativeMutationRevision &+= 1
             let invalidatedGeneration = advanceDimensionGenerationIfNeeded(to: size)
             if let invalidatedGeneration {
                 // Record this boundary while the same lock still serializes generation
@@ -567,6 +607,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
     func invalidate() {
         lock.withLock {
             isInvalidated = true
+            nativeMutationRevision &+= 1
         }
     }
 
@@ -592,6 +633,7 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                     // another observation under the previous touch generation.
                     let invalidatedGeneration = advanceDimensionGenerationIfNeeded(to: .zero)
                     pendingFrame = nil
+                    nativeMutationRevision &+= 1
                     if let invalidatedGeneration {
                         // Enqueue revocation while this lock still serializes native frame
                         // replacement. The production callback only hops to the MainActor; it must
@@ -626,10 +668,12 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
                     frame: frame,
                     exactMarker: exactMarker
                 )
+                nativeMutationRevision &+= 1
                 downstream.renderFrame(frame)
                 return invalidatedGeneration
             } else {
                 pendingFrame = nil
+                nativeMutationRevision &+= 1
                 // A native nil frame is a transport/rendering gap, not a privacy decision. The
                 // presentation owner installs an explicit cover at every Hide, authorization,
                 // lifecycle, and terminal boundary. Keep the last drawable until that cover or a
@@ -677,34 +721,67 @@ final class ObservedVideoRenderer: NSObject, LKRTCVideoRenderer, @unchecked Send
         }
     }
 
-    /// Serializes native frame replacement with LiveKit's Metal draw and attaches the completion
-    /// callback before LiveKit schedules that drawable for presentation.
+    /// Attaches the presentation callback before LiveKit schedules the drawable, but never holds
+    /// our state lock while calling Metal. Build 82 watchdog reports showed the main thread in
+    /// `addPresentedHandler` while Core Animation's presentation callback waited for this lock.
+    /// A frame/size mutation overlapping registration or draw rejects proof conservatively.
     func draw(
         drawable: (any CAMetalDrawable)?,
         usingLiveKit drawUsingLiveKit: () -> Void
     ) {
-        lock.withLock {
-            guard !isInvalidated else {
-                drawUsingLiveKit()
-                return
-            }
-            guard let pendingFrame,
+        draw(
+            registerPresentedHandler: drawable.map { drawable in
+                { callback in
+                    MTLDrawablePresentationObserver.observe(
+                        drawable,
+                        didPresent: callback
+                    )
+                }
+            },
+            usingLiveKit: drawUsingLiveKit
+        )
+    }
+
+    /// The registrar seam lets the watchdog regression test force a synchronous callback and a
+    /// frame replacement without requiring a GPU drawable in XCTest.
+    func draw(
+        registerPresentedHandler: ((@escaping @Sendable () -> Void) -> Bool)?,
+        usingLiveKit drawUsingLiveKit: () -> Void
+    ) {
+        let candidate: (frame: PendingFrame, revision: UInt64)? = lock.withLock {
+            guard !isInvalidated,
+                  let pendingFrame,
                   pendingFrame.frame.timeStampNs != lastSubmittedTimestampNanoseconds,
-                  let drawable else {
-                drawUsingLiveKit()
-                return
+                  registerPresentedHandler != nil else {
+                return nil
             }
-            let observesPresentation = MTLDrawablePresentationObserver.observe(
-                drawable
-            ) { [weak self] in
-                self?.didPresent(pendingFrame)
-            }
-            drawUsingLiveKit()
-            // LiveKit uses the same timestamp test to suppress duplicate MTKView draws.
-            if observesPresentation {
-                lastSubmittedTimestampNanoseconds = pendingFrame.frame.timeStampNs
-            }
+            return (pendingFrame, nativeMutationRevision)
         }
+        guard let candidate, let registerPresentedHandler else {
+            drawUsingLiveKit()
+            return
+        }
+
+        let ticket = WebRTCVideoPresentationTicket { [weak self] in
+            self?.didPresent(candidate.frame)
+        }
+        let observesPresentation = registerPresentedHandler {
+            ticket.presented()
+        }
+        drawUsingLiveKit()
+        let isValid = lock.withLock {
+            guard observesPresentation,
+                  !isInvalidated,
+                  nativeMutationRevision == candidate.revision,
+                  pendingFrame?.sequence == candidate.frame.sequence,
+                  dimensionGeneration == candidate.frame.dimensionGeneration else {
+                return false
+            }
+            // LiveKit uses the same timestamp test to suppress duplicate MTKView draws.
+            lastSubmittedTimestampNanoseconds = candidate.frame.frame.timeStampNs
+            return true
+        }
+        ticket.finishDrawing(valid: isValid)
     }
 
     private func didPresent(_ presentedFrame: PendingFrame) {

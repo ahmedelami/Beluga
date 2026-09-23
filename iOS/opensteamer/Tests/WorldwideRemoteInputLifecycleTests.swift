@@ -2396,6 +2396,138 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
         XCTAssertEqual(downstream.renderedFrameCount, 0)
     }
 
+    func testMetalPresentationCallbackCannotReenterRendererBeforeDraw() throws {
+        let publication = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let renderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in publication.recordPublication() }
+        )
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 1_000_000))
+        var nativeDrawCount = 0
+        var callbackDuringRegistration: (@Sendable () -> Void)?
+
+        // Metal may call a handler synchronously during registration. That is not a presented
+        // frame from the native draw which has not happened yet.
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                callbackDuringRegistration = callback
+                callback()
+                return true
+            },
+            usingLiveKit: { nativeDrawCount += 1 }
+        )
+        callbackDuringRegistration?()
+        XCTAssertEqual(nativeDrawCount, 1)
+        XCTAssertEqual(publication.publicationCount, 0)
+
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 2_000_000))
+        var callbackDuringDraw: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                callbackDuringDraw = callback
+                return true
+            },
+            usingLiveKit: {
+                nativeDrawCount += 1
+                callbackDuringDraw?()
+            }
+        )
+        callbackDuringDraw?()
+        XCTAssertEqual(nativeDrawCount, 2)
+        XCTAssertEqual(publication.publicationCount, 0)
+
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 3_000_000))
+        var callbackAfterDraw: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                callbackAfterDraw = callback
+                return true
+            },
+            usingLiveKit: { nativeDrawCount += 1 }
+        )
+        XCTAssertEqual(nativeDrawCount, 3)
+        XCTAssertEqual(publication.publicationCount, 0)
+        callbackAfterDraw?()
+        callbackAfterDraw?()
+        XCTAssertEqual(publication.publicationCount, 1)
+    }
+
+    func testMetalRegistrationAndDrawDoNotHoldRendererStateLock() throws {
+        let publication = VideoPresentationObservationCache(
+            WebRTCVideoRenderObservation(
+                frameCount: 0,
+                timestampNanoseconds: 0,
+                width: 64,
+                height: 128,
+                contentDigest: 0,
+                contentSampleCount: 0,
+                contentChangeCount: 0
+            )
+        )
+        let renderer = ObservedVideoRenderer(
+            downstream: SilentVideoRenderer(),
+            invalidatePresentation: { _, _ in },
+            publish: { _, _ in publication.recordPublication() }
+        )
+        let size = CGSize(width: 64, height: 128)
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 3_000_000))
+        let registrationMutationFinished = DispatchSemaphore(value: 0)
+        var callbackAfterRegistration: (@Sendable () -> Void)?
+
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                callbackAfterRegistration = callback
+                DispatchQueue.global().async {
+                    renderer.setSize(size)
+                    registrationMutationFinished.signal()
+                }
+                XCTAssertEqual(
+                    registrationMutationFinished.wait(timeout: .now() + 2),
+                    .success,
+                    "Metal callback registration must not hold the renderer state lock"
+                )
+                return true
+            },
+            usingLiveKit: {}
+        )
+        callbackAfterRegistration?()
+        XCTAssertEqual(publication.publicationCount, 0)
+
+        renderer.renderFrame(try makeRendererFrame(timestampNanoseconds: 4_000_000))
+        let nativeDrawMutationFinished = DispatchSemaphore(value: 0)
+        var callbackAfterNativeDraw: (@Sendable () -> Void)?
+        renderer.draw(
+            registerPresentedHandler: { callback in
+                callbackAfterNativeDraw = callback
+                return true
+            },
+            usingLiveKit: {
+                DispatchQueue.global().async {
+                    renderer.setSize(size)
+                    nativeDrawMutationFinished.signal()
+                }
+                XCTAssertEqual(
+                    nativeDrawMutationFinished.wait(timeout: .now() + 2),
+                    .success,
+                    "LiveKit draw must not hold the renderer state lock"
+                )
+            }
+        )
+        callbackAfterNativeDraw?()
+        XCTAssertEqual(publication.publicationCount, 0)
+    }
+
     func testNonzeroRotationFrameRevokesCachedTouchObservation() throws {
         let cachedObservation = WebRTCVideoRenderObservation(
             frameCount: 12,
@@ -4417,6 +4549,26 @@ final class WorldwideSessionGenerationFenceTests: XCTestCase {
                 role: .viewer,
                 iceServers: []
             )
+        )
+    }
+
+    private func makeRendererFrame(timestampNanoseconds: Int64) throws -> LKRTCVideoFrame {
+        var pixelBuffer: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                64,
+                128,
+                kCVPixelFormatType_32BGRA,
+                nil,
+                &pixelBuffer
+            ),
+            kCVReturnSuccess
+        )
+        return LKRTCVideoFrame(
+            buffer: LKRTCCVPixelBuffer(pixelBuffer: try XCTUnwrap(pixelBuffer)),
+            rotation: ._0,
+            timeStampNs: timestampNanoseconds
         )
     }
 }
