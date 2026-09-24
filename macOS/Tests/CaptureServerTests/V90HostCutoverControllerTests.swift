@@ -286,6 +286,10 @@ final class V90HostCutoverControllerTests: XCTestCase {
         try assertOfflineFixture("verify_reusable_rollback_history_fixture!")
     }
 
+    func testPublishedAppPinsOnlyTheApprovedMacOSRootAttribute() throws {
+        try assertOfflineFixture("verify_published_candidate_root_xattrs_fixture!")
+    }
+
     private func assertOfflineFixture(_ method: String) throws {
         let result = try runExecutable(
             URL(fileURLWithPath: "/usr/bin/ruby"),

@@ -785,6 +785,14 @@ module OpenSteamerV90Cutover
   end
 
   class CopyManifest
+    def self.capture_published_root_xattrs!(root)
+      names = Util.capture!("/usr/bin/xattr", root).lines.map(&:chomp).reject(&:empty?).sort
+      allowed = names.empty? ? {} : Pins::V90_RETAINED_FAILED_APP_ROOT_XATTRS
+      captured = allowed.transform_values { |value| value.dup.freeze }.freeze
+      new(root, allowed_root_xattrs: captured).send(:verify_root!)
+      captured
+    end
+
     def initialize(root, allowed_root_xattrs: {})
       @root = root
       @allowed_root_xattrs = allowed_root_xattrs
@@ -3194,11 +3202,12 @@ module OpenSteamerV90Cutover
     end
 
     def verify_installed_candidate_bytes!
+      Util.fail!("installed candidate root xattr baseline is unavailable") unless @candidate_root_xattrs
       Util.exact_file!(Pins::LIVE_EXECUTABLE, @candidate_executable_sha, "installed V90 executable", mode: 0o755, owner: 501)
       Util.exact_file!(Pins::LIVE_FRAMEWORK, @candidate_framework_sha, "installed V90 framework", mode: 0o755, owner: 501)
       Util.exact_file!(Pins::LIVE_INFO_PLIST, @candidate_info_sha, "installed V90 Info.plist", mode: 0o644, owner: 501)
       Util.exact_file!(Pins::LAUNCH_AGENT, @candidate_plist_sha, "installed V90 launch plist", mode: 0o600, owner: 501)
-      CopyManifest.new(Pins::LIVE_APP).verify!(@post_stop_copy_manifest)
+      CopyManifest.new(Pins::LIVE_APP, allowed_root_xattrs: @candidate_root_xattrs).verify!(@post_stop_copy_manifest)
       LaunchContract.verify!(Pins::LAUNCH_AGENT)
       true
     end
@@ -3289,6 +3298,7 @@ module OpenSteamerV90Cutover
       @predecessor_runtime.fresh_generation!(pid, record.fetch(:nonce))
       @new_nonce = record.fetch(:nonce)
       verify_dynamic_process!(pid, expected_cdhash: @candidate_cdhash)
+      capture_candidate_root_xattrs!
       verify_installed_candidate_bytes!
       Util.fail!("V90 display mode did not settle") unless current_display_mode == Pins::LIVE_DISPLAY_MODE
       @candidate_session = observe_candidate_session!(@session, fresh_generation: true)
@@ -3296,6 +3306,10 @@ module OpenSteamerV90Cutover
       route_monitor_clean!
       @candidate_manager_generation = readiness_generation!
       true
+    end
+
+    def capture_candidate_root_xattrs!
+      @candidate_root_xattrs ||= CopyManifest.capture_published_root_xattrs!(Pins::LIVE_APP)
     end
 
     def verify_candidate_stability_sample!
@@ -3513,8 +3527,7 @@ module OpenSteamerV90Cutover
       Util.directory!(transaction, "completed rollback transaction", mode: 0o700, owner: Process.euid)
       Util.regular_file!(plist, "failed rollback launch plist", mode: 0o600, owner: Process.euid)
       Util.fail!("failed rollback app is not a real directory") unless File.lstat(app).directory?
-      names = Util.capture!("/usr/bin/xattr", app).lines.map(&:chomp).reject(&:empty?).sort
-      allowed_xattrs = names.empty? ? {} : Pins::V90_RETAINED_FAILED_APP_ROOT_XATTRS
+      allowed_xattrs = CopyManifest.capture_published_root_xattrs!(app)
       CopyManifest.new(app, allowed_root_xattrs: allowed_xattrs).verify!(
         File.join(transaction, "v90-candidate-app-copy-manifest.txt")
       )
@@ -4104,6 +4117,67 @@ module OpenSteamerV90Cutover
     ensure
       FileUtils.remove_entry(source_parent) if source_parent && File.exist?(source_parent)
       FileUtils.remove_entry(destination_parent) if destination_parent && File.exist?(destination_parent)
+    end
+
+    def verify_published_candidate_root_xattrs_fixture!
+      expect_failure("installed candidate requires captured root metadata") do
+        RealHost.new.send(:verify_installed_candidate_bytes!)
+      end
+      Dir.mktmpdir("v90-published-root-") do |temporary|
+        root = File.join(File.realpath(temporary), "Fixture.app")
+        Dir.mkdir(root, 0o755)
+        File.chmod(0o755, root)
+        create_copy_manifest_fixture(root)
+        manifest = File.join(temporary, "copy-manifest.txt")
+        File.binwrite(manifest, CopyManifest.new(root).render.first)
+        empty_baseline = CopyManifest.capture_published_root_xattrs!(root)
+        assert("unlaunched published root retains empty immutable metadata") do
+          empty_baseline.empty? && empty_baseline.frozen?
+        end
+        CopyManifest.new(root, allowed_root_xattrs: empty_baseline).verify!(manifest)
+        Util.capture!("/usr/bin/xattr", "-w", "-x", "com.apple.macl", "00" * 72, root)
+        expect_failure("staged candidate still rejects launch metadata") do
+          CopyManifest.new(root).verify!(manifest)
+        end
+        expect_failure("empty published baseline cannot acquire new metadata") do
+          CopyManifest.new(root, allowed_root_xattrs: empty_baseline).verify!(manifest)
+        end
+        live_baseline = CopyManifest.capture_published_root_xattrs!(root)
+        assert("published root accepts only exact immutable launch metadata") do
+          live_baseline == { "com.apple.macl" => "00" * 72 } && live_baseline.frozen? &&
+            live_baseline.values.all?(&:frozen?)
+        end
+        CopyManifest.new(root, allowed_root_xattrs: live_baseline).verify!(manifest)
+        ["00" * 71, "00" * 73, "01" + "00" * 71].each do |invalid|
+          Util.capture!("/usr/bin/xattr", "-w", "-x", "com.apple.macl", invalid, root)
+          expect_failure("published root rejects malformed or nonzero launch metadata") do
+            CopyManifest.capture_published_root_xattrs!(root)
+          end
+          expect_failure("published root rejects changed launch metadata") do
+            CopyManifest.new(root, allowed_root_xattrs: live_baseline).verify!(manifest)
+          end
+        end
+        Util.capture!("/usr/bin/xattr", "-d", "com.apple.macl", root)
+        expect_failure("published root rejects disappearing launch metadata") do
+          CopyManifest.new(root, allowed_root_xattrs: live_baseline).verify!(manifest)
+        end
+        Util.capture!("/usr/bin/xattr", "-w", "-x", "com.opensteamer.unreviewed", "00", root)
+        expect_failure("published root rejects unreviewed metadata") do
+          CopyManifest.capture_published_root_xattrs!(root)
+        end
+        Util.capture!("/usr/bin/xattr", "-d", "com.opensteamer.unreviewed", root)
+        Util.capture!("/usr/bin/xattr", "-w", "-x", "com.apple.macl", "00" * 72, root)
+        child = File.join(root, "Contents/Frameworks/LiveKitWebRTC.framework/Versions/A/LiveKitWebRTC")
+        Util.capture!("/usr/bin/xattr", "-w", "-x", "com.apple.macl", "00" * 72, child)
+        expect_failure("published root policy does not permit child metadata") do
+          CopyManifest.new(root, allowed_root_xattrs: live_baseline).verify!(manifest)
+        end
+        Util.capture!("/usr/bin/xattr", "-d", "com.apple.macl", child)
+        File.open(child, "ab") { |file| file.write("drift") }
+        expect_failure("published root policy preserves exact content proof") do
+          CopyManifest.new(root, allowed_root_xattrs: live_baseline).verify!(manifest)
+        end
+      end
     end
 
     def verify_real_journal_state_machine!
@@ -5042,6 +5116,9 @@ module OpenSteamerV90Cutover
         raise Failure, "process drift" if fail_now.call(:process)
         true
       end
+      host.define_singleton_method(:capture_candidate_root_xattrs!) do
+        @candidate_root_xattrs ||= {}.freeze
+      end
       host.define_singleton_method(:verify_installed_candidate_bytes!) do
         raise Failure, "byte drift" if fail_now.call(:bytes)
         true
@@ -5412,6 +5489,7 @@ module OpenSteamerV90Cutover
       end
 
       verify_copy_stable_manifest_fixture!
+      verify_published_candidate_root_xattrs_fixture!
       verify_predecessor_signature_layout_fixture!
       verify_predecessor_codesign_metadata_fixture!
       verify_dynamic_codesign_metadata_fixture!
