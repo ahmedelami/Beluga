@@ -136,6 +136,8 @@ final class V90HostCutoverControllerTests: XCTestCase {
             )
         )
         XCTAssertTrue(source.contains("PredecessorReferenceFingerprint"))
+        XCTAssertTrue(source.contains("verify-media-v1-host-bundle.sh"))
+        XCTAssertTrue(source.contains("\"--media-integration-v1\""))
         XCTAssertTrue(source.contains("signature_layout"))
         XCTAssertTrue(source.contains("CandidateCDHashFull sha256="))
         XCTAssertTrue(source.contains("v90-candidate-app-copy-manifest.txt"))

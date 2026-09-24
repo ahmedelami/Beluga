@@ -172,7 +172,7 @@ module OpenSteamerV90Cutover
       "select-live-display-mode-v23" => "ee67b4797787098ea1073e4b579355366f534d865ff233a8b780ec5552c8f2a3",
       "verify-live-display-topology-v23" => "1502e07358f2316f4dee1fb12ce380cc5e9588cd6393ea3f34656ab80e9db292",
       "verify-live-mac-host-process.sh" => "0e56403570362c6d59ea86dc10d3cc53d7a5461d4a2f6c78d6e6c86dd13a4b41",
-      "verify-mac-host-bundle.sh" => "02a348a88d25b76ab95d45620d823339212bb53ee0f39bfb3a52f04240d3d745"
+      "verify-media-v1-host-bundle.sh" => "e8a486a8e7360e5d3c8517e237e046fc21b3ccc2a3eb5e14ccd5d40135742e0c"
     }.freeze
 
     PAYLOAD_SCHEMA = "opensteamer.v90-deployment-payload-manifest.v2"
@@ -2531,9 +2531,17 @@ module OpenSteamerV90Cutover
       Util.exact_file!(Pins::LIVE_INFO_PLIST, Pins::V86_INFO_PLIST_SHA256, "live V86 Info.plist", mode: 0o644, owner: 501)
       Util.exact_file!(Pins::LAUNCH_AGENT, Pins::LAUNCH_AGENT_SHA256, "live V86 launch plist", mode: 0o600, owner: 501)
       LaunchContract.verify!(Pins::LAUNCH_AGENT)
-      verifier = helper_path("verify-mac-host-bundle.sh")
+      verifier = helper_path("verify-media-v1-host-bundle.sh")
       reference = @post_stop_reference || @reference_path
-      command_with_environment!({ "OPENSTEAMER_EXPECTED_ARCHITECTURES" => "arm64" }, verifier, "--installed-runtime", Pins::LIVE_APP, Pins::TEAM_ID, reference) if reference
+      command_with_environment!(
+        { "OPENSTEAMER_EXPECTED_ARCHITECTURES" => "arm64" },
+        verifier,
+        "--installed-runtime",
+        "--media-integration-v1",
+        Pins::LIVE_APP,
+        Pins::TEAM_ID,
+        reference
+      ) if reference
       metadata = combined_capture!("/usr/bin/codesign", "--display", "--verbose=4", Pins::LIVE_EXECUTABLE)
       Util.fail!("live V86 code identifier mismatch") unless metadata.scan(/^Identifier=(.+)$/).flatten == [Pins::EXECUTABLE_IDENTIFIER]
       Util.fail!("live V86 TeamIdentifier mismatch") unless metadata.scan(/^TeamIdentifier=(.+)$/).flatten == [Pins::TEAM_ID]
@@ -3928,6 +3936,11 @@ module OpenSteamerV90Cutover
         Pins::LIVE_FRAMEWORK_IDENTITY_PATH ==
           "/Applications/opensteamer Host.app/Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC" &&
           Pins::LIVE_FRAMEWORK_IDENTITY_PATH != Pins::LIVE_FRAMEWORK
+      end
+      assert("V86 verification preserves the sealed media-integration contract") do
+        Pins::V86_HELPERS["verify-media-v1-host-bundle.sh"] ==
+          "e8a486a8e7360e5d3c8517e237e046fc21b3ccc2a3eb5e14ccd5d40135742e0c" &&
+          !Pins::V86_HELPERS.key?("verify-mac-host-bundle.sh")
       end
 
       capsule = FakeCapsule.new
