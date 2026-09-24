@@ -1043,7 +1043,9 @@ module OpenSteamerV90Cutover
   class SessionFence
     Snapshot = Struct.new(:device, :inode, :size, :last_reset_offset, :digest, keyword_init: true)
 
-    def self.observe!(path, pid, nonce, prior: nil)
+    def self.observe!(path, pid, nonce, prior: nil, fresh_generation: false)
+      Util.fail!("fresh-generation session fence requires a prior snapshot") if
+        fresh_generation && !prior
       stat = Util.regular_file!(path, "host stdout log", owner: Process.euid, links: 1)
       if prior
         Util.fail!("host stdout log was replaced") unless [stat.dev, stat.ino] == [prior.device, prior.inode]
@@ -1068,7 +1070,8 @@ module OpenSteamerV90Cutover
           prefix && Digest::SHA256.hexdigest(prefix) == prior.digest
       end
       online = "Worldwide paired-device availability is online pid=#{pid} nonce=#{nonce}"
-      Util.fail!("host log lacks pinned generation availability marker") unless data.include?(online)
+      online_offset = data.rindex(online)
+      Util.fail!("host log lacks pinned generation availability marker") unless online_offset
       reset_patterns = [
         "Worldwide availability is waiting for the paired iPhone",
         "Worldwide viewer disconnected",
@@ -1077,7 +1080,15 @@ module OpenSteamerV90Cutover
       reset = reset_patterns.map { |marker| data.rindex(marker) }.compact.max
       Util.fail!("host log has no quiescent-session boundary") unless reset
       if prior
-        Util.fail!("host quiescent-session boundary changed") unless reset == prior.last_reset_offset
+        if fresh_generation
+          Util.fail!("host lacks a fresh candidate quiescent-session boundary") unless
+            reset >= prior.size
+          Util.fail!("candidate availability marker precedes its fresh quiescent boundary") unless
+            online_offset > reset
+        else
+          Util.fail!("host quiescent-session boundary changed") unless
+            reset == prior.last_reset_offset
+        end
       end
       suffix = data.byteslice(reset..-1)
       unsafe = [
@@ -1461,12 +1472,19 @@ module OpenSteamerV90Cutover
     end
 
     def verify_candidate_ready!
-      wait_until!(90, "V90 host did not become ready") do
-        begin
-          establish_candidate_stability_baseline!
-        rescue Failure
-          false
+      last_failure = nil
+      begin
+        wait_until!(90, "V90 host did not become ready", interval: 1.0) do
+          begin
+            establish_candidate_stability_baseline!
+          rescue Failure => failure
+            last_failure = failure
+            false
+          end
         end
+      rescue Failure => failure
+        detail = last_failure ? last_failure.message : "no readiness failure was captured"
+        Util.fail!("#{failure.message}; last readiness failure: #{detail}")
       end
       run_candidate_stability_window!
       true
@@ -2734,8 +2752,14 @@ module OpenSteamerV90Cutover
       Integer(match[1], 10)
     end
 
-    def observe_candidate_session!(prior)
-      SessionFence.observe!(Pins::LAUNCH_STDOUT, @new_pid, @new_nonce, prior: prior)
+    def observe_candidate_session!(prior, fresh_generation: false)
+      SessionFence.observe!(
+        Pins::LAUNCH_STDOUT,
+        @new_pid,
+        @new_nonce,
+        prior: prior,
+        fresh_generation: fresh_generation
+      )
     end
 
     def establish_candidate_stability_baseline!
@@ -2748,11 +2772,11 @@ module OpenSteamerV90Cutover
       @new_nonce = record.fetch(:nonce)
       verify_dynamic_process!(pid, expected_cdhash: @candidate_cdhash)
       verify_installed_candidate_bytes!
-      @candidate_manager_generation = readiness_generation!
       Util.fail!("V90 display mode did not settle") unless current_display_mode == Pins::LIVE_DISPLAY_MODE
-      @candidate_session = observe_candidate_session!(@session)
+      @candidate_session = observe_candidate_session!(@session, fresh_generation: true)
       verify_routes!
       route_monitor_clean!
+      @candidate_manager_generation = readiness_generation!
       true
     end
 
@@ -2837,12 +2861,12 @@ module OpenSteamerV90Cutover
       strict_fsync_directory!(destination_parent, "exclusive rename parent")
     end
 
-    def wait_until!(seconds, diagnostic)
+    def wait_until!(seconds, diagnostic, interval: 0.1)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
       loop do
         return true if yield
         break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-        sleep 0.1
+        sleep interval
       end
       Util.fail!(diagnostic)
     end
@@ -3993,6 +4017,45 @@ module OpenSteamerV90Cutover
           advanced.size > baseline.size && advanced.last_reset_offset == baseline.last_reset_offset
         end
 
+        candidate_pid = pid + 1
+        candidate_nonce = "e" * 64
+        File.open(path, "ab") do |file|
+          file.write("Worldwide availability is waiting for the paired iPhone\n")
+          file.write(
+            "Worldwide paired-device availability is online " \
+            "pid=#{candidate_pid} nonce=#{candidate_nonce}\n"
+          )
+        end
+        candidate = SessionFence.observe!(
+          path,
+          candidate_pid,
+          candidate_nonce,
+          prior: advanced,
+          fresh_generation: true
+        )
+        assert("session fence accepts one append-only candidate generation boundary") do
+          candidate.last_reset_offset >= advanced.size
+        end
+        File.open(path, "ab") { |file| file.write("candidate health sample\n") }
+        stable_candidate = SessionFence.observe!(
+          path,
+          candidate_pid,
+          candidate_nonce,
+          prior: candidate
+        )
+        assert("candidate session fence returns to same-generation stability") do
+          stable_candidate.last_reset_offset == candidate.last_reset_offset
+        end
+        expect_failure("session fence requires a new boundary for another generation transition") do
+          SessionFence.observe!(
+            path,
+            candidate_pid,
+            candidate_nonce,
+            prior: stable_candidate,
+            fresh_generation: true
+          )
+        end
+
         File.open(path, "ab") do |file|
           file.write("Worldwide authenticated media route selected\n")
           file.write("Worldwide peer returned to idle\n")
@@ -4052,7 +4115,7 @@ module OpenSteamerV90Cutover
         bad = fail_now.call(:display)
         bad ? "drifted" : Pins::LIVE_DISPLAY_MODE
       end
-      host.define_singleton_method(:observe_candidate_session!) do |_prior|
+      host.define_singleton_method(:observe_candidate_session!) do |_prior, **_arguments|
         raise Failure, "session drift" if fail_now.call(:session)
         Object.new
       end

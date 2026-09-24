@@ -32,6 +32,21 @@ metadata() {
     /usr/bin/stat -f '%HT|%u|%Lp|%d|%i|%l|%z|%B|%m' -- "$1"
 }
 
+sha256_file() {
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '
+        {
+            candidate=substr($0, 1, 64)
+            separator=substr($0, 65, 2)
+            if (length(candidate) == 64 && candidate ~ /^[0-9a-f]+$/ &&
+                separator ~ /^[[:space:]][ *]$/) {
+                value=candidate
+                count++
+            }
+        }
+        END { if (count != 1) exit 1; print value }
+    '
+}
+
 require_private_directory() {
     local path="$1" label="$2" signature kind owner mode device inode links rest
     is_canonical_absolute_path "$path" || fail "$label path is not canonical"
@@ -167,8 +182,7 @@ IFS='|' read -r candidate_kind candidate_owner candidate_mode candidate_device c
     && "$candidate_mode" == "755" \
     && "$candidate_links" == "1" ]] || fail \
     "candidate CaptureServer identity is unsafe"
-readonly CANDIDATE_SHA256="$(/usr/bin/shasum -a 256 "$CANDIDATE_INPUT" \
-    | /usr/bin/awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { print $1 }')"
+readonly CANDIDATE_SHA256="$(sha256_file "$CANDIDATE_INPUT")"
 [[ "$CANDIDATE_SHA256" == "$EXPECTED_CANDIDATE_SHA256" ]] || fail \
     "candidate CaptureServer SHA-256 differs from the sealed expectation"
 /usr/bin/codesign --verify --strict --verbose=2 "$CANDIDATE_INPUT" \
@@ -223,8 +237,7 @@ require_probe_fences_unchanged() {
     candidate_after="$(metadata "$CANDIDATE_INPUT")"
     [[ "$candidate_after" == "$CANDIDATE_IDENTITY" ]] || fail \
         "candidate CaptureServer was replaced during a probe"
-    candidate_sha256_after="$(/usr/bin/shasum -a 256 "$CANDIDATE_INPUT" \
-        | /usr/bin/awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { print $1 }')"
+    candidate_sha256_after="$(sha256_file "$CANDIDATE_INPUT")"
     [[ "$candidate_sha256_after" == "$EXPECTED_CANDIDATE_SHA256" ]] || fail \
         "candidate CaptureServer bytes changed during a probe"
     /usr/bin/codesign --verify --strict --verbose=2 "$CANDIDATE_INPUT" \

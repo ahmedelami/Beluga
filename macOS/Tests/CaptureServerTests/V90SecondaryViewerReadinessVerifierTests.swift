@@ -129,6 +129,49 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
         }
     }
 
+    func testVerifierAcceptsSignedCandidateAtPathContainingSpaces() async throws {
+        try await withFixture { fixture in
+            let spacedDirectory = fixture.root.appendingPathComponent(
+                "candidate path with spaces",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: spacedDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let spacedCandidate = spacedDirectory.appendingPathComponent("Capture Server")
+            try FileManager.default.copyItem(at: fixture.candidate, to: spacedCandidate)
+            let framework = fixture.candidate
+                .deletingLastPathComponent()
+                .appendingPathComponent("LiveKitWebRTC.framework", isDirectory: true)
+            try FileManager.default.copyItem(
+                at: framework,
+                to: spacedDirectory.appendingPathComponent(
+                    "LiveKitWebRTC.framework",
+                    isDirectory: true
+                )
+            )
+            XCTAssertEqual(chmod(spacedCandidate.path, 0o755), 0)
+
+            let result = try runVerifier(
+                fixture: fixture,
+                candidate: spacedCandidate,
+                candidateSHA256: try sha256(of: spacedCandidate)
+            )
+
+            XCTAssertEqual(result.status, 0, result.stderr)
+            XCTAssertTrue(
+                result.stdout.hasPrefix("V90_SECONDARY_VIEWER_ENDPOINT_IDLE_OK "),
+                result.stdout
+            )
+            XCTAssertEqual(
+                try FileManager.default.contentsOfDirectory(atPath: fixture.scratch.path),
+                []
+            )
+        }
+    }
+
     func testFabricatedJSONWriterFailsCandidateSealBeforeExecution() async throws {
         try await withFixture { fixture in
             let fabricated = fixture.root.appendingPathComponent("FabricatedCaptureServer")
