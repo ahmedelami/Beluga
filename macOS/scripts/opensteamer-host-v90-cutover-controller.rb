@@ -150,13 +150,13 @@ module OpenSteamerV90Cutover
     V86_ROUTE_SHA256 = "d449ef1af733211f3de839229c8993d1431a277a0e3efcff300ed7a8a8e47f02"
     V86_TERMINAL = "STATE COMMITTED"
 
-    LIVE_PID = 94_637
-    LIVE_PROCESS_START = "Wed Sep 23 10:01:33 2026"
-    LIVE_NONCE = "b12cbe392896f7511bd1b9221a59738b6e6b5e0b1137f970cb1f2049cb804b04"
+    LIVE_PID = 87_562
+    LIVE_PROCESS_START = "Thu Sep 24 12:04:54 2026"
+    LIVE_NONCE = "56c4e4b4ae6f67ca14a22879865ee71b757d921822fbe83630b9b19bec5fb3ed"
     LIVE_LOCK = <<~LOCK.freeze
       OPENSTEAMER_WORLDWIDE_HOST_GENERATION_V1
-      pid=94637
-      nonce=b12cbe392896f7511bd1b9221a59738b6e6b5e0b1137f970cb1f2049cb804b04
+      pid=87562
+      nonce=56c4e4b4ae6f67ca14a22879865ee71b757d921822fbe83630b9b19bec5fb3ed
     LOCK
     LIVE_LOCK_PATH = "/Users/ahmed/Library/Application Support/com.elamin.AudioStreamer.CaptureServer.runtime/worldwide-host.lock"
     LIVE_LOCK_DIRECTORY_IDENTITY = [16_777_232, 10_835_207].freeze
