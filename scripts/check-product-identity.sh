@@ -2202,7 +2202,10 @@ assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
   'dataStore: WorldwideKeychainDataStore()' 1 \
   'explicit opensteamer pairing-store composition'
 assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
-  'fflush(stdout)' 2 'immediate primary and secondary one-time pairing-code flushes'
+  'fflush(stdout)' 1 'immediate primary one-time pairing-code flush'
+assert_literal_count macOS/Sources/CaptureServer/CaptureServerMain.swift \
+  'Secondary one-time test viewer code' 0 \
+  'secondary invitation absence from the long-lived host log'
 if require_directory macOS/Sources; then
   PROTECTED_PAIRING_SOURCE_MATCHES=$(find "$ROOT/macOS/Sources" -type f -name '*.swift' \
     -exec grep -lF -- \

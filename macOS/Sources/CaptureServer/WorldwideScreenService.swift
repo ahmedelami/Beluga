@@ -744,8 +744,26 @@ actor WorldwideScreenService {
             decoded.metrics.zeroFraction,
             decoded.metrics.clippingFraction
         )
+        let forwardingIdentity = snapshot.lastAttemptedKey
+        let forwardingIdentityMatchesSnapshot = forwardingIdentity.map {
+            $0.monitorEpoch == snapshot.monitorEpoch
+                && $0.deviceGeneration == snapshot.deviceGeneration
+                && $0.peerGeneration == snapshot.peerGeneration
+                && $0.transportAuthorizationEpoch
+                    == snapshot.transportAuthorizationEpoch
+                && $0.trackGeneration == snapshot.trackGeneration
+        } ?? false
         return "Worldwide iPhone microphone forwarding " +
             "phase=\(snapshot.phase.rawValue) " +
+            "monitorEpoch=\(snapshot.monitorEpoch?.uuidString.lowercased() ?? "none") " +
+            "deviceGeneration=\(snapshot.deviceGeneration) " +
+            "peerGeneration=\(snapshot.peerGeneration) " +
+            "transportAuthorizationEpoch=" +
+                "\(snapshot.transportAuthorizationEpoch) " +
+            "trackGeneration=\(snapshot.trackGeneration) " +
+            "attemptGeneration=\(snapshot.attemptGeneration) " +
+            "lastAttemptedKeyMatchesSnapshot=" +
+                "\(forwardingIdentityMatchesSnapshot) " +
             "inputEndpointAvailable=\(snapshot.deviceUID != nil) " +
             "hiddenSinkAvailable=\(snapshot.sinkDeviceUID != nil) " +
             "hiddenWriterSelectionProven=" +

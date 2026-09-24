@@ -20,6 +20,7 @@ struct CaptureServerOptions {
     var lanEnabled = true
     var worldwideEnabled = false
     var secondaryTestViewerEnabled = false
+    var secondaryTestViewerControlSocketPath: String?
     var resetWorldwidePairing = false
     var allowRemoteControl = false
     var rendezvousURL: URL?
@@ -51,6 +52,9 @@ struct CaptureServerOptions {
     Usage:
       swift run CaptureServer --port 9000 --duration 30 --verbose
       swift run CaptureServer --list-displays
+      swift run CaptureServer --probe-secondary-test-viewer-status <output-file>
+      swift run CaptureServer --request-secondary-test-viewer-invitation <output-file>
+      swift run CaptureServer --stop-secondary-test-viewer-generation <output-file.receipt>
 
     Options:
       --host <host>          Host label for diagnostics. Listener binds all interfaces.
@@ -64,8 +68,21 @@ struct CaptureServerOptions {
       --no-screen            Disable the screen video service.
       --worldwide            Enable one-code WebRTC access using the explicitly configured endpoint.
       --secondary-test-viewer
-                             Add one consume-once worldwide viewer alongside the primary host.
+                             Add a renewable consume-once worldwide viewer beside the primary host.
                              Requires --worldwide; secondary audio/routing/Now Playing stay disabled.
+      --secondary-test-viewer-control-socket <absolute-path>
+                             Owner-only local renewal socket. Requires --secondary-test-viewer.
+                             Defaults to /private/tmp/opensteamer-wv-<uid>/control.sock.
+      --probe-secondary-test-viewer-status <absolute-output-file>
+                             Client-only mode: atomically create a 0600 nonsecret status record
+                             for bounded readiness checks. Never mints an invitation or generation.
+      --request-secondary-test-viewer-invitation <absolute-output-file>
+                             Client-only mode: request one renewal from the running owner and
+                             create a 0600 invitation plus nonsecret .receipt cleanup file.
+                             Starts no host, capture, input, or audio.
+      --stop-secondary-test-viewer-generation <absolute-receipt-file>
+                             Client-only mode: stop and prove teardown for only the receipt's exact
+                             secondary generation. Never stops the primary host or owns audio/input.
       --reset-worldwide-pairing
                              Forget the paired iPhone before starting worldwide mode.
       --allow-remote-control Allow pointer and keyboard input for the active worldwide screen session.
@@ -98,6 +115,9 @@ struct CaptureServerOptions {
         var options = CaptureServerOptions()
         let rendezvousURLText = environment["OPENSTEAMER_RENDEZVOUS_URL"]?.nilIfEmpty
         options.rendezvousURL = rendezvousURLText.flatMap(URL.init(string:))
+        options.secondaryTestViewerControlSocketPath = environment[
+            "OPENSTEAMER_SECONDARY_VIEWER_CONTROL_SOCKET"
+        ]?.nilIfEmpty
         var index = 1
         var screenPortWasExplicit = false
         var lanModeWasExplicit = false
@@ -171,6 +191,15 @@ struct CaptureServerOptions {
                 options.worldwideEnabled = true
             case "--secondary-test-viewer":
                 options.secondaryTestViewerEnabled = true
+            case "--secondary-test-viewer-control-socket":
+                index += 1
+                guard index < arguments.count,
+                      arguments[index].hasPrefix("/") else {
+                    throw CaptureServerOptionError.invalid(
+                        "--secondary-test-viewer-control-socket requires an absolute path"
+                    )
+                }
+                options.secondaryTestViewerControlSocketPath = arguments[index]
             case "--reset-worldwide-pairing":
                 options.resetWorldwidePairing = true
             case "--allow-remote-control":
@@ -286,6 +315,13 @@ struct CaptureServerOptions {
         } else if options.secondaryTestViewerEnabled {
             throw CaptureServerOptionError.invalid(
                 "--secondary-test-viewer requires --worldwide"
+            )
+        }
+
+        if options.secondaryTestViewerControlSocketPath != nil,
+           !options.secondaryTestViewerEnabled {
+            throw CaptureServerOptionError.invalid(
+                "--secondary-test-viewer-control-socket requires --secondary-test-viewer"
             )
         }
 

@@ -1,5 +1,223 @@
+import Foundation
 import RemoteSessionCore
 import SwiftUI
+
+#if DEBUG
+/// DEBUG-only file/Keychain boundary for the dedicated physical-iPhone-15 secondary viewer.
+///
+/// The one-use invitation is never put in `RemoteTokenState`: doing so would eagerly persist it.
+/// Cleanup is completed and independently re-read before the boundary returns an in-memory
+/// invitation or publishes a nonce-bound, nonsecret receipt.
+enum IPhone15DevelopmentSecondarySecretBoundary {
+    static let developmentBundleIdentifier = "org.example.AudioStreamer.dev"
+    static let viewerLaunchArgument =
+        "--opensteamer-iphone15-dev-secondary-viewer"
+    static let cleanupLaunchArgument =
+        "--opensteamer-iphone15-dev-secondary-cleanup"
+    static let cleanupReceiptArgument =
+        "--opensteamer-iphone15-dev-cleanup-receipt"
+    static let invitationFileName =
+        ".opensteamer-dev-secondary-invitation"
+    static let cleanupReceiptFilePrefix =
+        ".opensteamer-dev-secondary-cleanup-receipt-"
+
+    enum LaunchRequest: Equatable {
+        case ordinary
+        case invalidDevelopmentRequest
+        case cleanup(nonce: String)
+        case viewer(nonce: String)
+    }
+
+    struct Outcome {
+        let invitation: String?
+        let receiptURL: URL
+    }
+
+    enum BoundaryError: Error {
+        case cleanupFailed
+        case receiptFailed
+    }
+
+    static func launchRequest(
+        arguments: [String],
+        bundleIdentifier: String?
+    ) -> LaunchRequest {
+        let viewerIndices = arguments.indices.filter {
+            arguments[$0] == viewerLaunchArgument
+        }
+        let cleanupIndices = arguments.indices.filter {
+            arguments[$0] == cleanupLaunchArgument
+        }
+        let receiptIndices = arguments.indices.filter {
+            arguments[$0] == cleanupReceiptArgument
+        }
+        let hasDevelopmentArgument = !viewerIndices.isEmpty
+            || !cleanupIndices.isEmpty
+            || !receiptIndices.isEmpty
+        guard hasDevelopmentArgument else { return .ordinary }
+        guard bundleIdentifier == developmentBundleIdentifier,
+              arguments.count == 4,
+              viewerIndices.count + cleanupIndices.count == 1,
+              receiptIndices.count == 1,
+              let modeIndex = viewerIndices.first ?? cleanupIndices.first,
+              let receiptIndex = receiptIndices.first,
+              modeIndex == arguments.startIndex + 1,
+              receiptIndex == modeIndex + 1,
+              receiptIndex + 1 == arguments.index(before: arguments.endIndex) else {
+            return .invalidDevelopmentRequest
+        }
+
+        let nonce = arguments[receiptIndex + 1]
+        guard nonce.utf8.count == 32,
+              nonce.utf8.allSatisfy({ byte in
+                  (48...57).contains(byte) || (97...102).contains(byte)
+              }) else {
+            return .invalidDevelopmentRequest
+        }
+        if cleanupIndices.count == 1 {
+            return .cleanup(nonce: nonce)
+        }
+        return .viewer(nonce: nonce)
+    }
+
+    static func perform(
+        request: LaunchRequest,
+        documentsDirectory: URL,
+        keychainStore: any RemoteTokenStoring,
+        fileManager: FileManager = .default
+    ) throws -> Outcome {
+        let cleanupNonce: String
+        let shouldImportInvitation: Bool
+        switch request {
+        case .cleanup(let nonce):
+            cleanupNonce = nonce
+            shouldImportInvitation = false
+        case .viewer(let nonce):
+            cleanupNonce = nonce
+            shouldImportInvitation = true
+        case .ordinary, .invalidDevelopmentRequest:
+            throw BoundaryError.cleanupFailed
+        }
+
+        let invitationURL = documentsDirectory.appendingPathComponent(
+            invitationFileName,
+            isDirectory: false
+        )
+        let receiptURL = documentsDirectory.appendingPathComponent(
+            cleanupReceiptFilePrefix + cleanupNonce,
+            isDirectory: false
+        )
+
+        // Read into a local value before deletion. Invalid/missing data never prevents the
+        // cleanup attempts below and is never copied into UI, arguments, output, or a receipt.
+        let invitation = shouldImportInvitation
+            ? validatedInvitation(at: invitationURL, fileManager: fileManager)
+            : nil
+
+        var cleanupSucceeded = true
+        do {
+            let children = try fileManager.contentsOfDirectory(
+                at: documentsDirectory,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            for child in children
+            where child.lastPathComponent.hasPrefix(cleanupReceiptFilePrefix) {
+                try fileManager.removeItem(at: child)
+            }
+        } catch {
+            cleanupSucceeded = false
+        }
+
+        do {
+            try keychainStore.deleteRemoteToken()
+            if try keychainStore.loadRemoteToken() != nil {
+                cleanupSucceeded = false
+            }
+        } catch {
+            cleanupSucceeded = false
+        }
+
+        do {
+            try removeItemIfPresent(invitationURL, fileManager: fileManager)
+        } catch {
+            cleanupSucceeded = false
+        }
+        if itemExists(at: invitationURL, fileManager: fileManager) {
+            cleanupSucceeded = false
+        }
+        guard cleanupSucceeded else { throw BoundaryError.cleanupFailed }
+
+        let receipt = Data(
+            "OPENSTEAMER_IPHONE15_DEV_SECRET_CLEANUP_V1 nonce=\(cleanupNonce)\n".utf8
+        )
+        do {
+            try receipt.write(to: receiptURL, options: .atomic)
+            guard try Data(contentsOf: receiptURL) == receipt else {
+                try? fileManager.removeItem(at: receiptURL)
+                throw BoundaryError.receiptFailed
+            }
+        } catch {
+            try? fileManager.removeItem(at: receiptURL)
+            throw BoundaryError.receiptFailed
+        }
+
+        return Outcome(invitation: invitation, receiptURL: receiptURL)
+    }
+
+    private static func validatedInvitation(
+        at invitationURL: URL,
+        fileManager: FileManager
+    ) -> String? {
+        guard itemExists(at: invitationURL, fileManager: fileManager),
+              let attributes = try? fileManager.attributesOfItem(
+                atPath: invitationURL.path
+              ),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let byteCount = (attributes[.size] as? NSNumber)?.intValue,
+              (1...256).contains(byteCount),
+              let data = try? Data(contentsOf: invitationURL),
+              data.count == byteCount,
+              let candidate = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !candidate.isEmpty,
+              (try? RemoteInvitationCode(candidate)) != nil else {
+            return nil
+        }
+        return candidate
+    }
+
+    private static func removeItemIfPresent(
+        _ url: URL,
+        fileManager: FileManager
+    ) throws {
+        do {
+            try fileManager.removeItem(at: url)
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        }
+    }
+
+    private static func itemExists(
+        at url: URL,
+        fileManager: FileManager
+    ) -> Bool {
+        fileManager.fileExists(atPath: url.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+}
+
+private struct IPhone15DevelopmentSecondaryInvitationEnvironmentKey: EnvironmentKey {
+    static let defaultValue: String? = nil
+}
+
+extension EnvironmentValues {
+    var iPhone15DevelopmentSecondaryInvitation: String? {
+        get { self[IPhone15DevelopmentSecondaryInvitationEnvironmentKey.self] }
+        set { self[IPhone15DevelopmentSecondaryInvitationEnvironmentKey.self] = newValue }
+    }
+}
+#endif
 
 /// Discovery and connection surface for both legacy streams and authenticated worldwide sessions.
 ///
@@ -33,6 +251,43 @@ struct BrowserView: View {
     }
 
     #if DEBUG
+    struct TemporaryTestViewerControlVisibility: Equatable {
+        let showsImportedDevelopmentControl: Bool
+        let showsOrdinaryBootstrapControl: Bool
+    }
+
+    /// Keeps the physical-runner capability independent of durable pairing presentation while
+    /// leaving the ordinary Debug affordance on the invitation bootstrap surface only.
+    static func temporaryTestViewerControlVisibility(
+        importedInvitation: String?,
+        surface: WorldwidePresentation.Surface
+    ) -> TemporaryTestViewerControlVisibility {
+        let hasImportedInvitation = importedInvitation?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        let isBootstrap: Bool
+        if case .bootstrap = surface {
+            isBootstrap = true
+        } else {
+            isBootstrap = false
+        }
+        return TemporaryTestViewerControlVisibility(
+            showsImportedDevelopmentControl: hasImportedInvitation,
+            showsOrdinaryBootstrapControl: !hasImportedInvitation && isBootstrap
+        )
+    }
+
+    /// The runner-imported secondary invitation must always use the bundled deployed endpoint.
+    /// Ordinary Debug pairing continues to honor the developer's stored localhost override.
+    static func temporaryTestViewerEndpoint(
+        infoDictionary: [String: Any] = Bundle.main.infoDictionary ?? [:]
+    ) -> URL? {
+        WorldwideSessionViewModel.rendezvousEndpoint(
+            debugOverride: nil,
+            infoDictionary: infoDictionary
+        )
+    }
+
     /// Starts the one-use raw-invitation path without entering the durable pairing coordinator.
     /// The returned value remains saved until transport proves the host consumed the invitation.
     @MainActor
@@ -104,7 +359,12 @@ struct BrowserView: View {
     @State private var worldwidePreparationGeneration = UUID()
     @FocusState private var invitationCodeIsFocused: Bool
     #if DEBUG
+    @Environment(\.iPhone15DevelopmentSecondaryInvitation)
+    private var importedDevelopmentSecondaryInvitation
     @State private var temporaryViewerInvitationAwaitingConsumption: String?
+    @State private var developmentSecondaryInvitation: String?
+    @State private var developmentSecondaryInvitationLoadWasAttempted = false
+    @State private var developmentSecondaryInvitationWasLoaded = false
     @AppStorage("debugWorldwideRendezvousEndpoint")
     private var debugWorldwideRendezvousEndpoint = "ws://127.0.0.1:8788"
     #endif
@@ -113,6 +373,16 @@ struct BrowserView: View {
 
     var body: some View {
         let presentation = worldwidePresentation
+        #if DEBUG
+        let temporaryViewerControls = Self.temporaryTestViewerControlVisibility(
+            importedInvitation: importedDevelopmentSecondaryInvitation,
+            surface: presentation.surface
+        )
+        let showsOrdinaryTemporaryViewer =
+            temporaryViewerControls.showsOrdinaryBootstrapControl
+        #else
+        let showsOrdinaryTemporaryViewer = false
+        #endif
 
         List {
             Section("Connect from Anywhere") {
@@ -137,8 +407,17 @@ struct BrowserView: View {
                     )
 
                 case .bootstrap:
-                    worldwideBootstrapContent(actionTitle: presentation.primaryActionTitle)
+                    worldwideBootstrapContent(
+                        actionTitle: presentation.primaryActionTitle,
+                        showsOrdinaryTemporaryViewer: showsOrdinaryTemporaryViewer
+                    )
                 }
+
+                #if DEBUG
+                if temporaryViewerControls.showsImportedDevelopmentControl {
+                    importedDevelopmentTemporaryViewerContent
+                }
+                #endif
 
                 if let storageError = viewerPairingState.storageError {
                     Label(storageError, systemImage: "exclamationmark.triangle")
@@ -266,6 +545,9 @@ struct BrowserView: View {
         }
         .navigationTitle("Beluga")
         .onAppear {
+            #if DEBUG
+            loadDevelopmentSecondaryInvitationIfRequested()
+            #endif
             invitationCodeState.loadIfNeeded()
             remoteTokenState.loadIfNeeded()
             viewerPairingState.retryHydrationIfNeeded()
@@ -285,12 +567,26 @@ struct BrowserView: View {
         }
         #if DEBUG
         .onChange(of: worldwideViewModel.isPeerConnected) { _, isConnected in
-            guard Self.clearTemporaryTestViewerInvitationIfConsumed(
-                pendingInvitation: temporaryViewerInvitationAwaitingConsumption,
-                currentInvitation: trimmedInvitationCode,
-                isPeerConnected: isConnected,
-                clearInvitation: invitationCodeState.clearSavedCode
-            ) else { return }
+            let didConsumeInvitation: Bool
+            if let developmentSecondaryInvitation {
+                didConsumeInvitation = Self.clearTemporaryTestViewerInvitationIfConsumed(
+                    pendingInvitation: temporaryViewerInvitationAwaitingConsumption,
+                    currentInvitation: developmentSecondaryInvitation,
+                    isPeerConnected: isConnected,
+                    clearInvitation: {
+                        self.developmentSecondaryInvitation = nil
+                        return true
+                    }
+                )
+            } else {
+                didConsumeInvitation = Self.clearTemporaryTestViewerInvitationIfConsumed(
+                    pendingInvitation: temporaryViewerInvitationAwaitingConsumption,
+                    currentInvitation: trimmedInvitationCode,
+                    isPeerConnected: isConnected,
+                    clearInvitation: invitationCodeState.clearSavedCode
+                )
+            }
+            guard didConsumeInvitation else { return }
             temporaryViewerInvitationAwaitingConsumption = nil
             showsInvitationCode = false
             invitationCodeIsFocused = false
@@ -467,7 +763,10 @@ struct BrowserView: View {
     }
 
     @ViewBuilder
-    private func worldwideBootstrapContent(actionTitle: String) -> some View {
+    private func worldwideBootstrapContent(
+        actionTitle: String,
+        showsOrdinaryTemporaryViewer: Bool = false
+    ) -> some View {
         HStack {
             Group {
                 if showsInvitationCode {
@@ -511,25 +810,27 @@ struct BrowserView: View {
         .accessibilityIdentifier("connectWorldwide")
 
         #if DEBUG
-        Button {
-            connectTemporaryTestViewer()
-        } label: {
-            Label("Connect Temporary Test Viewer", systemImage: "iphone.gen3")
-        }
-        .disabled(
-            trimmedInvitationCode.isEmpty
-                || worldwideViewModel.isConnecting
-                || worldwideViewModel.hasActiveSession
-                || worldwideConnection.isConnecting
-        )
-        .accessibilityIdentifier("connectTemporaryWorldwideViewer")
-        .accessibilityHint(
-            "Uses the one-time invitation above without saving a paired Mac."
-        )
+        if showsOrdinaryTemporaryViewer {
+            Button {
+                connectOrdinaryTemporaryTestViewer()
+            } label: {
+                Label("Connect Temporary Test Viewer", systemImage: "iphone.gen3")
+            }
+            .disabled(
+                trimmedInvitationCode.isEmpty
+                    || worldwideViewModel.isConnecting
+                    || worldwideViewModel.hasActiveSession
+                    || worldwideConnection.isConnecting
+            )
+            .accessibilityIdentifier("connectTemporaryWorldwideViewer")
+            .accessibilityHint(
+                "Uses the typed one-time invitation and Debug rendezvous endpoint without saving a paired Mac."
+            )
 
-        Text("Connects this Debug app as a one-time second viewer without saving or changing a paired Mac.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            Text("Connects this Debug app as a one-time viewer using the invitation above without saving or changing a paired Mac.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
         #endif
 
         if let storageError = invitationCodeState.storageError {
@@ -730,7 +1031,50 @@ struct BrowserView: View {
     }
 
     #if DEBUG
-    private func connectTemporaryTestViewer() {
+    @ViewBuilder
+    private var importedDevelopmentTemporaryViewerContent: some View {
+        if developmentSecondaryInvitationWasLoaded {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel("Development secondary invitation loaded")
+                .accessibilityIdentifier("developmentSecondaryInvitationLoaded")
+        }
+
+        Button {
+            connectImportedDevelopmentTemporaryTestViewer()
+        } label: {
+            Label("Connect Temporary Test Viewer", systemImage: "iphone.gen3")
+        }
+        .disabled(
+            developmentSecondaryInvitation?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty != false
+                || worldwideViewModel.isConnecting
+                || worldwideViewModel.hasActiveSession
+                || worldwideConnection.isConnecting
+        )
+        .accessibilityIdentifier("connectTemporaryWorldwideViewer")
+        .accessibilityHint(
+            "Uses the runner-imported one-time invitation without saving or changing a paired Mac."
+        )
+
+        Text("Connects this Debug app as the runner's one-time second viewer without saving or changing a paired Mac.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    /// Publishes the already-cleaned app-entry import into view-local memory exactly once. The
+    /// capability never enters the ordinary Keychain-backed invitation field.
+    private func loadDevelopmentSecondaryInvitationIfRequested() {
+        guard !developmentSecondaryInvitationLoadWasAttempted else { return }
+        developmentSecondaryInvitationLoadWasAttempted = true
+        guard let importedDevelopmentSecondaryInvitation else { return }
+        developmentSecondaryInvitation = importedDevelopmentSecondaryInvitation
+        developmentSecondaryInvitationWasLoaded = true
+    }
+
+    private func connectOrdinaryTemporaryTestViewer() {
         invitationCodeState.persistNow()
         guard let endpoint = configuredWorldwideEndpoint() else {
             worldwideConnection.reportConfigurationError(
@@ -741,6 +1085,27 @@ struct BrowserView: View {
 
         temporaryViewerInvitationAwaitingConsumption = Self.startTemporaryTestViewer(
             invitationCode: trimmedInvitationCode,
+            endpoint: endpoint,
+            connect: { invitation, endpointOverride in
+                worldwideViewModel.debugConnectTemporaryTestViewer(
+                    invitationCode: invitation,
+                    debugEndpointOverride: endpointOverride
+                )
+            }
+        )
+    }
+
+    private func connectImportedDevelopmentTemporaryTestViewer() {
+        guard let developmentSecondaryInvitation,
+              let endpoint = Self.temporaryTestViewerEndpoint() else {
+            worldwideConnection.reportConfigurationError(
+                "This build does not have a valid worldwide rendezvous endpoint."
+            )
+            return
+        }
+
+        temporaryViewerInvitationAwaitingConsumption = Self.startTemporaryTestViewer(
+            invitationCode: developmentSecondaryInvitation,
             endpoint: endpoint,
             connect: { invitation, endpointOverride in
                 worldwideViewModel.debugConnectTemporaryTestViewer(

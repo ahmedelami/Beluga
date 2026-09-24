@@ -18,16 +18,197 @@ implemented gates from the remaining release boundaries; it is not a feature-com
 | Replacement virtual-driver timeline | The clean-room C17 core and direct production-wrapper tests increment a nonzero zero-timestamp seed only when the shared clock moves from zero clients to its first client, preserve it when the sibling endpoint joins, bind ring frames to exact epoch/session/absolute-frame tags, and repeat both start orders and 1,000 complete restarts without stale PCM. Concurrent lifecycle/I/O/timestamp tests run under ThreadSanitizer; ASan/UBSan, malformed-bundle mutations, two byte-identical universal builds, and loading the actual built bundle cover the artifact seam. The user reports the current side-by-side product path works bidirectionally; provenance-bound installed public-API validation remains required for independent artifact proof. | Keep a constant seed across reset, change it on a join, publish a new seed with an old anchor, retain stale ring state, expose lifecycle retry as a callback error, omit a loadable Mach-O UUID, test only one order, or infer the seed from public AudioQueue time. |
 | Active iPhone call isolation | A signed lifecycle suite samples aggregate CallKit state before ordinary activation. Ringing-only startup keeps ordinary best-effort playout while microphone ownership stays closed. Connected-call startup remains globally closed until an exact startup-origin authorization is bound to the first healthy peer, synchronously armed by the quiescent native ADM with zero session side effects, and then proved by fresh inbound/native evidence. A later bare CallKit transition closes only microphone ownership; a genuine interruption replaces any startup authorization with a fresh interruption-origin authorization. Call end revokes hosted ownership and requires a fresh ordinary rebuild plus a newly advancing proof window. | Activate before the startup call sample, open the manual gate before native startup arm, accept an unspecified or wrong origin, bind a startup authorization to a replacement peer, let foreground/route callbacks rebuild after hosted failure, retain startup ownership across a real interruption or call end, accept a suspended pre-call stats read, disconnect the peer, or report Playing before fresh callbacks and frames advance. |
 | Background audio | The built-app test inspects `UIBackgroundModes=audio`. The physical gate presses Home for 35 seconds, returns to the app, and requires the original session generation to have accumulated real-time inbound duration/energy and output-only RemoteIO render-input PCM with the coded high/low-band and envelope signatures over the entire interval, without a callback gap, near-silence callback, or audio-unit rebuild. | Remove the capability, stop or mute the track on Home, freeze/replay one callback, suspend RemoteIO, stall for most of the interval, catch counters up only after foregrounding, or reconnect on foreground. |
-| Screen Show/Hide | The driver places a nonsecret changing pattern on every Mac display. The physical gate binds an authenticated Show/Active acknowledgement to a stable sequence of at least 12 decoded frames/sec whose independently sampled salted pixel digest changes at least 3 times/sec. It then samples the center of the final iPhone screenshot four times, requiring a visible saturated challenge region in every sample and a color change across samples, before requiring a newer authenticated Hide/Inactive acknowledgement and same-session audio continuity. | Acknowledge Show without advancing decoded frames, reuse a stale acknowledgement/renderer, emit one late frame, report 60 fps while pixels change only 1–2 times/sec, advance timestamps over frozen pixels, leave a black cover or static overlay above healthy decoded video, stop the deterministic visual challenge, or Hide by reconnecting the media session. |
+| Screen Show/Hide | The lifecycle driver retains its decoded-frame, decoded-pixel, Hide acknowledgement, and audio-continuity gates. A separate guarded visual driver pins the exact production iPhone 17 Pro (CoreDevice `7694F11E-D66D-5632-9A0D-462C980130A5`, hardware UDID `00008150-0002581C3E3A401C`) and installed production-bundle build, prepares and seals its signed test products while the phone may remain locked, then arms one observer for the next natural interval in which the already-authenticated viewer has its screen visible. It refuses to unlock, launch, activate, background, tap, hide, replace, or disconnect that production app/session. It continuously listens for all three Mac default-audio selectors, treats even a transient notification as a sticky violation, retains point-in-time UID readbacks, and draws four ordered high-contrast symbols whose 12-bit spatial payload is bound to a fresh 128-bit run nonce. Its UI test aspect-fits the decoded video inside `worldwideMacScreenVideo`, crops that region from repeated final-composite iPhone screenshots for the full observation interval, requires a complete cycle plus a fifth ordered run while the exact Show acknowledgement and renderer remain unchanged, bounds undecodable gaps and same-symbol hold time, and requires fresh final evidence before passing. CoreDevice metadata must report the exact `iPhone 17 Pro` marketing name at every checkpoint, and the `.xcresult` must bind its sole passing configuration to that hardware UDID and model. Device metadata does not prove TestFlight receipt provenance; that remains a separate App Store Connect fact. | Create or replace the viewer, change production-app lifecycle/UI, mutate a default audio route even if it later restores, acknowledge Show without advancing decoded frames, reuse a stale acknowledgement/renderer, report healthy counters under a black or obscured final surface, show unrelated vivid animation, replay a prior run's symbols, freeze after one complete cycle, skip/reverse a symbol, begin clear and remain black, sample letterboxing instead of the decoded content, use the wrong orientation/crop/build/device, mutate the sealed test products, or replace the installed production app during test setup. |
 
-The Screen gate checks both decoded pixel changes and a small final-composite iPhone screenshot
-region under the deterministic challenge. The screenshot assertion is a physical-test source
-change, not release proof until the matching build runs it successfully. The pixels still do not
-carry a cryptographic nonce identifying the exact source, and sampled screenshots do not prove
-every intervening frame or host capture-process quiescence after Hide. The
-current remote-input check proves only that a fresh authenticated capability is present;
-it does **not** yet drive a disposable Mac target and observe real AX/model mutations. Those claims
-remain release-incomplete and must not be inferred from acknowledgements or screenshots.
+The lifecycle Screen gate still checks decoded pixel changes and a small final-composite screenshot
+region under its changing challenge. The dedicated observe-only screen source closes that gate's source-
+identity ambiguity with a fresh nonce-derived spatial sequence and observes long enough to reject
+the reported clear-then-black failure. Its source, unit mutations, build, or an older screenshot are
+not release proof: the intended installed production-bundle build must run the non-skipping physical test
+and produce a fresh passing result. `arm-testflight-screen-visual-oracle.sh` performs compilation,
+signing, product sealing, and identity checks while the phone may remain locked, then leaves exactly
+one local observer waiting for up to a week. It automatically uses the next natural foreground Mac-
+screen interval and rearms if that interval closes before device/session binding, so the user does not
+need to hold the phone open while preparation or polling occurs. One uninterrupted foreground interval
+is still logically required for the changing final-composite screenshot sequence; the observer will not
+unlock or perturb iPhone microphone/audio ownership or production-app lifecycle merely to create that
+fixture, and it leaves that screen presentation in place. Sampled screenshots do not prove every
+intervening frame or host
+capture-process quiescence after Hide. The current remote-input check proves only that a fresh
+authenticated capability is present; it does **not** yet drive a disposable Mac target and observe
+real AX/model mutations. Those claims remain release-incomplete and must not be inferred from
+acknowledgements or screenshots.
+
+Both runners stage a candidate summary privately, atomically commit the terminal run status first,
+and only then publish a `passed` summary and success line. Failure of that final status commit instead
+publishes only failed evidence; an uncommitted staged file is never release proof.
+
+Both physical screen runners now require an external release seal for the Mac host before they can
+start the visual challenge. Set `OPENSTEAMER_SCREEN_ORACLE_HOST_IDENTITY_MANIFEST` to a canonical,
+owner-owned mode-0600 manifest,
+`OPENSTEAMER_SCREEN_ORACLE_HOST_IDENTITY_MANIFEST_SHA256_PATH` to its exact adjacent committed
+mode-0600 one-link `.sha256` sidecar, and
+`OPENSTEAMER_SCREEN_ORACLE_HOST_IDENTITY_MANIFEST_SHA256` to the independently transported SHA-256
+of those exact manifest bytes. The production armer forwards all three values through the environment;
+none is placed in the runner command line. The manifest schema is
+`opensteamer.sealed-live-mac-host-identity.v1` and contains exactly the installed executable path,
+SHA-256, CDHash, signing identifier, and TeamIdentifier plus the corresponding path, SHA-256,
+CDHash, signing identifier, and TeamIdentifier for the LiveKitWebRTC executable. The verifier first
+runs the reviewed installed-bundle verifier, then binds the launchd PID's executable vnode and
+dynamic signature to those sealed bytes and binds its loaded LiveKitWebRTC vnode to the sealed
+framework bytes. Both runners retain that exact snapshot immediately before challenge launch and
+require a byte-identical snapshot after the physical observation. The development runner establishes
+the same sealed baseline before its first secondary-manager probe and re-verifies it immediately
+around every probe, invitation mint, and exact-generation stop, including finalizer cleanup.
+
+The production V90 packaging hook is
+`macOS/scripts/prepare-v90-sealed-host-oracle-handoff.sh prepare`. It accepts only an owner-owned,
+mode-0600, one-link metadata file in a fresh owner-owned mode-0700 V90 capsule plus that metadata's
+independently retained lowercase SHA-256. That capsule must be outside the user-protected
+`~/Library/Application Support/opensteamer` runtime/evidence root. The exact
+`opensteamer.v90-host-oracle-capsule-metadata.v1` fields are `schema`,
+`candidateAppRelativePath`, `candidateExecutableSHA256`,
+`candidateMediaFrameworkExecutableSHA256`,
+`designatedRequirementReferenceRelativePath`, and
+`designatedRequirementReferenceSHA256`. Both relative paths must resolve canonically inside that
+new capsule. The reference must be a separate owner-owned, xattr-free, mode-0755, one-link code
+object whose digest came from the approved pinned predecessor metadata; the capsule builder must
+never fill that digest by hashing the V90 candidate, reading either installed `/Applications`
+bundle, or reopening any retained/consumed migration or update capsule. The candidate and reference
+digests must differ. If a separately authorized capsule assembler cannot supply those already
+reviewed inputs, preparation stops instead of borrowing historical live or retained state.
+
+Preparation creates the fixed, previously absent `v90-screen-oracle-handoff` directory once, calls
+`create-sealed-mac-host-identity-manifest.sh` with the metadata-pinned reference digest, and verifies
+that the generated manifest describes the exact metadata-pinned candidate and fixed production team
+`MSMG8CJLB3`. The generator publishes `sealed-live-mac-host-identity.json` followed by
+`sealed-live-mac-host-identity.json.sha256`; the wrapper then publishes
+`v90-screen-oracle-host-identity-handoff.json` followed by its own `.sha256` overall commit marker.
+The handoff schema records the trusted metadata digest, both candidate digests, the designated-
+reference digest, fixed team, and fixed manifest basenames. Any missing sidecar is an uncommitted
+capsule, and a failed output directory is never reused. Carry the complete four-file handoff
+directory plus the independently retained handoff SHA-256 into the post-deploy step.
+
+Only after a separately authorized deployment may
+`prepare-v90-sealed-host-oracle-handoff.sh arm <handoff> <external-handoff-sha256> <coredevice-id>
+<hardware-udid> <build>` consume it. `arm` revalidates both commit markers, both JSON field sets,
+the fixed team, and the candidate hashes, then supplies only the committed manifest path, sidecar
+path, and external digest through the existing production armer environment contract. Until that
+complete candidate-specific handoff exists, both physical runners intentionally fail before
+challenge launch. The artifacts
+contain identity metadata only; invitations, rendezvous capabilities, unlock material, and other
+secrets remain out of arguments, logs, and the manifests.
+
+Development diagnosis uses the separately signed `org.example.AudioStreamer.dev` bundle on the
+paired iPhone 15; it never operates the personal production iPhone. The guarded development runner
+builds the current checkout with a generic-iOS `build-for-testing`, performs at most one bounded
+Xcode-owned clean/rebuild for an invalid incremental runner signature, and seals those products
+before it needs the phone. It then publishes a private, 30-minute, run-nonce-bound unlock request and
+parks while refreshing an owner-only status heartbeat. The exact-device unlocked-state
+acknowledgement helper binds the runner's process-start identity, verifies that its exact run lock is
+still held, observes the pinned iPhone 15 unlocked, verifies that no matching credential-holding
+controller is currently running, and rejects a stale or replaced request and a competing writer. It
+does not attest screenshot history or prove that an unlock controller previously ran and exited. A
+local heartbeat/agent must still use the
+`iphone-usb-unlock` workflow against the exact saved-code
+Keychain account: inspect fresh before/after screenshots, make at most one complete entry, prove the
+phone unlocked, send `exit` to the credential-holding controller, and only then run
+`ack-iphone15-dev-screen-visual-oracle-unlock.sh`. The acknowledgement contains no credential and is
+only a wake signal; the runner independently rechecks the exact CoreDevice identity, hardware UDID,
+and unlocked state and has no manual-success or skip switch. During the live step a separate
+credential-free exact-UDID `PreventUserIdleSystemSleep` lease emits a private heartbeat. Its Python
+runtime is launched with `-I -S -B` and an empty environment, before any virtualenv `site` or `.pth`
+startup hook can execute. It pins the exact interpreter and a deterministic digest of every
+non-cache file in the complete third-party runtime, rejects symlinked runtime paths, installs a
+source/native-extension-only loader so excluded bytecode cannot execute, and re-hashes after import.
+It then uses an existing-pairing-only native tunnel path that never issues a pairing command. Tunnel,
+service, and lease acquisition are bounded. The runner supervises the background `xcodebuild`
+process against that heartbeat and terminates/reaps it before trap cleanup if the lease fails. The
+lease stays owned through nonce-bound device secret cleanup (including trap cleanup), explicitly
+closes its service and tunnel only after cleanup proof, and the runner waits out the final device
+lease's at-most-45-second residual because the assertion protocol has no release acknowledgement.
+Thus the unlock controller itself is never retained as a keepalive. The runner
+mints a one-use secondary invitation only after rechecking the installed `.dev` build, host
+generation, primary peer/screen lifecycle, and Mac default routes. A fresh owner-only status probe
+must bind the same host PID/generation to an idle secondary manager before baseline and again after
+the final continuity interval without advancing its generation. One final peer/screen-lifecycle
+fence follows that probe immediately before mint. The minted receipt must be the single successor
+of that baseline generation; after exact stop, a third idle probe must equal the receipt generation.
+
+The development runner has two explicit primary baselines. In `activePrimary`, primary audio must
+provide a fresh `renderingNonzero` checkpoint with bounded native/inbound evidence age and sequential
+counter progress at each fresh, non-overlapping before/mint/after window. Primary microphone
+forwarding may either stay healthy and advance, or begin with at least two consecutive exact
+app-inactive `sourceMediaStalled` all-zero samples and remain in that same phase and zero-state.
+Both modes require the forwarding snapshot's privacy-safe monitor, device, peer,
+transport-authorization, and track generations to match its last attempted key, plus a nonzero
+attempt generation that stays unchanged. An older host that does not emit the complete key fails
+closed. Every new forwarding sample must advance its media-sample sequence, and any partial
+writer/decoder state, mode transition, identity change, or new hidden-writer selection fails closed.
+Intermediate audio counters are accepted only as decimal unsigned integers before arithmetic, so a
+log value cannot be interpreted as a shell expression. Stale top-level audio status cannot borrow
+otherwise healthy-looking retained fields.
+
+In development-only `inactivePrimary`, the personal production iPhone may remain asleep. The runner
+requires the ordered terminal primary lifecycle `viewer disconnected` -> exact expected-build
+`unavailable.stopped` with `appActive=false` -> `media ended`, then proves the live secondary manager
+is idle. It labels this `inactivePrimaryNoAudioProof`; stopped audio is never reported as healthy.
+Fresh append windows must contain no primary audio, microphone forwarding/selection, virtual-mic
+route selection, or primary media-end activity. Before mint, any peer or capture transition fails.
+After the test, only the separately verified ordered secondary connect -> capture start -> viewer
+disconnect -> capture stop lifecycle is allowed. The final primary continuity interval is consumed
+first, then the receipt-bound manager must be idle again, and a final lifecycle fence must still
+prove that exact closed sequence. The sticky CoreAudio monitor must still report zero notifications.
+Completed historical secondary cycles may remain in the bounded
+baseline only when their latest capture is stopped and their later peer history has a later viewer
+disconnect; a stale connected peer or unmatched capture start fails closed. This mode supplies no
+primary audio or microphone continuity claim. The DEBUG app imports that
+invitation only in memory, removes the copied seed and worldwide Keychain item before constructing
+normal runtime owners, and emits a nonce-bound nonsecret cleanup receipt. Every post-copy exit
+repeats that cleanup, and the host tears down only the receipt-bound secondary generation. A passing
+iPhone 15 run is diagnostic behavior evidence; it can neither replace nor complete the final
+TestFlight oracle on the exact production iPhone/build.
+
+The development UI step observes an `Inactive` audio label and disabled microphone affordance; those
+are presentation/topology evidence, not an independent native `AVAudioSession`, audio-unit, or hidden
+ownership measurement. Separate native `videoControlOnly` tests require no custom iOS audio
+transaction device, no local microphone track, and no audio SDP section. Keep those source/native
+tests distinct from the physical pixel result and do not infer an unobserved ownership claim from the
+UI labels alone.
+
+Healthy and quiescent forwarding are both labeled `exactAttemptBound`. Pre-attempt-generation hosts
+cannot prove same-attempt continuity and therefore fail closed instead of receiving a sampled-health
+fallback.
+
+The initial host-log checkpoint records the exact append cursor and inode while retaining only a
+bounded 16 MiB complete-line tail. It never copies or repeatedly rescans the full long-lived host
+log; every later checkpoint consumes a fresh, non-overlapping byte interval from that cursor.
+
+The local integrity boundary trusts the current macOS user, authoritative worktree, and pinned UV
+CPython/standard-library tree. The sealing above prevents ambient environment/`.pth` execution,
+bytecode shadowing, and at-rest third-party drift; it does not claim resistance to a malicious
+concurrent process running as that same user, which could also rewrite the runner itself. Closing
+that different threat model requires an administrator-owned or OS-immutable Python and dependency
+runtime.
+
+For V90, `--probe-secondary-test-viewer-status <new-absolute-output-file>` is a strictly
+non-minting endpoint-idle observation only. The verifier requires the exact expected lowercase
+SHA-256 of an owner-matching, single-link `0755` CaptureServer candidate, validates its strict code
+signature and preserved `com.elamin.AudioStreamer.CaptureServer` identifier, then accepts only a
+fresh nonce-bound `observed` record with `managerPhase=idle`, `managerIsIdle=true`, no invitation or
+generation receipt, and an unchanged manager generation. Fence every probe to the same control-
+socket device/inode, owner UID and exact `0600` mode across connect, the current owner-only host-lock
+PID/generation, and the server peer PID. This observation does not inspect or certify screen-
+inactive, viewer-released, or stable-route safe-idle gates; revalidate those gates separately and
+immediately before any authorized mint. The probe replay table accepts at most 256 unique probes per
+host generation; the 257th fails closed, and even a clean bounded run is race sampling, not readiness,
+mint authority, or a continuous watchdog.
+V90 remains ineligible until rebuilt and sealed from a clean checkout whose exact HEAD equals a
+fresh upstream branch readback, with an immutable V89 committed-rollback-to-exact-V86 origin record
+pinned and validated from the actual success result, terminal journal state, and active V86 readback;
+the stale offline/unsealed V89 draft README is not origin evidence. After any pass, obtain fresh
+explicit per-run authorization and revalidate every fence immediately before a separate invitation-
+minting action.
 
 The retained historical BlackHole 2ch v0.7.1 is release-incompatible for worldwide routing. Its local
 timeline counter resets without a new zero-timestamp seed, and a no-call run still
@@ -459,9 +640,11 @@ proposal evidence separate from native acceptance and client presentation.
   begin that interruption-origin window only after interruption-ended supplies a resume hint, then
   end the final call and require a fresh ordinary audio-policy generation plus new advancing
   render evidence before claiming recovery.
-- The production-bundle physical driver binds evidence to a fresh artifact directory, physical
-  device identity, installed bundle/build number, signed Mac host, changing host PIDs, session
-  identity, and current `.xcresult`. `devicectl` cannot independently prove that the installed
+- The production-bundle physical driver binds evidence to a fresh artifact directory, the exact
+  pinned iPhone 17 Pro CoreDevice/hardware-UDID/marketing-name identity, installed bundle/build
+  number, externally release-sealed Mac host executable and
+  loaded media framework, unchanged live PID/vnodes/signing identities before and after the
+  challenge, session identity, and current `.xcresult`. `devicectl` cannot independently prove that the installed
   bytes arrived through TestFlight, so App Store Connect/TestFlight remains the authority for that
   distribution fact.
 - The driver binds every retained attachment's name and metadata to its exact XCTActivity. Current

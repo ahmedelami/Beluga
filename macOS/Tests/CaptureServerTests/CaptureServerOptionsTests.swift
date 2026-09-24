@@ -137,6 +137,24 @@ final class CaptureServerOptionsTests: XCTestCase {
         XCTAssertFalse(options.secondaryTestViewerEnabled)
     }
 
+    func testUsageDocumentsNonMintingSecondaryViewerStatusProbe() {
+        XCTAssertTrue(
+            CaptureServerOptions.usage.contains(
+                "--probe-secondary-test-viewer-status <absolute-output-file>"
+            )
+        )
+        XCTAssertTrue(
+            CaptureServerOptions.usage.contains(
+                "Never mints an invitation or generation."
+            )
+        )
+        XCTAssertTrue(
+            CaptureServerOptions.usage.contains(
+                "Defaults to /private/tmp/opensteamer-wv-<uid>/control.sock."
+            )
+        )
+    }
+
     func testSecondaryTestViewerRequiresWorldwideMode() {
         XCTAssertThrowsError(
             try CaptureServerOptions.parse([
@@ -164,6 +182,73 @@ final class CaptureServerOptionsTests: XCTestCase {
         XCTAssertTrue(options.secondaryTestViewerEnabled)
         XCTAssertFalse(options.lanEnabled)
         XCTAssertNil(options.duration)
+    }
+
+    func testSecondaryControlSocketAcceptsExplicitAbsolutePath() throws {
+        let options = try CaptureServerOptions.parse([
+            "CaptureServer",
+            "--worldwide",
+            "--rendezvous-url",
+            "wss://rendezvous.example.invalid",
+            "--secondary-test-viewer",
+            "--secondary-test-viewer-control-socket",
+            "/private/tmp/opensteamer-secondary-control.sock",
+        ], environment: [:])
+
+        XCTAssertEqual(
+            options.secondaryTestViewerControlSocketPath,
+            "/private/tmp/opensteamer-secondary-control.sock"
+        )
+    }
+
+    func testSecondaryControlSocketCanComeFromEnvironment() throws {
+        let options = try CaptureServerOptions.parse([
+            "CaptureServer",
+            "--worldwide",
+            "--rendezvous-url",
+            "wss://rendezvous.example.invalid",
+            "--secondary-test-viewer",
+        ], environment: [
+            "OPENSTEAMER_SECONDARY_VIEWER_CONTROL_SOCKET":
+                "/private/tmp/opensteamer-secondary-control.sock",
+        ])
+
+        XCTAssertEqual(
+            options.secondaryTestViewerControlSocketPath,
+            "/private/tmp/opensteamer-secondary-control.sock"
+        )
+    }
+
+    func testSecondaryControlSocketRequiresSecondaryViewer() {
+        XCTAssertThrowsError(
+            try CaptureServerOptions.parse([
+                "CaptureServer",
+                "--worldwide",
+                "--rendezvous-url",
+                "wss://rendezvous.example.invalid",
+                "--secondary-test-viewer-control-socket",
+                "/private/tmp/opensteamer-secondary-control.sock",
+            ], environment: [:])
+        ) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "--secondary-test-viewer-control-socket requires --secondary-test-viewer"
+            )
+        }
+    }
+
+    func testSecondaryControlSocketRejectsRelativePath() {
+        XCTAssertThrowsError(
+            try CaptureServerOptions.parse([
+                "CaptureServer",
+                "--worldwide",
+                "--rendezvous-url",
+                "wss://rendezvous.example.invalid",
+                "--secondary-test-viewer",
+                "--secondary-test-viewer-control-socket",
+                "relative.sock",
+            ], environment: [:])
+        )
     }
 
     func testWorldwideModeRequiresExplicitRendezvousConfiguration() {

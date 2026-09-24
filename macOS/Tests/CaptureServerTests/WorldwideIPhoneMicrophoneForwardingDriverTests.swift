@@ -103,6 +103,7 @@ final class WorldwideIPhoneMicrophoneForwardingDriverTests:
             unavailable.lastFailureCategory,
             .outputUnavailable
         )
+        XCTAssertEqual(unavailable.attemptGeneration, 1)
 
         factory.append(ready)
         await retryGate.open()
@@ -124,6 +125,7 @@ final class WorldwideIPhoneMicrophoneForwardingDriverTests:
         XCTAssertTrue(final.exactTrackAdmitted)
         XCTAssertTrue(final.queueRunning)
         XCTAssertTrue(final.hiddenWriterSelectionProven)
+        XCTAssertEqual(final.attemptGeneration, 2)
         XCTAssertEqual(
             final.currentKey?.deviceGeneration,
             1
@@ -1966,6 +1968,170 @@ final class WorldwideIPhoneMicrophoneForwardingDriverTests:
         XCTAssertEqual(healthy.phase, .forwardingHealthy)
         XCTAssertEqual(healthy.inboundMediaAdvancementCount, 1)
         XCTAssertTrue(healthy.inboundMediaFresh)
+    }
+
+    func testAttemptGenerationDistinguishesSameKeyRestallAfterFreshMediaRevival()
+        async throws {
+        let watchdog = DriverTestMediaFreshnessWatchdog()
+        let outputs = (0..<2).map { _ in
+            DriverTestOutput(
+                progressSnapshots: readyProgressSnapshots()
+            )
+        }
+        let factory = DriverTestOutputFactory(outputs: outputs)
+        let harness = DriverTestHarness(
+            factory: factory,
+            maximumAttemptCountPerKey: 1,
+            mediaFreshnessTimeoutNanoseconds: 100,
+            mediaFreshnessWatchdog: watchdog,
+            automaticallyAdvanceInboundMedia: false
+        )
+        let peer = DriverTestPeer()
+        let track = DriverTestTrack()
+        let epoch = UUID()
+
+        await prepare(
+            harness: harness,
+            epoch: epoch,
+            peer: peer,
+            track: track
+        )
+        await harness.authorize(peer: peer, generation: 1)
+        await harness.updateDevice(
+            snapshot(
+                epoch: epoch,
+                generation: 1,
+                available: true
+            )
+        )
+
+        let firstDeadlineReady = await eventually {
+            watchdog.scheduleCount >= 1
+        }
+        XCTAssertTrue(firstDeadlineReady)
+        await harness.publishInboundMedia(
+            packets: 10,
+            bytes: 800
+        )
+        await harness.publishInboundMedia(
+            packets: 11,
+            bytes: 880
+        )
+        let initiallyHealthy = await harness.snapshot()
+        XCTAssertEqual(initiallyHealthy.phase, .forwardingHealthy)
+
+        watchdog.advance(to: 100)
+        let firstQuiescentReady = await eventually {
+            let snapshot = await harness.snapshot()
+            return snapshot.phase == .sourceMediaStalled
+                && snapshot.currentAttemptID == nil
+        }
+        XCTAssertTrue(firstQuiescentReady)
+        let firstQuiescent = await harness.snapshot()
+        let forwardingKey = try XCTUnwrap(
+            firstQuiescent.lastAttemptedKey
+        )
+        let firstAttemptID = try XCTUnwrap(
+            firstQuiescent.lastAttemptID
+        )
+        XCTAssertEqual(firstQuiescent.attemptGeneration, 1)
+        XCTAssertNil(firstQuiescent.currentKey)
+        XCTAssertEqual(firstQuiescent.progress, .zero)
+        XCTAssertEqual(firstQuiescent.inboundMediaAdvancementCount, 0)
+        XCTAssertEqual(firstQuiescent.consecutiveStaleInboundMediaSamples, 0)
+        XCTAssertFalse(firstQuiescent.inboundMediaFresh)
+        XCTAssertGreaterThan(firstQuiescent.inboundMediaSampleSequence, 0)
+
+        await harness.publishInboundMedia(
+            packets: 12,
+            bytes: 960
+        )
+        let revived = await eventually {
+            let snapshot = await harness.snapshot()
+            return factory.requestCount == 2
+                && snapshot.currentAttemptID != nil
+                && snapshot.exactTrackAdmitted
+        }
+        XCTAssertTrue(revived)
+        let revivedSnapshot = await harness.snapshot()
+        XCTAssertEqual(revivedSnapshot.currentKey, forwardingKey)
+        XCTAssertEqual(revivedSnapshot.lastAttemptedKey, forwardingKey)
+        XCTAssertNotEqual(revivedSnapshot.lastAttemptID, firstAttemptID)
+        XCTAssertEqual(revivedSnapshot.attemptGeneration, 2)
+
+        await harness.publishInboundMedia(
+            packets: 13,
+            bytes: 1_040
+        )
+        let healthy = await harness.snapshot()
+        XCTAssertEqual(healthy.phase, .forwardingHealthy)
+        XCTAssertTrue(healthy.inboundMediaFresh)
+
+        watchdog.advance(to: 200)
+        let secondQuiescentReady = await eventually {
+            let snapshot = await harness.snapshot()
+            return snapshot.phase == .sourceMediaStalled
+                && snapshot.currentAttemptID == nil
+        }
+        XCTAssertTrue(secondQuiescentReady)
+        let secondQuiescent = await harness.snapshot()
+        XCTAssertEqual(secondQuiescent.lastAttemptedKey, forwardingKey)
+        XCTAssertEqual(
+            secondQuiescent.monitorEpoch,
+            firstQuiescent.monitorEpoch
+        )
+        XCTAssertEqual(
+            secondQuiescent.deviceGeneration,
+            firstQuiescent.deviceGeneration
+        )
+        XCTAssertEqual(
+            secondQuiescent.peerGeneration,
+            firstQuiescent.peerGeneration
+        )
+        XCTAssertEqual(
+            secondQuiescent.transportAuthorizationEpoch,
+            firstQuiescent.transportAuthorizationEpoch
+        )
+        XCTAssertEqual(
+            secondQuiescent.trackGeneration,
+            firstQuiescent.trackGeneration
+        )
+        XCTAssertNotEqual(secondQuiescent.lastAttemptID, firstAttemptID)
+        XCTAssertEqual(
+            secondQuiescent.attemptGeneration,
+            firstQuiescent.attemptGeneration + 1
+        )
+        XCTAssertNil(secondQuiescent.currentKey)
+        XCTAssertEqual(secondQuiescent.progress, .zero)
+        XCTAssertEqual(secondQuiescent.inboundMediaAdvancementCount, 0)
+        XCTAssertEqual(secondQuiescent.consecutiveStaleInboundMediaSamples, 0)
+        XCTAssertFalse(secondQuiescent.inboundMediaFresh)
+        XCTAssertGreaterThan(
+            secondQuiescent.inboundMediaSampleSequence,
+            firstQuiescent.inboundMediaSampleSequence
+        )
+        XCTAssertEqual(outputs.map(\.stopCount), [1, 1])
+        XCTAssertFalse(track.isEnabled)
+
+        let message = WorldwideScreenService
+            .iPhoneMicrophoneForwardingLogMessage(secondQuiescent)
+        XCTAssertTrue(message.contains("attemptGeneration=2 "))
+        XCTAssertTrue(
+            message.contains("lastAttemptedKeyMatchesSnapshot=true ")
+        )
+        XCTAssertFalse(message.contains("attemptID="))
+        XCTAssertFalse(
+            message.localizedCaseInsensitiveContains(
+                firstAttemptID.uuidString
+            )
+        )
+        if let secondAttemptID = secondQuiescent.lastAttemptID {
+            XCTAssertFalse(
+                message.localizedCaseInsensitiveContains(
+                    secondAttemptID.uuidString
+                )
+            )
+        }
     }
 
     func testAdvancingSilentQueueAwaitsDelayedFirstPCMWithoutRetiringAttempt()

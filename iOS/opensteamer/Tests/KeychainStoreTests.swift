@@ -217,6 +217,240 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertFalse(state.isStored)
     }
 
+    #if DEBUG
+    func testIPhone15DevelopmentSecretBoundaryAcceptsOnlyExactDevelopmentArguments() {
+        let nonce = "0123456789abcdef0123456789abcdef"
+        let executable = "/Applications/opensteamer.app/opensteamer"
+        let viewerArguments = [
+            executable,
+            IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+            IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+            nonce
+        ]
+        let cleanupArguments = [
+            executable,
+            IPhone15DevelopmentSecondarySecretBoundary.cleanupLaunchArgument,
+            IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+            nonce
+        ]
+
+        XCTAssertEqual(
+            IPhone15DevelopmentSecondarySecretBoundary.launchRequest(
+                arguments: viewerArguments,
+                bundleIdentifier: IPhone15DevelopmentSecondarySecretBoundary
+                    .developmentBundleIdentifier
+            ),
+            .viewer(nonce: nonce)
+        )
+        XCTAssertEqual(
+            IPhone15DevelopmentSecondarySecretBoundary.launchRequest(
+                arguments: cleanupArguments,
+                bundleIdentifier: IPhone15DevelopmentSecondarySecretBoundary
+                    .developmentBundleIdentifier
+            ),
+            .cleanup(nonce: nonce)
+        )
+        XCTAssertEqual(
+            IPhone15DevelopmentSecondarySecretBoundary.launchRequest(
+                arguments: [executable],
+                bundleIdentifier: "com.elamin.opensteamer"
+            ),
+            .ordinary
+        )
+
+        let invalidRequests: [([String], String?)] = [
+            (viewerArguments, "com.elamin.opensteamer"),
+            ([executable] + Array(viewerArguments.dropFirst()) + [
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupLaunchArgument
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                nonce,
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                "0123456789ABCDEF0123456789ABCDEF"
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                nonce + "\n"
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                String(nonce.dropLast())
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                nonce,
+                "--unexpected-extra-argument"
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                "--unexpected-leading-argument",
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                nonce
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier),
+            ([
+                executable,
+                IPhone15DevelopmentSecondarySecretBoundary.viewerLaunchArgument,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                nonce,
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptArgument,
+                nonce
+            ], IPhone15DevelopmentSecondarySecretBoundary.developmentBundleIdentifier)
+        ]
+        for (arguments, bundleIdentifier) in invalidRequests {
+            XCTAssertEqual(
+                IPhone15DevelopmentSecondarySecretBoundary.launchRequest(
+                    arguments: arguments,
+                    bundleIdentifier: bundleIdentifier
+                ),
+                .invalidDevelopmentRequest
+            )
+        }
+    }
+
+    func testIPhone15DevelopmentViewerImportsOnlyInMemoryAfterVerifiedCleanup() throws {
+        let documentsDirectory = try makeIPhone15DevelopmentBoundaryDirectory()
+        defer { try? FileManager.default.removeItem(at: documentsDirectory) }
+        let invitation = "04002-0G30G-2GC1R-81450-P30D1-R7H04-8J2EZ-G8AG3"
+        let nonce = "0123456789abcdef0123456789abcdef"
+        let invitationURL = documentsDirectory.appendingPathComponent(
+            IPhone15DevelopmentSecondarySecretBoundary.invitationFileName
+        )
+        let staleReceiptURLs = ["stale-one", "stale-two"].map {
+            documentsDirectory.appendingPathComponent(
+                IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptFilePrefix + $0
+            )
+        }
+        try Data((invitation + "\n").utf8).write(to: invitationURL)
+        for url in staleReceiptURLs {
+            try Data("stale".utf8).write(to: url)
+        }
+        let store = RemoteTokenStoreStub(loadResult: .success(nil))
+
+        let outcome = try IPhone15DevelopmentSecondarySecretBoundary.perform(
+            request: .viewer(nonce: nonce),
+            documentsDirectory: documentsDirectory,
+            keychainStore: store
+        )
+
+        XCTAssertEqual(outcome.invitation, invitation)
+        XCTAssertEqual(
+            outcome.receiptURL.lastPathComponent,
+            IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptFilePrefix + nonce
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invitationURL.path))
+        for url in staleReceiptURLs {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+        let receipt = try String(contentsOf: outcome.receiptURL, encoding: .utf8)
+        XCTAssertEqual(
+            receipt,
+            "OPENSTEAMER_IPHONE15_DEV_SECRET_CLEANUP_V1 nonce=\(nonce)\n"
+        )
+        XCTAssertFalse(receipt.contains(invitation))
+        XCTAssertEqual(store.deleteCount, 1)
+        XCTAssertEqual(store.loadCount, 1)
+        XCTAssertTrue(store.savedValues.isEmpty)
+    }
+
+    func testIPhone15DevelopmentCleanupWithoutSeedStillPublishesReceipt() throws {
+        let documentsDirectory = try makeIPhone15DevelopmentBoundaryDirectory()
+        defer { try? FileManager.default.removeItem(at: documentsDirectory) }
+        let nonce = "fedcba9876543210fedcba9876543210"
+        let store = RemoteTokenStoreStub(loadResult: .success(nil))
+
+        let outcome = try IPhone15DevelopmentSecondarySecretBoundary.perform(
+            request: .cleanup(nonce: nonce),
+            documentsDirectory: documentsDirectory,
+            keychainStore: store
+        )
+
+        XCTAssertNil(outcome.invitation)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outcome.receiptURL.path))
+        XCTAssertEqual(store.deleteCount, 1)
+        XCTAssertEqual(store.loadCount, 1)
+        XCTAssertTrue(store.savedValues.isEmpty)
+    }
+
+    func testIPhone15DevelopmentCleanupWithLingeringKeychainDeletesSeedButEmitsNoReceipt() throws {
+        let documentsDirectory = try makeIPhone15DevelopmentBoundaryDirectory()
+        defer { try? FileManager.default.removeItem(at: documentsDirectory) }
+        let nonce = "11111111111111111111111111111111"
+        let invitationURL = documentsDirectory.appendingPathComponent(
+            IPhone15DevelopmentSecondarySecretBoundary.invitationFileName
+        )
+        try Data("not-exported".utf8).write(to: invitationURL)
+        let store = RemoteTokenStoreStub(loadResult: .success("still-present"))
+
+        XCTAssertThrowsError(
+            try IPhone15DevelopmentSecondarySecretBoundary.perform(
+                request: .cleanup(nonce: nonce),
+                documentsDirectory: documentsDirectory,
+                keychainStore: store
+            )
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invitationURL.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: documentsDirectory.appendingPathComponent(
+                    IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptFilePrefix + nonce
+                ).path
+            )
+        )
+        XCTAssertEqual(store.deleteCount, 1)
+        XCTAssertEqual(store.loadCount, 1)
+        XCTAssertTrue(store.savedValues.isEmpty)
+    }
+
+    func testIPhone15DevelopmentCleanupAttemptsSeedRemovalWhenKeychainDeleteFails() throws {
+        let documentsDirectory = try makeIPhone15DevelopmentBoundaryDirectory()
+        defer { try? FileManager.default.removeItem(at: documentsDirectory) }
+        let nonce = "22222222222222222222222222222222"
+        let invitationURL = documentsDirectory.appendingPathComponent(
+            IPhone15DevelopmentSecondarySecretBoundary.invitationFileName
+        )
+        try Data("not-exported".utf8).write(to: invitationURL)
+        let store = RemoteTokenStoreStub(
+            loadResult: .success(nil),
+            deleteError: TestFailure.delete
+        )
+
+        XCTAssertThrowsError(
+            try IPhone15DevelopmentSecondarySecretBoundary.perform(
+                request: .cleanup(nonce: nonce),
+                documentsDirectory: documentsDirectory,
+                keychainStore: store
+            )
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invitationURL.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: documentsDirectory.appendingPathComponent(
+                    IPhone15DevelopmentSecondarySecretBoundary.cleanupReceiptFilePrefix + nonce
+                ).path
+            )
+        )
+        XCTAssertEqual(store.deleteCount, 1)
+        XCTAssertEqual(store.loadCount, 0)
+        XCTAssertTrue(store.savedValues.isEmpty)
+    }
+    #endif
+
     func testAsyncConnectionFailureBeforeAcceptanceRetainsInvitation() throws {
         let store = RemoteTokenStoreStub(loadResult: .success("still-usable-code"))
         let state = RemoteTokenState(store: store, codeDisplayName: "invitation code")
@@ -1220,20 +1454,45 @@ private func baseQuery(for item: KeychainStore.Item) -> [String: Any] {
     ]
 }
 
+#if DEBUG
+private func makeIPhone15DevelopmentBoundaryDirectory() throws -> URL {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "opensteamer-iphone15-development-boundary-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: false
+    )
+    return directory
+}
+#endif
+
 private final class RemoteTokenStoreStub: RemoteTokenStoring {
     private var loadResults: [Result<String?, any Error>]
+    private let deleteError: (any Error)?
     private(set) var savedValues: [String] = []
     private(set) var deleteCount = 0
+    private(set) var loadCount = 0
 
-    init(loadResult: Result<String?, any Error>) {
+    init(
+        loadResult: Result<String?, any Error>,
+        deleteError: (any Error)? = nil
+    ) {
         loadResults = [loadResult]
+        self.deleteError = deleteError
     }
 
-    init(loadResults: [Result<String?, any Error>]) {
+    init(
+        loadResults: [Result<String?, any Error>],
+        deleteError: (any Error)? = nil
+    ) {
         self.loadResults = loadResults
+        self.deleteError = deleteError
     }
 
     func loadRemoteToken() throws -> String? {
+        loadCount += 1
         guard !loadResults.isEmpty else { return nil }
         return try loadResults.removeFirst().get()
     }
@@ -1244,9 +1503,13 @@ private final class RemoteTokenStoreStub: RemoteTokenStoring {
 
     func deleteRemoteToken() throws {
         deleteCount += 1
+        if let deleteError {
+            throw deleteError
+        }
     }
 }
 
 private enum TestFailure: Error {
     case load
+    case delete
 }

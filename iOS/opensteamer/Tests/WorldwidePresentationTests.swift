@@ -18,6 +18,61 @@ final class WorldwidePresentationTests: XCTestCase {
     }
 
     #if DEBUG
+    func testImportedDevelopmentTemporaryViewerIgnoresDebugOverrideAndUsesBundledEndpoint() {
+        let infoDictionary: [String: Any] = [
+            "OpensteamerRendezvousURL": "wss://opensteamer.example.test/v1/rendezvous",
+        ]
+
+        let ordinaryDebugEndpoint = WorldwideSessionViewModel.rendezvousEndpoint(
+            debugOverride: "ws://127.0.0.1:8788",
+            infoDictionary: infoDictionary
+        )
+        let temporaryEndpoint = BrowserView.temporaryTestViewerEndpoint(
+            infoDictionary: infoDictionary
+        )
+
+        XCTAssertEqual(ordinaryDebugEndpoint, URL(string: "ws://127.0.0.1:8788"))
+        XCTAssertEqual(
+            temporaryEndpoint,
+            URL(string: "wss://opensteamer.example.test/v1/rendezvous")
+        )
+    }
+
+    func testTemporaryViewerControlsKeepImportedRunnerFlowVisibleWithPreexistingPair() {
+        let pair = pairedMac()
+        let pairedPresentation = BrowserView.worldwidePresentation(
+            input(pairedMac: pair)
+        )
+
+        let visibility = BrowserView.temporaryTestViewerControlVisibility(
+            importedInvitation: " RUNNER-INVITATION ",
+            surface: pairedPresentation.surface
+        )
+
+        XCTAssertEqual(pairedPresentation.surface, .pairedIdle(pair))
+        XCTAssertTrue(visibility.showsImportedDevelopmentControl)
+        XCTAssertFalse(visibility.showsOrdinaryBootstrapControl)
+    }
+
+    func testOrdinaryTemporaryViewerControlRemainsOnBootstrapOnly() {
+        let bootstrap = BrowserView.worldwidePresentation(input())
+        let bootstrapVisibility = BrowserView.temporaryTestViewerControlVisibility(
+            importedInvitation: nil,
+            surface: bootstrap.surface
+        )
+        let pairedVisibility = BrowserView.temporaryTestViewerControlVisibility(
+            importedInvitation: nil,
+            surface: BrowserView.worldwidePresentation(
+                input(pairedMac: pairedMac())
+            ).surface
+        )
+
+        XCTAssertTrue(bootstrapVisibility.showsOrdinaryBootstrapControl)
+        XCTAssertFalse(bootstrapVisibility.showsImportedDevelopmentControl)
+        XCTAssertFalse(pairedVisibility.showsOrdinaryBootstrapControl)
+        XCTAssertFalse(pairedVisibility.showsImportedDevelopmentControl)
+    }
+
     func testTemporaryTestViewerRetainsInvitationUntilTransportConsumesIt() {
         let endpoint = URL(string: "wss://opensteamer.example.test/v1/rendezvous")!
         var connectedInvitation: String?

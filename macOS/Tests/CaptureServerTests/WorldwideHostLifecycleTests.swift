@@ -232,7 +232,12 @@ final class WorldwideHostLifecycleTests: XCTestCase {
         XCTAssertEqual(
             message,
             "Worldwide iPhone microphone forwarding " +
-                "phase=waitingForPeer inputEndpointAvailable=false " +
+                "phase=waitingForPeer monitorEpoch=none " +
+                "deviceGeneration=0 peerGeneration=0 " +
+                "transportAuthorizationEpoch=0 trackGeneration=0 " +
+                "attemptGeneration=0 " +
+                "lastAttemptedKeyMatchesSnapshot=false " +
+                "inputEndpointAvailable=false " +
                 "hiddenSinkAvailable=false " +
                 "hiddenWriterSelectionProven=false transport=false " +
                 "trackAdmitted=false queueRunning=false callbacks=0 " +

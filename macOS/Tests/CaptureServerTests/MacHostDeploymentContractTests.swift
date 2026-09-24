@@ -363,6 +363,624 @@ final class MacHostDeploymentContractTests: XCTestCase {
         XCTAssertTrue(stale.standardError.contains("live framework mapping:"), stale.diagnostic)
     }
 
+    func testSealedLiveHostGateRejectsSHAIdentityAndMappedFrameworkMutationsBeforeChallenge() throws {
+        // The installed product path contains "opensteamer Host.app". Keep a space in this
+        // fixture so digest parsing cannot accidentally treat a shasum pathname as one field.
+        let temporaryRoot = makeCanonicalRepositoryTemporaryDirectory(
+            prefix: "sealed live host"
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let executableIdentifier = "com.elamin.AudioStreamer.CaptureServer"
+        let frameworkIdentifier = "io.livekit.LiveKitWebRTC"
+        let productionTeamIdentifier = "MSMG8CJLB3"
+        let releaseSigningIdentity = try approvedReleaseSigningIdentity()
+        let framework = temporaryRoot.appendingPathComponent("libFixture.dylib")
+        let replacement = temporaryRoot.appendingPathComponent("replacement-libFixture.dylib")
+        let executable = temporaryRoot.appendingPathComponent("runner")
+        try compileDynamicLibrary(at: framework, returnValue: 7)
+        try compileDynamicLibrary(at: replacement, returnValue: 11)
+        try compileFrameworkFixtureRunner(at: executable, linkedTo: framework)
+        try sign(
+            executable: framework,
+            identifier: frameworkIdentifier,
+            signingIdentity: releaseSigningIdentity
+        )
+        try sign(
+            executable: replacement,
+            identifier: frameworkIdentifier,
+            signingIdentity: releaseSigningIdentity
+        )
+        try sign(
+            executable: executable,
+            identifier: executableIdentifier,
+            signingIdentity: releaseSigningIdentity
+        )
+
+        let process = Process()
+        process.executableURL = executable
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        defer {
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+        }
+
+        let verifier = repositoryRoot.appendingPathComponent(
+            "macOS/scripts/verify-sealed-live-mac-host-identity.sh"
+        )
+        let challengeMarker = temporaryRoot.appendingPathComponent("challenge-started")
+        var manifestSequence = 0
+
+        func writeManifest(
+            executableSHA256: String,
+            executableIdentifier expectedExecutableIdentifier: String,
+            frameworkSHA256: String,
+            frameworkCDHash: String,
+            executableTeamIdentifier: String = productionTeamIdentifier,
+            frameworkTeamIdentifier: String = productionTeamIdentifier
+        ) throws -> (url: URL, sidecar: URL, digest: String) {
+            manifestSequence += 1
+            let url = temporaryRoot.appendingPathComponent(
+                "sealed-host-identity-\(manifestSequence).json"
+            )
+            let object: [String: String] = [
+                "schema": "opensteamer.sealed-live-mac-host-identity.v1",
+                "executablePath": executable.path,
+                "executableSHA256": executableSHA256,
+                "executableCDHash": try codeHash(of: executable),
+                "executableIdentifier": expectedExecutableIdentifier,
+                "executableTeamIdentifier": executableTeamIdentifier,
+                "mediaFrameworkExecutablePath": framework.path,
+                "mediaFrameworkExecutableSHA256": frameworkSHA256,
+                "mediaFrameworkExecutableCDHash": frameworkCDHash,
+                "mediaFrameworkExecutableIdentifier": frameworkIdentifier,
+                "mediaFrameworkExecutableTeamIdentifier": frameworkTeamIdentifier,
+            ]
+            let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
+            let digest = try sha256(of: url)
+            let sidecar = URL(fileURLWithPath: url.path + ".sha256")
+            try (digest + "\n").write(to: sidecar, atomically: false, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: sidecar.path
+            )
+            return (url, sidecar, digest)
+        }
+
+        func gateArguments(manifest: URL, sidecar: URL, digest: String) -> [String] {
+            [
+                "-c",
+                """
+                /bin/zsh "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" \
+                  && /usr/bin/touch "$9"
+                """,
+                "sealed-live-host-gate",
+                verifier.path,
+                manifest.path,
+                sidecar.path,
+                digest,
+                String(process.processIdentifier),
+                executable.path,
+                framework.path,
+                "-",
+                challengeMarker.path,
+            ]
+        }
+
+        let executableSHA256 = try sha256(of: executable)
+        let initialFrameworkSHA256 = try sha256(of: framework)
+        let initialFrameworkCDHash = try codeHash(of: framework)
+        let validManifest = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        let positive = try eventuallyRun(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: validManifest.url,
+                sidecar: validManifest.sidecar,
+                digest: validManifest.digest
+            )
+        ) { $0.status == 0 }
+        XCTAssertEqual(positive.status, 0, positive.diagnostic)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        if FileManager.default.fileExists(atPath: challengeMarker.path) {
+            try FileManager.default.removeItem(at: challengeMarker)
+        }
+        let wrongSHA = try writeManifest(
+            executableSHA256: String(repeating: "0", count: 64),
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        let shaRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: wrongSHA.url,
+                sidecar: wrongSHA.sidecar,
+                digest: wrongSHA.digest
+            )
+        )
+        XCTAssertNotEqual(shaRejection.status, 0, shaRejection.diagnostic)
+        XCTAssertTrue(
+            shaRejection.standardError.contains("executable SHA-256 does not match"),
+            shaRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let wrongCodeIdentity = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier + ".mutated",
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        let identityRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: wrongCodeIdentity.url,
+                sidecar: wrongCodeIdentity.sidecar,
+                digest: wrongCodeIdentity.digest
+            )
+        )
+        XCTAssertNotEqual(identityRejection.status, 0, identityRejection.diagnostic)
+        XCTAssertTrue(
+            identityRejection.standardError.contains(
+                "sealed code identifiers do not match the fixed production identities"
+            ),
+            identityRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let alternateTeam = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash,
+            executableTeamIdentifier: "92LVX32M8K",
+            frameworkTeamIdentifier: "92LVX32M8K"
+        )
+        let alternateTeamRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: alternateTeam.url,
+                sidecar: alternateTeam.sidecar,
+                digest: alternateTeam.digest
+            )
+        )
+        XCTAssertNotEqual(
+            alternateTeamRejection.status,
+            0,
+            alternateTeamRejection.diagnostic
+        )
+        XCTAssertTrue(
+            alternateTeamRejection.standardError.contains(
+                "sealed TeamIdentifier values do not match the fixed production team"
+            ),
+            alternateTeamRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let orphanManifest = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        try FileManager.default.removeItem(at: orphanManifest.sidecar)
+        let orphanRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: orphanManifest.url,
+                sidecar: orphanManifest.sidecar,
+                digest: orphanManifest.digest
+            )
+        )
+        XCTAssertNotEqual(orphanRejection.status, 0, orphanRejection.diagnostic)
+        XCTAssertTrue(
+            orphanRejection.standardError.contains(
+                "sidecar must be an existing absolute physically canonical regular file"
+            ),
+            orphanRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let symlinkedSidecar = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        let realSidecar = temporaryRoot.appendingPathComponent("real-sidecar")
+        try FileManager.default.moveItem(at: symlinkedSidecar.sidecar, to: realSidecar)
+        try FileManager.default.createSymbolicLink(
+            at: symlinkedSidecar.sidecar,
+            withDestinationURL: realSidecar
+        )
+        let symlinkSidecarRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: symlinkedSidecar.url,
+                sidecar: symlinkedSidecar.sidecar,
+                digest: symlinkedSidecar.digest
+            )
+        )
+        XCTAssertNotEqual(
+            symlinkSidecarRejection.status,
+            0,
+            symlinkSidecarRejection.diagnostic
+        )
+        XCTAssertTrue(
+            symlinkSidecarRejection.standardError.contains(
+                "sidecar must be an existing absolute physically canonical regular file"
+            ),
+            symlinkSidecarRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let mismatchedSidecar = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        try (String(repeating: "0", count: 64) + "\n").write(
+            to: mismatchedSidecar.sidecar,
+            atomically: false,
+            encoding: .utf8
+        )
+        let sidecarDigestRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: mismatchedSidecar.url,
+                sidecar: mismatchedSidecar.sidecar,
+                digest: mismatchedSidecar.digest
+            )
+        )
+        XCTAssertNotEqual(
+            sidecarDigestRejection.status,
+            0,
+            sidecarDigestRejection.diagnostic
+        )
+        XCTAssertTrue(
+            sidecarDigestRejection.standardError.contains(
+                "sidecar does not match the externally supplied digest"
+            ),
+            sidecarDigestRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let malformedSidecar = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        try malformedSidecar.digest.write(
+            to: malformedSidecar.sidecar,
+            atomically: false,
+            encoding: .utf8
+        )
+        let malformedSidecarRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: malformedSidecar.url,
+                sidecar: malformedSidecar.sidecar,
+                digest: malformedSidecar.digest
+            )
+        )
+        XCTAssertNotEqual(
+            malformedSidecarRejection.status,
+            0,
+            malformedSidecarRejection.diagnostic
+        )
+        XCTAssertTrue(
+            malformedSidecarRejection.standardError.contains(
+                "sidecar must contain exactly 65 bytes"
+            ),
+            malformedSidecarRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let linkedSidecar = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: initialFrameworkSHA256,
+            frameworkCDHash: initialFrameworkCDHash
+        )
+        let sidecarAlias = temporaryRoot.appendingPathComponent("sidecar-hardlink-alias")
+        let linkSidecar = try run(
+            executable: URL(fileURLWithPath: "/bin/ln"),
+            arguments: [linkedSidecar.sidecar.path, sidecarAlias.path]
+        )
+        XCTAssertEqual(linkSidecar.status, 0, linkSidecar.diagnostic)
+        let linkedSidecarRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: linkedSidecar.url,
+                sidecar: linkedSidecar.sidecar,
+                digest: linkedSidecar.digest
+            )
+        )
+        XCTAssertNotEqual(
+            linkedSidecarRejection.status,
+            0,
+            linkedSidecarRejection.diagnostic
+        )
+        XCTAssertTrue(
+            linkedSidecarRejection.standardError.contains(
+                "sidecar must be owner-owned mode 0600 with one hard link"
+            ),
+            linkedSidecarRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+
+        let move = try run(
+            executable: URL(fileURLWithPath: "/bin/mv"),
+            arguments: ["-f", replacement.path, framework.path]
+        )
+        XCTAssertEqual(move.status, 0, move.diagnostic)
+        let replacedFrameworkManifest = try writeManifest(
+            executableSHA256: executableSHA256,
+            executableIdentifier: executableIdentifier,
+            frameworkSHA256: try sha256(of: framework),
+            frameworkCDHash: try codeHash(of: framework)
+        )
+        let mappingRejection = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: gateArguments(
+                manifest: replacedFrameworkManifest.url,
+                sidecar: replacedFrameworkManifest.sidecar,
+                digest: replacedFrameworkManifest.digest
+            )
+        )
+        XCTAssertNotEqual(mappingRejection.status, 0, mappingRejection.diagnostic)
+        XCTAssertTrue(
+            mappingRejection.standardError.contains(
+                "live-process verification rejected the sealed host identity"
+            ),
+            mappingRejection.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+    }
+
+    func testSealedLiveHostGateRejectsManifestThroughSymlinkedParentBeforeChallenge() throws {
+        let temporaryRoot = makeCanonicalRepositoryTemporaryDirectory(
+            prefix: "sealed manifest canonical path"
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let realParent = temporaryRoot.appendingPathComponent("real", isDirectory: true)
+        let symlinkedParent = temporaryRoot.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: realParent,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createSymbolicLink(
+            at: symlinkedParent,
+            withDestinationURL: realParent
+        )
+
+        let realManifest = realParent.appendingPathComponent("sealed-host-identity.json")
+        try String(repeating: "x", count: 256).write(
+            to: realManifest,
+            atomically: false,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: realManifest.path
+        )
+        let manifestThroughSymlinkedParent = symlinkedParent.appendingPathComponent(
+            realManifest.lastPathComponent
+        )
+        let challengeMarker = temporaryRoot.appendingPathComponent("challenge-started")
+        let verifier = repositoryRoot.appendingPathComponent(
+            "macOS/scripts/verify-sealed-live-mac-host-identity.sh"
+        )
+        let result = try run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: [
+                "-c",
+                """
+                /bin/zsh "$1" "$2" "$3" "$4" 1 /tmp/host /tmp/framework - \
+                  && /usr/bin/touch "$5"
+                """,
+                "sealed-live-host-canonical-path-gate",
+                verifier.path,
+                manifestThroughSymlinkedParent.path,
+                manifestThroughSymlinkedParent.path + ".sha256",
+                String(repeating: "0", count: 64),
+                challengeMarker.path,
+            ]
+        )
+
+        XCTAssertNotEqual(result.status, 0, result.diagnostic)
+        XCTAssertTrue(
+            result.standardError.contains(
+                "physically canonical regular file with no symlinked ancestors"
+            ),
+            result.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: challengeMarker.path))
+    }
+
+    func testSealedLiveHostGateRejectsManifestSourceSwapAfterPinnedSnapshot() throws {
+        let temporaryRoot = makeCanonicalRepositoryTemporaryDirectory(
+            prefix: "sealed manifest swap"
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let releaseSigningIdentity = try approvedReleaseSigningIdentity()
+        let executableIdentifier = "com.elamin.AudioStreamer.CaptureServer"
+        let frameworkIdentifier = "io.livekit.LiveKitWebRTC"
+        let framework = temporaryRoot.appendingPathComponent("libFixture.dylib")
+        let executable = temporaryRoot.appendingPathComponent("runner")
+        try compileDynamicLibrary(at: framework, returnValue: 7)
+        try compileFrameworkFixtureRunner(at: executable, linkedTo: framework)
+        try sign(
+            executable: framework,
+            identifier: frameworkIdentifier,
+            signingIdentity: releaseSigningIdentity
+        )
+        try sign(
+            executable: executable,
+            identifier: executableIdentifier,
+            signingIdentity: releaseSigningIdentity
+        )
+
+        let liveProcess = Process()
+        liveProcess.executableURL = executable
+        liveProcess.standardOutput = FileHandle.nullDevice
+        liveProcess.standardError = FileHandle.nullDevice
+        try liveProcess.run()
+        defer {
+            if liveProcess.isRunning { liveProcess.terminate() }
+            liveProcess.waitUntilExit()
+        }
+
+        let manifest = temporaryRoot.appendingPathComponent("sealed-host-identity.json")
+        let manifestObject: [String: String] = [
+            "schema": "opensteamer.sealed-live-mac-host-identity.v1",
+            "executablePath": executable.path,
+            "executableSHA256": try sha256(of: executable),
+            "executableCDHash": try codeHash(of: executable),
+            "executableIdentifier": executableIdentifier,
+            "executableTeamIdentifier": "MSMG8CJLB3",
+            "mediaFrameworkExecutablePath": framework.path,
+            "mediaFrameworkExecutableSHA256": try sha256(of: framework),
+            "mediaFrameworkExecutableCDHash": try codeHash(of: framework),
+            "mediaFrameworkExecutableIdentifier": frameworkIdentifier,
+            "mediaFrameworkExecutableTeamIdentifier": "MSMG8CJLB3",
+        ]
+        let manifestData = try JSONSerialization.data(
+            withJSONObject: manifestObject,
+            options: [.sortedKeys]
+        )
+        try manifestData.write(to: manifest, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: manifest.path
+        )
+        let digest = try sha256(of: manifest)
+        let sidecar = URL(fileURLWithPath: manifest.path + ".sha256")
+        try (digest + "\n").write(to: sidecar, atomically: false, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: sidecar.path
+        )
+
+        let fixtureScripts = temporaryRoot.appendingPathComponent(
+            "fixture-scripts",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: fixtureScripts,
+            withIntermediateDirectories: false
+        )
+        let verifier = fixtureScripts.appendingPathComponent(
+            "verify-sealed-live-mac-host-identity.sh"
+        )
+        try FileManager.default.copyItem(
+            at: repositoryRoot.appendingPathComponent(
+                "macOS/scripts/verify-sealed-live-mac-host-identity.sh"
+            ),
+            to: verifier
+        )
+        let fakeLiveVerifier = fixtureScripts.appendingPathComponent(
+            "verify-live-mac-host-process.sh"
+        )
+        try """
+        #!/bin/zsh
+        set -euo pipefail
+        /usr/bin/touch "$OPENSTEAMER_SEAL_SWAP_READY"
+        while [[ ! -f "$OPENSTEAMER_SEAL_SWAP_CONTINUE" ]]; do
+          /bin/sleep 0.01
+        done
+        """.write(to: fakeLiveVerifier, atomically: false, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeLiveVerifier.path
+        )
+
+        let ready = temporaryRoot.appendingPathComponent("snapshot-ready")
+        let proceed = temporaryRoot.appendingPathComponent("continue-verification")
+        let verifierProcess = Process()
+        verifierProcess.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        verifierProcess.arguments = [
+            verifier.path,
+            manifest.path,
+            sidecar.path,
+            digest,
+            String(liveProcess.processIdentifier),
+            executable.path,
+            framework.path,
+            "-",
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["OPENSTEAMER_SEAL_SWAP_READY"] = ready.path
+        environment["OPENSTEAMER_SEAL_SWAP_CONTINUE"] = proceed.path
+        verifierProcess.environment = environment
+        let stdout = Pipe()
+        let stderr = Pipe()
+        verifierProcess.standardOutput = stdout
+        verifierProcess.standardError = stderr
+        try verifierProcess.run()
+
+        let deadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: ready.path),
+              verifierProcess.isRunning,
+              Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: ready.path),
+            "Verifier did not reach the post-snapshot live-process fence."
+        )
+
+        let replacement = temporaryRoot.appendingPathComponent("replacement-manifest.json")
+        try manifestData.write(to: replacement, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: replacement.path
+        )
+        let replace = try run(
+            executable: URL(fileURLWithPath: "/bin/mv"),
+            arguments: ["-f", replacement.path, manifest.path]
+        )
+        XCTAssertEqual(replace.status, 0, replace.diagnostic)
+        XCTAssertTrue(FileManager.default.createFile(atPath: proceed.path, contents: Data()))
+        verifierProcess.waitUntilExit()
+        let standardOutput = String(
+            decoding: stdout.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+        let standardError = String(
+            decoding: stderr.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+        let diagnostic = """
+        status=\(verifierProcess.terminationStatus)
+        stdout:
+        \(standardOutput)
+        stderr:
+        \(standardError)
+        """
+        XCTAssertNotEqual(verifierProcess.terminationStatus, 0, diagnostic)
+        XCTAssertTrue(
+            standardError.contains("sealed host artifacts changed during verification"),
+            diagnostic
+        )
+    }
+
     private func replacingExactlyOnce(
         _ original: String,
         with replacement: String,
@@ -511,6 +1129,24 @@ final class MacHostDeploymentContractTests: XCTestCase {
         return url
     }
 
+    private func makeCanonicalRepositoryTemporaryDirectory(prefix: String) -> URL {
+        let base = repositoryRoot.appendingPathComponent(".build", isDirectory: true)
+        try! FileManager.default.createDirectory(
+            at: base,
+            withIntermediateDirectories: true
+        )
+        let url = base.appendingPathComponent(
+            "opensteamer-\(prefix)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try! FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return url
+    }
+
     private func copyAndSign(source: URL, destination: URL, identifier: String) throws {
         let copy = try run(
             executable: URL(fileURLWithPath: "/bin/cp"),
@@ -520,12 +1156,43 @@ final class MacHostDeploymentContractTests: XCTestCase {
         try sign(executable: destination, identifier: identifier)
     }
 
-    private func sign(executable: URL, identifier: String) throws {
+    private func sign(
+        executable: URL,
+        identifier: String,
+        signingIdentity: String = "-"
+    ) throws {
         let result = try run(
             executable: URL(fileURLWithPath: "/usr/bin/codesign"),
-            arguments: ["--force", "--sign", "-", "--identifier", identifier, executable.path]
+            arguments: [
+                "--force",
+                "--sign", signingIdentity,
+                "--identifier", identifier,
+                "--timestamp=none",
+                executable.path,
+            ]
         )
         XCTAssertEqual(result.status, 0, result.diagnostic)
+    }
+
+    private func approvedReleaseSigningIdentity() throws -> String {
+        let result = try run(
+            executable: URL(fileURLWithPath: "/usr/bin/security"),
+            arguments: ["find-identity", "-v", "-p", "codesigning"]
+        )
+        XCTAssertEqual(result.status, 0, result.diagnostic)
+        for line in result.standardOutput.split(whereSeparator: \.isNewline) {
+            let value = String(line)
+            guard value.contains("Developer ID Application:"),
+                  value.contains("(MSMG8CJLB3)"),
+                  let match = value.range(
+                    of: "[0-9A-Fa-f]{40}",
+                    options: .regularExpression
+                  ) else {
+                continue
+            }
+            return String(value[match]).uppercased()
+        }
+        throw XCTSkip("No Developer ID Application identity for MSMG8CJLB3 is available.")
     }
 
     private func compileDynamicLibrary(at output: URL, returnValue: Int) throws {
@@ -586,6 +1253,20 @@ final class MacHostDeploymentContractTests: XCTestCase {
             .first { $0.hasPrefix("CDHash=") }?
             .dropFirst("CDHash=".count)
         return try XCTUnwrap(hash.map(String.init), result.diagnostic)
+    }
+
+    private func sha256(of file: URL) throws -> String {
+        let result = try run(
+            executable: URL(fileURLWithPath: "/usr/bin/shasum"),
+            arguments: ["-a", "256", file.path]
+        )
+        XCTAssertEqual(result.status, 0, result.diagnostic)
+        let digest = String(result.standardOutput.prefix(64))
+        XCTAssertNotNil(
+            digest.range(of: "^[0-9a-f]{64}$", options: .regularExpression),
+            result.diagnostic
+        )
+        return digest
     }
 
     private func eventuallyRun(

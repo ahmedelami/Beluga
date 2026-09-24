@@ -87,6 +87,7 @@ struct WorldwideIPhoneMicrophoneForwardingHostSnapshot:
     let trackGeneration: UInt64
     let currentAttemptID: UUID?
     let lastAttemptID: UUID?
+    let attemptGeneration: UInt64
     let exactTrackAdmitted: Bool
     let queueRunning: Bool
     let progress: BlackHoleMicrophoneOutputProgressSnapshot
@@ -124,6 +125,7 @@ struct WorldwideIPhoneMicrophoneForwardingHostSnapshot:
             trackGeneration: 0,
             currentAttemptID: nil,
             lastAttemptID: nil,
+            attemptGeneration: 0,
             exactTrackAdmitted: false,
             queueRunning: false,
             progress: .zero,
@@ -395,6 +397,7 @@ final class WorldwideIPhoneMicrophoneForwardingDriver<
     private var lastAttemptedKey:
         WorldwideIPhoneMicrophoneForwardingKey?
     private var lastAttemptID: UUID?
+    private var attemptGeneration: UInt64 = 0
     private var lastFailureCategory:
         WorldwideIPhoneMicrophoneForwardingFailureCategory?
     private var preserveSharedClockUnsafePhaseUntilPeerOrPairChanges =
@@ -867,6 +870,7 @@ final class WorldwideIPhoneMicrophoneForwardingDriver<
             trackGeneration: trackGeneration,
             currentAttemptID: currentAttempt?.id,
             lastAttemptID: lastAttemptID,
+            attemptGeneration: attemptGeneration,
             exactTrackAdmitted:
                 currentAttempt?.exactTrackAdmitted ?? false,
             queueRunning: progress.queueRunning,
@@ -953,6 +957,7 @@ final class WorldwideIPhoneMicrophoneForwardingDriver<
         }
 
         rememberAttempted(candidate.key)
+        attemptGeneration = Self.nextNonzero(attemptGeneration)
         let attemptID = makeAttemptID()
         lastAttemptID = attemptID
 

@@ -13,6 +13,16 @@ import VirtualDisplayCore
 struct CaptureServerMain {
     /// Parses configuration, starts enabled services, and exits nonzero on any fatal failure.
     static func main() async {
+        do {
+            if let clientMode = try WorldwideSecondaryTestViewerControlClientMode
+                .parseIfRequested(CommandLine.arguments) {
+                try clientMode.run()
+                return
+            }
+        } catch {
+            fputs("error: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
         if let probe = ScreenVideoDisplayModeProbeMode.executionIfRequested(
             CommandLine.arguments
         ) {
@@ -341,37 +351,78 @@ struct CaptureServerMain {
                 }
 
                 if options.secondaryTestViewerEnabled {
-                    // Construct only after primary startup and presentation. Invitation RNG or
-                    // signaling-client construction failure is optional and cannot tear down the
-                    // paired host. Both services share only the owner-scoped input controller.
+                    // Construct only after primary startup and presentation. Every secondary
+                    // generation gets a fresh consume-once service and a dedicated view-only
+                    // input controller, so its Show message cannot supersede primary ownership.
+                    let secondaryForceRelay = options.forceRelay
+                    let secondaryScreenDisplayID = displaySelection.screenDisplayID
+                    let secondarySystemAudioDisplayID =
+                        displaySelection.systemAudioDisplayID
+                    let secondaryMaximumWidth = options.screenMaximumWidth
+                    let secondaryFramesPerSecond = options.screenFramesPerSecond
+                    let secondaryMaximumVideoBitrate = Int(
+                        options.worldwideTotalRTPBitrate
+                    )
+                    let secondaryCaptureLifetime =
+                        virtualDisplayOwner == nil ? nil : serviceLifetime
+                    let secondaryMicrophonePolicy =
+                        options.iPhoneMicrophoneForwardingPolicy
+                    let configuredSecondaryControlSocketPath =
+                        options.secondaryTestViewerControlSocketPath
+                    let hostProcessIdentifier =
+                        ProcessInfo.processInfo.processIdentifier
+                    let hostGeneration = worldwideHostProcessLock.generationNonce
                     let construction = constructOptionalSecondaryTestViewer {
-                        let secondaryService = try WorldwideScreenService(
-                            endpoint: rendezvousURL,
-                            forceRelay: options.forceRelay,
-                            screenDisplayID: displaySelection.screenDisplayID,
-                            screenDisplayRequirement: screenDisplayRequirement,
-                            systemAudioDisplayID: displaySelection.systemAudioDisplayID,
-                            maximumWidth: options.screenMaximumWidth,
-                            framesPerSecond: options.screenFramesPerSecond,
-                            maximumVideoBitrate: Int(
-                                options.worldwideTotalRTPBitrate
-                            ),
-                            featureProfile: .secondaryTest,
-                            remoteInputController: remoteInputController,
-                            captureLifetime:
-                                virtualDisplayOwner == nil ? nil : serviceLifetime,
-                            iPhoneMicrophoneForwardingPolicy:
-                                options.iPhoneMicrophoneForwardingPolicy,
-                            makeServiceTeardownWatchdog: {
-                                virtualDisplayTeardownDeadline?.makeMediaServiceWatchdog()
-                            },
-                            makeNativeCaptureWatchdog: {
-                                virtualDisplayTeardownDeadline?.makeNativeCaptureWatchdog()
-                            },
-                            logger: logger
+                        let secondaryControlSocketPath = try
+                            configuredSecondaryControlSocketPath ??
+                            WorldwideSecondaryTestViewerControlServer
+                                .defaultSocketPath()
+                        let factory = WorldwideSecondaryTestViewerServiceFactory {
+                            _ in
+                            try WorldwideScreenService(
+                                endpoint: rendezvousURL,
+                                forceRelay: secondaryForceRelay,
+                                screenDisplayID: secondaryScreenDisplayID,
+                                screenDisplayRequirement: screenDisplayRequirement,
+                                systemAudioDisplayID: secondarySystemAudioDisplayID,
+                                maximumWidth: secondaryMaximumWidth,
+                                framesPerSecond: secondaryFramesPerSecond,
+                                maximumVideoBitrate:
+                                    secondaryMaximumVideoBitrate,
+                                featureProfile: .secondaryTest,
+                                remoteInputController: MacRemoteInputController(
+                                    allowRemoteControl: false
+                                ),
+                                captureLifetime: secondaryCaptureLifetime,
+                                iPhoneMicrophoneForwardingPolicy:
+                                    secondaryMicrophonePolicy,
+                                makeServiceTeardownWatchdog: {
+                                    virtualDisplayTeardownDeadline?
+                                        .makeMediaServiceWatchdog()
+                                },
+                                makeNativeCaptureWatchdog: {
+                                    virtualDisplayTeardownDeadline?
+                                        .makeNativeCaptureWatchdog()
+                                },
+                                logger: logger
+                            )
+                        }
+                        let coordinator = WorldwideSecondaryTestViewerCoordinator(
+                            factory: factory
                         )
-                        return WorldwideSecondaryTestViewerCoordinator(
-                            service: secondaryService
+                        let handler = WorldwideSecondaryTestViewerControlHandler(
+                            hostProcessIdentifier: hostProcessIdentifier,
+                            hostGeneration: hostGeneration,
+                            coordinator: coordinator
+                        )
+                        let controlServer =
+                            WorldwideSecondaryTestViewerControlServer(
+                                socketPath: secondaryControlSocketPath,
+                                handler: handler
+                            )
+                        return (
+                            coordinator: coordinator,
+                            controlServer: controlServer
                         )
                     }
                     switch construction {
@@ -380,43 +431,26 @@ struct CaptureServerMain {
                             "Secondary test viewer is unavailable; the primary paired host " +
                                 "remains active: " + failureDescription
                         )
-                    case .constructed(let secondaryTestViewerCoordinator):
-                        try serviceLifetime.install(
-                            secondaryTestViewerCoordinator:
-                                secondaryTestViewerCoordinator
-                        )
-                        let outcome = try await startOptionalSecondaryTestViewer(
-                            start: {
-                                try await runUntilProcessTermination(
-                                    terminationSignals:
-                                        activeTerminationSignalMonitor?.events
-                                ) {
-                                    try await secondaryTestViewerCoordinator.start()
-                                }
-                            },
-                            stop: {
-                                await secondaryTestViewerCoordinator.stop()
-                            }
-                        )
-                        switch outcome {
-                        case .started(let invitationCode):
-                            // Like primary bootstrap, this is the sole intentional presentation
-                            // of the secret. The secondary owner never logs or persists it.
-                            print("")
-                            print("Secondary one-time test viewer code")
-                            print("-----------------------------------")
-                            print(invitationCode)
-                            print("Enter this code on the secondary iPhone before it expires.")
-                            print("")
-                            fflush(stdout)
-                        case .unavailable(let failureDescription):
+                    case .constructed(let secondary):
+                        do {
+                            try serviceLifetime.installAndStart(
+                                secondaryTestViewerCoordinator:
+                                    secondary.coordinator,
+                                controlServer: secondary.controlServer
+                            )
+                            // Stay idle until an owner-authenticated local request arrives. The
+                            // invitation is returned exactly once over that connection and is
+                            // never printed into the long-lived host log.
+                            try activeTerminationSignalMonitor?.throwIfSignaled()
+                            try serviceLifetime.requireValid()
+                        } catch let error as VirtualDisplayLifetimeError {
+                            throw error
+                        } catch {
                             logger.error(
                                 "Secondary test viewer is unavailable; the primary paired host " +
-                                    "remains active: " + failureDescription
+                                    "remains active: \(error.localizedDescription)"
                             )
                         }
-                        try activeTerminationSignalMonitor?.throwIfSignaled()
-                        try serviceLifetime.requireValid()
                     }
                 }
             } else {

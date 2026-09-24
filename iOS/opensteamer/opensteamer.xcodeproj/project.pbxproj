@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		0A6518B4EB4B3E68DC6BD363 /* RemoteKeyboardInputView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B740987453823FD64F7C0982 /* RemoteKeyboardInputView.swift */; };
 		103C41100893D8012C60ADE6 /* ViewerPairingPersistenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6958FC2CA2AB682B2500A8CA /* ViewerPairingPersistenceTests.swift */; };
+		15D3A9B8C7E6F5041320ABCE /* IPhone15SecondaryViewerDevelopmentPhysicalUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15D3A9B8C7E6F5041320ABCD /* IPhone15SecondaryViewerDevelopmentPhysicalUITests.swift */; };
+		1B68820CF3936A71D2B7BCEA /* PhysicalScreenSequenceOracleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82C1960DA0B4FF5EE2B3F7CF /* PhysicalScreenSequenceOracleTests.swift */; };
 		1E220F17ECE4F06A1552C770 /* PhysicalOracleEvaluatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA37DD740FBC007D8FFBCA52 /* PhysicalOracleEvaluatorTests.swift */; };
 		2A22F44ECDB811632D6B3812 /* ScreenVideoRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCF50C685C4CBFD9F3AC8546 /* ScreenVideoRenderer.swift */; };
 		2AB8172E29C70E7D96DA0A8A /* KeychainStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05F997BDA71C2DC04DB754E9 /* KeychainStoreTests.swift */; };
@@ -21,11 +23,13 @@
 		4D7160E2C12B45C36CA6F0B5 /* WorldwideCallActivityObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE7AAEDB7B667B93413D7D8E /* WorldwideCallActivityObserver.swift */; };
 		534113CA5D7FA5E6D5EE4A03 /* PhysicalScreenImageOracleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6059D9C4EAF612456387AF8B /* PhysicalScreenImageOracleTests.swift */; };
 		53A239A67395BC6888999045 /* BrowserView+WorldwidePresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 218C21538913DA6CC4E8E209 /* BrowserView+WorldwidePresentation.swift */; };
+		540EE2BEA11C2CE3AA04FA17 /* PhysicalScreenSequenceScreenshotSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CE16C78E2A0A4B702D59EEB /* PhysicalScreenSequenceScreenshotSampler.swift */; };
 		5F6310C5C74FD76205C2BDD6 /* RemoteMediaArtworkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7B1BF8B41EA3FE864A61077 /* RemoteMediaArtworkTests.swift */; };
 		627187065AADC178DAECE8BE /* ScreenViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A452CD7D5104C509DB5D168E /* ScreenViewerView.swift */; };
 		6550CFB51C42A93D157E803F /* WebRTCTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 525D57D5DCA36B6B514B1F0A /* WebRTCTransport */; };
 		683C25329BC8E20088E6116B /* RemoteTokenState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEC26144551DD1E27BA28F74 /* RemoteTokenState.swift */; };
 		688161A555027B4D83A84E0D /* ViewerPairingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64465AAC8CF00A21486FD95A /* ViewerPairingState.swift */; };
+		6A058DDC1801641E4CC917E1 /* PhysicalScreenSequenceProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD05EFF5B0B4B73AE0B392EC /* PhysicalScreenSequenceProtocol.swift */; };
 		6FABEE1730A7A0908FD6FFB9 /* InvitationAcceptanceAction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAA833D0E3961518CB2AF39 /* InvitationAcceptanceAction.swift */; };
 		70C2F5089C84108917111CF0 /* ScreenSessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6219C964B51CAC699E64A54 /* ScreenSessionViewModel.swift */; };
 		70D49162C0A5742D3966087D /* OpensteamerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76F2CC18DCFD9E1ACAC69A25 /* OpensteamerApp.swift */; };
@@ -33,8 +37,11 @@
 		7A896917C5694180149B0C64 /* WorldwideAudioLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF58ACCC60E0F1CDD3B085F1 /* WorldwideAudioLifecycleTests.swift */; };
 		802BDF19BBE720E4EA99CC24 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = CE709A348BA23148805A49B5 /* THIRD_PARTY_NOTICES.md */; };
 		82252C5C7C19C8D8D08E1FAE /* StreamSessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F4D135483CC5D23B56ADE12 /* StreamSessionViewModel.swift */; };
+		846708C0EFD3004C69EC3D4A /* PhysicalScreenSequenceOracle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D379672507C0BAD1D36EF33 /* PhysicalScreenSequenceOracle.swift */; };
 		8553B3C7A16926908E26AFE9 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DF002ECF8773045115B13E3F /* Assets.xcassets */; };
 		881899A1F6D178BB816711C4 /* IOSOrdinaryPlayoutLivenessTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C1DE117468B2DA4EEECD94B /* IOSOrdinaryPlayoutLivenessTracker.swift */; };
+		8B3BB9E71658E51F6B5CD2BE /* PhysicalScreenSequenceScreenshotSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CE16C78E2A0A4B702D59EEB /* PhysicalScreenSequenceScreenshotSampler.swift */; };
+		8C0C6B242C70FBED1C2FB4D0 /* PhysicalScreenSequenceProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD05EFF5B0B4B73AE0B392EC /* PhysicalScreenSequenceProtocol.swift */; };
 		8CEE8A4F3BF37A783F2E66B9 /* ScreenVideoConnectionDescriptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F524855347D7B066F88321D0 /* ScreenVideoConnectionDescriptor.swift */; };
 		8CFD309C5EAD23E3B7142DB9 /* WorldwidePhysicalOracles.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD7C32B18437F49BE65ED68D /* WorldwidePhysicalOracles.swift */; };
 		99CFD2E50E0881AC366C4738 /* BrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89673B77A859E243F7FD3131 /* BrowserView.swift */; };
@@ -57,6 +64,7 @@
 		C8262450EBF279627543D271 /* ServerInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 132D234332E7CDAD5F0F3213 /* ServerInfo.swift */; };
 		C9E6069A49A4706FF9BF6058 /* MetricRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DBE9263C82F3F738B8AA3DF /* MetricRow.swift */; };
 		D1336366C939E9D02ECF6925 /* WorldwideScreenViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22BA2C0E3FA5E56CBEFF2B54 /* WorldwideScreenViewerView.swift */; };
+		D2E0A90468F5B64F496F77B6 /* ScreenVisualOraclePhysicalUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3DDCE4C6F7143536E9111F3 /* ScreenVisualOraclePhysicalUITests.swift */; };
 		D2FB014BB9E23EC04BBBE548 /* ScreenVideoClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BDB3748CE96A0E684F2EF76 /* ScreenVideoClient.swift */; };
 		D4EAE6BA0BBBC5807F6B32F6 /* WorldwideRemoteInputLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D11FA42392B5E334511C469E /* WorldwideRemoteInputLifecycleTests.swift */; };
 		D7DA2F47EE5B5EF6EBCF40C7 /* RemoteScrollGesturePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4F9F8CF671205198FE2CCDB /* RemoteScrollGesturePolicy.swift */; };
@@ -66,6 +74,7 @@
 		DCC8E31D0010C395981E59BC /* DiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CA340C807653853951DB090 /* DiagnosticsView.swift */; };
 		DFD966915181FF541A343040 /* BonjourBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65CCD3F1ABD9D4172744A0F4 /* BonjourBrowser.swift */; };
 		E0CFAFCA3B3074DC9A70FEC2 /* BackgroundPlaybackCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 093577922497DF95FEAFD8EF /* BackgroundPlaybackCoordinator.swift */; };
+		E497CAB068FB74BE7A542186 /* PhysicalScreenSequenceOracle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D379672507C0BAD1D36EF33 /* PhysicalScreenSequenceOracle.swift */; };
 		E70EEBCEDCB6197A7AF99513 /* RemoteSessionCore in Frameworks */ = {isa = PBXBuildFile; productRef = C90C3F3FA906FF223BDF865B /* RemoteSessionCore */; };
 		EA28552E783109EE7CEB283A /* RemotePointerGestureSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4AE757E2363D02C7C78F641 /* RemotePointerGestureSurface.swift */; };
 		F5EC00BDA63D36E530D77711 /* WorldwideAudioLifecycleController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D8B7D553630E727E5BA02A0 /* WorldwideAudioLifecycleController.swift */; };
@@ -93,12 +102,15 @@
 		093577922497DF95FEAFD8EF /* BackgroundPlaybackCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundPlaybackCoordinator.swift; sourceTree = "<group>"; };
 		0B08A0C97FDDE54F9FD2A8EE /* RemoteKeyboardInputProxyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteKeyboardInputProxyTests.swift; sourceTree = "<group>"; };
 		132D234332E7CDAD5F0F3213 /* ServerInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerInfo.swift; sourceTree = "<group>"; };
+		15D3A9B8C7E6F5041320ABCD /* IPhone15SecondaryViewerDevelopmentPhysicalUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPhone15SecondaryViewerDevelopmentPhysicalUITests.swift; sourceTree = "<group>"; };
 		1C92AB7DA244DF1596EEB1A2 /* Beluga */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Beluga; path = ../..; sourceTree = SOURCE_ROOT; };
+		1D379672507C0BAD1D36EF33 /* PhysicalScreenSequenceOracle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenSequenceOracle.swift; sourceTree = "<group>"; };
 		1D8B7D553630E727E5BA02A0 /* WorldwideAudioLifecycleController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideAudioLifecycleController.swift; sourceTree = "<group>"; };
 		218C21538913DA6CC4E8E209 /* BrowserView+WorldwidePresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BrowserView+WorldwidePresentation.swift"; sourceTree = "<group>"; };
 		22BA2C0E3FA5E56CBEFF2B54 /* WorldwideScreenViewerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideScreenViewerView.swift; sourceTree = "<group>"; };
 		235E2095A9F021D79D1278C5 /* PlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerView.swift; sourceTree = "<group>"; };
 		2ADDF37DFF4BF8165F226443 /* opensteamerUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = opensteamerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		2CE16C78E2A0A4B702D59EEB /* PhysicalScreenSequenceScreenshotSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenSequenceScreenshotSampler.swift; sourceTree = "<group>"; };
 		2F3847AFDCAAE82502B598F0 /* ViewerPairingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerPairingStore.swift; sourceTree = "<group>"; };
 		3509D44693CBE35F3D3D8633 /* H264SampleBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264SampleBuilder.swift; sourceTree = "<group>"; };
 		3C98B7E2E267B10F3812ED68 /* PhysicalScreenImageOracle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenImageOracle.swift; sourceTree = "<group>"; };
@@ -121,6 +133,7 @@
 		76F2CC18DCFD9E1ACAC69A25 /* OpensteamerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpensteamerApp.swift; sourceTree = "<group>"; };
 		77E21C152BA0763A029B6EA5 /* PhysicalOracleEvaluator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalOracleEvaluator.swift; sourceTree = "<group>"; };
 		33F120C227DF28ABE6BBF84F /* opensteamer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = opensteamer; path = ../..; sourceTree = SOURCE_ROOT; };
+		82C1960DA0B4FF5EE2B3F7CF /* PhysicalScreenSequenceOracleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenSequenceOracleTests.swift; sourceTree = "<group>"; };
 		89673B77A859E243F7FD3131 /* BrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserView.swift; sourceTree = "<group>"; };
 		89D2E46B6C68480FE21BE89A /* RemotePrimaryDragGesturePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePrimaryDragGesturePolicy.swift; sourceTree = "<group>"; };
 		8BDB3748CE96A0E684F2EF76 /* ScreenVideoClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenVideoClient.swift; sourceTree = "<group>"; };
@@ -148,8 +161,10 @@
 		EF58ACCC60E0F1CDD3B085F1 /* WorldwideAudioLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideAudioLifecycleTests.swift; sourceTree = "<group>"; };
 		F2929FAEAC7A483ECCCDA903 /* RemoteMediaArtworkNetworkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMediaArtworkNetworkTests.swift; sourceTree = "<group>"; };
 		F36373D0CB1979AF2ABF3A1F /* WorldwideViewerConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldwideViewerConnectionCoordinator.swift; sourceTree = "<group>"; };
+		F3DDCE4C6F7143536E9111F3 /* ScreenVisualOraclePhysicalUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenVisualOraclePhysicalUITests.swift; sourceTree = "<group>"; };
 		F524855347D7B066F88321D0 /* ScreenVideoConnectionDescriptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenVideoConnectionDescriptor.swift; sourceTree = "<group>"; };
 		FB6E5C0C5FD82651759A73F3 /* WebRTCRemoteScreenView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebRTCRemoteScreenView.swift; sourceTree = "<group>"; };
+		FD05EFF5B0B4B73AE0B392EC /* PhysicalScreenSequenceProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenSequenceProtocol.swift; sourceTree = "<group>"; };
 		FE5308EFBD1542023CA23117 /* SampleBufferScreenView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleBufferScreenView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -198,7 +213,9 @@
 		45EE504DB5D2A420EFAE46CC /* UITests */ = {
 			isa = PBXGroup;
 			children = (
+				15D3A9B8C7E6F5041320ABCD /* IPhone15SecondaryViewerDevelopmentPhysicalUITests.swift */,
 				70D0F6A95821E569AE4C4C88 /* PairedReconnectPhysicalUITests.swift */,
+				F3DDCE4C6F7143536E9111F3 /* ScreenVisualOraclePhysicalUITests.swift */,
 			);
 			path = UITests;
 			sourceTree = "<group>";
@@ -238,6 +255,9 @@
 			children = (
 				77E21C152BA0763A029B6EA5 /* PhysicalOracleEvaluator.swift */,
 				3C98B7E2E267B10F3812ED68 /* PhysicalScreenImageOracle.swift */,
+				1D379672507C0BAD1D36EF33 /* PhysicalScreenSequenceOracle.swift */,
+				FD05EFF5B0B4B73AE0B392EC /* PhysicalScreenSequenceProtocol.swift */,
+				2CE16C78E2A0A4B702D59EEB /* PhysicalScreenSequenceScreenshotSampler.swift */,
 			);
 			path = OracleTestSupport;
 			sourceTree = "<group>";
@@ -359,6 +379,7 @@
 				05F997BDA71C2DC04DB754E9 /* KeychainStoreTests.swift */,
 				DA37DD740FBC007D8FFBCA52 /* PhysicalOracleEvaluatorTests.swift */,
 				6059D9C4EAF612456387AF8B /* PhysicalScreenImageOracleTests.swift */,
+				82C1960DA0B4FF5EE2B3F7CF /* PhysicalScreenSequenceOracleTests.swift */,
 				0B08A0C97FDDE54F9FD2A8EE /* RemoteKeyboardInputProxyTests.swift */,
 				F2929FAEAC7A483ECCCDA903 /* RemoteMediaArtworkNetworkTests.swift */,
 				C7B1BF8B41EA3FE864A61077 /* RemoteMediaArtworkTests.swift */,
@@ -495,9 +516,14 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				15D3A9B8C7E6F5041320ABCE /* IPhone15SecondaryViewerDevelopmentPhysicalUITests.swift in Sources */,
 				9CA8D23DE85C9FC0A77536B6 /* PairedReconnectPhysicalUITests.swift in Sources */,
 				C70D90B1D6A781720B3E38F6 /* PhysicalOracleEvaluator.swift in Sources */,
 				AE023D22A0FF9D3289DA9E2B /* PhysicalScreenImageOracle.swift in Sources */,
+				846708C0EFD3004C69EC3D4A /* PhysicalScreenSequenceOracle.swift in Sources */,
+				8C0C6B242C70FBED1C2FB4D0 /* PhysicalScreenSequenceProtocol.swift in Sources */,
+				540EE2BEA11C2CE3AA04FA17 /* PhysicalScreenSequenceScreenshotSampler.swift in Sources */,
+				D2E0A90468F5B64F496F77B6 /* ScreenVisualOraclePhysicalUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -557,6 +583,10 @@
 				1E220F17ECE4F06A1552C770 /* PhysicalOracleEvaluatorTests.swift in Sources */,
 				C0190D2FEB98D536396D2C2D /* PhysicalScreenImageOracle.swift in Sources */,
 				534113CA5D7FA5E6D5EE4A03 /* PhysicalScreenImageOracleTests.swift in Sources */,
+				E497CAB068FB74BE7A542186 /* PhysicalScreenSequenceOracle.swift in Sources */,
+				1B68820CF3936A71D2B7BCEA /* PhysicalScreenSequenceOracleTests.swift in Sources */,
+				6A058DDC1801641E4CC917E1 /* PhysicalScreenSequenceProtocol.swift in Sources */,
+				8B3BB9E71658E51F6B5CD2BE /* PhysicalScreenSequenceScreenshotSampler.swift in Sources */,
 				AB6196D04E1C6B5D11B5771D /* RemoteKeyboardInputProxyTests.swift in Sources */,
 				410A20E5A1359F7ACEC16FEE /* RemoteMediaArtworkNetworkTests.swift in Sources */,
 				5F6310C5C74FD76205C2BDD6 /* RemoteMediaArtworkTests.swift in Sources */,
