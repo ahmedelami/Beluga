@@ -129,6 +129,87 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
         }
     }
 
+    func testVerifierClassifiesRealClientGenerationMismatchAndCleansOutput() async throws {
+        try await withFixture(handlerGeneration: String(repeating: "b", count: 64)) { fixture in
+            let result = try runVerifier(fixture: fixture)
+
+            XCTAssertNotEqual(result.status, 0)
+            XCTAssertEqual(result.stdout, "")
+            XCTAssertTrue(result.stderr.contains("shell_status=1 signal_hint=none classification=invalid_response"), result.stderr)
+            XCTAssertFalse(result.stderr.contains("error: The secondary viewer"), result.stderr)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fixture.scratch.path), [])
+        }
+    }
+
+    func testProbeWrapperClassifiesTypedFailuresWithoutExposingStderr() throws {
+        let cases = [
+            ("The secondary viewer request arguments are invalid.", "invalid_arguments"),
+            ("The secondary viewer control endpoint failed owner or identity validation.", "unsafe_endpoint"),
+            ("The secondary viewer control response was invalid.", "invalid_response"),
+            ("The secondary viewer invitation output path is unsafe or already exists.", "unsafe_output"),
+            ("The secondary viewer status probe was rejected with status quarantined.", "rejected_quarantined"),
+        ]
+        for (message, classification) in cases {
+            let result = try runProbeWrapperFixture(
+                body: "print STDERR q{error: \(message)}; exit 7;"
+            )
+            XCTAssertNotEqual(result.status, 0)
+            XCTAssertEqual(result.stdout, "")
+            XCTAssertTrue(result.stderr.contains("shell_status=7 signal_hint=none classification=\(classification)"), result.stderr)
+            XCTAssertFalse(result.stderr.contains(message), result.stderr)
+        }
+    }
+
+    func testProbeWrapperDistinguishesDeadlineAndRejectsNoisySuccess() throws {
+        let expired = try runProbeWrapperFixture(body: "sleep 2;", timeout: 1)
+        XCTAssertNotEqual(expired.status, 0)
+        XCTAssertTrue(expired.stderr.contains("shell_status=142 signal_hint=14 classification=no_stderr"), expired.stderr)
+
+        let success = try runProbeWrapperFixture(body: "exit 0;")
+        XCTAssertEqual(success.status, 0, success.stderr)
+        XCTAssertEqual(success.stdout, "")
+        XCTAssertEqual(success.stderr, "")
+
+        for body in ["print q{sensitive fixture output};", "print STDERR q{sensitive fixture output};"] {
+            let noisy = try runProbeWrapperFixture(body: body)
+            XCTAssertNotEqual(noisy.status, 0)
+            XCTAssertTrue(noisy.stderr.contains("wrote unexpected console output"), noisy.stderr)
+            XCTAssertFalse(noisy.stderr.contains("sensitive fixture output"), noisy.stderr)
+        }
+    }
+
+    func testProbeWrapperClassifiesProtocolErrorsWithoutExposingStderr() throws {
+        let errors: [WorldwideSecondaryTestViewerControlProtocolError] = [
+            .invalidRequest, .invalidResponse, .unsafeSocketPath, .endpointUnavailable,
+        ]
+        for error in errors {
+            let bridgedError = error as NSError
+            XCTAssertEqual(bridgedError.domain, "CaptureServer.WorldwideSecondaryTestViewerControlProtocolError")
+            XCTAssertTrue((0...3).contains(bridgedError.code))
+            let result = try runProbeWrapperFixture(
+                body: "print STDERR q{error: \(error.localizedDescription)}; exit 1;"
+            )
+            XCTAssertNotEqual(result.status, 0)
+            XCTAssertEqual(result.stdout, "")
+            XCTAssertTrue(result.stderr.contains("shell_status=1 signal_hint=none classification=protocol_error_\(bridgedError.code)"), result.stderr)
+            XCTAssertFalse(result.stderr.contains(error.localizedDescription), result.stderr)
+        }
+    }
+
+    func testProbeWrapperRedactsUnknownAndOversizedFailureOutput() throws {
+        for body in [
+            "print STDERR q{secret-fixture-token}; exit 9;",
+            "print STDERR qq{error: The secondary viewer control response was invalid.\\nsecret-fixture-token}; exit 9;",
+        ] {
+            let result = try runProbeWrapperFixture(body: body)
+            XCTAssertTrue(result.stderr.contains("classification=unrecognized_stderr"), result.stderr)
+            XCTAssertFalse(result.stderr.contains("secret-fixture-token"), result.stderr)
+        }
+        let oversized = try runProbeWrapperFixture(body: "print STDERR q{s} x 4097; exit 9;")
+        XCTAssertTrue(oversized.stderr.contains("classification=oversized_stderr stderr_bytes=4097"), oversized.stderr)
+        XCTAssertFalse(oversized.stderr.contains(String(repeating: "s", count: 32)), oversized.stderr)
+    }
+
     func testVerifierAcceptsSignedCandidateAtPathContainingSpaces() async throws {
         try await withFixture { fixture in
             let spacedDirectory = fixture.root.appendingPathComponent(
@@ -247,6 +328,7 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
     }
 
     private func withFixture(
+        handlerGeneration: String? = nil,
         _ body: (Fixture) async throws -> Void
     ) async throws {
         let root = repositoryRoot
@@ -302,7 +384,7 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
         let coordinator = WorldwideSecondaryTestViewerCoordinator(factory: factory)
         let handler = WorldwideSecondaryTestViewerControlHandler(
             hostProcessIdentifier: getpid(),
-            hostGeneration: hostGeneration,
+            hostGeneration: handlerGeneration ?? hostGeneration,
             coordinator: coordinator
         )
         let server = WorldwideSecondaryTestViewerControlServer(
@@ -311,7 +393,15 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
         )
         try server.start()
 
-        let candidate = try builtCaptureServer()
+        let candidate: URL
+        if let supplied = ProcessInfo.processInfo.environment["OPENSTEAMER_V90_READINESS_TEST_CANDIDATE"] {
+            candidate = URL(fileURLWithPath: supplied)
+            guard supplied.hasPrefix("/"), candidate.resolvingSymlinksInPath().path == supplied else {
+                throw V90VerifierTestError.captureServerUnavailable
+            }
+        } else {
+            candidate = try builtCaptureServer()
+        }
         let fixture = Fixture(
             root: root,
             home: home,
@@ -401,6 +491,46 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
             fixture: fixture,
             temporaryDirectory: temporaryDirectory,
             extraEnvironment: extraEnvironment
+        )
+    }
+
+    private func runProbeWrapperFixture(body: String, timeout: Int = 1) throws -> ProcessResult {
+        let source = try verifierSource
+        let start = try XCTUnwrap(source.range(of: "probe_failure_classification() {"))
+        let end = try XCTUnwrap(source.range(of: "run_and_validate_probe() {", range: start.upperBound..<source.endIndex))
+        let functions = String(source[start.lowerBound..<end.lowerBound])
+        let root = repositoryRoot.appendingPathComponent(".build/probe-wrapper-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = #"""
+        set -euo pipefail
+        fail() { print -ru2 -- "$*"; exit 1; }
+        CANDIDATE_INPUT=/usr/bin/perl
+        PROBE_FLAG=-e
+        STATUS_OUTPUT="$FIXTURE_BODY"
+        SOCKET_FLAG=--
+        CONTROL_SOCKET=unused
+        PROBE_TIMEOUT_SECONDS="$FIXTURE_TIMEOUT"
+        PROBE_STDOUT="$FIXTURE_ROOT/probe.stdout"
+        PROBE_STDERR="$FIXTURE_ROOT/probe.stderr"
+        """# + "\n" + functions + "\nexecute_status_probe 1\n"
+        let fixture = Fixture(
+            root: root, home: root, scratch: root,
+            candidate: URL(fileURLWithPath: "/usr/bin/perl"), candidateSHA256: "", socketPath: ""
+        )
+        return try runProcess(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-f", "-c", script],
+            fixture: fixture,
+            extraEnvironment: [
+                "FIXTURE_BODY": body,
+                "FIXTURE_TIMEOUT": String(timeout),
+                "FIXTURE_ROOT": root.path,
+            ]
         )
     }
 

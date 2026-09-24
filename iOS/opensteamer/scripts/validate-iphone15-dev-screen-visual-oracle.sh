@@ -2019,7 +2019,7 @@ function inactive_primary_lifecycle_is_terminal() {
     || return 1
   suffix=$(/usr/bin/sed -n "$(( media_line + 1 )),\$p" "$file")
   if print -r -- "$suffix" | rg -q \
-      'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;'; then
+      'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange'; then
     return 1
   fi
   latest_peer=$(print -r -- "$suffix" \
@@ -2048,6 +2048,59 @@ function inactive_primary_lifecycle_is_terminal() {
       || return 1
   fi
   return 0
+}
+
+function never_connected_primary_baseline_is_exact() {
+  local file=$1
+  [[ "${HOST_PID:-}" =~ '^[1-9][0-9]*$' \
+      && "${HOST_GENERATION:-}" =~ '^[0-9a-f]{64}$' \
+      && "${SECONDARY_MANAGER_GENERATION_BASELINE:-}" =~ '^[0-9]+$' ]] \
+    || return 1
+  # Startup must be present in the bounded snapshot; a later waiting marker alone could hide
+  # a previous primary session outside the tail. The secondary idle probe is established first.
+  /usr/bin/awk -v expected="Worldwide paired-device availability is online pid=${HOST_PID} nonce=${HOST_GENERATION}" '
+    {
+      line = $0
+      sub(/^\[[a-z]+\] /, "", line)
+      if (line == "Loaded the paired iPhone and started worldwide availability") {
+        if (online) overlapping_generation = 1
+        started = 1
+        waiting = 0
+        online = 0
+        unsafe = 0
+        next
+      }
+      if (!started) next
+      if (line == "Worldwide availability is waiting for the paired iPhone") {
+        waiting = 1
+      } else if (index(line, "Worldwide paired-device availability is online ") == 1) {
+        if (line != expected || !waiting) unsafe = 1
+        else online = 1
+      }
+      if (line ~ /Worldwide WebRTC peer state:|Starting screen video capture|Stopping screen video capture|Worldwide viewer disconnected;|Worldwide media ended;|Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange|peerConnected=true|controlOpen=true/) {
+        unsafe = 1
+      }
+    }
+    END { exit !(started && waiting && online && !unsafe && !overlapping_generation) }
+  ' "$file"
+}
+
+function record_never_connected_primary_baseline() {
+  local file=$1
+  never_connected_primary_baseline_is_exact "$file" \
+    || fail 'fresh host generation does not prove a never-connected primary baseline'
+  PRIMARY_BASELINE_MODE=neverConnectedPrimary
+  PRIMARY_MIC_BASELINE_MODE=neverConnectedPrimary
+  PRIMARY_AUDIO_STATUS=notObserved
+  PRIMARY_MIC_FORWARDING_PHASE=notObserved
+  PRIMARY_CONTINUITY_ASSURANCE=neverConnectedPrimaryNoAudioProof
+  jq -n --arg pid "$HOST_PID" --arg generation "$HOST_GENERATION" \
+    --arg managerGeneration "$SECONDARY_MANAGER_GENERATION_BASELINE" \
+    '{proof:"no-primary-since-host-generation-start",hostPid:($pid | tonumber),
+      hostGeneration:$generation,secondaryManagerGeneration:$managerGeneration,
+      session:null,build:null,peerGeneration:null,negotiationEpoch:null,
+      audioProof:false,microphoneProof:false}' \
+    > "${ARTIFACT_DIR}/before-never-connected-primary-continuity.json"
 }
 
 function write_host_baseline_snapshot() {
@@ -2088,6 +2141,12 @@ function write_host_baseline_snapshot() {
       latest_forwarding=$(rg \
         'Worldwide iPhone microphone forwarding phase=' "$output" \
         | /usr/bin/tail -n 1 || true)
+      if [[ -z "$latest_audio" ]] && never_connected_primary_baseline_is_exact "$output"; then
+        HOST_LOG_BASE_SIZE=$current_size
+        HOST_LOG_CONTINUITY_CURSOR=$current_size
+        /bin/rm -f "$raw"
+        return
+      fi
       if [[ -n "$latest_audio" ]] && { \
           { [[ -n "$latest_forwarding" ]] \
             && primary_audio_diagnostic_is_current_healthy "$latest_audio" \
@@ -2433,8 +2492,9 @@ function write_inactive_primary_append_window() {
 
 function inactive_primary_append_has_no_primary_activity() {
   local file=$1
+  # Primary rendezvous/authentication can begin before the first peer or audio diagnostic.
   ! rg -q \
-    'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;' \
+    'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange' \
     "$file"
 }
 
@@ -2474,7 +2534,8 @@ function capture_primary_continuity() {
   local prefix=$1
   local filtered="${ARTIFACT_DIR}/${prefix}-primary-continuity.log"
   local audio_line selection_line forwarding_line
-  if [[ "$PRIMARY_BASELINE_MODE" == inactivePrimary ]]; then
+  if [[ "$PRIMARY_BASELINE_MODE" == inactivePrimary \
+      || "$PRIMARY_BASELINE_MODE" == neverConnectedPrimary ]]; then
     capture_inactive_primary_continuity "$prefix"
     return
   fi
@@ -2692,6 +2753,11 @@ function capture_host_baseline() {
   HOST_LOG_INODE=$(/usr/bin/stat -f '%i' "$HOST_LOG") \
     || fail 'Mac host log inode identity is unavailable'
   write_host_baseline_snapshot "${ARTIFACT_DIR}/before-host-baseline.log"
+  if never_connected_primary_baseline_is_exact "${ARTIFACT_DIR}/before-host-baseline.log"; then
+    capture_host_generation_identity never-connected-baseline
+    record_never_connected_primary_baseline "${ARTIFACT_DIR}/before-host-baseline.log"
+    return
+  fi
   rg -n \
     'Worldwide WebRTC peer state:|Starting screen video capture|Stopping screen video capture|Worldwide viewer disconnected;|Worldwide audio client diagnostics|Worldwide media ended;' \
     "${ARTIFACT_DIR}/before-host-baseline.log" \

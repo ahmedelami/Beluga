@@ -175,6 +175,10 @@ same artifact, acceptance of a fresh verified predecessor generation, rejection 
 within-attempt identity drift, and rejection of incomplete or altered history. The
 readiness observer must be bound to current deployment tooling, not the capsule's old
 source export. These are tooling proofs, not installed-host or final-pixel proof.
+Readiness failures retain the client exit status, a possible signal number, and a
+bounded allowlisted error classification; they must not collapse every rejection
+into a timeout or print arbitrary client output. The exact sealed client can be
+exercised against an isolated local control-server fixture before another cutover.
 
 After a terminal `COMMITTED_V90` host result and fresh sealed-host readback, run
 `validate-iphone15-dev-screen-visual-oracle.sh` on the paired iPhone 15. That pass is development
@@ -189,6 +193,12 @@ are distinct evidence boundaries; no earlier stage implies a later one.
 
 Development diagnosis uses the separately signed `org.example.AudioStreamer.dev` bundle on the
 paired iPhone 15; it never operates the personal production iPhone. The guarded development runner
+also admits a never-connected primary only when the complete current-generation
+startup/waiting/online boundary, exact PID/nonce, secondary-manager idle proof, and
+absence of subsequent primary activity agree. This branch records no primary
+session, build, audio, or microphone proof; the existing no-reactivation and exact
+secondary-session cleanup fences still apply. A fresh host therefore does not need
+the personal phone connected merely to enable development validation. The runner
 builds the current checkout with a generic-iOS `build-for-testing`, performs at most one bounded
 Xcode-owned clean/rebuild for an invalid incremental runner signature, and seals those products
 before it needs the phone. It then publishes a private, 30-minute, run-nonce-bound unlock request and

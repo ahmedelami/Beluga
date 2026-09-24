@@ -275,18 +275,52 @@ require_probe_fences_unchanged() {
         "temporary root was replaced during a probe"
 }
 
-run_and_validate_probe() {
-    local attempt="$1" probe_started_at probe_finished_at probe_status=0
-    local status_identity status_kind status_owner status_mode status_device status_inode
-    local status_links status_size status_birth status_modified canonical_status last_status_byte
-    local status_identity_after work_directory_after manager_generation request_nonce
-    STATUS_OUTPUT="${WORK_DIRECTORY}/status-${attempt}.json"
-    PROBE_STDOUT="${WORK_DIRECTORY}/probe-${attempt}.stdout"
-    PROBE_STDERR="${WORK_DIRECTORY}/probe-${attempt}.stderr"
-    [[ ! -e "$STATUS_OUTPUT" && ! -L "$STATUS_OUTPUT" ]] || fail \
-        "fresh status output path collided before probe ${attempt}"
+probe_failure_classification() {
+    local stderr_bytes error_text rejected_status protocol_error_code
+    [[ -f "$PROBE_STDERR" && ! -L "$PROBE_STDERR" ]] || {
+        print -r -- 'unavailable'
+        return
+    }
+    stderr_bytes="$(/usr/bin/stat -f '%z' -- "$PROBE_STDERR")" || return
+    (( stderr_bytes <= 4096 )) || {
+        print -r -- 'oversized_stderr'
+        return
+    }
+    error_text="$(<"$PROBE_STDERR")"
+    case "$error_text" in
+        '') print -r -- 'no_stderr' ;;
+        'error: The secondary viewer request arguments are invalid.')
+            print -r -- 'invalid_arguments' ;;
+        'error: The secondary viewer control endpoint failed owner or identity validation.')
+            print -r -- 'unsafe_endpoint' ;;
+        'error: The secondary viewer control response was invalid.')
+            print -r -- 'invalid_response' ;;
+        'error: The secondary viewer invitation output path is unsafe or already exists.')
+            print -r -- 'unsafe_output' ;;
+        *)
+            # This Error-only enum bridges to a fixed NSError description before client
+            # validation (for example, loading the host lock). Keep its bounded numeric
+            # code rather than attributing a case name to a compiler-generated code.
+            for protocol_error_code in 0 1 2 3; do
+                if [[ "$error_text" == "error: The operation couldn’t be completed. (CaptureServer.WorldwideSecondaryTestViewerControlProtocolError error ${protocol_error_code}.)" ]]; then
+                    print -r -- "protocol_error_${protocol_error_code}"
+                    return
+                fi
+            done
+            for rejected_status in observed started stopped busy staleGeneration quarantined \
+                shutdown unavailable replayed wrongHost invalidReceipt invalidRequest; do
+                if [[ "$error_text" == "error: The secondary viewer status probe was rejected with status ${rejected_status}." ]]; then
+                    print -r -- "rejected_${rejected_status}"
+                    return
+                fi
+            done
+            print -r -- 'unrecognized_stderr'
+            ;;
+    esac
+}
 
-    probe_started_at="$(/bin/date +%s)"
+execute_status_probe() {
+    local attempt="$1" probe_status=0 signal_hint='none' classification stderr_bytes
     set +e
     /usr/bin/perl -e '
         my $seconds = shift @ARGV;
@@ -300,11 +334,34 @@ run_and_validate_probe() {
         >"$PROBE_STDOUT" 2>"$PROBE_STDERR"
     probe_status=$?
     set -e
-    probe_finished_at="$(/bin/date +%s)"
-    (( probe_status == 0 )) || fail \
-        "candidate status probe ${attempt} failed or exceeded its deadline"
+    if (( probe_status != 0 )); then
+        # Shell status cannot distinguish an explicit exit 142 from SIGALRM; retain a hint,
+        # not an unsupported timeout claim. Never forward unclassified client stderr.
+        if (( probe_status > 128 && probe_status <= 192 )); then
+            signal_hint="$(( probe_status - 128 ))"
+        fi
+        classification="$(probe_failure_classification)"
+        stderr_bytes="$(/usr/bin/stat -f '%z' -- "$PROBE_STDERR")" || stderr_bytes='unknown'
+        fail "candidate status probe ${attempt} failed shell_status=${probe_status} signal_hint=${signal_hint} classification=${classification} stderr_bytes=${stderr_bytes}"
+    fi
     [[ ! -s "$PROBE_STDOUT" && ! -s "$PROBE_STDERR" ]] || fail \
         "candidate status probe ${attempt} wrote unexpected console output"
+}
+
+run_and_validate_probe() {
+    local attempt="$1" probe_started_at probe_finished_at
+    local status_identity status_kind status_owner status_mode status_device status_inode
+    local status_links status_size status_birth status_modified canonical_status last_status_byte
+    local status_identity_after work_directory_after manager_generation request_nonce
+    STATUS_OUTPUT="${WORK_DIRECTORY}/status-${attempt}.json"
+    PROBE_STDOUT="${WORK_DIRECTORY}/probe-${attempt}.stdout"
+    PROBE_STDERR="${WORK_DIRECTORY}/probe-${attempt}.stderr"
+    [[ ! -e "$STATUS_OUTPUT" && ! -L "$STATUS_OUTPUT" ]] || fail \
+        "fresh status output path collided before probe ${attempt}"
+
+    probe_started_at="$(/bin/date +%s)"
+    execute_status_probe "$attempt"
+    probe_finished_at="$(/bin/date +%s)"
     require_probe_fences_unchanged
 
     status_identity="$(metadata "$STATUS_OUTPUT")" || fail \

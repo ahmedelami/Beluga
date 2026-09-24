@@ -1525,6 +1525,16 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
                 terminalPrefix + "Starting screen video capture\n",
                 1
             ),
+            (
+                "primary-rendezvous-after-terminal",
+                terminalPrefix + "A fresh encrypted media rendezvous is ready for the paired iPhone\n",
+                1
+            ),
+            (
+                "primary-left-availability-after-terminal",
+                terminalPrefix + "The paired iPhone left the availability exchange\n",
+                1
+            ),
         ]
 
         let fileManager = FileManager.default
