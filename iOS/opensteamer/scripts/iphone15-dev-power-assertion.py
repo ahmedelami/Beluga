@@ -343,6 +343,7 @@ async def _run(args: argparse.Namespace) -> int:
     last_lease_expires_at: int | None = None
     tunnel = tunnel_type(serial=args.udid)
     service: Any | None = None
+    renewal_service: Any | None = None
     run_error: BaseException | None = None
     service_closed = False
     tunnel_closed = False
@@ -352,15 +353,33 @@ async def _run(args: argparse.Namespace) -> int:
         )
         if rsd.udid != args.udid:
             raise RuntimeError("wrong_device")
-        service = power_assertion_type(rsd)
-        await asyncio.wait_for(
-            service.connect(), timeout=SERVICE_CONNECT_TIMEOUT_SECONDS
-        )
         while not stop_requested.is_set():
             if os.getppid() != args.owner_pid or args.stop_file.exists():
                 break
-            await _acquire_bounded_assertion(service)
-            last_lease_expires_at = int(time.time()) + LEASE_SECONDS
+            # The assertion agent consumes one command per connection. Acquire the replacement
+            # before closing the prior service so renewal never intentionally drops the lease.
+            renewal_service = power_assertion_type(rsd)
+            await asyncio.wait_for(
+                renewal_service.connect(), timeout=SERVICE_CONNECT_TIMEOUT_SECONDS
+            )
+            if (
+                stop_requested.is_set()
+                or os.getppid() != args.owner_pid
+                or args.stop_file.exists()
+            ):
+                break
+            try:
+                await _acquire_bounded_assertion(renewal_service)
+            finally:
+                # A lost reply can still mean the phone accepted the command. Bound its possible
+                # residual from completion/cancellation, not just the last acknowledged lease.
+                last_lease_expires_at = int(time.time()) + LEASE_SECONDS
+            if service is not None:
+                await asyncio.wait_for(
+                    service.close(), timeout=SERVICE_CLOSE_TIMEOUT_SECONDS
+                )
+            service = renewal_service
+            renewal_service = None
             renewal_deadline = time.monotonic() + RENEW_AFTER_SECONDS
             while time.monotonic() < renewal_deadline:
                 if (
@@ -391,13 +410,16 @@ async def _run(args: argparse.Namespace) -> int:
     except BaseException as error:
         run_error = error
     finally:
-        if service is not None:
+        service_closed = True
+        for owned_service in (renewal_service, service):
+            if owned_service is None:
+                continue
             try:
                 await asyncio.wait_for(
-                    service.close(), timeout=SERVICE_CLOSE_TIMEOUT_SECONDS
+                    owned_service.close(), timeout=SERVICE_CLOSE_TIMEOUT_SECONDS
                 )
-                service_closed = True
             except BaseException as error:
+                service_closed = False
                 run_error = run_error or error
         try:
             await asyncio.wait_for(

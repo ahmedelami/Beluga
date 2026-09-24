@@ -225,17 +225,23 @@ Keychain account: inspect fresh before/after screenshots, make at most one compl
 phone unlocked, send `exit` to the credential-holding controller, and only then run
 `ack-iphone15-dev-screen-visual-oracle-unlock.sh`. The acknowledgement contains no credential and is
 only a wake signal; the runner independently rechecks the exact CoreDevice identity, hardware UDID,
-and unlocked state and has no manual-success or skip switch. During the live step a separate
+and unlocked state and has no manual-success or skip switch. Offline acknowledgement tests execute
+the actual helper serializer and runner validator together, including exact keys, identity, digest,
+request mutation, and observation-age rejection; matching source strings are not a handoff proof.
+During the live step a separate
 credential-free exact-UDID `PreventUserIdleSystemSleep` lease emits a private heartbeat. Its Python
 runtime is launched with `-I -S -B` and an empty environment, before any virtualenv `site` or `.pth`
 startup hook can execute. It pins the exact interpreter and a deterministic digest of every
 non-cache file in the complete third-party runtime, rejects symlinked runtime paths, installs a
 source/native-extension-only loader so excluded bytecode cannot execute, and re-hashes after import.
-It then uses an existing-pairing-only native tunnel path that never issues a pairing command. Tunnel,
-service, and lease acquisition are bounded. The runner supervises the background `xcodebuild`
+It then uses an existing-pairing-only native tunnel path that never issues a pairing command. Each
+renewal acquires a replacement lease on a fresh assertion-service connection before closing the old
+connection: the physical device resets a second create command on a reused connection. Behavioral
+tests must model that one-command connection and exercise multiple renewals and failure cleanup.
+Tunnel, service, and lease acquisition are bounded. The runner supervises the background `xcodebuild`
 process against that heartbeat and terminates/reaps it before trap cleanup if the lease fails. The
 lease stays owned through nonce-bound device secret cleanup (including trap cleanup), explicitly
-closes its service and tunnel only after cleanup proof, and the runner waits out the final device
+closes its remaining service and tunnel after cleanup proof, and the runner waits out the final device
 lease's at-most-45-second residual because the assertion protocol has no release acknowledgement.
 Thus the unlock controller itself is never retained as a keepalive. The runner
 mints a one-use secondary invitation only after rechecking the installed `.dev` build, host
