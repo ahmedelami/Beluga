@@ -121,6 +121,8 @@ module OpenSteamerV90Cutover
     ROUTE_MONITOR_RESULT = "RESULT notifications=0 teardown=clean input=BlackHole2ch_UID output=BuiltInSpeakerDevice system=BuiltInSpeakerDevice"
     LAUNCHER_ATTESTATION = "opensteamer-v90-pinned-launcher-v1"
     DYNAMIC_CODESIGN_VERIFY_ARGUMENTS = ["--verify"].freeze
+    READINESS_SOURCE_MODE = 0o755
+    READINESS_STAGED_MODE = 0o500
 
     V89_POINTER = "#{RUNTIME_ROOT}/active-paired-host-update-v89"
     V89_POINTER_SHA256 = "5c2c7b0d60de0682d208e399a68ffd81cf46cdfd3a10d1774f7f39d8eb550111"
@@ -2397,13 +2399,19 @@ module OpenSteamerV90Cutover
 
     def stage_post_stop_evidence!(capsule)
       readiness_source = File.join(capsule.root, "source/macOS/scripts/verify-v90-secondary-viewer-readiness.sh")
-      Util.regular_file!(readiness_source, "V90 readiness observer", mode: 0o500, owner: Process.euid, links: 1)
+      Util.regular_file!(
+        readiness_source,
+        "V90 readiness observer",
+        mode: Pins::READINESS_SOURCE_MODE,
+        owner: Process.euid,
+        links: 1
+      )
       @post_stop_readiness_sha = Util.sha256(readiness_source)
       @post_stop_readiness = File.join(@transaction, "verify-v90-secondary-viewer-readiness.sh")
       write_durable(
         @post_stop_readiness,
         File.binread(readiness_source),
-        0o500,
+        Pins::READINESS_STAGED_MODE,
         exclusive: true
       ) { |identity| @post_stop_readiness_identity = identity }
 
@@ -2449,7 +2457,7 @@ module OpenSteamerV90Cutover
         readiness_source,
         @post_stop_readiness_sha,
         "capsule V90 readiness observer",
-        mode: 0o500,
+        mode: Pins::READINESS_SOURCE_MODE,
         owner: Process.euid
       )
       assert_identity!(@post_stop_readiness, @post_stop_readiness_identity, "staged V90 readiness observer")
@@ -2457,7 +2465,7 @@ module OpenSteamerV90Cutover
         @post_stop_readiness,
         @post_stop_readiness_sha,
         "staged V90 readiness observer",
-        mode: 0o500,
+        mode: Pins::READINESS_STAGED_MODE,
         owner: Process.euid
       )
       copy_sha = capsule.payload.fetch("candidateAppCopyManifestSHA256")
@@ -4008,6 +4016,9 @@ module OpenSteamerV90Cutover
       end
       assert("dynamic codesign verification uses the supported PID contract") do
         Pins::DYNAMIC_CODESIGN_VERIFY_ARGUMENTS == ["--verify"]
+      end
+      assert("readiness observer preserves executable source and owner-only staged modes") do
+        Pins::READINESS_SOURCE_MODE == 0o755 && Pins::READINESS_STAGED_MODE == 0o500
       end
 
       capsule = FakeCapsule.new

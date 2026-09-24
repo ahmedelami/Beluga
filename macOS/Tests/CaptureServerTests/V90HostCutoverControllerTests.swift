@@ -80,6 +80,40 @@ final class V90HostCutoverControllerTests: XCTestCase {
         XCTAssertEqual(selfTest.stderr, "")
     }
 
+    func testReadinessObserverPreservesCapsuleAndPrivateStagingModes() throws {
+        let source = try String(contentsOf: controller, encoding: .utf8)
+        XCTAssertTrue(source.contains("READINESS_SOURCE_MODE = 0o755"))
+        XCTAssertTrue(source.contains("READINESS_STAGED_MODE = 0o500"))
+
+        let stageStart = try XCTUnwrap(
+            source.range(of: "    def stage_post_stop_evidence!(capsule)")
+        )
+        let stageEnd = try XCTUnwrap(
+            source.range(
+                of: "      @post_stop_copy_manifest =",
+                range: stageStart.upperBound..<source.endIndex
+            )
+        )
+        let stageContract = String(source[stageStart.lowerBound..<stageEnd.lowerBound])
+        XCTAssertTrue(stageContract.contains("mode: Pins::READINESS_SOURCE_MODE"))
+        XCTAssertTrue(stageContract.contains("Pins::READINESS_STAGED_MODE"))
+        XCTAssertFalse(stageContract.contains("0o500"))
+
+        let verifyStart = try XCTUnwrap(
+            source.range(of: "    def verify_post_stop_evidence!(capsule)")
+        )
+        let verifyEnd = try XCTUnwrap(
+            source.range(
+                of: "      copy_sha =",
+                range: verifyStart.upperBound..<source.endIndex
+            )
+        )
+        let verifyContract = String(source[verifyStart.lowerBound..<verifyEnd.lowerBound])
+        XCTAssertTrue(verifyContract.contains("mode: Pins::READINESS_SOURCE_MODE"))
+        XCTAssertTrue(verifyContract.contains("mode: Pins::READINESS_STAGED_MODE"))
+        XCTAssertFalse(verifyContract.contains("mode: 0o500"))
+    }
+
     func testStickyCoreAudioMonitorTypechecksWithoutExecution() throws {
         let swiftc = URL(fileURLWithPath:
             "/Volumes/t7/opensteamer-space-recovery-20260804/nonrepo/Xcode-26.6.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
