@@ -433,13 +433,12 @@ struct WorldwideSecondaryTestViewerHostIdentity: Equatable, Sendable {
 
     /// Opens the record without following a symlink and binds the bytes to the inspected inode.
     static func load(from url: URL) throws -> Self {
-        let path = url.standardizedFileURL.path
-        guard url.isFileURL, path == url.path else {
+        let path = url.path
+        guard url.isFileURL, WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(path) else {
             throw WorldwideSecondaryTestViewerControlProtocolError.invalidRequest
         }
         let directory = url.deletingLastPathComponent()
-        guard directory.resolvingSymlinksInPath().standardizedFileURL.path ==
-                directory.standardizedFileURL.path else {
+        guard WorldwideSecondaryTestViewerControlPath.isCanonicalDirectory(directory.path) else {
             throw WorldwideSecondaryTestViewerControlProtocolError.invalidRequest
         }
         do {
@@ -1035,14 +1034,7 @@ final class WorldwideSecondaryTestViewerControlServer: @unchecked Sendable {
     static let maximumActiveClients = 8
 
     static func defaultSocketPath() throws -> String {
-        let path = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent(
-                "opensteamer-wv-\(geteuid())",
-                isDirectory: true
-            )
-            .appendingPathComponent("control.sock")
-            .standardizedFileURL
-            .path
+        let path = "/private/tmp/opensteamer-wv-\(geteuid())/control.sock"
         _ = try MediaBridgeSocket.address(path)
         return path
     }
@@ -1217,10 +1209,10 @@ final class WorldwideSecondaryTestViewerControlServer: @unchecked Sendable {
         descriptor: Int32,
         identity: (device: dev_t, inode: ino_t)
     ) {
-        let socketURL = URL(fileURLWithPath: path).standardizedFileURL
-        guard socketURL.isFileURL, socketURL.path == path else {
+        guard WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(path) else {
             throw WorldwideSecondaryTestViewerControlProtocolError.unsafeSocketPath
         }
+        let socketURL = URL(fileURLWithPath: path)
         let directory = socketURL.deletingLastPathComponent()
         if !FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.createDirectory(
@@ -1229,8 +1221,7 @@ final class WorldwideSecondaryTestViewerControlServer: @unchecked Sendable {
                 attributes: [.posixPermissions: 0o700]
             )
         }
-        guard directory.resolvingSymlinksInPath().standardizedFileURL.path ==
-                directory.standardizedFileURL.path else {
+        guard WorldwideSecondaryTestViewerControlPath.isCanonicalDirectory(directory.path) else {
             throw WorldwideSecondaryTestViewerControlProtocolError.unsafeSocketPath
         }
         _ = try MediaBridgeSocket.address(path)

@@ -617,7 +617,8 @@ final class WorldwideSecondaryTestViewerControlServerTests: XCTestCase {
 
     func testClientWritesInvitationToFreshOwnerOnlyFileWithoutOverwrite()
         async throws {
-        let directory = try makePrivateDirectory()
+        // Keep the real /private spelling through creation, receipt load, and exact stop.
+        let directory = try makePrivateDirectory(usePrivateTemporaryRoot: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("control.sock").path
         let lockURL = directory.appendingPathComponent("worldwide-host.lock")
@@ -2248,7 +2249,12 @@ final class WorldwideSecondaryTestViewerControlServerTests: XCTestCase {
         )
     }
 
-    private func makePrivateDirectory() throws -> URL {
+    private func makePrivateDirectory(usePrivateTemporaryRoot: Bool = false) throws -> URL {
+        if usePrivateTemporaryRoot {
+            var template = Array("/private/tmp/v90-control-fixture.XXXXXX".utf8CString)
+            let created = try XCTUnwrap(mkdtemp(&template))
+            return URL(fileURLWithPath: String(cString: created), isDirectory: true)
+        }
         let directory = FileManager.default.temporaryDirectory
             .resolvingSymlinksInPath()
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

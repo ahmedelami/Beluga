@@ -108,12 +108,12 @@ struct WorldwideSecondaryTestViewerControlClientMode: Equatable {
             index += 1
         }
         guard let requestedPath,
-              Self.isCanonicalAbsolutePath(requestedPath) else {
+              WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(requestedPath) else {
             throw WorldwideSecondaryTestViewerControlClientError.invalidArguments
         }
         let resolvedSocketPath = try socketPath ??
             WorldwideSecondaryTestViewerControlServer.defaultSocketPath()
-        guard Self.isCanonicalAbsolutePath(resolvedSocketPath) else {
+        guard WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(resolvedSocketPath) else {
             throw WorldwideSecondaryTestViewerControlClientError.invalidArguments
         }
         let requestedURL = URL(fileURLWithPath: requestedPath)
@@ -122,7 +122,7 @@ struct WorldwideSecondaryTestViewerControlClientMode: Equatable {
             action = .probe(outputURL: requestedURL)
         } else if requestsInvitation {
             let receiptPath = requestedPath + ".receipt"
-            guard Self.isCanonicalAbsolutePath(receiptPath),
+            guard WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(receiptPath),
                   receiptPath != requestedPath else {
                 throw WorldwideSecondaryTestViewerControlClientError.invalidArguments
             }
@@ -163,10 +163,6 @@ struct WorldwideSecondaryTestViewerControlClientMode: Equatable {
         }
     }
 
-    private static func isCanonicalAbsolutePath(_ path: String) -> Bool {
-        path.hasPrefix("/") &&
-            URL(fileURLWithPath: path).standardizedFileURL.path == path
-    }
 }
 
 /// Nonsecret, nonce-bound status record emitted by the client-only probe mode.
@@ -369,7 +365,8 @@ struct WorldwideSecondaryTestViewerControlClient: Sendable {
         let resolvedReceiptURL = receiptURL ?? URL(
             fileURLWithPath: outputURL.path + ".receipt"
         )
-        guard resolvedReceiptURL.standardizedFileURL.path == resolvedReceiptURL.path,
+        guard resolvedReceiptURL.isFileURL,
+              WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(resolvedReceiptURL.path),
               resolvedReceiptURL.path != outputURL.path else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
@@ -620,7 +617,8 @@ struct WorldwideSecondaryTestViewerControlClient: Sendable {
         request: WorldwideSecondaryTestViewerControlRequest
     ) throws -> WorldwideSecondaryTestViewerControlResponse {
         var before = stat()
-        guard lstat(socketPath, &before) == 0,
+        guard WorldwideSecondaryTestViewerControlPath.hasCanonicalParent(socketPath),
+              lstat(socketPath, &before) == 0,
               before.st_mode & S_IFMT == S_IFSOCK,
               before.st_uid == geteuid(),
               before.st_mode & 0o777 == 0o600 else {
@@ -647,7 +645,8 @@ struct WorldwideSecondaryTestViewerControlClient: Sendable {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeEndpoint
         }
         var after = stat()
-        guard lstat(socketPath, &after) == 0,
+        guard WorldwideSecondaryTestViewerControlPath.hasCanonicalParent(socketPath),
+              lstat(socketPath, &after) == 0,
               after.st_dev == before.st_dev,
               after.st_ino == before.st_ino,
               after.st_mode & S_IFMT == S_IFSOCK,
@@ -771,9 +770,7 @@ struct WorldwideSecondaryTestViewerPersistedGenerationReceipt: Codable, Equatabl
     private var isValid: Bool {
         v == Self.version &&
             type == Self.messageType &&
-            invitationOutputPath.hasPrefix("/") &&
-            URL(fileURLWithPath: invitationOutputPath).standardizedFileURL.path ==
-                invitationOutputPath &&
+            WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(invitationOutputPath) &&
             receipt.isValid
     }
 }
@@ -988,8 +985,7 @@ enum WorldwideSecondaryTestViewerStatusFile {
 
     static func reserve(at outputURL: URL) throws -> Reservation {
         guard outputURL.isFileURL,
-              outputURL.path.hasPrefix("/"),
-              outputURL.standardizedFileURL.path == outputURL.path else {
+              WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(outputURL.path) else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
         let directoryURL = outputURL.deletingLastPathComponent()
@@ -997,8 +993,7 @@ enum WorldwideSecondaryTestViewerStatusFile {
         guard !outputName.isEmpty,
               outputName != ".",
               outputName != "..",
-              directoryURL.resolvingSymlinksInPath().standardizedFileURL.path ==
-                directoryURL.standardizedFileURL.path else {
+              WorldwideSecondaryTestViewerControlPath.isCanonicalDirectory(directoryURL.path) else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
         let directory = open(
@@ -1327,8 +1322,7 @@ enum WorldwideSecondaryTestViewerInvitationFile {
         afterOutputOpenForTesting: (() throws -> Void)? = nil
     ) throws -> Reservation {
         guard outputURL.isFileURL,
-              outputURL.path.hasPrefix("/"),
-              outputURL.standardizedFileURL.path == outputURL.path else {
+              WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(outputURL.path) else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
         let directoryURL = outputURL.deletingLastPathComponent()
@@ -1336,8 +1330,7 @@ enum WorldwideSecondaryTestViewerInvitationFile {
         guard !fileName.isEmpty,
               fileName != ".",
               fileName != "..",
-              directoryURL.resolvingSymlinksInPath().standardizedFileURL.path ==
-                directoryURL.standardizedFileURL.path else {
+              WorldwideSecondaryTestViewerControlPath.isCanonicalDirectory(directoryURL.path) else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
         let directory = open(
@@ -1544,8 +1537,7 @@ enum WorldwideSecondaryTestViewerGenerationReceiptFile {
 
     static func load(from receiptURL: URL) throws -> Loaded {
         guard receiptURL.isFileURL,
-              receiptURL.path.hasPrefix("/"),
-              receiptURL.standardizedFileURL.path == receiptURL.path else {
+              WorldwideSecondaryTestViewerControlPath.isLexicallyAbsolute(receiptURL.path) else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
         let directoryURL = receiptURL.deletingLastPathComponent()
@@ -1553,8 +1545,7 @@ enum WorldwideSecondaryTestViewerGenerationReceiptFile {
         guard !fileName.isEmpty,
               fileName != ".",
               fileName != "..",
-              directoryURL.resolvingSymlinksInPath().standardizedFileURL.path ==
-                directoryURL.standardizedFileURL.path else {
+              WorldwideSecondaryTestViewerControlPath.isCanonicalDirectory(directoryURL.path) else {
             throw WorldwideSecondaryTestViewerControlClientError.unsafeOutput
         }
         let directory = open(

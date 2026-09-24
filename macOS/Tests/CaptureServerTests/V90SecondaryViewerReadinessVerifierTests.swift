@@ -129,6 +129,69 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
         }
     }
 
+    func testRealClientObservesIdleEndpointWithProductionLocaleAndTemporaryRoot() async throws {
+        try await withFixture { fixture in
+            let result = try runVerifier(
+                fixture: fixture,
+                temporaryDirectory: "/private/tmp",
+                extraEnvironment: [
+                    "LC_ALL": "C",
+                    "USER": NSUserName(),
+                    "LOGNAME": NSUserName(),
+                ]
+            )
+
+            XCTAssertEqual(result.status, 0, result.stderr)
+            XCTAssertTrue(result.stdout.hasPrefix("V90_SECONDARY_VIEWER_ENDPOINT_IDLE_OK "), result.stdout)
+            XCTAssertEqual(result.stderr, "")
+        }
+    }
+
+    func testRealClientObservesExistingPrivateTemporarySocketAndRejectsAncestorAlias() async throws {
+        try await withFixture(usePrivateTemporaryRoot: true) { fixture in
+            XCTAssertTrue(fixture.socketPath.hasPrefix("/private/tmp/"))
+            var socketMetadata = stat()
+            XCTAssertEqual(lstat(fixture.socketPath, &socketMetadata), 0)
+            XCTAssertEqual(socketMetadata.st_mode & S_IFMT, S_IFSOCK)
+            let result = try runVerifier(
+                fixture: fixture,
+                temporaryDirectory: "/private/tmp",
+                extraEnvironment: ["LC_ALL": "C", "USER": NSUserName(), "LOGNAME": NSUserName()]
+            )
+            XCTAssertEqual(result.status, 0, result.stderr)
+            XCTAssertTrue(result.stdout.hasPrefix("V90_SECONDARY_VIEWER_ENDPOINT_IDLE_OK "), result.stdout)
+            XCTAssertEqual(result.stderr, "")
+
+            let alias = fixture.root.appendingPathComponent("alias")
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.root)
+            XCTAssertThrowsError(try WorldwideSecondaryTestViewerControlClient().probeStatus(
+                socketPath: alias.appendingPathComponent("control/control.sock").path,
+                hostIdentity: WorldwideSecondaryTestViewerHostIdentity(
+                    processIdentifier: getpid(), generation: hostGeneration
+                )
+            )) { error in
+                XCTAssertEqual(error as? WorldwideSecondaryTestViewerControlClientError, .unsafeEndpoint)
+            }
+        }
+    }
+
+    func testVerifierDefaultSocketExpansionMatchesClientDefault() async throws {
+        let declaration = try XCTUnwrap(verifierSource.split(separator: "\n").first {
+            $0.hasPrefix("readonly CONTROL_SOCKET=")
+        })
+        try await withFixture { fixture in
+            let result = try runProcess(
+                executable: URL(fileURLWithPath: "/bin/zsh"),
+                arguments: ["-f", "-c", String(declaration) + "\nprint -r -- \"$CONTROL_SOCKET\""],
+                fixture: fixture
+            )
+
+            XCTAssertEqual(result.status, 0, result.stderr)
+            XCTAssertEqual(result.stdout, try WorldwideSecondaryTestViewerControlServer.defaultSocketPath() + "\n")
+            XCTAssertEqual(result.stderr, "")
+        }
+    }
+
     func testVerifierClassifiesRealClientGenerationMismatchAndCleansOutput() async throws {
         try await withFixture(handlerGeneration: String(repeating: "b", count: 64)) { fixture in
             let result = try runVerifier(fixture: fixture)
@@ -329,14 +392,22 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
 
     private func withFixture(
         handlerGeneration: String? = nil,
+        usePrivateTemporaryRoot: Bool = false,
         _ body: (Fixture) async throws -> Void
     ) async throws {
-        let root = repositoryRoot
-            .appendingPathComponent(".build", isDirectory: true)
-            .appendingPathComponent(
-                "v90-\(UUID().uuidString.prefix(8))",
-                isDirectory: true
+        let root: URL
+        if usePrivateTemporaryRoot {
+            var template = Array("/private/tmp/v90-readiness-fixture.XXXXXX".utf8CString)
+            let created = try XCTUnwrap(mkdtemp(&template))
+            root = URL(fileURLWithPath: String(cString: created), isDirectory: true)
+        } else {
+            root = repositoryRoot.appendingPathComponent(".build", isDirectory: true)
+                .appendingPathComponent("v90-\(UUID().uuidString.prefix(8))", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: root, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
             )
+        }
         let home = root.appendingPathComponent("home", isDirectory: true)
         let scratch = root.appendingPathComponent("scratch", isDirectory: true)
         let hostDirectory = home.appendingPathComponent(
@@ -344,11 +415,6 @@ final class V90SecondaryViewerReadinessVerifierTests: XCTestCase {
             isDirectory: true
         )
         let socketDirectory = root.appendingPathComponent("control", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: root,
-            withIntermediateDirectories: false,
-            attributes: [.posixPermissions: 0o700]
-        )
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(
             at: hostDirectory,

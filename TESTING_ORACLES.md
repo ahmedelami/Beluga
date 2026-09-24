@@ -179,6 +179,15 @@ Readiness failures retain the client exit status, a possible signal number, and 
 bounded allowlisted error classification; they must not collapse every rejection
 into a timeout or print arbitrary client output. The exact sealed client can be
 exercised against an isolated local control-server fixture before another cutover.
+That fixture must bind a real socket inside a fresh private directory under
+`/private/tmp`, not merely put its output there. Foundation's `standardizedFileURL`
+can rewrite an existing `/private/tmp/...` path to `/tmp/...` while leaving the
+same nonexistent path unchanged. Path syntax validation must not depend on whether
+the socket, invitation, or cleanup receipt already exists. Preserve the separate
+owner/mode, no-follow, descriptor, inode, and parent-symlink checks; accepting a
+valid spelling is not permission to trust the object at that path. Require the
+exact signed candidate to pass this isolated socket fixture before switching the
+installed host, so this class of client-side rejection is caught offline.
 
 After a terminal `COMMITTED_V90` host result and fresh sealed-host readback, run
 `validate-iphone15-dev-screen-visual-oracle.sh` on the paired iPhone 15. That pass is development
