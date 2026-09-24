@@ -1316,20 +1316,27 @@ module OpenSteamerV90Cutover
       end
 
       @token = SecureRandom.uuid
-      @staged_app = "/Applications/.opensteamer-paired-v90-install-#{@token}.app"
+      @staged_root = "/Applications/.opensteamer-paired-v90-install-#{@token}"
+      @staged_app = File.join(@staged_root, File.basename(Pins::LIVE_APP))
       @backup_app = "/Applications/.opensteamer-paired-v90-rollback-#{@token}.app"
       @failed_app = "/Applications/.opensteamer-paired-v90-failed-#{@token}.app"
       launch_parent = File.dirname(Pins::LAUNCH_AGENT)
       @staged_plist = File.join(launch_parent, ".org.example.opensteamer.worldwide.v90-install-#{@token}.plist")
       @backup_plist = File.join(launch_parent, ".org.example.opensteamer.worldwide.v86-rollback-#{@token}.plist")
       @failed_plist = File.join(launch_parent, ".org.example.opensteamer.worldwide.v90-failed-#{@token}.plist")
-      [@staged_app, @backup_app, @failed_app, @staged_plist, @backup_plist, @failed_plist].each do |path|
+      verify_staged_install_layout!
+      [@staged_root, @staged_app, @backup_app, @failed_app, @staged_plist, @backup_plist, @failed_plist].each do |path|
         Util.fail!("transaction staging name already exists") if File.exist?(path) || File.symlink?(path)
       end
       create_owned_directory!(
+        @staged_root,
+        0o700,
+        "Applications directory after staged-root creation"
+      ) { |identity| @staged_root_identity = identity }
+      create_owned_directory!(
         @staged_app,
         0o755,
-        "Applications directory after staged-app creation"
+        "staged root after staged-app creation"
       ) { |identity| @staged_app_identity = identity }
       Dir.children(capsule.paths.fetch(:candidate)).each do |name|
         FileUtils.cp_r(File.join(capsule.paths.fetch(:candidate), name), @staged_app, preserve: true)
@@ -1436,7 +1443,9 @@ module OpenSteamerV90Cutover
 
     def publish_candidate!
       Util.fail!("V86 app/plist are not held") unless File.exist?(@backup_app) && File.exist?(@backup_plist)
+      verify_staged_install_hold!
       exclusive_rename(@staged_app, Pins::LIVE_APP)
+      remove_staged_root_if_owned!
       exclusive_rename(@staged_plist, Pins::LAUNCH_AGENT)
       @candidate_installed = true
       route_monitor_clean!
@@ -1570,6 +1579,7 @@ module OpenSteamerV90Cutover
       attempt_cleanup(errors, "staged app") do
         remove_tree_exact!(@staged_app, @staged_app_identity) if @staged_app_identity && path_present?(@staged_app)
       end
+      attempt_cleanup(errors, "staged root") { remove_staged_root_if_owned! }
       attempt_cleanup(errors, "staged plist") do
         unlink_exact!(@staged_plist, @staged_plist_identity) if @staged_plist_identity && path_present?(@staged_plist)
       end
@@ -1640,6 +1650,9 @@ module OpenSteamerV90Cutover
           strict_lock_record == { pid: @rollback_pid, nonce: @rollback_nonce }
         sleep 1
       end
+      # The private install-hold root is auxiliary cleanup. Restore and prove V86 first so a
+      # filesystem error removing this now-empty directory can never strand the host offline.
+      remove_staged_root_if_owned!
       remove_provisional_active_pointer!
       remove_pending_pointer_if_owned!
       remove_lock_if_owned!
@@ -1978,7 +1991,8 @@ module OpenSteamerV90Cutover
 
     def remove_tree_exact!(path, identity)
       allowed = if path == @staged_app
-                  File.dirname(Pins::LIVE_APP)
+                  verify_staged_install_layout!
+                  @staged_root
                 elsif path == @transaction
                   Pins::V90_UPDATE_ROOT
                 end
@@ -1989,6 +2003,51 @@ module OpenSteamerV90Cutover
       remove_tree_contents!(path, root.dev)
       Dir.rmdir(path)
       strict_fsync_directory!(File.dirname(path), "recursive cleanup parent")
+      true
+    end
+
+    def verify_staged_install_layout!
+      Util.fail!("V90 staging token is malformed") unless
+        @token&.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/)
+      expected_root = "/Applications/.opensteamer-paired-v90-install-#{@token}"
+      expected_app = File.join(expected_root, File.basename(Pins::LIVE_APP))
+      Util.fail!("V90 staged root escaped the exact install-hold namespace") unless
+        @staged_root == expected_root && File.dirname(@staged_root) == File.dirname(Pins::LIVE_APP)
+      Util.fail!("V90 staged app lacks the production bundle basename") unless
+        @staged_app == expected_app && File.basename(@staged_app) == File.basename(Pins::LIVE_APP)
+      true
+    end
+
+    def verify_staged_install_hold!
+      verify_staged_install_layout!
+      Util.fail!("V90 staged-root identity was not recorded") unless @staged_root_identity
+      Util.fail!("V90 staged-app identity was not recorded") unless @staged_app_identity
+      verify_private_install_hold!(
+        @staged_root,
+        @staged_app,
+        @staged_root_identity,
+        @staged_app_identity
+      )
+    end
+
+    def verify_private_install_hold!(root, app, root_identity, app_identity)
+      Util.directory!(root, "V90 staged root", mode: 0o700, owner: Process.euid)
+      Util.directory!(app, "V90 staged app", mode: 0o755, owner: Process.euid)
+      assert_identity!(root, root_identity, "V90 staged root")
+      assert_identity!(app, app_identity, "V90 staged app")
+      expected_basename = File.basename(Pins::LIVE_APP)
+      Util.fail!("V90 staged app escaped its private root") unless
+        File.dirname(app) == root && File.basename(app) == expected_basename
+      Util.fail!("V90 staged root contains unexpected entries") unless
+        Dir.children(root) == [expected_basename]
+      true
+    end
+
+    def remove_staged_root_if_owned!
+      return true unless @staged_root_identity
+      verify_staged_install_layout!
+      remove_empty_directory_exact!(@staged_root, @staged_root_identity)
+      @staged_root_identity = nil
       true
     end
 
@@ -2581,6 +2640,7 @@ module OpenSteamerV90Cutover
     end
 
     def verify_staged_candidate!(capsule)
+      verify_staged_install_hold!
       staged_executable = File.join(@staged_app, "Contents/MacOS/CaptureServer")
       staged_framework = File.join(@staged_app, "Contents/Frameworks/LiveKitWebRTC.framework/Versions/A/LiveKitWebRTC")
       staged_info = File.join(@staged_app, "Contents/Info.plist")
@@ -2769,9 +2829,12 @@ module OpenSteamerV90Cutover
       Util.fail!("rename source is missing") unless File.exist?(source) || File.symlink?(source)
       Util.fail!("rename destination already exists") if File.exist?(destination) || File.symlink?(destination)
       Util.fail!("rename crosses filesystems") unless File.lstat(source).dev == File.lstat(File.dirname(destination)).dev
+      source_parent = File.dirname(source)
+      destination_parent = File.dirname(destination)
       result = DarwinRename.renamex_np(source, destination, 0x00000004) # RENAME_EXCL
       Util.fail!("exclusive rename failed for #{source}") unless result.zero?
-      strict_fsync_directory!(File.dirname(destination), "exclusive rename parent")
+      strict_fsync_directory!(source_parent, "exclusive rename source parent") if source_parent != destination_parent
+      strict_fsync_directory!(destination_parent, "exclusive rename parent")
     end
 
     def wait_until!(seconds, diagnostic)
@@ -3603,6 +3666,84 @@ module OpenSteamerV90Cutover
       end
     end
 
+    def verify_staged_install_layout_fixture!
+      token = "12345678-1234-4123-8123-123456789abc"
+      root = "/Applications/.opensteamer-paired-v90-install-#{token}"
+      app = File.join(root, "opensteamer Host.app")
+      build = lambda do |candidate_token: token, candidate_root: root, candidate_app: app|
+        host = RealHost.new
+        host.instance_variable_set(:@token, candidate_token)
+        host.instance_variable_set(:@staged_root, candidate_root)
+        host.instance_variable_set(:@staged_app, candidate_app)
+        host
+      end
+      assert("staged install hold preserves the production bundle basename") do
+        build.call.send(:verify_staged_install_layout!)
+      end
+      expect_failure("staged install hold malformed token") do
+        build.call(candidate_token: "not-a-uuid").send(:verify_staged_install_layout!)
+      end
+      expect_failure("staged install hold escaped root") do
+        build.call(candidate_root: "/private/tmp/.opensteamer-paired-v90-install-#{token}")
+             .send(:verify_staged_install_layout!)
+      end
+      expect_failure("staged install hold wrong bundle basename") do
+        build.call(candidate_app: File.join(root, "hidden.app")).send(:verify_staged_install_layout!)
+      end
+
+      Dir.mktmpdir("v90-install-hold-") do |parent|
+        hold = File.join(parent, "private-hold")
+        staged = File.join(hold, "opensteamer Host.app")
+        Dir.mkdir(hold, 0o700)
+        Dir.mkdir(staged, 0o755)
+        File.chmod(0o700, hold)
+        File.chmod(0o755, staged)
+        host = RealHost.new
+        hold_identity = host.send(:file_identity, hold)
+        staged_identity = host.send(:file_identity, staged)
+        assert("private install hold exact metadata and topology") do
+          host.send(:verify_private_install_hold!, hold, staged, hold_identity, staged_identity)
+        end
+        foreign = File.join(hold, "foreign")
+        File.binwrite(foreign, "unexpected")
+        expect_failure("private install hold rejects foreign child") do
+          host.send(:verify_private_install_hold!, hold, staged, hold_identity, staged_identity)
+        end
+        File.unlink(foreign)
+        File.chmod(0o755, hold)
+        expect_failure("private install hold rejects public root mode") do
+          host.send(:verify_private_install_hold!, hold, staged, hold_identity, staged_identity)
+        end
+      end
+    end
+
+    def verify_cross_parent_rename_fsync_fixture!
+      Dir.mktmpdir("v90-cross-parent-rename-") do |root|
+        source_parent = File.join(root, "source")
+        destination_parent = File.join(root, "destination")
+        Dir.mkdir(source_parent)
+        Dir.mkdir(destination_parent)
+        source = File.join(source_parent, "payload")
+        destination = File.join(destination_parent, "payload")
+        File.binwrite(source, "candidate")
+        host = RealHost.new
+        syncs = []
+        base = host.method(:strict_fsync_directory!)
+        host.define_singleton_method(:strict_fsync_directory!) do |directory, label|
+          base.call(directory, label)
+          syncs << [directory, label]
+          true
+        end
+        host.send(:exclusive_rename, source, destination)
+        assert("cross-parent rename syncs source then destination directory") do
+          syncs == [
+            [source_parent, "exclusive rename source parent"],
+            [destination_parent, "exclusive rename parent"]
+          ]
+        end
+      end
+    end
+
     def configure_topology_fixture!(host, runtime_root)
       update_root = File.join(runtime_root, "updates")
       lock_path = File.join(runtime_root, "lock")
@@ -4188,6 +4329,8 @@ module OpenSteamerV90Cutover
       verify_real_inode_recovery_fixture!
       verify_recursive_fsync_fixture!
       verify_full_durability_barrier_fixture!
+      verify_staged_install_layout_fixture!
+      verify_cross_parent_rename_fsync_fixture!
       verify_transaction_topology_fixture!
       verify_write_durable_mode_fixture!
       verify_creation_signal_gap_fixture!

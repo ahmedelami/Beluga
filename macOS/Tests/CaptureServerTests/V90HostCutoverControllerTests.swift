@@ -114,6 +114,49 @@ final class V90HostCutoverControllerTests: XCTestCase {
         XCTAssertFalse(verifyContract.contains("mode: 0o500"))
     }
 
+    func testStagedCandidateUsesProductionBundleBasenameInsidePrivateInstallHold() throws {
+        let source = try String(contentsOf: controller, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains(
+                "@staged_root = \"/Applications/.opensteamer-paired-v90-install-#{@token}\""
+            )
+        )
+        XCTAssertTrue(
+            source.contains(
+                "@staged_app = File.join(@staged_root, File.basename(Pins::LIVE_APP))"
+            )
+        )
+        XCTAssertTrue(source.contains("File.basename(@staged_app) == File.basename(Pins::LIVE_APP)"))
+        XCTAssertFalse(
+            source.contains(
+                "@staged_app = \"/Applications/.opensteamer-paired-v90-install-#{@token}.app\""
+            )
+        )
+        XCTAssertEqual(
+            source.components(separatedBy: "remove_staged_root_if_owned!").count - 1,
+            4
+        )
+        XCTAssertEqual(
+            source.components(separatedBy: "verify_staged_install_hold!").count - 1,
+            3
+        )
+        XCTAssertTrue(source.contains("Dir.children(root) == [expected_basename]"))
+        XCTAssertTrue(source.contains("exclusive rename source parent"))
+
+        let rollbackStart = try XCTUnwrap(source.range(of: "    def rollback_exact_v86!"))
+        let rollbackEnd = try XCTUnwrap(
+            source.range(of: "    private", range: rollbackStart.upperBound..<source.endIndex)
+        )
+        let rollback = String(source[rollbackStart.lowerBound..<rollbackEnd.lowerBound])
+        let restored = try XCTUnwrap(rollback.range(of: "journal!(\"V86_BOOTSTRAPPED\")"))
+        let proofTail = try XCTUnwrap(rollback.range(of: "        sleep 1\n      end\n"))
+        let cleanup = try XCTUnwrap(rollback.range(of: "remove_staged_root_if_owned!"))
+        let terminal = try XCTUnwrap(rollback.range(of: "journal!(\"ROLLED_BACK_EXACT_V86\")"))
+        XCTAssertLessThan(restored.lowerBound, cleanup.lowerBound)
+        XCTAssertLessThan(proofTail.upperBound, cleanup.lowerBound)
+        XCTAssertLessThan(cleanup.lowerBound, terminal.lowerBound)
+    }
+
     func testStickyCoreAudioMonitorTypechecksWithoutExecution() throws {
         let swiftc = URL(fileURLWithPath:
             "/Volumes/t7/opensteamer-space-recovery-20260804/nonrepo/Xcode-26.6.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
