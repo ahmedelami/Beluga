@@ -64,6 +64,7 @@ module OpenSteamerV90Cutover
     APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT = V86_DESIGNATED_REQUIREMENT
     LIVE_APP = "/Applications/opensteamer Host.app"
     LIVE_EXECUTABLE = "#{LIVE_APP}/Contents/MacOS/CaptureServer"
+    LIVE_FRAMEWORK_IDENTITY_PATH = "#{LIVE_APP}/Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC"
     LIVE_FRAMEWORK = "#{LIVE_APP}/Contents/Frameworks/LiveKitWebRTC.framework/Versions/A/LiveKitWebRTC"
     LIVE_INFO_PLIST = "#{LIVE_APP}/Contents/Info.plist"
     LIVE_V86_IDENTITIES = {
@@ -1010,7 +1011,7 @@ module OpenSteamerV90Cutover
         "executableSHA256" => @payload.fetch("candidateExecutableSHA256"),
         "executableIdentifier" => Pins::EXECUTABLE_IDENTIFIER,
         "executableTeamIdentifier" => Pins::TEAM_ID,
-        "mediaFrameworkExecutablePath" => Pins::LIVE_FRAMEWORK,
+        "mediaFrameworkExecutablePath" => Pins::LIVE_FRAMEWORK_IDENTITY_PATH,
         "mediaFrameworkExecutableSHA256" => @payload.fetch("candidateMediaFrameworkExecutableSHA256"),
         "mediaFrameworkExecutableIdentifier" => Pins::FRAMEWORK_IDENTIFIER,
         "mediaFrameworkExecutableTeamIdentifier" => Pins::TEAM_ID
@@ -3923,6 +3924,12 @@ module OpenSteamerV90Cutover
     end
 
     def run!
+      assert("sealed framework identity preserves the public bundle path") do
+        Pins::LIVE_FRAMEWORK_IDENTITY_PATH ==
+          "/Applications/opensteamer Host.app/Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC" &&
+          Pins::LIVE_FRAMEWORK_IDENTITY_PATH != Pins::LIVE_FRAMEWORK
+      end
+
       capsule = FakeCapsule.new
       host = FakeHost.new
       Coordinator.new(host, capsule).preflight!
