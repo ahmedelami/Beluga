@@ -10,6 +10,8 @@
 		<string>/Applications/opensteamer Host.app/Contents/MacOS/CaptureServer</string>
 		<string>--worldwide</string>
 		<string>--allow-remote-control</string>
+		<string>--virtual-phone-display</string>
+		<string>--secondary-test-viewer</string>
 		<string>--duration</string>
 		<string>0</string>
 		<string>--verbose</string>

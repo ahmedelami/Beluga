@@ -53,6 +53,8 @@ final class MacHostDeploymentContractTests: XCTestCase {
                 "/Applications/opensteamer Host.app/Contents/MacOS/CaptureServer",
                 "--worldwide",
                 "--allow-remote-control",
+                "--virtual-phone-display",
+                "--secondary-test-viewer",
                 "--duration",
                 "0",
                 "--verbose",
@@ -137,6 +139,10 @@ final class MacHostDeploymentContractTests: XCTestCase {
             ("wrong-program", "program = \(executable)", "program = /tmp/CaptureServer"),
             ("wrong-throttle", "minimum runtime = 10", "minimum runtime = 11"),
             ("wrong-log", "stdout path = /var/tmp/opensteamer-worldwide-host.log", "stdout path = /tmp/wrong.log"),
+            ("missing-virtual-display", "        --virtual-phone-display\n", ""),
+            ("missing-secondary-viewer", "        --secondary-test-viewer\n", ""),
+            ("swapped-v90-flags", "        --virtual-phone-display\n        --secondary-test-viewer\n", "        --secondary-test-viewer\n        --virtual-phone-display\n"),
+            ("duplicate-secondary-viewer", "        --secondary-test-viewer\n", "        --secondary-test-viewer\n        --secondary-test-viewer\n"),
             ("extra-argument", "        --verbose\n", "        --with-lan\n        --verbose\n"),
             ("endpoint-override", "OSLogRateLimit => 64", "OSLogRateLimit => 64\n        OPENSTEAMER_RENDEZVOUS_URL => wss://wrong.example"),
             ("unknown-job-env", "XPC_SERVICE_NAME => org.example.opensteamer.worldwide", "XPC_SERVICE_NAME => org.example.opensteamer.worldwide\n        UNREVIEWED_MODE => enabled"),
@@ -210,6 +216,8 @@ final class MacHostDeploymentContractTests: XCTestCase {
                     "/Applications/opensteamer Host.app/Contents/MacOS/CaptureServer",
                     "--worldwide",
                     "--allow-remote-control",
+                    "--virtual-phone-display",
+                    "--secondary-test-viewer",
                     "--duration",
                     0,
                     "--verbose",
@@ -1074,6 +1082,8 @@ final class MacHostDeploymentContractTests: XCTestCase {
                 /Applications/opensteamer Host.app/Contents/MacOS/CaptureServer
                 --worldwide
                 --allow-remote-control
+                --virtual-phone-display
+                --secondary-test-viewer
                 --duration
                 0
                 --verbose

@@ -123,6 +123,8 @@ assert_reviewed_plist() {
 /Applications/opensteamer Host.app/Contents/MacOS/CaptureServer
 --worldwide
 --allow-remote-control
+--virtual-phone-display
+--secondary-test-viewer
 --duration
 0
 --verbose
@@ -131,7 +133,7 @@ wss://audiostreamer-rendezvous.elaminahmed03.workers.dev
 ARGS
 )"
     [[ "$actual_arguments" == "$expected_arguments" ]] || fail \
-        "LaunchAgent ProgramArguments do not equal the reviewed eight-item contract"
+        "LaunchAgent ProgramArguments do not equal the reviewed ten-item contract"
     wss_count="$(print -r -- "$actual_arguments" | /usr/bin/awk '/^wss:\/\// { count += 1 } END { print count + 0 }')"
     [[ "$wss_count" == 1 ]] || fail "LaunchAgent must contain exactly one wss:// URL"
     if print -r -- "$actual_arguments" | /usr/bin/grep -Fxq -- '--reset-worldwide-pairing'; then
@@ -242,6 +244,8 @@ gui/501/org.example.opensteamer.worldwide = {
         /Applications/opensteamer Host.app/Contents/MacOS/CaptureServer
         --worldwide
         --allow-remote-control
+        --virtual-phone-display
+        --secondary-test-viewer
         --duration
         0
         --verbose
@@ -280,7 +284,7 @@ LAUNCHCTL
     parsed_fixture="$(print -r -- "$local_fixture" | parse_launch_snapshot /dev/stdin)" || fail         "real coalition launchctl fixture was rejected"
     [[ "$(print -r -- "$parsed_fixture" | /usr/bin/awk -F '\t' '$1 == "pid" { print $2 }')" == 820 ]] || fail         "nested coalition PID contaminated the top-level parse"
     [[ "$(print -r -- "$parsed_fixture" | /usr/bin/awk -F '\t' '$1 == "program" { print $2 }')" == "$REVIEWED_EXECUTABLE" ]] || fail         "nested coalition program contaminated the top-level parse"
-    [[ "$(print -r -- "$parsed_fixture" | /usr/bin/awk -F '\t' '$1 == "argument" { count += 1 } END { print count + 0 }')" == 8 ]] || fail         "nested coalition arguments contaminated the top-level parse"
+    [[ "$(print -r -- "$parsed_fixture" | /usr/bin/awk -F '\t' '$1 == "argument" { count += 1 } END { print count + 0 }')" == 10 ]] || fail         "nested coalition arguments contaminated the top-level parse"
     duplicate_fixture="$(print -r -- "$local_fixture" | /usr/bin/awk '/^[[:space:]]*resource coalition = \{$/ { print "    pid = 999" } { print }')"
     if print -r -- "$duplicate_fixture" | parse_launch_snapshot /dev/stdin >/dev/null 2>&1; then
         fail "duplicate top-level PID fixture was accepted"
