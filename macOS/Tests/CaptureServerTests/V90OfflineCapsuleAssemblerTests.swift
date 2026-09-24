@@ -166,11 +166,11 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         )
         XCTAssertEqual(
             payloadObject["sourceCommit"],
-            "229eabc22b9990891c5e5b2a5cfa27111f0a6b3e"
+            "92d08a1c434eefef40901333f6d924dc8851a162"
         )
         XCTAssertEqual(
             payloadObject["sourceTree"],
-            "0192ef02be478f094afe1f66b50fe3b14717d0ea"
+            "00ace7a5f69afffdbe7abfdc5c27b1708ab0908c"
         )
         XCTAssertEqual(payloadObject["sourceTreeManifestSHA256"], try sha256(of: sourceManifest))
         XCTAssertEqual(
@@ -843,8 +843,8 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         )
         let text = try String(contentsOf: script, encoding: .utf8)
         for expected in [
-            "229eabc22b9990891c5e5b2a5cfa27111f0a6b3e",
-            "0192ef02be478f094afe1f66b50fe3b14717d0ea",
+            "92d08a1c434eefef40901333f6d924dc8851a162",
+            "00ace7a5f69afffdbe7abfdc5c27b1708ab0908c",
             "fix/ios-metal-watchdog-testflight-83",
             "https://github.com/ahmedelami/opensteamer.git",
             "483C08B6517EBC1CFCCAB1A88BBEE8028750AA13",
@@ -1428,16 +1428,16 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
                   if [[ "$repository" == "${FAKE_TOOLING_ROOT}" ]]; then
                     print -r -- aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   else
-                    print -r -- 229eabc22b9990891c5e5b2a5cfa27111f0a6b3e
+                    print -r -- 92d08a1c434eefef40901333f6d924dc8851a162
                   fi ;;
                 'HEAD^{tree}')
                   if [[ "$repository" == "${FAKE_TOOLING_ROOT}" ]]; then
                     print -r -- bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                   else
-                    print -r -- 0192ef02be478f094afe1f66b50fe3b14717d0ea
+                    print -r -- 00ace7a5f69afffdbe7abfdc5c27b1708ab0908c
                   fi ;;
-                '229eabc22b9990891c5e5b2a5cfa27111f0a6b3e^{tree}')
-                  print -r -- 0192ef02be478f094afe1f66b50fe3b14717d0ea ;;
+                '92d08a1c434eefef40901333f6d924dc8851a162^{tree}')
+                  print -r -- 00ace7a5f69afffdbe7abfdc5c27b1708ab0908c ;;
                 'HEAD:macOS/scripts/assemble-v90-sealed-host-oracle-capsule.sh')
                   print -r -- cccccccccccccccccccccccccccccccccccccccc ;;
                 *) exit 65 ;;

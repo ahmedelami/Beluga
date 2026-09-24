@@ -36,8 +36,8 @@ module OpenSteamerV90Cutover
 
     SOURCE_BRANCH = "fix/ios-metal-watchdog-testflight-83"
     SOURCE_UPSTREAM = "origin/fix/ios-metal-watchdog-testflight-83"
-    SOURCE_COMMIT = "229eabc22b9990891c5e5b2a5cfa27111f0a6b3e"
-    SOURCE_TREE = "0192ef02be478f094afe1f66b50fe3b14717d0ea"
+    SOURCE_COMMIT = "92d08a1c434eefef40901333f6d924dc8851a162"
+    SOURCE_TREE = "00ace7a5f69afffdbe7abfdc5c27b1708ab0908c"
     TOOLING_ROOT = "/Volumes/t7/beluga-ios-metal-watchdog-release-83"
     TOOLING_REMOTE_URL = "https://github.com/ahmedelami/opensteamer.git"
     TOOLING_FILES = {

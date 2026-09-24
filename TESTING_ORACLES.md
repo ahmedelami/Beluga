@@ -119,8 +119,8 @@ secrets remain out of arguments, logs, and the manifests.
 ### V90 sealed build, cutover, and physical promotion sequence
 
 The immutable V90 release source (commit A) is commit
-`229eabc22b9990891c5e5b2a5cfa27111f0a6b3e`, tree
-`0192ef02be478f094afe1f66b50fe3b14717d0ea`. It is exported and built only from a
+`92d08a1c434eefef40901333f6d924dc8851a162`, tree
+`00ace7a5f69afffdbe7abfdc5c27b1708ab0908c`. It is exported and built only from a
 separate clean checkout at that exact identity. The assembler and cutover tooling belong to a
 later reviewed tooling identity (commit B): its local HEAD, upstream, and fresh single-record
 remote branch readback must agree, its running tracked blobs must equal commit B, and commit A

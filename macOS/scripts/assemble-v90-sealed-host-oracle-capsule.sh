@@ -11,8 +11,8 @@ unset TMPDIR
 
 readonly EXPECTED_SOURCE_BRANCH='fix/ios-metal-watchdog-testflight-83'
 readonly EXPECTED_SOURCE_UPSTREAM='origin/fix/ios-metal-watchdog-testflight-83'
-readonly EXPECTED_SOURCE_COMMIT='229eabc22b9990891c5e5b2a5cfa27111f0a6b3e'
-readonly EXPECTED_SOURCE_TREE='0192ef02be478f094afe1f66b50fe3b14717d0ea'
+readonly EXPECTED_SOURCE_COMMIT='92d08a1c434eefef40901333f6d924dc8851a162'
+readonly EXPECTED_SOURCE_TREE='00ace7a5f69afffdbe7abfdc5c27b1708ab0908c'
 readonly EXPECTED_TOOLING_REMOTE_URL='https://github.com/ahmedelami/opensteamer.git'
 readonly ASSEMBLER_RELATIVE_PATH='macOS/scripts/assemble-v90-sealed-host-oracle-capsule.sh'
 readonly EXPECTED_DEVELOPER_DIR='/Volumes/t7/opensteamer-space-recovery-20260804/nonrepo/Xcode-26.6.0.app/Contents/Developer'

@@ -173,8 +173,8 @@ final class V90HostCutoverControllerTests: XCTestCase {
 
     func testSourcePinsExactV90AndTenArgumentLaunchContract() throws {
         let source = try String(contentsOf: controller, encoding: .utf8)
-        XCTAssertTrue(source.contains("229eabc22b9990891c5e5b2a5cfa27111f0a6b3e"))
-        XCTAssertTrue(source.contains("0192ef02be478f094afe1f66b50fe3b14717d0ea"))
+        XCTAssertTrue(source.contains("92d08a1c434eefef40901333f6d924dc8851a162"))
+        XCTAssertTrue(source.contains("00ace7a5f69afffdbe7abfdc5c27b1708ab0908c"))
         XCTAssertTrue(source.contains("--virtual-phone-display"))
         XCTAssertTrue(source.contains("--secondary-test-viewer"))
         XCTAssertTrue(source.contains("STOP_INTENT"))
