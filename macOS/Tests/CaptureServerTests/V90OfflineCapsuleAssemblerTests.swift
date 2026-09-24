@@ -40,6 +40,11 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         case candidateOutputBSDFlag
     }
 
+    private enum BuilderOutputFault {
+        case none
+        case wrongFinalPath
+    }
+
     private enum SourceToolingPlacement {
         case siblings
         case sourceInsideTooling
@@ -490,6 +495,20 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.buildCapture.path))
     }
 
+    func testAssemblerRejectsWrongFinalBuilderPathAfterBuildDiagnostics() throws {
+        let fixture = try makeFixture(builderOutputFault: .wrongFinalPath)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let result = try runAssembler(fixture)
+        XCTAssertNotEqual(result.status, 0, result.diagnostic)
+        XCTAssertTrue(
+            result.stderr.contains("V90 builder returned an unexpected candidate path"),
+            result.diagnostic
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.buildCapture.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.prepareCapture.path))
+    }
+
     func testAssemblerRejectsUnreviewedCandidateSymlink() throws {
         let fixture = try makeFixture(linkFault: .unknown)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -863,7 +882,8 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         reverseCandidateCreationOrder: Bool = false,
         candidateOutputDebris: Bool = false,
         sourceToolingPlacement: SourceToolingPlacement = .siblings,
-        initialMetadataFault: InitialMetadataFault = .none
+        initialMetadataFault: InitialMetadataFault = .none,
+        builderOutputFault: BuilderOutputFault = .none
     ) throws -> Fixture {
         let root = repositoryRoot.appendingPathComponent(".build", isDirectory: true)
             .appendingPathComponent(
@@ -949,7 +969,8 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
                 candidateBytes: candidateBytes,
                 linkFault: linkFault,
                 candidateOutputDebris: candidateOutputDebris,
-                initialMetadataFault: initialMetadataFault
+                initialMetadataFault: initialMetadataFault,
+                outputFault: builderOutputFault
             ).write(to: builder, atomically: false, encoding: .utf8)
             try setMode(0o755, on: builder)
             let preparer = scripts.appendingPathComponent(
@@ -1105,7 +1126,8 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         candidateBytes: String,
         linkFault: CandidateLinkFault,
         candidateOutputDebris: Bool,
-        initialMetadataFault: InitialMetadataFault
+        initialMetadataFault: InitialMetadataFault,
+        outputFault: BuilderOutputFault
     ) -> String {
         let infoPlistCreation = """
         /usr/bin/printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \\
@@ -1153,6 +1175,16 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
             initialMetadataFaultScript = "/usr/bin/xattr -w org.example.opensteamer.fixture unsafe \"${OPENSTEAMER_HOST_APP_OUTPUT_DIR}\"\n"
         case .candidateOutputBSDFlag:
             initialMetadataFaultScript = "/usr/bin/chflags hidden \"${OPENSTEAMER_HOST_APP_OUTPUT_DIR}\"\n"
+        }
+        let reportedPathLines: String
+        switch outputFault {
+        case .none:
+            reportedPathLines = "print -r -- \"$app\""
+        case .wrongFinalPath:
+            reportedPathLines = """
+            print -r -- "$app"
+            print -r -- "$app.unexpected"
+            """
         }
         return """
         #!/bin/zsh
@@ -1204,7 +1236,8 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
           print -r -- "scratch=${OPENSTEAMER_HOST_SCRATCH_PATH}"
           print -r -- "tmpdir=${TMPDIR}"
         } > "$fixture_root/build-capture.txt"
-        print -r -- "$app"
+        print -r -- '[1/1] Build complete!'
+        \(reportedPathLines)
         """
     }
 

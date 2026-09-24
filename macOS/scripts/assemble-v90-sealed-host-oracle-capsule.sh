@@ -915,7 +915,15 @@ builder_output=$(/usr/bin/env -i \
     OPENSTEAMER_EXPECTED_ARCHITECTURES="$EXPECTED_ARCHITECTURES" \
     "$BUILDER") || fail "fresh pinned V90 host build failed"
 readonly CANDIDATE_APP="${CAPSULE_ROOT}/${CANDIDATE_RELATIVE}"
-[[ "$builder_output" == "$CANDIDATE_APP" ]] \
+# The pinned builder's subprocesses emit ordinary progress on stdout before the builder's own
+# final path record. Only that final nonempty record is the builder protocol response; the
+# candidate filesystem and signatures are validated independently below.
+builder_reported_path=$(/usr/bin/printf '%s\n' "$builder_output" | /usr/bin/awk '
+    NF { last=$0; count++ }
+    END { if (count == 0) exit 1; print last }
+') || fail "V90 builder did not report a candidate path"
+readonly BUILDER_REPORTED_PATH=$builder_reported_path
+[[ "$BUILDER_REPORTED_PATH" == "$CANDIDATE_APP" ]] \
     || fail "V90 builder returned an unexpected candidate path"
 assert_exact_private_directory_shape "$BUILD_OUTPUT" \
     "V90 candidate output directory" 'opensteamer Host.app'
