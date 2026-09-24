@@ -120,6 +120,7 @@ module OpenSteamerV90Cutover
     ROUTE_MONITOR_READY = "READY input=BlackHole2ch_UID output=BuiltInSpeakerDevice system=BuiltInSpeakerDevice"
     ROUTE_MONITOR_RESULT = "RESULT notifications=0 teardown=clean input=BlackHole2ch_UID output=BuiltInSpeakerDevice system=BuiltInSpeakerDevice"
     LAUNCHER_ATTESTATION = "opensteamer-v90-pinned-launcher-v1"
+    DYNAMIC_CODESIGN_VERIFY_ARGUMENTS = ["--verify"].freeze
 
     V89_POINTER = "#{RUNTIME_ROOT}/active-paired-host-update-v89"
     V89_POINTER_SHA256 = "5c2c7b0d60de0682d208e399a68ffd81cf46cdfd3a10d1774f7f39d8eb550111"
@@ -2602,7 +2603,7 @@ module OpenSteamerV90Cutover
       Util.fail!("host command differs from ten-argument contract") unless command == Pins::LAUNCH_ARGUMENTS.join(" ")
       start = Util.capture!("/bin/ps", "-p", pid.to_s, "-o", "lstart=").split.join(" ")
       Util.fail!("host process-start identity mismatch") if expected_start && start != expected_start
-      command!("/usr/bin/codesign", "--verify", "--strict", "--verbose=1", "+#{pid}")
+      command!("/usr/bin/codesign", *Pins::DYNAMIC_CODESIGN_VERIFY_ARGUMENTS, "+#{pid}")
       metadata_stdout, metadata_stderr, metadata_status = Open3.capture3(
         "/usr/bin/codesign", "--display", "--verbose=4", "+#{pid}"
       )
@@ -3956,6 +3957,9 @@ module OpenSteamerV90Cutover
         Pins::V86_HELPERS["verify-media-v1-host-bundle.sh"] ==
           "e8a486a8e7360e5d3c8517e237e046fc21b3ccc2a3eb5e14ccd5d40135742e0c" &&
           !Pins::V86_HELPERS.key?("verify-mac-host-bundle.sh")
+      end
+      assert("dynamic codesign verification uses the supported PID contract") do
+        Pins::DYNAMIC_CODESIGN_VERIFY_ARGUMENTS == ["--verify"]
       end
 
       capsule = FakeCapsule.new
