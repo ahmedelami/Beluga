@@ -83,7 +83,7 @@ git_value() {
 }
 
 verify_clean_remote_tooling() {
-    local root branch upstream fetch_urls push_urls head tree upstream_head status remote_record
+    local root branch upstream fetch_urls push_urls head tree upstream_head worktree_status remote_record
     local relative path tracked working_blob head_blob mode
 
     root=$(git_value rev-parse --show-toplevel)
@@ -106,8 +106,8 @@ verify_clean_remote_tooling() {
     [[ "$head" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] \
         || fail 'tooling HEAD/tree identity is malformed'
     [[ "$head" == "$upstream_head" ]] || fail 'tooling HEAD differs from local upstream'
-    status=$(git_value status --porcelain=v1 --untracked-files=all)
-    [[ -z "$status" ]] || fail 'tooling worktree is not clean'
+    worktree_status=$(git_value status --porcelain=v1 --untracked-files=all)
+    [[ -z "$worktree_status" ]] || fail 'tooling worktree is not clean'
     remote_record=$(git_value ls-remote --exit-code --refs --heads origin "refs/heads/${branch}")
     [[ "$remote_record" == "${head}"$'\t'"refs/heads/${branch}" ]] \
         || fail 'fresh remote branch tip differs from exact tooling HEAD'
