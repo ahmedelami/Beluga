@@ -209,6 +209,12 @@ readonly RUN_STARTED_AT=$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 typeset -g STAGE=preflight
 typeset -g FAILURE_REASON=''
+typeset -g PHYSICAL_TEST_EXIT_STATUS=''
+typeset -g PHYSICAL_TEST_FAILURE_CLASS=''
+typeset -g PHYSICAL_TEST_FAILURE_REASON=''
+typeset -g SELECTED_TEST_RECORD=unavailable
+typeset -gi XCRESULT_SUMMARY_CAPTURED=0
+typeset -gi XCRESULT_TESTS_CAPTURED=0
 typeset -g SIGNAL_NAME=''
 typeset -g PENDING_SIGNAL_NAME=''
 typeset -gi PENDING_SIGNAL_STATUS=0
@@ -357,18 +363,68 @@ function write_run_status() {
 }
 
 function fail() {
-  FAILURE_REASON=$1
+  append_failure_reason "$1"
   print -u2 -- "iPhone 15 development screen oracle: ${FAILURE_REASON} (artifacts: ${ARTIFACT_DIR})"
   exit 1
 }
 
 function append_failure_reason() {
   local reason=$1
+  [[ "$FAILURE_REASON" != "$reason" ]] || return 0
   if [[ -n "$FAILURE_REASON" ]]; then
     FAILURE_REASON="${FAILURE_REASON}; ${reason}"
   else
     FAILURE_REASON=$reason
   fi
+}
+
+function capture_physical_test_result() {
+  PHYSICAL_TEST_EXIT_STATUS=$1
+  if xcrun xcresulttool get test-results summary \
+      --path "$RESULT_BUNDLE" --compact > "${ARTIFACT_DIR}/xcresult-summary.json" \
+      2> "${ARTIFACT_DIR}/xcresult-summary.stderr.log"; then
+    XCRESULT_SUMMARY_CAPTURED=1
+  fi
+  if xcrun xcresulttool get test-results tests \
+      --path "$RESULT_BUNDLE" --compact > "${ARTIFACT_DIR}/xcresult-tests.json" \
+      2> "${ARTIFACT_DIR}/xcresult-tests.stderr.log"; then
+    XCRESULT_TESTS_CAPTURED=1
+  fi
+  if (( XCRESULT_TESTS_CAPTURED )) && jq -e --arg udid "$HARDWARE_UDID" '
+      (.devices | type == "array" and length == 1) and
+      .devices[0].deviceId == $udid and (.testNodes | type == "array")
+    ' "${ARTIFACT_DIR}/xcresult-tests.json" >/dev/null 2>&1; then
+    SELECTED_TEST_RECORD=$(jq -r --arg test "$TEST_NODE" '
+      if any(.. | objects; .nodeType? == "Test Case" and .nodeIdentifier? == $test)
+      then "present" else "absent" end
+    ' "${ARTIFACT_DIR}/xcresult-tests.json")
+  fi
+  (( PHYSICAL_TEST_EXIT_STATUS != 0 )) || return 0
+  PHYSICAL_TEST_FAILURE_CLASS=xctestExecutionFailure
+  PHYSICAL_TEST_FAILURE_REASON='physical iPhone 15 final-pixel test failed; see test.log and xcresult'
+  local selected_test_log_scan_status=2
+  if [[ "$SELECTED_TEST_RECORD" == absent && -f "${ARTIFACT_DIR}/test.log" ]]; then
+    if rg -q 'Test Case .*IPhone15SecondaryViewerDevelopmentPhysicalUITests.*testTemporaryViewerFinalPixelsTrackFreshMacChallenge' \
+        "${ARTIFACT_DIR}/test.log" 2> "${ARTIFACT_DIR}/selected-test-log-scan.stderr.log"; then
+      selected_test_log_scan_status=0
+    else
+      selected_test_log_scan_status=$?
+    fi
+  fi
+  # XCTest reports runner initialization errors as synthetic test cases, not zero total tests.
+  if [[ "$SELECTED_TEST_RECORD" == absent ]] && (( XCRESULT_SUMMARY_CAPTURED )) \
+      && jq -e --arg udid "$HARDWARE_UDID" '
+        .result == "Failed" and
+        (.devicesAndConfigurations | type == "array" and length == 1) and
+        .devicesAndConfigurations[0].device.deviceId == $udid and
+        any(.testFailures[]?; .targetName == "opensteamerUITests" and
+          (.failureText | startswith("The test runner failed to initialize for UI testing.")))
+      ' "${ARTIFACT_DIR}/xcresult-summary.json" >/dev/null 2>&1 \
+      && (( selected_test_log_scan_status == 1 )); then
+    PHYSICAL_TEST_FAILURE_CLASS=xctestInitializationFailure
+    PHYSICAL_TEST_FAILURE_REASON='XCTest initialization failed before the selected iPhone 15 oracle test ran; see test.log and xcresult'
+  fi
+  append_failure_reason "$PHYSICAL_TEST_FAILURE_REASON"
 }
 
 function owned_child_is_alive() {
@@ -813,6 +869,9 @@ function finish() {
     --arg visualMarker "$VISUAL_MARKER" \
     --arg testId "$TEST_ID" \
     --arg resultBundle "$RESULT_BUNDLE" \
+    --arg physicalTestExitStatus "$PHYSICAL_TEST_EXIT_STATUS" \
+    --arg physicalTestFailureClass "$PHYSICAL_TEST_FAILURE_CLASS" \
+    --arg selectedTestRecord "$SELECTED_TEST_RECORD" \
     --arg secondaryHostGeneration "$SECONDARY_HOST_GENERATION" \
     --arg secondaryManagerGenerationBaseline "$SECONDARY_MANAGER_GENERATION_BASELINE" \
     --arg secondaryManagerGeneration "$SECONDARY_MANAGER_GENERATION" \
@@ -896,6 +955,10 @@ function finish() {
       audioRouteNotificationCount:$audioRouteNotificationCount,
       audioRouteMonitorStatus:$audioRouteMonitorStatus,nonce:$nonce,
       visualMarker:$visualMarker,testId:$testId,resultBundle:$resultBundle,
+      testExecution:{exitStatus:(if $physicalTestExitStatus == "" then null
+          else ($physicalTestExitStatus | tonumber) end),
+        failureClass:($physicalTestFailureClass | emptyToNull),
+        selectedTestRecord:$selectedTestRecord},
       unlockedStateGate:{requestSHA256:(if $unlockRequestSHA256 == "" then null
           else $unlockRequestSHA256 end),
         acknowledgementValidated:($unlockAcknowledgementValidated == 1)},
@@ -4202,6 +4265,7 @@ else
 fi
 PHYSICAL_TEST_PID=''
 
+capture_physical_test_result "$test_status"
 STAGE=post-test-safety
 require_no_production_observer
 require_same_host
@@ -4228,7 +4292,7 @@ stop_secondary_generation \
   || fail 'the exact secondary-viewer generation did not confirm teardown'
 require_audio_route_monitor_healthy after-secondary-generation-cleanup
 (( test_status == 0 )) \
-  || fail 'physical iPhone 15 final-pixel test failed; see test.log and xcresult'
+  || fail "$PHYSICAL_TEST_FAILURE_REASON"
 
 typeset -a visual_markers
 visual_markers=("${(@f)$(rg -o \
@@ -4241,11 +4305,9 @@ VISUAL_MARKER=${visual_markers[1]}
   || fail 'iPhone 15 final-pixel evidence marker is not bound to this nonce'
 
 STAGE=xcresult-proof
-xcrun xcresulttool get test-results summary \
-  --path "$RESULT_BUNDLE" --compact > "${ARTIFACT_DIR}/xcresult-summary.json" \
+(( XCRESULT_SUMMARY_CAPTURED )) \
   || fail 'xcresult summary unavailable'
-xcrun xcresulttool get test-results tests \
-  --path "$RESULT_BUNDLE" --compact > "${ARTIFACT_DIR}/xcresult-tests.json" \
+(( XCRESULT_TESTS_CAPTURED )) \
   || fail 'xcresult test result unavailable'
 jq -e --arg udid "$HARDWARE_UDID" '
   (.result == "Passed") and (.totalTestCount == 1) and

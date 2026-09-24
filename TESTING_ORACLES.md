@@ -228,6 +228,17 @@ only a wake signal; the runner independently rechecks the exact CoreDevice ident
 and unlocked state and has no manual-success or skip switch. Offline acknowledgement tests execute
 the actual helper serializer and runner validator together, including exact keys, identity, digest,
 request mutation, and observation-age rejection; matching source strings are not a handoff proof.
+Ordinary screen unlock does not grant XCTest's separate UI-automation authorization. If the exact
+development phone shows “Enter iPhone Passcode for XCTest — Enable UI Automation,” request direct
+user approval and stop unchanged retries; do not enter the saved credential into that protected
+authorization prompt. A bounded read-only screen observation during initialization can distinguish
+this gate from an app failure without changing phone security settings. The runner preserves the
+`xcodebuild` exit status and exact-device result tree before checking the required import receipt.
+An explicit runner-initialization error with no selected-test record or start log is reported as
+`xctestInitializationFailure`; unavailable or conflicting evidence stays a generic execution failure.
+Missing import/cleanup proof remains fatal and is retained alongside the original failure. These
+reporting fixtures run offline in `scripts/tests/test_iphone15_dev_test_failure_reporting.py` under
+`iOS/opensteamer`; they do not replace the sole passing XCTest, final-pixel marker, or safety gates.
 During the live step a separate
 credential-free exact-UDID `PreventUserIdleSystemSleep` lease emits a private heartbeat. Its Python
 runtime is launched with `-I -S -B` and an empty environment, before any virtualenv `site` or `.pth`
