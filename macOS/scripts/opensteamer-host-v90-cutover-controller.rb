@@ -255,6 +255,14 @@ module OpenSteamerV90Cutover
       Digest::SHA256.hexdigest(text.b)
     end
 
+    def exact_prefixed_values(text, prefix)
+      binary_prefix = prefix.b
+      text.b.lines.map do |line|
+        stripped = line.strip
+        stripped.delete_prefix(binary_prefix) if stripped.start_with?(binary_prefix)
+      end.compact
+    end
+
     def assert_sha!(value, label)
       fail!("#{label} is not a lowercase SHA-256") unless SHA256.match?(value.to_s)
     end
@@ -465,14 +473,11 @@ module OpenSteamerV90Cutover
     def combined_codesign!(*arguments)
       stdout, stderr, status = Open3.capture3("/usr/bin/codesign", *arguments)
       Util.fail!("codesign metadata inspection failed: #{stderr.strip}") unless status.success?
-      stdout + stderr
+      stdout.b + stderr.b
     end
 
     def exact_field!(metadata, prefix, expected, label)
-      values = metadata.lines.map do |line|
-        stripped = line.strip
-        stripped.delete_prefix(prefix) if stripped.start_with?(prefix)
-      end.compact
+      values = Util.exact_prefixed_values(metadata, prefix)
       Util.fail!("#{label} #{prefix.delete_suffix('=')} differs from approved predecessor") unless
         values == [expected]
     end
@@ -2543,11 +2548,17 @@ module OpenSteamerV90Cutover
         reference
       ) if reference
       metadata = combined_capture!("/usr/bin/codesign", "--display", "--verbose=4", Pins::LIVE_EXECUTABLE)
-      Util.fail!("live V86 code identifier mismatch") unless metadata.scan(/^Identifier=(.+)$/).flatten == [Pins::EXECUTABLE_IDENTIFIER]
-      Util.fail!("live V86 TeamIdentifier mismatch") unless metadata.scan(/^TeamIdentifier=(.+)$/).flatten == [Pins::TEAM_ID]
-      Util.fail!("live V86 CDHash mismatch") unless metadata.scan(/^CDHash=([0-9A-Fa-f]+)$/).flatten.map(&:downcase) == [Pins::V86_CDHASH]
+      Util.fail!("live V86 code identifier mismatch") unless
+        Util.exact_prefixed_values(metadata, "Identifier=") == [Pins::EXECUTABLE_IDENTIFIER]
+      Util.fail!("live V86 TeamIdentifier mismatch") unless
+        Util.exact_prefixed_values(metadata, "TeamIdentifier=") == [Pins::TEAM_ID]
+      cdhashes = Util.exact_prefixed_values(metadata, "CDHash=")
+      Util.fail!("live V86 CDHash mismatch") unless
+        cdhashes.length == 1 && cdhashes.first.match?(/\A[0-9A-Fa-f]+\z/n) &&
+          cdhashes.first.downcase == Pins::V86_CDHASH
       requirement_output = combined_capture!("/usr/bin/codesign", "--display", "--requirements", "-", Pins::LIVE_EXECUTABLE)
-      requirement = requirement_output.lines.map { |line| line.strip.sub(/\A# /, "") }.find { |line| line.start_with?("designated =>") }
+      requirement = requirement_output.b.lines.map { |line| line.strip.sub(/\A# /n, "") }
+                                      .find { |line| line.start_with?("designated =>") }
       Util.fail!("live V86 designated requirement mismatch") unless requirement == "designated => #{Pins::V86_DESIGNATED_REQUIREMENT}"
       true
     end
@@ -2762,7 +2773,7 @@ module OpenSteamerV90Cutover
     def combined_capture!(*args)
       stdout, stderr, status = Open3.capture3(*args)
       Util.fail!("command failed: #{args.shelljoin}: #{stderr.strip}") unless status.success?
-      stdout + stderr
+      stdout.b + stderr.b
     end
 
     def write_durable(path, contents, mode, exclusive:)
@@ -3138,7 +3149,11 @@ module OpenSteamerV90Cutover
 
     def verify_predecessor_codesign_metadata_fixture!
       parser = PredecessorReferenceFingerprint
-      metadata = "Executable=/fixture/CaptureServer\nIdentifier=com.example.expected\n"
+      metadata = (
+        "Executable=/fixture/CaptureServer\n" \
+        "Identifier=com.example.expected\n" \
+        "Signed Time=Sep 19, 2026 at 10:02:48 \xE2\x80\xAFPM\n"
+      ).dup.force_encoding(Encoding::US_ASCII)
       assert("predecessor codesign metadata field parses on pinned system Ruby") do
         parser.send(
           :exact_field!,
