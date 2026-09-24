@@ -264,6 +264,14 @@ module OpenSteamerV90Cutover
       end.compact
     end
 
+    def exact_code_identity_values(text)
+      {
+        identifier: exact_prefixed_values(text, "Identifier="),
+        team_identifier: exact_prefixed_values(text, "TeamIdentifier="),
+        cdhash: exact_prefixed_values(text, "CDHash=").map(&:downcase)
+      }
+    end
+
     def assert_sha!(value, label)
       fail!("#{label} is not a lowercase SHA-256") unless SHA256.match?(value.to_s)
     end
@@ -2608,15 +2616,23 @@ module OpenSteamerV90Cutover
         "/usr/bin/codesign", "--display", "--verbose=4", "+#{pid}"
       )
       Util.fail!("could not read live process code identity") unless metadata_status.success?
-      metadata = metadata_stdout + metadata_stderr
-      identifier = metadata.lines.grep(/\AIdentifier=/).map { |line| line.split("=", 2).last.strip }
-      team = metadata.lines.grep(/\ATeamIdentifier=/).map { |line| line.split("=", 2).last.strip }
-      cdhash = metadata.lines.grep(/\ACDHash=/).map { |line| line.split("=", 2).last.strip.downcase }
-      Util.fail!("live process code identity is ambiguous") unless identifier == [Pins::EXECUTABLE_IDENTIFIER] && team == [Pins::TEAM_ID] && cdhash == [expected_cdhash]
+      verify_dynamic_codesign_identity!(
+        metadata_stdout.b + metadata_stderr.b,
+        expected_cdhash: expected_cdhash
+      )
       text = Util.capture!("/usr/sbin/lsof", "-a", "-p", pid.to_s, "-d", "txt", "-Fn")
       Util.fail!("live process text mapping differs") unless text.lines.map(&:chomp).count("n#{Pins::LIVE_EXECUTABLE}") == 1
       mappings = Util.capture!("/usr/sbin/lsof", "-a", "-p", pid.to_s, "-Fn")
       Util.fail!("live process lacks pinned media-framework mapping") unless mappings.lines.map(&:chomp).include?("n#{Pins::LIVE_FRAMEWORK}")
+      true
+    end
+
+    def verify_dynamic_codesign_identity!(metadata, expected_cdhash:)
+      identity = Util.exact_code_identity_values(metadata)
+      Util.fail!("live process code identity is ambiguous") unless
+        identity.fetch(:identifier) == [Pins::EXECUTABLE_IDENTIFIER] &&
+        identity.fetch(:team_identifier) == [Pins::TEAM_ID] &&
+        identity.fetch(:cdhash) == [expected_cdhash]
       true
     end
 
@@ -3181,6 +3197,38 @@ module OpenSteamerV90Cutover
           "Identifier=",
           "com.example.hostile",
           "fixture predecessor"
+        )
+      end
+    end
+
+    def verify_dynamic_codesign_metadata_fixture!
+      metadata = (
+        "Executable=/fixture/CaptureServer\n" \
+        "Identifier=#{Pins::EXECUTABLE_IDENTIFIER}\n" \
+        "Signed Time=Sep 19, 2026 at 10:02:48 \xE2\x80\xAFPM\n" \
+        "TeamIdentifier=#{Pins::TEAM_ID}\n" \
+        "CDHash=#{Pins::V86_CDHASH.upcase}\n"
+      ).dup.force_encoding(Encoding::US_ASCII)
+      host = RealHost.allocate
+      assert("dynamic codesign identity parses non-ASCII metadata on pinned system Ruby") do
+        host.send(
+          :verify_dynamic_codesign_identity!,
+          metadata,
+          expected_cdhash: Pins::V86_CDHASH
+        )
+      end
+      expect_failure("dynamic codesign identity rejects duplicate fields") do
+        host.send(
+          :verify_dynamic_codesign_identity!,
+          metadata + "Identifier=#{Pins::EXECUTABLE_IDENTIFIER}\n",
+          expected_cdhash: Pins::V86_CDHASH
+        )
+      end
+      expect_failure("dynamic codesign identity rejects wrong CDHash") do
+        host.send(
+          :verify_dynamic_codesign_identity!,
+          metadata,
+          expected_cdhash: "0" * 40
         )
       end
     end
@@ -4122,6 +4170,7 @@ module OpenSteamerV90Cutover
       verify_copy_stable_manifest_fixture!
       verify_predecessor_signature_layout_fixture!
       verify_predecessor_codesign_metadata_fixture!
+      verify_dynamic_codesign_metadata_fixture!
       verify_real_journal_state_machine!
       verify_journal_fault_reconciliation!
       verify_atomic_pointer_fixture!
