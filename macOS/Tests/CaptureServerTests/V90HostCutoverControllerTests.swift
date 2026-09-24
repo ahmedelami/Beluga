@@ -290,6 +290,14 @@ final class V90HostCutoverControllerTests: XCTestCase {
         try assertOfflineFixture("verify_published_candidate_root_xattrs_fixture!")
     }
 
+    func testFastStabilityWindowPreservesEverySampleAndDriftFence() throws {
+        try assertOfflineFixture("verify_stability_fixture!")
+    }
+
+    func testSlowStabilityWindowUsesElapsedTimeAndRejectsDeadlineCrossingDrift() throws {
+        try assertOfflineFixture("verify_elapsed_stability_fixture!")
+    }
+
     private func assertOfflineFixture(_ method: String) throws {
         let result = try runExecutable(
             URL(fileURLWithPath: "/usr/bin/ruby"),

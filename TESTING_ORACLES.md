@@ -150,8 +150,11 @@ retained handoff and payload digests. The launcher re-proves clean remote toolin
 controller, route-monitor, Ruby, Swift compiler, and SDK identities. Preflight performs two
 mutation-free observations; execution replays the full capsule and live V86 fences immediately
 before durable `STOP_INTENT`. The controller holds same-filesystem exact-V86 app/plist rollback
-copies, keeps the sticky CoreAudio monitor armed with zero notifications, and requires 31 seconds of
-stable V90 PID, generation, bytes, display, session, routes, and secondary-viewer readiness. Any
+copies, keeps the sticky CoreAudio monitor armed with zero notifications, and requires at least
+31 monotonic elapsed seconds of stable V90 PID, generation, bytes, display, session, routes, and
+secondary-viewer readiness. Full samples run once per second when fast; slow samples count toward
+elapsed time, and the window ends only after a complete successful sample reaches its deadline.
+The full final pre-irreversible safety replay remains mandatory. Any
 failure after `STOP_INTENT` but before durable `V90_COMMIT_IRREVERSIBLE` must traverse the journaled
 rollback to terminal `ROLLED_BACK_EXACT_V86`. The sticky monitor remains live through that point of
 no return. A later failure must leave V90 live, publish committed-but-unverified evidence, exit

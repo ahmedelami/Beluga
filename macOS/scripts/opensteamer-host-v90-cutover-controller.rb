@@ -3341,15 +3341,18 @@ module OpenSteamerV90Cutover
 
     def run_candidate_stability_window!(duration: 31)
       started = monotonic_now
+      final_deadline = started + duration
       1.upto(duration) do |second|
         deadline = started + second
         remaining = deadline - monotonic_now
         stability_sleep(remaining) if remaining.positive?
         Util.fail!("monotonic stability clock did not reach second #{second}") if monotonic_now < deadline
         verify_candidate_stability_sample!
+        # Slow complete probes count toward elapsed stability; never exit midway through a sample.
+        break if monotonic_now >= final_deadline
       end
       Util.fail!("candidate stability window was shorter than #{duration} seconds") if
-        monotonic_now < started + duration
+        monotonic_now < final_deadline
       true
     end
 
@@ -5086,7 +5089,7 @@ module OpenSteamerV90Cutover
       end
     end
 
-    def stability_harness(fail_probe: nil, fail_call: nil)
+    def stability_harness(fail_probe: nil, fail_call: nil, sample_seconds: 0.0)
       host = RealHost.new
       files = (Pins::PREDECESSOR_IDENTITY_PATHS + [Pins::LAUNCH_AGENT]).each_with_index.to_h do |path, index|
         [path, [1, index + 10, path == Pins::LIVE_APP ? "directory" : "file"]]
@@ -5125,6 +5128,7 @@ module OpenSteamerV90Cutover
       end
       host.define_singleton_method(:readiness_generation!) do
         bad = fail_now.call(:readiness)
+        clock[0] += sample_seconds
         bad ? 8 : 7
       end
       host.define_singleton_method(:current_display_mode) do
@@ -5164,6 +5168,31 @@ module OpenSteamerV90Cutover
           expect_failure("#{probe} drift at sample #{call - 1}") do
             host.send(:run_candidate_stability_window!)
           end
+        end
+      end
+    end
+
+    def verify_elapsed_stability_fixture!
+      host, counters, clock = stability_harness(sample_seconds: 5.0)
+      host.send(:establish_candidate_stability_baseline!)
+      started = clock.first
+      host.send(:run_candidate_stability_window!)
+      assert("slow probes retain the full 31-second monotonic window") { clock.first - started == 31.0 }
+      %i[launch lock process bytes readiness display session routes monitor].each do |probe|
+        assert("slow probes complete baseline plus six full #{probe} samples") { counters[probe] == 7 }
+      end
+
+      # These probes fail after the last readiness call advances time across the deadline.
+      # Reaching the deadline must never bypass the rest of the full sample's safety checks.
+      %i[readiness display session routes monitor].each do |probe|
+        host, counters, clock = stability_harness(fail_probe: probe, fail_call: 7, sample_seconds: 5.0)
+        host.send(:establish_candidate_stability_baseline!)
+        started = clock.first
+        expect_failure("#{probe} drift in the deadline-crossing sample") do
+          host.send(:run_candidate_stability_window!)
+        end
+        assert("#{probe} drift was checked after the full elapsed window") do
+          clock.first - started == 31.0 && counters[probe] == 7
         end
       end
     end
@@ -5507,6 +5536,7 @@ module OpenSteamerV90Cutover
       verify_creation_signal_gap_fixture!
       verify_session_fence_fixture!
       verify_stability_fixture!
+      verify_elapsed_stability_fixture!
       verify_second_signal_deferral!
       # This is read-only: it exercises the exact pinned compiler/SDK/source metadata path without
       # compiling or starting the CoreAudio observer.
