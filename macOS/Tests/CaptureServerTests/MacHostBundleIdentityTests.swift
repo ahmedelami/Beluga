@@ -1005,10 +1005,15 @@ final class MacHostBundleIdentityTests: XCTestCase {
         XCTAssertEqual(positive.status, 0, positive.diagnostic)
         let downgrade = try run(executable: verifier, arguments: ["--media-integration-v1", legacy.path])
         XCTAssertNotEqual(downgrade.status, 0, downgrade.diagnostic)
-        XCTAssertTrue(downgrade.standardError.contains("media integration v1 contract is required"), downgrade.diagnostic)
+        XCTAssertTrue(
+            downgrade.standardError.contains(
+                "app bundle does not exist: --media-integration-v1"
+            ),
+            downgrade.diagnostic
+        )
         try assertMutationRejected(
             app: legacy, verifier: verifier, name: "legacy-automation-entitlement",
-            expectedDiagnostic: "signed code entitlements differ from the exact reviewed contract"
+            expectedDiagnostic: "signed code contains unreviewed entitlements"
         ) { mutant in
             try self.signCode(
                 mutant, identifier: "com.elamin.AudioStreamer.CaptureServer",

@@ -175,6 +175,9 @@ final class MacHostMigrationContractTests: XCTestCase {
         let buildScript = repositoryRoot.appendingPathComponent(
             "macOS/scripts/build-opensteamer-host-app.sh"
         )
+        let bundleVerifier = repositoryRoot.appendingPathComponent(
+            "macOS/scripts/verify-mac-host-bundle.sh"
+        )
         let verifier = repositoryRoot.appendingPathComponent(
             "macOS/scripts/verify-no-private-virtual-display-imports.sh"
         )
@@ -223,10 +226,43 @@ final class MacHostMigrationContractTests: XCTestCase {
         let buildHash = try XCTUnwrap(
             buildHashResult.standardOutput.split(whereSeparator: \.isWhitespace).first.map(String.init)
         )
+        XCTAssertEqual(
+            buildHash,
+            "96ffbce9ecff2ece81f1901001108ad3b14d3991e0d8481341db7125fa81365a"
+        )
         XCTAssertTrue(
             launcherSource.contains("EXPECTED_BUILD_SCRIPT_SHA256='\(buildHash)'")
         )
         XCTAssertTrue(controllerSource.contains(buildHash))
+
+        let bundleVerifierHashResult = try run(
+            executable: URL(fileURLWithPath: "/usr/bin/shasum"),
+            arguments: ["-a", "256", bundleVerifier.path]
+        )
+        XCTAssertEqual(
+            bundleVerifierHashResult.status,
+            0,
+            bundleVerifierHashResult.diagnostic
+        )
+        let bundleVerifierHash = try XCTUnwrap(
+            bundleVerifierHashResult.standardOutput
+                .split(whereSeparator: \.isWhitespace).first.map(String.init)
+        )
+        XCTAssertEqual(
+            bundleVerifierHash,
+            "02a348a88d25b76ab95d45620d823339212bb53ee0f39bfb3a52f04240d3d745"
+        )
+        XCTAssertTrue(
+            launcherSource.contains(
+                "EXPECTED_BUNDLE_VERIFIER_SHA256='\(bundleVerifierHash)'"
+            )
+        )
+        XCTAssertTrue(
+            controllerSource.contains(
+                "include_bytes!(\"verify-mac-host-bundle.sh\")"
+            )
+        )
+        XCTAssertTrue(controllerSource.contains(bundleVerifierHash))
     }
 
     func testPostV20UpdaterHasPinnedCrashRecoverableJournalAndSafeSelfTest() throws {
