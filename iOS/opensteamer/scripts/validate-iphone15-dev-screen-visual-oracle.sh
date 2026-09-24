@@ -3030,8 +3030,8 @@ function validate_unlock_ack() {
     --arg udid "$HARDWARE_UDID" --arg bundle "$APP_BUNDLE_ID" \
     --arg runnerProcessStart "$RUN_PROCESS_START" \
     --arg requestSHA256 "$UNLOCK_REQUEST_SHA256" --argjson pid "$$" '
-      (keys | sort) == ["bundleId","deviceId","hardwareUDID","observedUnlockedAt",
-        "matchingUnlockControllerAbsent","runNonce","runnerPid",
+      (keys | sort) == ["bundleId","deviceId","hardwareUDID","matchingUnlockControllerAbsent",
+        "observedUnlockedAt","runNonce","runnerPid",
         "runnerProcessStart","schema","unlockRequestSHA256"] and
       .schema == "opensteamer.iphone15-dev-unlock-ack.v1" and
       .runNonce == $nonce and .runnerPid == $pid and .deviceId == $device and
