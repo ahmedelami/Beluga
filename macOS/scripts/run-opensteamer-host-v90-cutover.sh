@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Pinned entry point for the one-shot V90 host cutover controller.
+# Pinned entry point for V90 deployment attempts using a reusable sealed build.
 # Live modes remain gated by the exact compiled predecessor-reference digest and clean tooling.
 set -euo pipefail
 umask 077
@@ -14,7 +14,8 @@ readonly LAUNCHER_BASENAME='run-opensteamer-host-v90-cutover.sh'
 readonly CONTROLLER_BASENAME='opensteamer-host-v90-cutover-controller.rb'
 readonly MONITOR_BASENAME='opensteamer-v90-coreaudio-route-monitor.swift'
 readonly ASSEMBLER_BASENAME='assemble-v90-sealed-host-oracle-capsule.sh'
-readonly CONTROLLER_SHA256='a9da833820ff4316e6e51bdc76a595de1e94dca1af1d49b728b2cd6863eef42b'
+readonly READINESS_BASENAME='verify-v90-secondary-viewer-readiness.sh'
+readonly CONTROLLER_SHA256='711a5eb696c65779d115f621f73b8acaa1f064bd658b38d75f73709fa6ad4a58'
 readonly MONITOR_SHA256='4a788f63122b84a51b3009a544cda62589664ba51fd5a6bc1658381fdc28e36d'
 readonly RUBY='/usr/bin/ruby'
 readonly RUBY_SHA256='9d6ff3e289c7d908e3c785e0bedd6692d1d6a3377965c88c04d847104b7c892c'
@@ -116,11 +117,12 @@ verify_clean_remote_tooling() {
         "macOS/scripts/${ASSEMBLER_BASENAME}" \
         "macOS/scripts/${CONTROLLER_BASENAME}" \
         "macOS/scripts/${MONITOR_BASENAME}" \
+        "macOS/scripts/${READINESS_BASENAME}" \
         "macOS/scripts/${LAUNCHER_BASENAME}"
     do
         path="${TOOLING_ROOT}/${relative}"
         case "$relative" in
-            *"/${ASSEMBLER_BASENAME}"|*"/${LAUNCHER_BASENAME}") mode=755 ;;
+            *"/${ASSEMBLER_BASENAME}"|*"/${LAUNCHER_BASENAME}"|*"/${READINESS_BASENAME}") mode=755 ;;
             *) mode=644 ;;
         esac
         verify_regular_metadata "$path" 501 "$mode" 0 "tracked V90 tooling file ${relative}"

@@ -1,8 +1,7 @@
 import Foundation
 import XCTest
 
-/// Offline-only contract tests for the one-shot V90 host cutover controller. These tests use the
-/// controller's fake adapter and never invoke either live mode.
+/// Offline-only deployment regression tests. Fixtures never invoke either live mode.
 final class V90HostCutoverControllerTests: XCTestCase {
     private struct Result {
         let status: Int32
@@ -95,7 +94,8 @@ final class V90HostCutoverControllerTests: XCTestCase {
             )
         )
         let stageContract = String(source[stageStart.lowerBound..<stageEnd.lowerBound])
-        XCTAssertTrue(stageContract.contains("mode: Pins::READINESS_SOURCE_MODE"))
+        XCTAssertTrue(stageContract.contains("ToolingProof.readiness_observer!(capsule.tooling)"))
+        XCTAssertFalse(stageContract.contains("source/macOS/scripts/verify-v90-secondary-viewer-readiness.sh"))
         XCTAssertTrue(stageContract.contains("Pins::READINESS_STAGED_MODE"))
         XCTAssertFalse(stageContract.contains("0o500"))
 
@@ -109,7 +109,7 @@ final class V90HostCutoverControllerTests: XCTestCase {
             )
         )
         let verifyContract = String(source[verifyStart.lowerBound..<verifyEnd.lowerBound])
-        XCTAssertTrue(verifyContract.contains("mode: Pins::READINESS_SOURCE_MODE"))
+        XCTAssertTrue(verifyContract.contains("ToolingProof.readiness_observer!(capsule.tooling)"))
         XCTAssertTrue(verifyContract.contains("mode: Pins::READINESS_STAGED_MODE"))
         XCTAssertFalse(verifyContract.contains("mode: 0o500"))
     }
@@ -268,6 +268,35 @@ final class V90HostCutoverControllerTests: XCTestCase {
         XCTAssertTrue(source.contains("553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66"))
         XCTAssertFalse(source.contains("UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"))
         XCTAssertFalse(source.contains("pending explicit Ahmed approval"))
+    }
+
+    func testReusableArtifactRetainsExactHistoricalBuildProvenance() throws {
+        try assertOfflineFixture("verify_artifact_build_provenance_fixture!")
+    }
+
+    func testReadinessObserverUsesCurrentVerifiedDeploymentTooling() throws {
+        try assertOfflineFixture("verify_deployment_observer_fixture!")
+    }
+
+    func testFreshRuntimeGenerationsAreAcceptedButMidAttemptDriftIsRejected() throws {
+        try assertOfflineFixture("verify_predecessor_runtime_snapshots!")
+    }
+
+    func testRepeatedRollbacksPreserveHistoryAndReuseTheArtifact() throws {
+        try assertOfflineFixture("verify_reusable_rollback_history_fixture!")
+    }
+
+    private func assertOfflineFixture(_ method: String) throws {
+        let result = try runExecutable(
+            URL(fileURLWithPath: "/usr/bin/ruby"),
+            arguments: [
+                "-r", controller.path, "-e",
+                "OpenSteamerV90Cutover::SelfTest.\(method)",
+            ]
+        )
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertEqual(result.stdout, "")
+        XCTAssertEqual(result.stderr, "")
     }
 
     private func run(_ arguments: [String]) throws -> Result {

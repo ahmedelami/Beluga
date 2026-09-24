@@ -125,7 +125,10 @@ separate clean checkout at that exact identity. The assembler and cutover toolin
 later reviewed tooling identity (commit B): its local HEAD, upstream, and fresh single-record
 remote branch readback must agree, its running tracked blobs must equal commit B, and commit A
 must be its ancestor. Commit A identifies the product source bytes; commit B identifies the
-mechanism that assembled and deployed them. Neither identity substitutes for the other.
+mechanism that assembled them. Deployment may use a later reviewed descendant of B;
+it records its own current commit, tree, and tracked observer blobs. The build's
+historical commit/tree/assembler blob must remain exact and ancestral, but need not
+equal the deployment-tool commit. Neither identity substitutes for the other.
 
 `macOS/scripts/assemble-v90-sealed-host-oracle-capsule.sh` is offline with respect to the
 installed host and every running service. It accepts only nonoverlapping clean source/tooling
@@ -155,6 +158,23 @@ no return. A later failure must leave V90 live, publish committed-but-unverified
 nonzero, and never attempt an unmonitored rollback. Only clean zero-notification monitor teardown,
 the post-commit safety proof, final route readback, and terminal `COMMITTED_V90` form a successful
 host-deployment result; neither an intermediate state nor a pending result/pointer is such a claim.
+
+The signed capsule is a reusable artifact, not a deployment-attempt identifier. Each
+execution allocates a new private transaction and captures the verified predecessor's
+PID/start/nonce, lock identity, and app/plist identities. Any change before stop fails
+the attempt. Rollback restores those exact held filesystem objects and proves the new
+process generation against the same trusted predecessor bytes. Completed rollback
+transactions and their failed archives remain immutable history; a durable terminal
+receipt permits a subsequent fresh attempt with the same artifact. Missing or corrupt
+receipts, unfinished transactions, active pointers, and unknown staging residue block
+automatic retry. Existing pre-receipt history is admitted only by its reviewed legacy
+baseline. The controller never deletes history to make a retry pass.
+
+Offline regression coverage must exercise two completed rollback attempts with the
+same artifact, acceptance of a fresh verified predecessor generation, rejection of
+within-attempt identity drift, and rejection of incomplete or altered history. The
+readiness observer must be bound to current deployment tooling, not the capsule's old
+source export. These are tooling proofs, not installed-host or final-pixel proof.
 
 After a terminal `COMMITTED_V90` host result and fresh sealed-host readback, run
 `validate-iphone15-dev-screen-visual-oracle.sh` on the paired iPhone 15. That pass is development

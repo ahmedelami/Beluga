@@ -464,11 +464,13 @@ input is physically validated until the matching live-service and interactive-de
 passes succeed, and do not claim "works anywhere" until TURN is active and
 unrelated-network plus forced-TURN physical-device tests pass.
 
-Every pairing-preserving installed-host update must use a fresh one-shot version
-namespace and pin the exact committed predecessor pointer, evidence, rollback app,
-and verification tools. Build only from a clean pushed commit/tree, prove pairing
-through metadata without retrieving secrets, and never reset or re-pair. Once an
-attempt leaves retained evidence, do not reuse that version for a retry.
+Every pairing-preserving installed-host update must use a fresh one-shot transaction
+namespace and bind the exact trusted predecessor, evidence, rollback app, and
+verification tools. Build only from a clean pushed commit/tree, prove pairing through
+metadata without retrieving secrets, and never reset or re-pair. Never reuse a
+transaction that left retained evidence. A verified immutable build may be reused by a
+new transaction after a proven rollback; a retry must not require a source edit,
+product-version bump, or rebuild solely because process IDs or file identities changed.
 
 ## Efficient Internal Releases
 
@@ -535,6 +537,12 @@ worker.
 - Reuse gates already proven for the same immutable commit and invocation. Do not
   rerun unchanged test suites, source audits, account checks, or artifact checks
   unless their bound identity changed or the previous check failed.
+- Keep product build provenance separate from deployment-tool provenance. A fixed
+  signed artifact retains its original source/build identities when deployment
+  tooling is corrected. Stage readiness observers from the current verified tooling,
+  not an old product-source export. Capture runtime PID/start/nonce and filesystem
+  identities once per attempt after trusted predecessor validation, then fence them
+  until mutation; do not compile transient runtime identities into source.
 - Run independent work concurrently. Archive/upload, App Store Connect processing
   observation, and read-only host preparation need not wait on one another.
 - Report only meaningful stage changes, failures, required user action, and final
