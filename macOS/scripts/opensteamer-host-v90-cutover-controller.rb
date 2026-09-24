@@ -468,10 +468,10 @@ module OpenSteamerV90Cutover
     end
 
     def exact_field!(metadata, prefix, expected, label)
-      values = metadata.lines.filter_map do |line|
+      values = metadata.lines.map do |line|
         stripped = line.strip
         stripped.delete_prefix(prefix) if stripped.start_with?(prefix)
-      end
+      end.compact
       Util.fail!("#{label} #{prefix.delete_suffix('=')} differs from approved predecessor") unless
         values == [expected]
     end
@@ -3127,6 +3127,39 @@ module OpenSteamerV90Cutover
       end
     end
 
+    def verify_predecessor_codesign_metadata_fixture!
+      parser = PredecessorReferenceFingerprint
+      metadata = "Executable=/fixture/CaptureServer\nIdentifier=com.example.expected\n"
+      assert("predecessor codesign metadata field parses on pinned system Ruby") do
+        parser.send(
+          :exact_field!,
+          metadata,
+          "Identifier=",
+          "com.example.expected",
+          "fixture predecessor"
+        )
+        true
+      end
+      expect_failure("predecessor codesign metadata rejects duplicate fields") do
+        parser.send(
+          :exact_field!,
+          metadata + "Identifier=com.example.expected\n",
+          "Identifier=",
+          "com.example.expected",
+          "fixture predecessor"
+        )
+      end
+      expect_failure("predecessor codesign metadata rejects mismatched fields") do
+        parser.send(
+          :exact_field!,
+          metadata,
+          "Identifier=",
+          "com.example.hostile",
+          "fixture predecessor"
+        )
+      end
+    end
+
     def close_journal!(host)
       io = host.instance_variable_get(:@journal_io)
       io.close if io && !io.closed?
@@ -4049,6 +4082,7 @@ module OpenSteamerV90Cutover
 
       verify_copy_stable_manifest_fixture!
       verify_predecessor_signature_layout_fixture!
+      verify_predecessor_codesign_metadata_fixture!
       verify_real_journal_state_machine!
       verify_journal_fault_reconciliation!
       verify_atomic_pointer_fixture!
