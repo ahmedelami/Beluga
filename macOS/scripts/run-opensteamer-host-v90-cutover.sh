@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Pinned entry point for the one-shot V90 host cutover controller.
-# Live modes intentionally remain disabled until Ahmed approves the predecessor-reference digest.
+# Live modes remain gated by the exact compiled predecessor-reference digest and clean tooling.
 set -euo pipefail
 umask 077
 
@@ -14,7 +14,7 @@ readonly LAUNCHER_BASENAME='run-opensteamer-host-v90-cutover.sh'
 readonly CONTROLLER_BASENAME='opensteamer-host-v90-cutover-controller.rb'
 readonly MONITOR_BASENAME='opensteamer-v90-coreaudio-route-monitor.swift'
 readonly ASSEMBLER_BASENAME='assemble-v90-sealed-host-oracle-capsule.sh'
-readonly CONTROLLER_SHA256='b03ee6f3dcf643ff4a132792f2d1831cc8742c21e969fc23132af0c4e93967c2'
+readonly CONTROLLER_SHA256='13aa41ddbd7ed8e4d90206286aff1f384997009ad3f533468217040d971756fa'
 readonly MONITOR_SHA256='4a788f63122b84a51b3009a544cda62589664ba51fd5a6bc1658381fdc28e36d'
 readonly RUBY='/usr/bin/ruby'
 readonly RUBY_SHA256='9d6ff3e289c7d908e3c785e0bedd6692d1d6a3377965c88c04d847104b7c892c'
@@ -26,7 +26,7 @@ readonly MACOS_SDK='/Volumes/t7/opensteamer-space-recovery-20260804/nonrepo/Xcod
 readonly MACOS_SDK_TARGET='MacOSX.sdk'
 readonly MACOS_SDK_IDENTITY='16777240:15672618'
 readonly MACOS_SDK_SETTINGS_SHA256='f8d005f09381389167f9e0aeaa169bc9e7dff162ef22ca2fd8e98df7ff1acafe'
-readonly APPROVED_PREDECESSOR_REFERENCE_SHA256='UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL'
+readonly APPROVED_PREDECESSOR_REFERENCE_SHA256='553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66'
 readonly LAUNCHER_ATTESTATION='opensteamer-v90-pinned-launcher-v1'
 
 fail() {
@@ -187,7 +187,7 @@ case "$MODE" in
     --verify-v90-cutover-preflight|--execute-authorized-v90-cutover)
         (( $# == 4 )) || fail 'live mode requires capsule root and exactly two external digests'
         [[ "$APPROVED_PREDECESSOR_REFERENCE_SHA256" =~ ^[0-9a-f]{64}$ ]] \
-            || fail 'live V90 modes remain blocked pending explicit Ahmed approval of the predecessor-reference digest'
+            || fail 'compiled approved predecessor-reference digest is invalid'
         verify_clean_remote_tooling
         ;;
     *)

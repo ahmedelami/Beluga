@@ -144,11 +144,20 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
                 "hostIdentityManifestRelativePath", "hostIdentityManifestSHA256",
                 "designatedRequirementReferenceRelativePath",
                 "designatedRequirementReferenceSHA256",
+                "designatedRequirementReferenceFileSize",
+                "designatedRequirementReferenceCodeSignatureDataOffset",
+                "designatedRequirementReferenceCodeSignatureDataSize",
+                "designatedRequirementReferenceUnsignedPrefixSHA256",
+                "designatedRequirementReferenceCDHash",
+                "designatedRequirementReferenceCodeDirectorySHA256",
+                "designatedRequirementReferenceTeamIdentifier",
+                "designatedRequirementReferenceIdentifier",
+                "designatedRequirementReferenceDesignatedRequirement",
             ])
         )
         XCTAssertEqual(
             payloadObject["schema"],
-            "opensteamer.v90-deployment-payload-manifest.v1"
+            "opensteamer.v90-deployment-payload-manifest.v2"
         )
         XCTAssertEqual(
             payloadObject["sourceCommit"],
@@ -174,6 +183,36 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         XCTAssertEqual(
             payloadObject["designatedRequirementReferenceSHA256"],
             fixture.referenceSHA256
+        )
+        XCTAssertEqual(payloadObject["designatedRequirementReferenceFileSize"], "24")
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceCodeSignatureDataOffset"],
+            "12"
+        )
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceCodeSignatureDataSize"],
+            "12"
+        )
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceUnsignedPrefixSHA256"],
+            "68a2c7e75a3c3555b5f445601bf2980be25a7282a1a7ea977ae3177d9996eed4"
+        )
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceCDHash"],
+            "e41c23322912104a648e791bfb0d3a5714323b26"
+        )
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceCodeDirectorySHA256"],
+            "e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0"
+        )
+        XCTAssertEqual(payloadObject["designatedRequirementReferenceTeamIdentifier"], "MSMG8CJLB3")
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceIdentifier"],
+            "com.elamin.AudioStreamer.CaptureServer"
+        )
+        XCTAssertEqual(
+            payloadObject["designatedRequirementReferenceDesignatedRequirement"],
+            "identifier \"com.elamin.AudioStreamer.CaptureServer\" and anchor apple generic and certificate leaf[subject.CN] = \"Apple Development: Ahmed Elamin (92LVX32M8K)\" and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */"
         )
         XCTAssertEqual(
             payloadObject["candidateLaunchPlistRelativePath"],
@@ -366,6 +405,89 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
             )
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.prepareCapture.path))
+    }
+
+    func testAssemblerRejectsEveryHostilePredecessorFingerprintDivergence() throws {
+        let cases: [([String: String], String)] = [
+            (["FAKE_OTOOL_DATAOFF": "13"], "LC_CODE_SIGNATURE layout differs"),
+            (["FAKE_OTOOL_DATASIZE": "11"], "LC_CODE_SIGNATURE layout differs"),
+            (["FAKE_HEAD_MUTATE_PREFIX": "1"], "unsigned-prefix digest differs"),
+            (["FAKE_CODESIGN_IDENTIFIER": "com.example.hostile"], "code-signature identity differs"),
+            (["FAKE_CODESIGN_TEAM": "HOSTILETEAM"], "code-signature identity differs"),
+            (["FAKE_CODESIGN_CDHASH": String(repeating: "0", count: 40)], "code-signature identity differs"),
+            (["FAKE_CODESIGN_CODE_DIRECTORY": String(repeating: "0", count: 64)], "code-signature identity differs"),
+            (["FAKE_CODESIGN_REQUIREMENT": "identifier hostile"], "designated requirement differs"),
+        ]
+        for (environment, diagnostic) in cases {
+            let fixture = try makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let result = try runAssembler(fixture, extraEnvironment: environment)
+            XCTAssertNotEqual(result.status, 0, result.diagnostic)
+            XCTAssertTrue(result.stderr.contains(diagnostic), result.diagnostic)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.capsule.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.buildCapture.path))
+        }
+    }
+
+    func testAssemblerRequiresOriginalReferenceInsideCompleteStrictValidApp() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let standalone = fixture.root.appendingPathComponent("standalone-CaptureServer")
+        try FileManager.default.copyItem(at: fixture.reference, to: standalone)
+        try setMode(0o755, on: standalone)
+
+        let result = try runAssembler(
+            fixture,
+            argumentOverride: [
+                fixture.source.path,
+                fixture.capsule.path,
+                standalone.path,
+                fixture.referenceSHA256,
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0, result.diagnostic)
+        XCTAssertTrue(
+            result.stderr.contains("not the CaptureServer executable inside a complete app bundle"),
+            result.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.capsule.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.buildCapture.path))
+    }
+
+    func testAssemblerFailsClosedWhenOriginalAppDeepStrictVerificationFails() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let result = try runAssembler(
+            fixture,
+            extraEnvironment: ["FAKE_FAIL_DEEP_APP_VERIFY": "1"]
+        )
+        XCTAssertNotEqual(result.status, 0, result.diagnostic)
+        XCTAssertTrue(
+            result.stderr.contains("original app bundle is not deep strict-valid"),
+            result.diagnostic
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.capsule.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.buildCapture.path))
+    }
+
+    func testAssemblerRevalidatesCopiedCapsuleReferenceFingerprint() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let result = try runAssembler(
+            fixture,
+            extraEnvironment: ["FAKE_COPY_CODESIGN_IDENTIFIER": "com.example.copied-hostile"]
+        )
+        XCTAssertNotEqual(result.status, 0, result.diagnostic)
+        XCTAssertTrue(
+            result.stderr.contains(
+                "capsule predecessor reference code-signature identity differs"
+            ),
+            result.diagnostic
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.capsule.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.buildCapture.path))
     }
 
     func testAssemblerRejectsUnreviewedCandidateSymlink() throws {
@@ -669,7 +791,7 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         }
     }
 
-    func testProductionPlaceholderFailsBeforeCapsuleCreation() throws {
+    func testProductionApprovedPinRejectsAnyOtherReferenceBeforeCapsuleCreation() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let production = repositoryRoot.appendingPathComponent(
@@ -688,7 +810,7 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         XCTAssertNotEqual(result.status, 0, result.diagnostic)
         XCTAssertTrue(
             result.stderr.contains(
-                "compiled approved predecessor-reference digest (explicit Ahmed approval required)"
+                "external predecessor-reference digest does not equal the explicitly approved compiled pin"
             ),
             result.diagnostic
         )
@@ -710,11 +832,24 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
             "MSMG8CJLB3",
             "OPENSTEAMER_REQUIRE_FRESH_RELEASE=1",
             "git -C \"$SOURCE_ROOT\" archive",
-            "APPROVED_PREDECESSOR_REFERENCE_SHA256='UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL'",
+            "APPROVED_PREDECESSOR_REFERENCE_SHA256='553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66'",
+            "APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE='11442304'",
+            "APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATAOFF='11401072'",
+            "APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATASIZE='41232'",
+            "APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256='a7885a8d1ffef70f5a747eaed984a6cb70fe382491fcc6fbf8505aa0ad47ff5b'",
+            "APPROVED_PREDECESSOR_REFERENCE_CDHASH='e41c23322912104a648e791bfb0d3a5714323b26'",
+            "APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256='e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0'",
+            "APPROVED_PREDECESSOR_REFERENCE_TEAM_ID='MSMG8CJLB3'",
+            "APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER='com.elamin.AudioStreamer.CaptureServer'",
+            "APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT='identifier \"com.elamin.AudioStreamer.CaptureServer\"",
+            "assert_predecessor_reference_fingerprint",
+            "--verify --deep --strict",
         ] {
             XCTAssertTrue(text.contains(expected), "missing production pin: \(expected)")
         }
         XCTAssertFalse(text.contains("4b353f"))
+        XCTAssertFalse(text.contains("UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"))
+        XCTAssertFalse(text.contains("explicit Ahmed approval required"))
         XCTAssertFalse(text.contains("beluga-v86-independent-reference-rebuild"))
         XCTAssertFalse(text.contains("/bin/launchctl"))
         XCTAssertFalse(text.contains("/usr/bin/kill"))
@@ -786,14 +921,24 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
             )
             let buildCapture = root.appendingPathComponent("build-capture.txt")
             let prepareCapture = root.appendingPathComponent("prepare-capture.txt")
-            let reference = root.appendingPathComponent("approved-reference/CaptureServer")
+            let referenceApp = root.appendingPathComponent(
+                "approved-reference/Beluga Host.app",
+                isDirectory: true
+            )
+            let reference = referenceApp.appendingPathComponent(
+                "Contents/MacOS/CaptureServer"
+            )
             try FileManager.default.createDirectory(
                 at: reference.deletingLastPathComponent(),
-                withIntermediateDirectories: false,
-                attributes: [.posixPermissions: 0o700]
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o755]
             )
             try Data("independent predecessor\n".utf8).write(to: reference)
             try setMode(0o755, on: reference)
+            try setMode(0o755, on: referenceApp)
+            let referenceInfo = referenceApp.appendingPathComponent("Contents/Info.plist")
+            try Data("fixture complete bundle\n".utf8).write(to: referenceInfo)
+            try setMode(0o644, on: referenceInfo)
             let referenceSHA256 = try sha256(of: reference)
 
             let builder = scripts.appendingPathComponent("build-opensteamer-host-app.sh")
@@ -837,6 +982,19 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
             let fakeGit = root.appendingPathComponent("fake-git")
             try fakeGitScript.write(to: fakeGit, atomically: false, encoding: .utf8)
             try setMode(0o755, on: fakeGit)
+            let fakeCodesign = root.appendingPathComponent("fake-codesign")
+            try fakeCodesignScript.write(
+                to: fakeCodesign,
+                atomically: false,
+                encoding: .utf8
+            )
+            try setMode(0o755, on: fakeCodesign)
+            let fakeOtool = root.appendingPathComponent("fake-otool")
+            try fakeOtoolScript.write(to: fakeOtool, atomically: false, encoding: .utf8)
+            try setMode(0o755, on: fakeOtool)
+            let fakeHead = root.appendingPathComponent("fake-head")
+            try fakeHeadScript.write(to: fakeHead, atomically: false, encoding: .utf8)
+            try setMode(0o755, on: fakeHead)
             let sourceAssembler = repositoryRoot.appendingPathComponent(
                 "macOS/scripts/assemble-v90-sealed-host-oracle-capsule.sh"
             )
@@ -844,6 +1002,18 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
             assemblerText = assemblerText.replacingOccurrences(
                 of: "/usr/bin/git",
                 with: fakeGit.path
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "/usr/bin/codesign",
+                with: fakeCodesign.path
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "/usr/bin/otool",
+                with: fakeOtool.path
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "/usr/bin/head",
+                with: fakeHead.path
             )
             assemblerText = assemblerText.replacingOccurrences(
                 of: "/Volumes/t7/opensteamer-space-recovery-20260804/nonrepo/Xcode-26.6.0.app/Contents/Developer",
@@ -861,8 +1031,24 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
                 withIntermediateDirectories: true
             )
             assemblerText = assemblerText.replacingOccurrences(
-                of: "UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL",
+                of: "553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66",
                 with: referenceSHA256
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "11442304",
+                with: "24"
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "11401072",
+                with: "12"
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "41232",
+                with: "12"
+            )
+            assemblerText = assemblerText.replacingOccurrences(
+                of: "a7885a8d1ffef70f5a747eaed984a6cb70fe382491fcc6fbf8505aa0ad47ff5b",
+                with: "68a2c7e75a3c3555b5f445601bf2980be25a7282a1a7ea977ae3177d9996eed4"
             )
             try assemblerText.write(to: assembler, atomically: false, encoding: .utf8)
             try setMode(0o755, on: assembler)
@@ -1117,6 +1303,72 @@ final class V90OfflineCapsuleAssemblerTests: XCTestCase {
         print -r -- "manifest_path=$manifest"
         print -r -- "manifest_sha256=$manifest_sha"
         print -r -- "manifest_sha256_path=$manifest_sidecar"
+        """
+    }
+
+    private var fakeCodesignScript: String {
+        """
+        #!/bin/zsh
+        set -euo pipefail
+        target=${@[-1]}
+        if [[ " $* " == *" --verify "* ]]; then
+          if [[ "$target" == *.app ]]; then
+            if [[ "${FAKE_FAIL_DEEP_APP_VERIFY:-0}" == 1 ]]; then
+              print -u2 -- 'fixture deep app verification failure'
+              exit 92
+            fi
+            [[ -f "$target/Contents/Info.plist" \
+              && -f "$target/Contents/MacOS/CaptureServer" ]]
+          elif [[ "$target" == */Contents/MacOS/CaptureServer ]]; then
+            app=${target%/Contents/MacOS/CaptureServer}
+            [[ "$app" == *.app && -f "$app/Contents/Info.plist" ]]
+          else
+            print -u2 -- 'standalone strict verification is intentionally unavailable'
+            exit 91
+          fi
+          exit 0
+        fi
+        if [[ " $* " == *" --requirements "* ]]; then
+          print -r -- "Executable=$target"
+          print -r -- "designated => ${FAKE_CODESIGN_REQUIREMENT:-identifier \\\"com.elamin.AudioStreamer.CaptureServer\\\" and anchor apple generic and certificate leaf[subject.CN] = \\\"Apple Development: Ahmed Elamin (92LVX32M8K)\\\" and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */}"
+          exit 0
+        fi
+        [[ " $* " == *" --display "* ]]
+        identifier=${FAKE_CODESIGN_IDENTIFIER:-com.elamin.AudioStreamer.CaptureServer}
+        if [[ "$target" == */trusted-reference/CaptureServer \
+          && -n "${FAKE_COPY_CODESIGN_IDENTIFIER:-}" ]]; then
+          identifier=$FAKE_COPY_CODESIGN_IDENTIFIER
+        fi
+        print -r -- "Executable=$target"
+        print -r -- "Identifier=$identifier"
+        print -r -- "CandidateCDHashFull sha256=${FAKE_CODESIGN_CODE_DIRECTORY:-e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0}"
+        print -r -- "CDHash=${FAKE_CODESIGN_CDHASH:-e41c23322912104a648e791bfb0d3a5714323b26}"
+        print -r -- "TeamIdentifier=${FAKE_CODESIGN_TEAM:-MSMG8CJLB3}"
+        """
+    }
+
+    private var fakeOtoolScript: String {
+        """
+        #!/bin/zsh
+        set -euo pipefail
+        [[ $# == 2 && "$1" == -l ]]
+        print -r -- 'Load command 58'
+        print -r -- '      cmd LC_CODE_SIGNATURE'
+        print -r -- '  cmdsize 16'
+        print -r -- "  dataoff ${FAKE_OTOOL_DATAOFF:-12}"
+        print -r -- " datasize ${FAKE_OTOOL_DATASIZE:-12}"
+        """
+    }
+
+    private var fakeHeadScript: String {
+        """
+        #!/bin/zsh
+        set -euo pipefail
+        if [[ "${FAKE_HEAD_MUTATE_PREFIX:-0}" == 1 ]]; then
+          /usr/bin/printf 'hostile prefix'
+        else
+          exec /usr/bin/head "$@"
+        fi
         """
     }
 

@@ -78,6 +78,23 @@ bundle, or reopening any retained/consumed migration or update capsule. The cand
 digests must differ. If a separately authorized capsule assembler cannot supply those already
 reviewed inputs, preparation stops instead of borrowing historical live or retained state.
 
+The approved predecessor input is the preserved-input V86 re-sign whose executable SHA-256 is
+`553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66`. Before copying it, the
+assembler requires that executable to remain at `Contents/MacOS/CaptureServer` inside its complete
+canonical app and verifies both the code object and the full app with strict resource validation.
+It then fingerprints the original and independent capsule copy by exact size (`11442304`),
+`LC_CODE_SIGNATURE` extent (`dataoff=11401072`, `datasize=41232`), unsigned-prefix SHA-256
+`a7885a8d1ffef70f5a747eaed984a6cb70fe382491fcc6fbf8505aa0ad47ff5b`, CDHash
+`e41c23322912104a648e791bfb0d3a5714323b26`, full CodeDirectory SHA-256
+`e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0`, TeamIdentifier
+`MSMG8CJLB3`, identifier `com.elamin.AudioStreamer.CaptureServer`, and designated requirement
+`identifier "com.elamin.AudioStreamer.CaptureServer" and anchor apple generic and certificate
+leaf[subject.CN] = "Apple Development: Ahmed Elamin (92LVX32M8K)" and certificate
+1[field.1.2.840.113635.100.6.2.1] /* exists */`. The standalone copy is code-identity
+evidence, not full-bundle resource proof: the controller replays those compiled byte, Mach-O,
+CodeDirectory, identity, and requirement pins without pretending the separated executable still
+contains its original Info.plist or sealed resources.
+
 Preparation creates the fixed, previously absent `v90-screen-oracle-handoff` directory once, calls
 `create-sealed-mac-host-identity-manifest.sh` with the metadata-pinned reference digest, and verifies
 that the generated manifest describes the exact metadata-pinned candidate and fixed production team
@@ -113,13 +130,16 @@ mechanism that assembled and deployed them. Neither identity substitutes for the
 `macOS/scripts/assemble-v90-sealed-host-oracle-capsule.sh` is offline with respect to the
 installed host and every running service. It accepts only nonoverlapping clean source/tooling
 locations, a fresh private capsule root, and an independent predecessor-reference code object
-whose externally supplied SHA-256 equals the explicitly approved compiled pin. An unset pin or
-digest mismatch fails before capsule construction; deployment authorization alone does not approve
-a byte- or CDHash-different predecessor reconstruction. The assembler exports commit A, builds and
-signs the candidate, copies the exact source launch plist, removes build scratch, and commits strong
-source/candidate manifests, a copy-stable candidate manifest, the host-identity handoff, and
-`v90-deployment-payload-manifest.json` plus its sidecar. Capsule assembly is sealed build evidence,
-not deployment evidence.
+whose externally supplied SHA-256 equals the explicitly approved compiled pin. A malformed
+compiled pin or digest mismatch fails before capsule construction; deployment authorization alone
+does not approve a byte- or CDHash-different predecessor reconstruction. The assembler exports
+commit A, builds and signs the candidate, copies the exact source launch plist, removes build
+scratch, and commits strong source/candidate manifests, a copy-stable candidate manifest, the
+host-identity handoff, and
+`v90-deployment-payload-manifest.json` plus its sidecar. Payload schema
+`opensteamer.v90-deployment-payload-manifest.v2` records all nine additional predecessor fingerprint
+fields so the controller can require the capsule record, compiled pins, copied bytes, and copied
+signature metadata to agree. Capsule assembly is sealed build evidence, not deployment evidence.
 
 Live use goes only through `macOS/scripts/run-opensteamer-host-v90-cutover.sh` and
 `macOS/scripts/opensteamer-host-v90-cutover-controller.rb` with the sealed capsule and independently

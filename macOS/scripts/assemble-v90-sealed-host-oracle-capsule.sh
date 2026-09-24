@@ -19,7 +19,16 @@ readonly EXPECTED_DEVELOPER_DIR='/Volumes/t7/opensteamer-space-recovery-20260804
 readonly EXPECTED_SIGNING_IDENTITY_SHA1='483C08B6517EBC1CFCCAB1A88BBEE8028750AA13'
 readonly EXPECTED_TEAM_ID='MSMG8CJLB3'
 readonly EXPECTED_ARCHITECTURES='arm64'
-readonly APPROVED_PREDECESSOR_REFERENCE_SHA256='UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL'
+readonly APPROVED_PREDECESSOR_REFERENCE_SHA256='553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66'
+readonly APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE='11442304'
+readonly APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATAOFF='11401072'
+readonly APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATASIZE='41232'
+readonly APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256='a7885a8d1ffef70f5a747eaed984a6cb70fe382491fcc6fbf8505aa0ad47ff5b'
+readonly APPROVED_PREDECESSOR_REFERENCE_CDHASH='e41c23322912104a648e791bfb0d3a5714323b26'
+readonly APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256='e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0'
+readonly APPROVED_PREDECESSOR_REFERENCE_TEAM_ID='MSMG8CJLB3'
+readonly APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER='com.elamin.AudioStreamer.CaptureServer'
+readonly APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT='identifier "com.elamin.AudioStreamer.CaptureServer" and anchor apple generic and certificate leaf[subject.CN] = "Apple Development: Ahmed Elamin (92LVX32M8K)" and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */'
 readonly PROTECTED_RUNTIME_ROOT='/Users/ahmed/Library/Application Support/opensteamer'
 readonly METADATA_SCHEMA='opensteamer.v90-host-oracle-capsule-metadata.v1'
 readonly METADATA_BASENAME='trusted-v90-host-oracle-capsule-metadata.json'
@@ -28,7 +37,7 @@ readonly REFERENCE_RELATIVE='trusted-reference/CaptureServer'
 readonly SOURCE_TREE_MANIFEST_BASENAME='v90-source-export-tree-manifest.txt'
 readonly CANDIDATE_TREE_MANIFEST_BASENAME='v90-candidate-app-tree-manifest.txt'
 readonly CANDIDATE_COPY_MANIFEST_BASENAME='v90-candidate-app-copy-manifest.txt'
-readonly PAYLOAD_SCHEMA='opensteamer.v90-deployment-payload-manifest.v1'
+readonly PAYLOAD_SCHEMA='opensteamer.v90-deployment-payload-manifest.v2'
 readonly PAYLOAD_MANIFEST_BASENAME='v90-deployment-payload-manifest.json'
 readonly PAYLOAD_SIDECAR_BASENAME='v90-deployment-payload-manifest.json.sha256'
 
@@ -71,6 +80,132 @@ sha256_text() {
         }
         END { if (count != 1) exit 1; print value }
     '
+}
+
+sha256_prefix() {
+    local target=$1
+    local length=$2
+
+    /usr/bin/head -c "$length" "$target" | /usr/bin/shasum -a 256 | /usr/bin/awk '
+        {
+            candidate=substr($0, 1, 64)
+            separator=substr($0, 65, 2)
+            if (length(candidate) == 64 && candidate ~ /^[0-9a-f]+$/ &&
+                separator ~ /^[[:space:]][ *]$/) {
+                value=candidate
+                count++
+            }
+        }
+        END { if (count != 1) exit 1; print value }
+    '
+}
+
+codesign_single_field() {
+    local metadata=$1
+    local prefix=$2
+
+    /usr/bin/printf '%s\n' "$metadata" | /usr/bin/awk -v prefix="$prefix" '
+        index($0, prefix) == 1 {
+            value=substr($0, length(prefix) + 1)
+            count++
+        }
+        END { if (count != 1 || value == "") exit 1; print value }
+    '
+}
+
+assert_predecessor_reference_fingerprint() {
+    local target=$1
+    local label=$2
+    local require_bundle_strict=$3
+    local signature_fields dataoff datasize size prefix_sha metadata cdhash code_directory_sha
+    local team identifier requirement_output requirement app_root
+
+    assert_private_file "$target" 755 "$label"
+    [[ "$(sha256_file "$target")" == "$APPROVED_PREDECESSOR_REFERENCE_SHA256" ]] \
+        || fail "$label full-file SHA-256 differs from the approved predecessor"
+    size=$(/usr/bin/stat -f '%z' "$target") \
+        || fail "$label size is unavailable"
+    [[ "$size" == "$APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE" ]] \
+        || fail "$label size differs from the approved predecessor"
+
+    signature_fields=$(/usr/bin/otool -l "$target" | /usr/bin/awk '
+        $1 == "cmd" && $2 == "LC_CODE_SIGNATURE" {
+            count++
+            active=1
+            next
+        }
+        active && $1 == "dataoff" {
+            dataoff=$2
+            next
+        }
+        active && $1 == "datasize" {
+            datasize=$2
+            active=0
+            next
+        }
+        END {
+            if (count != 1 || dataoff !~ /^[0-9]+$/ || datasize !~ /^[0-9]+$/) exit 1
+            print dataoff ":" datasize
+        }
+    ') || fail "$label has no unique parseable LC_CODE_SIGNATURE"
+    dataoff=${signature_fields%%:*}
+    datasize=${signature_fields##*:}
+    [[ "$dataoff" == "$APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATAOFF" \
+        && "$datasize" == "$APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATASIZE" \
+        && "$(( dataoff + datasize ))" == "$size" ]] \
+        || fail "$label LC_CODE_SIGNATURE layout differs from the approved predecessor "\
+"(actual=${dataoff}:${datasize}/${size}, expected="\
+"${APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATAOFF}:"\
+"${APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATASIZE}/"\
+"${APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE})"
+    prefix_sha=$(sha256_prefix "$target" "$dataoff") \
+        || fail "$label unsigned-prefix digest is unavailable"
+    [[ "$prefix_sha" == "$APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256" ]] \
+        || fail "$label unsigned-prefix digest differs from the approved predecessor"
+
+    metadata=$(/usr/bin/codesign --display --verbose=6 "$target" 2>&1) \
+        || fail "$label code-signature metadata is unavailable"
+    identifier=$(codesign_single_field "$metadata" 'Identifier=') \
+        || fail "$label has ambiguous code identifier metadata"
+    team=$(codesign_single_field "$metadata" 'TeamIdentifier=') \
+        || fail "$label has ambiguous TeamIdentifier metadata"
+    cdhash=$(codesign_single_field "$metadata" 'CDHash=') \
+        || fail "$label has ambiguous CDHash metadata"
+    code_directory_sha=$(codesign_single_field "$metadata" 'CandidateCDHashFull sha256=') \
+        || fail "$label has ambiguous full CodeDirectory digest metadata"
+    [[ "$identifier" == "$APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER" \
+        && "$team" == "$APPROVED_PREDECESSOR_REFERENCE_TEAM_ID" \
+        && "$cdhash" == "$APPROVED_PREDECESSOR_REFERENCE_CDHASH" \
+        && "$code_directory_sha" == "$APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256" ]] \
+        || fail "$label code-signature identity differs from the approved predecessor"
+
+    requirement_output=$(/usr/bin/codesign --display --requirements - "$target" 2>&1) \
+        || fail "$label designated requirement is unavailable"
+    requirement=$(/usr/bin/printf '%s\n' "$requirement_output" | /usr/bin/awk '
+        sub(/^# /, "")
+        index($0, "designated => ") == 1 {
+            value=substr($0, length("designated => ") + 1)
+            count++
+        }
+        END { if (count != 1 || value == "") exit 1; print value }
+    ') || fail "$label has no unique designated requirement"
+    [[ "$requirement" == "$APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT" ]] \
+        || fail "$label designated requirement differs from the approved predecessor"
+
+    if [[ "$require_bundle_strict" == 1 ]]; then
+        [[ "$target" == */Contents/MacOS/CaptureServer ]] \
+            || fail "$label is not the CaptureServer executable inside a complete app bundle"
+        app_root=${target%/Contents/MacOS/CaptureServer}
+        [[ "$app_root" == *.app && -d "$app_root" && ! -L "$app_root" \
+            && "${app_root:A}" == "$app_root" ]] \
+            || fail "$label does not belong to a canonical complete app bundle"
+        /usr/bin/codesign --verify --strict --verbose=4 "$target" \
+            || fail "$label is not strict-valid in its original bundle context"
+        /usr/bin/codesign --verify --deep --strict --verbose=4 "$app_root" \
+            || fail "$label original app bundle is not deep strict-valid"
+    elif [[ "$require_bundle_strict" != 0 ]]; then
+        fail "$label fingerprint verifier received an invalid strict-verification mode"
+    fi
 }
 
 assert_sha256() {
@@ -618,7 +753,7 @@ readonly REFERENCE_INPUT=${3%/}
 readonly EXPECTED_REFERENCE_SHA256=$4
 assert_sha256 "$EXPECTED_REFERENCE_SHA256" "independently supplied predecessor-reference digest"
 assert_sha256 "$APPROVED_PREDECESSOR_REFERENCE_SHA256" \
-    "compiled approved predecessor-reference digest (explicit Ahmed approval required)"
+    "compiled approved predecessor-reference digest"
 [[ "$EXPECTED_REFERENCE_SHA256" == "$APPROVED_PREDECESSOR_REFERENCE_SHA256" ]] \
     || fail "external predecessor-reference digest does not equal the explicitly approved compiled pin"
 
@@ -658,6 +793,8 @@ assert_private_file "$REFERENCE_INPUT" 755 "trusted predecessor reference"
 [[ "$REFERENCE_INPUT" != "$SOURCE_ROOT" && "$REFERENCE_INPUT" != "$SOURCE_ROOT/"* \
     && "$REFERENCE_INPUT" != "$CAPSULE_ROOT" && "$REFERENCE_INPUT" != "$CAPSULE_ROOT/"* ]] \
     || fail "trusted predecessor reference must be independent of source and capsule"
+assert_predecessor_reference_fingerprint \
+    "$REFERENCE_INPUT" "trusted predecessor reference" 1
 readonly REFERENCE_INPUT_IDENTITY=$(/usr/bin/stat -f '%d:%i:%z' "$REFERENCE_INPUT") \
     || fail "trusted predecessor reference identity is unavailable"
 readonly REFERENCE_INPUT_SHA256=$(sha256_file "$REFERENCE_INPUT") \
@@ -752,6 +889,10 @@ assert_private_file "$REFERENCE_COPY" 755 "capsule predecessor reference"
         == "$REFERENCE_INPUT_IDENTITY" \
     && "$(sha256_file "$REFERENCE_INPUT")" == "$EXPECTED_REFERENCE_SHA256" ]] \
     || fail "trusted predecessor reference changed or was not independently copied"
+assert_predecessor_reference_fingerprint \
+    "$REFERENCE_INPUT" "trusted predecessor reference after capsule copy" 1
+assert_predecessor_reference_fingerprint \
+    "$REFERENCE_COPY" "capsule predecessor reference" 0
 
 readonly BUILDER="${SOURCE_EXPORT}/macOS/scripts/build-opensteamer-host-app.sh"
 readonly HANDOFF_PREPARER="${SOURCE_EXPORT}/macOS/scripts/prepare-v90-sealed-host-oracle-handoff.sh"
@@ -956,7 +1097,16 @@ payload_staged=$(/usr/bin/mktemp "${CAPSULE_ROOT}/.v90-deployment-payload.XXXXXX
     --arg hostIdentityManifestRelativePath "$HOST_IDENTITY_RELATIVE" \
     --arg hostIdentityManifestSHA256 "$HOST_IDENTITY_SHA256" \
     --arg designatedRequirementReferenceRelativePath "$REFERENCE_RELATIVE" \
-    --arg designatedRequirementReferenceSHA256 "$EXPECTED_REFERENCE_SHA256" '
+    --arg designatedRequirementReferenceSHA256 "$EXPECTED_REFERENCE_SHA256" \
+    --arg designatedRequirementReferenceFileSize "$APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE" \
+    --arg designatedRequirementReferenceCodeSignatureDataOffset "$APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATAOFF" \
+    --arg designatedRequirementReferenceCodeSignatureDataSize "$APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATASIZE" \
+    --arg designatedRequirementReferenceUnsignedPrefixSHA256 "$APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256" \
+    --arg designatedRequirementReferenceCDHash "$APPROVED_PREDECESSOR_REFERENCE_CDHASH" \
+    --arg designatedRequirementReferenceCodeDirectorySHA256 "$APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256" \
+    --arg designatedRequirementReferenceTeamIdentifier "$APPROVED_PREDECESSOR_REFERENCE_TEAM_ID" \
+    --arg designatedRequirementReferenceIdentifier "$APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER" \
+    --arg designatedRequirementReferenceDesignatedRequirement "$APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT" '
     {
       schema: $schema,
       sourceCommit: $sourceCommit,
@@ -993,7 +1143,16 @@ payload_staged=$(/usr/bin/mktemp "${CAPSULE_ROOT}/.v90-deployment-payload.XXXXXX
       hostIdentityManifestRelativePath: $hostIdentityManifestRelativePath,
       hostIdentityManifestSHA256: $hostIdentityManifestSHA256,
       designatedRequirementReferenceRelativePath: $designatedRequirementReferenceRelativePath,
-      designatedRequirementReferenceSHA256: $designatedRequirementReferenceSHA256
+      designatedRequirementReferenceSHA256: $designatedRequirementReferenceSHA256,
+      designatedRequirementReferenceFileSize: $designatedRequirementReferenceFileSize,
+      designatedRequirementReferenceCodeSignatureDataOffset: $designatedRequirementReferenceCodeSignatureDataOffset,
+      designatedRequirementReferenceCodeSignatureDataSize: $designatedRequirementReferenceCodeSignatureDataSize,
+      designatedRequirementReferenceUnsignedPrefixSHA256: $designatedRequirementReferenceUnsignedPrefixSHA256,
+      designatedRequirementReferenceCDHash: $designatedRequirementReferenceCDHash,
+      designatedRequirementReferenceCodeDirectorySHA256: $designatedRequirementReferenceCodeDirectorySHA256,
+      designatedRequirementReferenceTeamIdentifier: $designatedRequirementReferenceTeamIdentifier,
+      designatedRequirementReferenceIdentifier: $designatedRequirementReferenceIdentifier,
+      designatedRequirementReferenceDesignatedRequirement: $designatedRequirementReferenceDesignatedRequirement
     }
 ' >"$payload_staged" || fail "could not render V90 deployment-payload manifest"
 /bin/chmod 600 "$payload_staged" \
@@ -1001,7 +1160,7 @@ payload_staged=$(/usr/bin/mktemp "${CAPSULE_ROOT}/.v90-deployment-payload.XXXXXX
 assert_private_file "$payload_staged" 600 "staged V90 deployment-payload manifest"
 /usr/bin/jq --stream -c . "$payload_staged" | /usr/bin/jq -e -s '
     [ .[] | select(length == 2) | .[0] ] as $paths
-    | ($paths | length) == 36
+    | ($paths | length) == 45
       and ($paths | all(length == 1))
       and (($paths | map(.[0]) | sort) == [
         "assemblerScriptGitBlob",
@@ -1021,8 +1180,17 @@ assert_private_file "$payload_staged" 600 "staged V90 deployment-payload manifes
         "candidateMediaFrameworkExecutableSHA256",
         "capsuleMetadataRelativePath",
         "capsuleMetadataSHA256",
+        "designatedRequirementReferenceCDHash",
+        "designatedRequirementReferenceCodeDirectorySHA256",
+        "designatedRequirementReferenceCodeSignatureDataOffset",
+        "designatedRequirementReferenceCodeSignatureDataSize",
+        "designatedRequirementReferenceDesignatedRequirement",
+        "designatedRequirementReferenceFileSize",
+        "designatedRequirementReferenceIdentifier",
         "designatedRequirementReferenceRelativePath",
         "designatedRequirementReferenceSHA256",
+        "designatedRequirementReferenceTeamIdentifier",
+        "designatedRequirementReferenceUnsignedPrefixSHA256",
         "handoffRelativePath",
         "handoffSHA256",
         "hostIdentityManifestRelativePath",
@@ -1043,7 +1211,7 @@ assert_private_file "$payload_staged" 600 "staged V90 deployment-payload manifes
       ])
 ' >/dev/null || fail "V90 deployment-payload manifest has duplicate, nested, or unknown fields"
 /usr/bin/jq -e --arg schema "$PAYLOAD_SCHEMA" '
-    type == "object" and (keys | length) == 36 and .schema == $schema and
+    type == "object" and (keys | length) == 45 and .schema == $schema and
     all(.[]; type == "string")
 ' "$payload_staged" >/dev/null \
     || fail "V90 deployment-payload manifest shape is invalid"
@@ -1117,6 +1285,10 @@ revalidate_committed_tree_manifests
 assert_exact_private_directory_shape "$BUILD_OUTPUT" \
     "final V90 candidate output directory" 'opensteamer Host.app'
 assert_candidate_app_root "$CANDIDATE_APP" "final V90 candidate app root"
+assert_predecessor_reference_fingerprint \
+    "$REFERENCE_INPUT" "final trusted predecessor reference" 1
+assert_predecessor_reference_fingerprint \
+    "$REFERENCE_COPY" "final capsule predecessor reference" 0
 [[ "$(/usr/bin/stat -f '%d:%i' "$CAPSULE_ROOT")" == "$CAPSULE_ROOT_IDENTITY" \
     && "$(/usr/bin/stat -f '%d:%i:%z' "$REFERENCE_INPUT")" \
         == "$REFERENCE_INPUT_IDENTITY" \
@@ -1162,6 +1334,9 @@ print -r -- "candidate_launch_plist_path=$DEPLOYMENT_LAUNCH_PLIST"
 print -r -- "candidate_launch_plist_sha256=$DEPLOYMENT_LAUNCH_PLIST_SHA256"
 print -r -- "designated_requirement_reference_path=$REFERENCE_COPY"
 print -r -- "designated_requirement_reference_sha256=$EXPECTED_REFERENCE_SHA256"
+print -r -- "designated_requirement_reference_unsigned_prefix_sha256=$APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256"
+print -r -- "designated_requirement_reference_cdhash=$APPROVED_PREDECESSOR_REFERENCE_CDHASH"
+print -r -- "designated_requirement_reference_code_directory_sha256=$APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256"
 print -r -- "metadata_path=$METADATA"
 print -r -- "metadata_sha256=$METADATA_SHA256"
 print -r -- "$handoff_output"

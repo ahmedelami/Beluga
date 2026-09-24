@@ -73,22 +73,11 @@ final class V90HostCutoverControllerTests: XCTestCase {
         )
     }
 
-    func testPinnedLauncherCanRunOnlyOfflineSelfTestWhileApprovalPinIsInvalid() throws {
+    func testPinnedLauncherRunsOfflineSelfTestWithExactApprovedReferencePin() throws {
         let selfTest = try runExecutable(launcher, arguments: ["--self-test-v90-cutover"])
         XCTAssertEqual(selfTest.status, 0, selfTest.stderr)
         XCTAssertEqual(selfTest.stdout, "opensteamer V90 cutover self-test: PASS\n")
         XCTAssertEqual(selfTest.stderr, "")
-
-        let digest = String(repeating: "0", count: 64)
-        let blocked = try runExecutable(
-            launcher,
-            arguments: ["--verify-v90-cutover-preflight", "/does/not/exist", digest, digest]
-        )
-        XCTAssertNotEqual(blocked.status, 0)
-        XCTAssertTrue(
-            blocked.stderr.contains("explicit Ahmed approval"),
-            blocked.stderr
-        )
     }
 
     func testStickyCoreAudioMonitorTypechecksWithoutExecution() throws {
@@ -118,7 +107,37 @@ final class V90HostCutoverControllerTests: XCTestCase {
         XCTAssertTrue(source.contains("COMMITTED_V90"))
         XCTAssertTrue(source.contains("COMMITTED_V90_UNVERIFIED"))
         XCTAssertTrue(source.contains("ROLLED_BACK_EXACT_V86"))
-        XCTAssertTrue(source.contains("UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"))
+        XCTAssertTrue(source.contains("553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66"))
+        XCTAssertTrue(source.contains("11_442_304"))
+        XCTAssertTrue(source.contains("11_401_072"))
+        XCTAssertTrue(source.contains("41_232"))
+        XCTAssertTrue(source.contains("a7885a8d1ffef70f5a747eaed984a6cb70fe382491fcc6fbf8505aa0ad47ff5b"))
+        XCTAssertTrue(source.contains("e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0"))
+        XCTAssertTrue(source.contains("APPROVED_PREDECESSOR_REFERENCE_TEAM_ID = TEAM_ID"))
+        XCTAssertTrue(
+            source.contains(
+                "APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER = EXECUTABLE_IDENTIFIER"
+            )
+        )
+        XCTAssertTrue(
+            source.contains(
+                "APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT = V86_DESIGNATED_REQUIREMENT"
+            )
+        )
+        XCTAssertTrue(source.contains("TEAM_ID = \"MSMG8CJLB3\""))
+        XCTAssertTrue(
+            source.contains(
+                "EXECUTABLE_IDENTIFIER = \"com.elamin.AudioStreamer.CaptureServer\""
+            )
+        )
+        XCTAssertTrue(
+            source.contains(
+                "V86_DESIGNATED_REQUIREMENT = 'identifier \"com.elamin.AudioStreamer.CaptureServer\""
+            )
+        )
+        XCTAssertTrue(source.contains("PredecessorReferenceFingerprint"))
+        XCTAssertTrue(source.contains("signature_layout"))
+        XCTAssertTrue(source.contains("CandidateCDHashFull sha256="))
         XCTAssertTrue(source.contains("v90-candidate-app-copy-manifest.txt"))
         XCTAssertTrue(source.contains("sticky-coreaudio-route-monitor"))
         XCTAssertTrue(source.contains("\"TMPDIR\" => compiler_tmp"))
@@ -147,6 +166,7 @@ final class V90HostCutoverControllerTests: XCTestCase {
         XCTAssertFalse(source.contains("rm_rf"))
         XCTAssertFalse(source.contains("finalize_commit!"))
         XCTAssertFalse(source.contains("4b353f"))
+        XCTAssertFalse(source.contains("UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"))
         XCTAssertFalse(source.contains("/Applications/AudioStreamer Host.app"))
         XCTAssertFalse(source.contains("SwitchAudioSource\", \"-s"))
     }
@@ -160,7 +180,9 @@ final class V90HostCutoverControllerTests: XCTestCase {
         XCTAssertTrue(source.contains("hash-object --no-filters"))
         XCTAssertTrue(source.contains("OPENSTEAMER_V90_TOOLING_COMMIT"))
         XCTAssertTrue(source.contains("OPENSTEAMER_V90_LAUNCHER_BLOB"))
-        XCTAssertTrue(source.contains("UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"))
+        XCTAssertTrue(source.contains("553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66"))
+        XCTAssertFalse(source.contains("UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"))
+        XCTAssertFalse(source.contains("pending explicit Ahmed approval"))
     }
 
     private func run(_ arguments: [String]) throws -> Result {

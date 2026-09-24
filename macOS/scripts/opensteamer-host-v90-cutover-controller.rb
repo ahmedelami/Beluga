@@ -50,9 +50,18 @@ module OpenSteamerV90Cutover
     TEAM_ID = "MSMG8CJLB3"
     EXECUTABLE_IDENTIFIER = "com.elamin.AudioStreamer.CaptureServer"
     FRAMEWORK_IDENTIFIER = "io.livekit.LiveKitWebRTC"
-    # Deliberately invalid until Ahmed explicitly approves the independently transported V86
-    # designated-requirement reference digest. Live preflight must remain blocked meanwhile.
-    APPROVED_PREDECESSOR_REFERENCE_SHA256 = "UNSET_REQUIRES_EXPLICIT_AHMED_APPROVAL"
+    V86_CDHASH = "e41c23322912104a648e791bfb0d3a5714323b26"
+    V86_DESIGNATED_REQUIREMENT = 'identifier "com.elamin.AudioStreamer.CaptureServer" and anchor apple generic and certificate leaf[subject.CN] = "Apple Development: Ahmed Elamin (92LVX32M8K)" and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */'
+    APPROVED_PREDECESSOR_REFERENCE_SHA256 = "553892526e1f9de1e6d67b5556b3c2c008d9b48bbd553eb799c2260ee184ac66"
+    APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE = 11_442_304
+    APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATA_OFFSET = 11_401_072
+    APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATA_SIZE = 41_232
+    APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256 = "a7885a8d1ffef70f5a747eaed984a6cb70fe382491fcc6fbf8505aa0ad47ff5b"
+    APPROVED_PREDECESSOR_REFERENCE_CDHASH = V86_CDHASH
+    APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256 = "e41c23322912104a648e791bfb0d3a5714323b26b1b299ae5f0cfa225f68aba0"
+    APPROVED_PREDECESSOR_REFERENCE_TEAM_ID = TEAM_ID
+    APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER = EXECUTABLE_IDENTIFIER
+    APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT = V86_DESIGNATED_REQUIREMENT
     LIVE_APP = "/Applications/opensteamer Host.app"
     LIVE_EXECUTABLE = "#{LIVE_APP}/Contents/MacOS/CaptureServer"
     LIVE_FRAMEWORK = "#{LIVE_APP}/Contents/Frameworks/LiveKitWebRTC.framework/Versions/A/LiveKitWebRTC"
@@ -87,8 +96,6 @@ module OpenSteamerV90Cutover
     V86_EXECUTABLE_SHA256 = "b6d51fce0a9d2169d2ee28749210a3faee6f1f7360063060c97b11c298e63d5b"
     V86_FRAMEWORK_SHA256 = "d0b2075bd97686dd65749665b4c32ec27ca242347cd99df2b53255901aa5036a"
     V86_INFO_PLIST_SHA256 = "9c6568c97ef11321edc1cc53a5fc070c491ea713a872fb6b119f777ce34e8b55"
-    V86_CDHASH = "e41c23322912104a648e791bfb0d3a5714323b26"
-    V86_DESIGNATED_REQUIREMENT = 'identifier "com.elamin.AudioStreamer.CaptureServer" and anchor apple generic and certificate leaf[subject.CN] = "Apple Development: Ahmed Elamin (92LVX32M8K)" and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */'
     V86_SOURCE_COMMIT = "2321b65806b9d30554c2382d699dd89d9feebac5"
     V86_SOURCE_TREE = "d60e2a71f66fe92399e491bca2773981bcbec62f"
 
@@ -167,7 +174,7 @@ module OpenSteamerV90Cutover
       "verify-mac-host-bundle.sh" => "02a348a88d25b76ab95d45620d823339212bb53ee0f39bfb3a52f04240d3d745"
     }.freeze
 
-    PAYLOAD_SCHEMA = "opensteamer.v90-deployment-payload-manifest.v1"
+    PAYLOAD_SCHEMA = "opensteamer.v90-deployment-payload-manifest.v2"
     CAPSULE_SCHEMA = "opensteamer.v90-host-oracle-capsule-metadata.v1"
     HANDOFF_SCHEMA = "opensteamer.v90-screen-oracle-host-identity-handoff.v1"
     IDENTITY_SCHEMA = "opensteamer.sealed-live-mac-host-identity.v1"
@@ -183,6 +190,13 @@ module OpenSteamerV90Cutover
       handoffRelativePath handoffSHA256 hostIdentityManifestRelativePath
       hostIdentityManifestSHA256 designatedRequirementReferenceRelativePath
       designatedRequirementReferenceSHA256 candidateAppCopyManifestRelativePath
+      designatedRequirementReferenceFileSize
+      designatedRequirementReferenceCodeSignatureDataOffset
+      designatedRequirementReferenceCodeSignatureDataSize
+      designatedRequirementReferenceUnsignedPrefixSHA256
+      designatedRequirementReferenceCDHash designatedRequirementReferenceCodeDirectorySHA256
+      designatedRequirementReferenceTeamIdentifier designatedRequirementReferenceIdentifier
+      designatedRequirementReferenceDesignatedRequirement
       candidateAppCopyManifestSHA256 toolingBranch toolingUpstream toolingCommit toolingTree
       toolingRemoteURL assemblerScriptRelativePath assemblerScriptGitBlob
     ].freeze
@@ -337,6 +351,129 @@ module OpenSteamerV90Cutover
       path
     rescue Errno::ENOENT
       fail!("#{label} is missing")
+    end
+  end
+
+  # The retained predecessor is copied out of its original app bundle before cutover. A standalone
+  # copy is intentionally not treated as full-bundle resource proof because its Info.plist and
+  # sealed resources remain behind. Revalidate the copied code object without weakening its
+  # identity: exact bytes, unsigned Mach-O prefix, embedded signature extent, CodeDirectory digest,
+  # TeamIdentifier, identifier, and designated requirement are all independently pinned.
+  module PredecessorReferenceFingerprint
+    extend self
+
+    MACH_HEADER_64_SIZE = 32
+    MH_MAGIC_64 = 0xfeedfacf
+    CPU_TYPE_ARM64 = 0x0100000c
+    LC_CODE_SIGNATURE = 0x1d
+
+    def verify!(path, label: "capsule predecessor reference")
+      stat, data = read_snapshot(path, label)
+      Util.fail!("#{label} size differs from approved predecessor") unless
+        stat.size == Pins::APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE
+      Util.fail!("#{label} full-file digest differs from approved predecessor") unless
+        Digest::SHA256.hexdigest(data) == Pins::APPROVED_PREDECESSOR_REFERENCE_SHA256
+
+      data_offset, data_size = signature_layout(data)
+      Util.fail!("#{label} LC_CODE_SIGNATURE layout differs from approved predecessor") unless
+        data_offset == Pins::APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATA_OFFSET &&
+        data_size == Pins::APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATA_SIZE &&
+        data_offset + data_size == data.bytesize
+      prefix = data.byteslice(0, data_offset)
+      Util.fail!("#{label} unsigned-prefix digest differs from approved predecessor") unless
+        prefix && Digest::SHA256.hexdigest(prefix) == Pins::APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256
+
+      metadata = combined_codesign!("--display", "--verbose=6", path)
+      exact_field!(metadata, "Identifier=", Pins::APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER, label)
+      exact_field!(metadata, "TeamIdentifier=", Pins::APPROVED_PREDECESSOR_REFERENCE_TEAM_ID, label)
+      exact_field!(metadata, "CDHash=", Pins::APPROVED_PREDECESSOR_REFERENCE_CDHASH, label)
+      exact_field!(
+        metadata,
+        "CandidateCDHashFull sha256=",
+        Pins::APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256,
+        label
+      )
+
+      requirements = combined_codesign!("--display", "--requirements", "-", path)
+      designated = requirements.lines.map { |line| line.strip.sub(/\A# /, "") }
+                               .select { |line| line.start_with?("designated => ") }
+      expected = "designated => #{Pins::APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT}"
+      Util.fail!("#{label} designated requirement differs from approved predecessor") unless
+        designated == [expected]
+      final_stat, final_data = read_snapshot(path, label)
+      Util.fail!("#{label} identity or bytes changed during fingerprint verification") unless
+        [final_stat.dev, final_stat.ino, final_stat.size] == [stat.dev, stat.ino, stat.size] &&
+        Digest::SHA256.hexdigest(final_data) == Pins::APPROVED_PREDECESSOR_REFERENCE_SHA256
+      true
+    rescue Errno::ENOENT, Errno::EACCES => error
+      Util.fail!("could not fingerprint #{label}: #{error.message}")
+    end
+
+    def signature_layout(data)
+      Util.fail!("predecessor reference is too short for a Mach-O header") if
+        data.bytesize < MACH_HEADER_64_SIZE
+      magic, cpu_type, _cpu_subtype, _file_type, command_count, commands_size,
+        _flags, _reserved = data.byteslice(0, MACH_HEADER_64_SIZE).unpack("V8")
+      Util.fail!("predecessor reference is not a thin 64-bit Mach-O") unless magic == MH_MAGIC_64
+      Util.fail!("predecessor reference is not arm64") unless cpu_type == CPU_TYPE_ARM64
+      command_end = MACH_HEADER_64_SIZE + commands_size
+      Util.fail!("predecessor reference load-command extent is invalid") if
+        command_end > data.bytesize || command_count.zero?
+
+      cursor = MACH_HEADER_64_SIZE
+      signatures = []
+      command_count.times do
+        Util.fail!("predecessor reference has a truncated load command") if cursor + 8 > command_end
+        command, command_size = data.byteslice(cursor, 8).unpack("V2")
+        Util.fail!("predecessor reference has an invalid load-command size") if
+          command_size < 8 || (command_size % 8) != 0 || cursor + command_size > command_end
+        if command == LC_CODE_SIGNATURE
+          Util.fail!("predecessor LC_CODE_SIGNATURE has an invalid size") unless command_size == 16
+          signatures << data.byteslice(cursor + 8, 8).unpack("V2")
+        end
+        cursor += command_size
+      end
+      Util.fail!("predecessor reference load-command count/size mismatch") unless cursor == command_end
+      Util.fail!("predecessor reference must contain exactly one LC_CODE_SIGNATURE") unless
+        signatures.length == 1
+      signatures.fetch(0)
+    end
+
+    private
+
+    def read_snapshot(path, label)
+      before = Util.regular_file!(path, label, mode: 0o755, owner: Process.euid, links: 1)
+      opened = nil
+      data = nil
+      File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
+        opened = file.stat
+        Util.fail!("#{label} changed while opening") unless
+          opened.file? &&
+          [opened.dev, opened.ino, opened.size, opened.nlink] ==
+            [before.dev, before.ino, before.size, 1]
+        data = file.read
+        Util.fail!("#{label} short read") unless data.bytesize == opened.size
+      end
+      after = File.lstat(path)
+      Util.fail!("#{label} changed while reading") unless
+        after.file? && [after.dev, after.ino, after.size, after.nlink] ==
+          [opened.dev, opened.ino, opened.size, 1]
+      [opened, data]
+    end
+
+    def combined_codesign!(*arguments)
+      stdout, stderr, status = Open3.capture3("/usr/bin/codesign", *arguments)
+      Util.fail!("codesign metadata inspection failed: #{stderr.strip}") unless status.success?
+      stdout + stderr
+    end
+
+    def exact_field!(metadata, prefix, expected, label)
+      values = metadata.lines.filter_map do |line|
+        stripped = line.strip
+        stripped.delete_prefix(prefix) if stripped.start_with?(prefix)
+      end
+      Util.fail!("#{label} #{prefix.delete_suffix('=')} differs from approved predecessor") unless
+        values == [expected]
     end
   end
 
@@ -727,6 +864,16 @@ module OpenSteamerV90Cutover
         "handoffRelativePath" => "v90-screen-oracle-handoff/v90-screen-oracle-host-identity-handoff.json",
         "hostIdentityManifestRelativePath" => "v90-screen-oracle-handoff/sealed-live-mac-host-identity.json",
         "designatedRequirementReferenceRelativePath" => "trusted-reference/CaptureServer",
+        "designatedRequirementReferenceSHA256" => Pins::APPROVED_PREDECESSOR_REFERENCE_SHA256,
+        "designatedRequirementReferenceFileSize" => Pins::APPROVED_PREDECESSOR_REFERENCE_FILE_SIZE.to_s,
+        "designatedRequirementReferenceCodeSignatureDataOffset" => Pins::APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATA_OFFSET.to_s,
+        "designatedRequirementReferenceCodeSignatureDataSize" => Pins::APPROVED_PREDECESSOR_REFERENCE_CODE_SIGNATURE_DATA_SIZE.to_s,
+        "designatedRequirementReferenceUnsignedPrefixSHA256" => Pins::APPROVED_PREDECESSOR_REFERENCE_UNSIGNED_PREFIX_SHA256,
+        "designatedRequirementReferenceCDHash" => Pins::APPROVED_PREDECESSOR_REFERENCE_CDHASH,
+        "designatedRequirementReferenceCodeDirectorySHA256" => Pins::APPROVED_PREDECESSOR_REFERENCE_CODE_DIRECTORY_SHA256,
+        "designatedRequirementReferenceTeamIdentifier" => Pins::APPROVED_PREDECESSOR_REFERENCE_TEAM_ID,
+        "designatedRequirementReferenceIdentifier" => Pins::APPROVED_PREDECESSOR_REFERENCE_IDENTIFIER,
+        "designatedRequirementReferenceDesignatedRequirement" => Pins::APPROVED_PREDECESSOR_REFERENCE_DESIGNATED_REQUIREMENT,
         "toolingBranch" => Pins::SOURCE_BRANCH,
         "toolingUpstream" => Pins::SOURCE_UPSTREAM,
         "toolingRemoteURL" => "https://github.com/ahmedelami/opensteamer.git",
@@ -823,6 +970,7 @@ module OpenSteamerV90Cutover
         Util.exact_file!(@paths.fetch(name), expected, name.to_s.tr("_", " "), mode: mode, owner: Process.euid)
       end
       Util.sidecar!(@paths.fetch(:handoff), @paths.fetch(:handoff) + ".sha256", @external_handoff_sha, "handoff")
+      PredecessorReferenceFingerprint.verify!(@paths.fetch(:reference))
     end
 
     def validate_metadata!
@@ -2329,6 +2477,14 @@ module OpenSteamerV90Cutover
         mode: 0o755,
         owner: Process.euid
       )
+      PredecessorReferenceFingerprint.verify!(
+        capsule.paths.fetch(:reference),
+        label: "capsule predecessor reference"
+      )
+      PredecessorReferenceFingerprint.verify!(
+        @post_stop_reference,
+        label: "staged predecessor reference"
+      )
       Pins::V86_HELPERS.each do |name, digest|
         source = File.join(Pins::V86_EVIDENCE, name)
         Util.exact_file!(source, digest, "V86 helper #{name}", mode: 0o500, owner: Process.euid)
@@ -2915,6 +3071,58 @@ module OpenSteamerV90Cutover
           assert("real rollback journal terminal #{origin}") do
             states.last(RealHost::ROLLBACK_STATES.length) == RealHost::ROLLBACK_STATES
           end
+        end
+      end
+    end
+
+    def verify_predecessor_signature_layout_fixture!
+      data_offset = 56
+      data_size = 8
+      header = [
+        PredecessorReferenceFingerprint::MH_MAGIC_64,
+        PredecessorReferenceFingerprint::CPU_TYPE_ARM64,
+        0,
+        2,
+        2,
+        24,
+        0,
+        0
+      ].pack("V8")
+      ordinary_command = [0x2, 8].pack("V2")
+      signature_command = [
+        PredecessorReferenceFingerprint::LC_CODE_SIGNATURE,
+        16,
+        data_offset,
+        data_size
+      ].pack("V4")
+      valid = header + ordinary_command + signature_command + ("s" * data_size)
+      assert("predecessor Mach-O signature layout parses") do
+        PredecessorReferenceFingerprint.signature_layout(valid) == [data_offset, data_size]
+      end
+
+      mutations = {
+        "truncated header" => valid.byteslice(0, 31),
+        "wrong magic" => ([0, PredecessorReferenceFingerprint::CPU_TYPE_ARM64] +
+          [0, 2, 2, 24, 0, 0]).pack("V8") + valid.byteslice(32..),
+        "wrong architecture" => ([PredecessorReferenceFingerprint::MH_MAGIC_64, 7] +
+          [0, 2, 2, 24, 0, 0]).pack("V8") + valid.byteslice(32..),
+        "missing signature" => ([
+          PredecessorReferenceFingerprint::MH_MAGIC_64,
+          PredecessorReferenceFingerprint::CPU_TYPE_ARM64,
+          0, 2, 1, 8, 0, 0
+        ].pack("V8") + ordinary_command + ("s" * data_size)),
+        "duplicate signature" => ([
+          PredecessorReferenceFingerprint::MH_MAGIC_64,
+          PredecessorReferenceFingerprint::CPU_TYPE_ARM64,
+          0, 2, 2, 32, 0, 0
+        ].pack("V8") + signature_command + signature_command + ("s" * data_size)),
+        "invalid signature command size" => (header + ordinary_command + [
+          PredecessorReferenceFingerprint::LC_CODE_SIGNATURE, 8
+        ].pack("V2") + ("s" * 16))
+      }
+      mutations.each do |label, bytes|
+        expect_failure("predecessor Mach-O parser rejects #{label}") do
+          PredecessorReferenceFingerprint.signature_layout(bytes)
         end
       end
     end
@@ -3840,6 +4048,7 @@ module OpenSteamerV90Cutover
       end
 
       verify_copy_stable_manifest_fixture!
+      verify_predecessor_signature_layout_fixture!
       verify_real_journal_state_machine!
       verify_journal_fault_reconciliation!
       verify_atomic_pointer_fixture!
