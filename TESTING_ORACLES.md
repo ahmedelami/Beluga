@@ -99,6 +99,54 @@ challenge launch. The artifacts
 contain identity metadata only; invitations, rendezvous capabilities, unlock material, and other
 secrets remain out of arguments, logs, and the manifests.
 
+### V90 sealed build, cutover, and physical promotion sequence
+
+The immutable V90 release source (commit A) is commit
+`229eabc22b9990891c5e5b2a5cfa27111f0a6b3e`, tree
+`0192ef02be478f094afe1f66b50fe3b14717d0ea`. It is exported and built only from a
+separate clean checkout at that exact identity. The assembler and cutover tooling belong to a
+later reviewed tooling identity (commit B): its local HEAD, upstream, and fresh single-record
+remote branch readback must agree, its running tracked blobs must equal commit B, and commit A
+must be its ancestor. Commit A identifies the product source bytes; commit B identifies the
+mechanism that assembled and deployed them. Neither identity substitutes for the other.
+
+`macOS/scripts/assemble-v90-sealed-host-oracle-capsule.sh` is offline with respect to the
+installed host and every running service. It accepts only nonoverlapping clean source/tooling
+locations, a fresh private capsule root, and an independent predecessor-reference code object
+whose externally supplied SHA-256 equals the explicitly approved compiled pin. An unset pin or
+digest mismatch fails before capsule construction; deployment authorization alone does not approve
+a byte- or CDHash-different predecessor reconstruction. The assembler exports commit A, builds and
+signs the candidate, copies the exact source launch plist, removes build scratch, and commits strong
+source/candidate manifests, a copy-stable candidate manifest, the host-identity handoff, and
+`v90-deployment-payload-manifest.json` plus its sidecar. Capsule assembly is sealed build evidence,
+not deployment evidence.
+
+Live use goes only through `macOS/scripts/run-opensteamer-host-v90-cutover.sh` and
+`macOS/scripts/opensteamer-host-v90-cutover-controller.rb` with the sealed capsule and independently
+retained handoff and payload digests. The launcher re-proves clean remote tooling and pinned
+controller, route-monitor, Ruby, Swift compiler, and SDK identities. Preflight performs two
+mutation-free observations; execution replays the full capsule and live V86 fences immediately
+before durable `STOP_INTENT`. The controller holds same-filesystem exact-V86 app/plist rollback
+copies, keeps the sticky CoreAudio monitor armed with zero notifications, and requires 31 seconds of
+stable V90 PID, generation, bytes, display, session, routes, and secondary-viewer readiness. Any
+failure after `STOP_INTENT` but before durable `V90_COMMIT_IRREVERSIBLE` must traverse the journaled
+rollback to terminal `ROLLED_BACK_EXACT_V86`. The sticky monitor remains live through that point of
+no return. A later failure must leave V90 live, publish committed-but-unverified evidence, exit
+nonzero, and never attempt an unmonitored rollback. Only clean zero-notification monitor teardown,
+the post-commit safety proof, final route readback, and terminal `COMMITTED_V90` form a successful
+host-deployment result; neither an intermediate state nor a pending result/pointer is such a claim.
+
+After a terminal `COMMITTED_V90` host result and fresh sealed-host readback, run
+`validate-iphone15-dev-screen-visual-oracle.sh` on the paired iPhone 15. That pass is development
+diagnosis only. Only after it passes may the production iOS candidate proceed through the
+separately evidenced TestFlight build/upload, App Store Connect availability, and exact-build
+installation steps. Release completion then requires a fresh non-skipping
+`validate-testflight-screen-visual-oracle.sh` pass on the pinned personal iPhone 17 Pro, with the
+nonce-bound final pixels, sole XCTest pass, unchanged app/build/host/peer/screen-session identities,
+and clean zero-notification route-monitor teardown. Source tests, capsule sealing, host cutover,
+iPhone 15 diagnosis, TestFlight availability, installation, and the iPhone 17 Pro physical result
+are distinct evidence boundaries; no earlier stage implies a later one.
+
 Development diagnosis uses the separately signed `org.example.AudioStreamer.dev` bundle on the
 paired iPhone 15; it never operates the personal production iPhone. The guarded development runner
 builds the current checkout with a generic-iOS `build-for-testing`, performs at most one bounded
@@ -632,6 +680,15 @@ proposal evidence separate from native acceptance and client presentation.
   substitute because it cannot exercise the production Keychain access group.
 - A generic-device UI `build-for-testing` proves the physical test source compiles; it does not
   execute a physical oracle.
+- An offline V90 capsule with valid manifests proves a pinned source build and sealed handoff; it
+  does not prove that `/Applications`, launchd, the live PID, or any audio route changed.
+- Only terminal `COMMITTED_V90` plus its fresh installed/live readbacks is V90 host-deployment
+  evidence. `V90_COMMIT_IRREVERSIBLE` or committed-but-unverified evidence means the host must remain
+  on V90 pending safety review, not that deployment passed; a rollback terminal proves restoration
+  to exact V86, not a successful V90 deployment.
+- An iPhone 15 `.dev` pass is diagnostic, TestFlight availability is distribution evidence, and
+  exact-build installation is device-state evidence. Only the fresh iPhone 17 Pro
+  production-bundle oracle is final user-device visual evidence.
 - Injected CallKit tests prove fail-closed microphone policy, explicit hosted-origin ownership,
   and asynchronous race fencing, not that a real device reports every transition. A signed
   physical-device pass must cold-launch during a real connected iPhone call, prove
