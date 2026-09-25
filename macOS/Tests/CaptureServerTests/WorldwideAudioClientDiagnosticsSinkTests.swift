@@ -100,6 +100,42 @@ final class WorldwideAudioClientDiagnosticsSinkTests: XCTestCase {
         XCTAssertEqual(sink.latest(now: 14).status, .unavailable(.stopped))
     }
 
+    func testTerminalReportPublishesWhenTheDiagnosticSummaryLogIsRateLimited() throws {
+        var sink = makeSink()
+        let token = context()
+        XCTAssertTrue(sink.receive(received(sequence: 1, context: token),
+                                   peerGeneration: 7, now: 0))
+        XCTAssertTrue(sink.receive(received(sequence: 2, context: token,
+                                            snapshot: healthy(counter: 20)),
+                                   peerGeneration: 7, now: 3))
+        XCTAssertTrue(try XCTUnwrap(sink.logMessageIfDue(now: 3))
+            .contains("status=renderingNonzero"))
+        var schedule = WorldwideAudioClientReportSchedule()
+        schedule.offer(.init(latest: sink.latest(now: 3), uptime: 3,
+                             date: Date(timeIntervalSince1970: 1_000)), terminal: false)
+        XCTAssertEqual(schedule.take(now: 3)?.status, "renderingNonzero")
+
+        sink.markUnavailable(.stopped)
+        XCTAssertNil(sink.logMessageIfDue(now: 3.25))
+        let terminal = WorldwideAudioClientDiagnosticsReport(
+            latest: sink.latest(now: 3.25), uptime: 3.25,
+            date: Date(timeIntervalSince1970: 1_000.25)
+        )
+        schedule.offer(terminal, terminal: true)
+        let published = try XCTUnwrap(schedule.take(now: 3.25))
+        XCTAssertEqual(published.status, "unavailable.stopped")
+        XCTAssertTrue(published.isValid)
+        XCTAssertEqual(published.hostPID, 123)
+        XCTAssertEqual(published.peerGeneration, 7)
+        XCTAssertEqual(published.negotiationEpoch, 1)
+        XCTAssertEqual(published.heartbeat?.sessionID, sessionID)
+        XCTAssertEqual(published.heartbeat?.build, build)
+        XCTAssertEqual(published.heartbeat?.sequence, 2)
+        XCTAssertEqual(published.heartbeat?.snapshot.applicationActive, false)
+        XCTAssertEqual(published.heartbeat?.snapshot.peerConnected, true)
+        XCTAssertEqual(published.acousticAudibility, "unverified")
+    }
+
     func testLateUnnegotiatedObservationCannotReplaceCurrentValidHeartbeat() {
         var sink = makeSink()
         sink.observeNegotiated(false)

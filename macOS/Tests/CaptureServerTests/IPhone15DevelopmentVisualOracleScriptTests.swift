@@ -1708,6 +1708,7 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
         function inactive_primary_lifecycle_is_terminal() {
           /usr/bin/grep -Fq 'Worldwide media ended;' "$1"
         }
+        function capture_inactive_primary_stopped_report() { return 1 }
         \(functionSource)
         HOST_LOG="$HOST_LOG_PATH"
         HOST_PID=321
@@ -2000,7 +2001,10 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
                 range: deltaStart.lowerBound..<source.endIndex
             )
         )
-        let helperSource = String(source[inactiveStart.lowerBound..<inactiveEnd.lowerBound])
+        let onlineStart = try XCTUnwrap(source.range(of: "\nfunction inactive_primary_online_announcements_are_exact() {\n"))
+        let onlineEnd = try XCTUnwrap(source.range(of: "\nfunction stopped_audio_report_directory_identity() {\n"))
+        let helperSource = String(source[onlineStart.lowerBound..<onlineEnd.lowerBound])
+            + String(source[inactiveStart.lowerBound..<inactiveEnd.lowerBound])
             + String(source[deltaStart.lowerBound..<deltaEnd.lowerBound])
 
         let harness = """

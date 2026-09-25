@@ -279,7 +279,19 @@ otherwise healthy-looking retained fields.
 In development-only `inactivePrimary`, the personal production iPhone may remain asleep. The runner
 requires the ordered terminal primary lifecycle `viewer disconnected` -> exact expected-build
 `unavailable.stopped` with `appActive=false` -> `media ended`, then proves the live secondary manager
-is idle. It labels this `inactivePrimaryNoAudioProof`; stopped audio is never reported as healthy.
+is idle. A force-closed signaling session can omit the viewer-disconnected event, and the host's
+rate-limited summary logger can suppress its terminal diagnostic even though the separate atomic
+report writer publishes `unavailable.stopped`. For that case only, the runner may use the private
+stopped report bound to the latest logged host/session/build/peer/negotiation/heartbeat identity and
+the current host lifetime, corroborated by later completed media teardown and waiting state with no
+subsequent primary reactivation. It pins and rechecks the report's bytes and filesystem identity
+through the existing continuity checkpoints. The report alone is not teardown proof: the host
+publishes it before closing the peer and native capture owners. The real sink/report-schedule
+regression and executable reader/lifecycle/continuity fixtures must cover this reporting gap and
+reject mismatched, replaced, malformed, or reactivated evidence without synthesizing a log message.
+Both paths remain terminal-only/no-audio-proof evidence; stopped audio is never reported as healthy.
+The offline production-function fixtures run with `python3 -I -S -B
+iOS/opensteamer/scripts/tests/test_iphone15_inactive_primary_stopped_report.py`.
 Fresh append windows must contain no primary audio, microphone forwarding/selection, virtual-mic
 route selection, or primary media-end activity. Before mint, any peer or capture transition fails.
 After the test, only the separately verified ordered secondary connect -> capture start -> viewer

@@ -156,12 +156,17 @@ final class IPhone15NeverConnectedPrimaryOracleTests: XCTestCase {
 
     func testPrimaryLifecycleBeforeDiagnosticsIsRejectedAtPremintAndAfter() throws {
         let continuity = try functions(
+            from: "inactive_primary_online_announcements_are_exact",
+            throughBefore: "stopped_audio_report_directory_identity"
+        ) + functions(
             from: "inactive_primary_append_has_no_primary_activity",
             throughBefore: "capture_host_generation_identity"
         )
         let markers = [
             "A fresh encrypted media rendezvous is ready for the paired iPhone",
             "The paired iPhone left the availability exchange",
+            "Worldwide screen host is waiting for the paired iPhone media session",
+            "Fresh paired media rendezvous expires in about 60 seconds",
         ]
         for mode in ["neverConnectedPrimary", "inactivePrimary"] {
             for phase in ["premint", "after"] {

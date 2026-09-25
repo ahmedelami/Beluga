@@ -28,6 +28,7 @@ readonly HOST_EXECUTABLE='/Applications/opensteamer Host.app/Contents/MacOS/Capt
 readonly HOST_MEDIA_FRAMEWORK_EXECUTABLE='/Applications/opensteamer Host.app/Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC'
 readonly HOST_LOG=/var/tmp/opensteamer-worldwide-host.log
 readonly HOST_LOCK="${HOME}/Library/Application Support/com.elamin.AudioStreamer.CaptureServer.runtime/worldwide-host.lock"
+readonly HOST_AUDIO_CLIENT_REPORT="${HOME}/Library/Application Support/opensteamer/diagnostics/audio-client-v1.json"
 readonly SCRIPT_DIR=${0:A:h}
 readonly PROJECT_DIR=${SCRIPT_DIR:h}
 readonly REPOSITORY_ROOT=${PROJECT_DIR:h:h}
@@ -269,6 +270,12 @@ typeset -g PRIMARY_SESSION_ID=''
 typeset -g PRIMARY_PEER_GENERATION=''
 typeset -g PRIMARY_NEGOTIATION_EPOCH=''
 typeset -g PRIMARY_BASELINE_MODE=''
+typeset -g PRIMARY_INACTIVE_EVIDENCE=log
+typeset -g PRIMARY_STOPPED_REPORT_IDENTITY=''
+typeset -g PRIMARY_STOPPED_REPORT_DIRECTORIES=''
+typeset -g PRIMARY_STOPPED_REPORT_HOST_START=''
+typeset -g STOPPED_REPORT_READ_IDENTITY=''
+typeset -g STOPPED_REPORT_READ_DIRECTORIES=''
 typeset -g PRIMARY_AUDIO_STATUS=''
 typeset -g PRIMARY_AUDIO_APP_ACTIVE=''
 typeset -g PRIMARY_AUDIO_SEQUENCE_BEFORE=''
@@ -2080,11 +2087,19 @@ function inactive_primary_lifecycle_is_terminal() {
   primary_audio_diagnostic_is_terminal_inactive "$audio_line" || return 1
   (( disconnect_line < audio_line_number && audio_line_number < media_line )) \
     || return 1
+  inactive_primary_lifecycle_suffix_is_quiescent "$file" "$media_line"
+}
+
+function inactive_primary_lifecycle_suffix_is_quiescent() {
+  local file=$1 media_line=$2 suffix
+  local latest_peer latest_connected latest_viewer_disconnect
+  local latest_capture_start latest_capture_stop
   suffix=$(/usr/bin/sed -n "$(( media_line + 1 )),\$p" "$file")
   if print -r -- "$suffix" | rg -q \
-      'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange'; then
+      'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange|Worldwide screen host is waiting for the paired iPhone media session|Fresh paired media rendezvous expires in about|Loaded the paired iPhone and started worldwide availability'; then
     return 1
   fi
+  print -r -- "$suffix" | inactive_primary_online_announcements_are_exact || return 1
   latest_peer=$(print -r -- "$suffix" \
     | rg -n 'Worldwide WebRTC peer state:' | /usr/bin/tail -n 1 || true)
   latest_connected=$(print -r -- "$suffix" \
@@ -2111,6 +2126,225 @@ function inactive_primary_lifecycle_is_terminal() {
       || return 1
   fi
   return 0
+}
+
+function inactive_primary_online_announcements_are_exact() {
+  # Availability reconnections can reannounce the same immutable host identity after media
+  # completion. They prove identity only, not inactivity; callers retain all lifecycle fences.
+  /usr/bin/awk -v pid="${HOST_PID:-}" -v generation="${HOST_GENERATION:-}" '
+    /Worldwide paired-device availability is online/ {
+      sub(/^\[[a-z]+\] /, "")
+      expected = "Worldwide paired-device availability is online pid=" pid " nonce=" generation
+      if (pid !~ /^[1-9][0-9]*$/ || generation !~ /^[0-9a-f]+$/ ||
+          length(generation) != 64 || $0 != expected) bad = 1
+    }
+    END { exit bad }
+  '
+}
+
+function stopped_audio_report_directory_identity() {
+  local directory_path identity='' acl scan_status
+  for directory_path in "${HOST_AUDIO_CLIENT_REPORT:h:h:h}" \
+      "${HOST_AUDIO_CLIENT_REPORT:h:h}" "${HOST_AUDIO_CLIENT_REPORT:h}"; do
+    [[ -d "$directory_path" && ! -L "$directory_path" && "${directory_path:A}" == "$directory_path" \
+        && "$(/usr/bin/stat -f '%u:%Lp' "$directory_path")" == "${UID}:700" ]] \
+      || return 1
+    acl=$(/bin/ls -lde "$directory_path") || return 1
+    scan_status=0
+    print -r -- "$acl" | rg -q '^[[:space:]]*[0-9]+:.* allow ' || scan_status=$?
+    (( scan_status == 1 )) || return 1
+    identity+="$(/usr/bin/stat -f '%d:%i:%u:%Lp' "$directory_path")|" || return 1
+  done
+  print -rn -- "$identity"
+}
+
+function stopped_audio_report_descriptor_identity() {
+  local -A descriptor_stat
+  zstat -H descriptor_stat -f "$1" || return 1
+  (( (descriptor_stat[mode] & 8#170000) == 8#100000 )) || return 1
+  printf 'Regular File|%d|%o|%d|%d|%d|%d|%d|%d' \
+    "$descriptor_stat[uid]" "$(( descriptor_stat[mode] & 8#7777 ))" \
+    "$descriptor_stat[nlink]" "$descriptor_stat[size]" "$descriptor_stat[device]" \
+    "$descriptor_stat[inode]" "$descriptor_stat[mtime]" "$descriptor_stat[ctime]"
+}
+
+function read_private_stopped_audio_report() {
+  local output=$1 identity directories descriptor descriptor_identity ok=0 acl scan_status=0
+  local -a fields
+  directories=$(stopped_audio_report_directory_identity) || return 1
+  [[ -f "$HOST_AUDIO_CLIENT_REPORT" && ! -L "$HOST_AUDIO_CLIENT_REPORT" \
+      && "${HOST_AUDIO_CLIENT_REPORT:A}" == "$HOST_AUDIO_CLIENT_REPORT" ]] || return 1
+  identity=$(/usr/bin/stat -f '%HT|%u|%Lp|%l|%z|%d|%i|%m|%c' \
+    "$HOST_AUDIO_CLIENT_REPORT") || return 1
+  fields=("${(@s:|:)identity}")
+  [[ ${#fields[@]} == 9 && "${fields[1]}" == 'Regular File' \
+      && "${fields[2]}:${fields[3]}:${fields[4]}" == "${UID}:600:1" \
+      && "${fields[5]}" -gt 0 && "${fields[5]}" -le 32768 ]] || return 1
+  acl=$(/bin/ls -lde "$HOST_AUDIO_CLIENT_REPORT") || return 1
+  print -r -- "$acl" | rg -q '^[[:space:]]*[0-9]+:.* allow ' || scan_status=$?
+  (( scan_status == 1 )) || return 1
+  zmodload zsh/system || return 1
+  zmodload zsh/stat || return 1
+  sysopen -r -o nofollow,nonblock,cloexec -u descriptor "$HOST_AUDIO_CLIENT_REPORT" || return 1
+  descriptor_identity=$(stopped_audio_report_descriptor_identity "$descriptor") || descriptor_identity=''
+  if [[ "$descriptor_identity" == "$identity" ]] \
+      && /usr/bin/head -c 32769 <&$descriptor > "$output" \
+      && [[ "$(/usr/bin/stat -f '%z' "$output")" == "${fields[5]}" \
+        && "$(stopped_audio_report_descriptor_identity "$descriptor")" == "$identity" \
+        && ! -L "$HOST_AUDIO_CLIENT_REPORT" \
+        && "$(/usr/bin/stat -f '%HT|%u|%Lp|%l|%z|%d|%i|%m|%c' "$HOST_AUDIO_CLIENT_REPORT")" == "$identity" \
+        && "$(stopped_audio_report_directory_identity)" == "$directories" ]]; then
+    ok=1
+  fi
+  exec {descriptor}<&- || return 1
+  (( ok )) || return 1
+  STOPPED_REPORT_READ_IDENTITY=$identity
+  STOPPED_REPORT_READ_DIRECTORIES=$directories
+}
+
+function stopped_audio_report_matches_logged_identity() {
+  local report=$1 line=$2 session build peer epoch sequence app_active
+  [[ "$line" == *"Worldwide audio client diagnostics pid=${HOST_PID} "* \
+      && "${PRIMARY_STOPPED_REPORT_HOST_START:-}" =~ '^[1-9][0-9]*$' ]] || return 1
+  session=$(diagnostic_field "$line" session) || return 1
+  build=$(diagnostic_field "$line" build) || return 1
+  peer=$(diagnostic_field "$line" peerGeneration) || return 1
+  epoch=$(diagnostic_field "$line" negotiationEpoch) || return 1
+  sequence=$(diagnostic_field "$line" sequence) || return 1
+  app_active=$(diagnostic_field "$line" appActive) || return 1
+  [[ "$session" =~ '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' \
+      && "$peer" =~ '^[1-9][0-9]*$' && "$epoch" =~ '^[1-9][0-9]*$' \
+      && "$sequence" =~ '^[1-9][0-9]*$' && "$app_active" == false \
+      && "$build" == *"(${EXPECTED_PRIMARY_BUILD})" ]] || return 1
+  # The interpreter bytes are pinned at runner startup. Reject duplicate objects as well as
+  # duplicate leaves; jq alone would silently accept a second disjoint heartbeat container.
+  "$IPHONE_CONTROL_PYTHON" -I -S -B - "$report" "$HOST_PID" "${session:l}" "$build" \
+    "$peer" "$epoch" "$sequence" "$PRIMARY_STOPPED_REPORT_HOST_START" <<'PY'
+import json
+import sys
+import time
+
+def exact_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+def require(condition):
+    if not condition:
+        raise ValueError("invalid stopped report")
+
+def integer(value, minimum=1):
+    return type(value) is int and value >= minimum
+
+try:
+    report, pid, session, build, peer, epoch, sequence, host_start = sys.argv[1:]
+    with open(report, "rb") as source:
+        value = json.load(source, object_pairs_hook=exact_object,
+                          parse_constant=lambda _: require(False))
+    require(type(value) is dict and set(value) == {
+        "schemaVersion", "kind", "hostPID", "generatedAtUnixMilliseconds",
+        "receivedAtUnixMilliseconds", "freshUntilUnixMilliseconds", "status",
+        "acousticAudibility", "peerGeneration", "negotiationEpoch", "heartbeat"})
+    require(type(value["schemaVersion"]) is int and value["schemaVersion"] == 1)
+    require(value["kind"] == "opensteamer.audio-client.v1")
+    require(value["status"] == "unavailable.stopped" and value["acousticAudibility"] == "unverified")
+    for key, expected in (("hostPID", pid), ("peerGeneration", peer), ("negotiationEpoch", epoch)):
+        require(integer(value[key]) and value[key] == int(expected))
+    generated, received, fresh_until = (value[key] for key in (
+        "generatedAtUnixMilliseconds", "receivedAtUnixMilliseconds", "freshUntilUnixMilliseconds"))
+    require(all(integer(item) for item in (generated, received, fresh_until)))
+    require(int(host_start) * 1000 <= received <= generated <= time.time_ns() // 1_000_000)
+    # freshUntil describes retained-heartbeat freshness, not a terminal-record expiry.
+    require(fresh_until >= received)
+    heartbeat = value["heartbeat"]
+    require(type(heartbeat) is dict and type(heartbeat["i"]) is str)
+    require(heartbeat["i"].lower() == session and integer(heartbeat["s"]) and heartbeat["s"] == int(sequence))
+    require(type(heartbeat["n"]) is dict and heartbeat["n"]["l"] is False)
+    version = heartbeat["b"]
+    require(type(version) is dict and set(version) == {"a", "b", "c", "d"})
+    require(all(integer(item, 0) for item in version.values()))
+    require(f'{version["a"]}.{version["b"]}.{version["c"]}({version["d"]})' == build)
+except (OSError, ValueError, TypeError, KeyError, RecursionError):
+    sys.exit(1)
+PY
+}
+
+function inactive_primary_report_lifecycle_is_terminal() {
+  local file=$1 audio_record media_record audio_line_number media_line
+  audio_record=$(rg -n "Worldwide audio client diagnostics pid=${HOST_PID} " "$file" \
+    | /usr/bin/tail -n 1 || true)
+  media_record=$(rg -n 'Worldwide media ended;' "$file" | /usr/bin/tail -n 1 || true)
+  [[ -n "$audio_record" && -n "$media_record" ]] || return 1
+  audio_line_number=${audio_record%%:*}
+  media_line=${media_record%%:*}
+  (( audio_line_number < media_line )) || return 1
+  /usr/bin/sed -n "$(( media_line + 1 )),\$p" "$file" \
+    | rg -q 'Worldwide availability is waiting for the paired iPhone' || return 1
+  inactive_primary_lifecycle_suffix_is_quiescent "$file" "$media_line" || return 1
+  # No newer primary session may borrow the older report while its first diagnostic is pending.
+  if /usr/bin/sed -n "$(( audio_line_number + 1 )),${media_line}p" "$file" | rg -q \
+      'Worldwide audio client diagnostics|A fresh encrypted media rendezvous is ready for the paired iPhone|Worldwide screen host is waiting for the paired iPhone media session|Fresh paired media rendezvous expires in about|Loaded the paired iPhone and started worldwide availability'; then
+    return 1
+  fi
+  /usr/bin/sed -n "$(( audio_line_number + 1 )),${media_line}p" "$file" \
+    | inactive_primary_online_announcements_are_exact || return 1
+  return 0
+}
+
+function stopped_report_current_host_start() {
+  local started
+  started=$(LC_ALL=C ps -ww -p "$HOST_PID" -o lstart=) || return 1
+  LC_ALL=C /bin/date -j -f '%a %b %e %T %Y' "$started" '+%s' 2>/dev/null
+}
+
+function capture_inactive_primary_stopped_report() {
+  local file=$1 line report="${ARTIFACT_DIR}/before-primary-stopped-report.json"
+  inactive_primary_report_lifecycle_is_terminal "$file" || return 1
+  PRIMARY_STOPPED_REPORT_HOST_START=$(stopped_report_current_host_start) || return 1
+  line=$(rg "Worldwide audio client diagnostics pid=${HOST_PID} " "$file" \
+    | /usr/bin/tail -n 1) || return 1
+  read_private_stopped_audio_report "$report" || return 1
+  stopped_audio_report_matches_logged_identity "$report" "$line" || return 1
+  PRIMARY_STOPPED_REPORT_IDENTITY=$STOPPED_REPORT_READ_IDENTITY
+  PRIMARY_STOPPED_REPORT_DIRECTORIES=$STOPPED_REPORT_READ_DIRECTORIES
+  PRIMARY_INACTIVE_EVIDENCE=stoppedReport
+}
+
+function recheck_inactive_primary_stopped_report() {
+  local prefix=$1 report="${ARTIFACT_DIR}/${1}-primary-stopped-report-readback.json"
+  [[ "${PRIMARY_INACTIVE_EVIDENCE:-log}" == stoppedReport ]] || return 0
+  capture_host_generation_identity "${prefix}-stopped-report"
+  [[ "$(stopped_report_current_host_start)" == "$PRIMARY_STOPPED_REPORT_HOST_START" ]] \
+    || fail "Mac host process start changed at ${prefix}"
+  read_private_stopped_audio_report "$report" \
+    && [[ "$STOPPED_REPORT_READ_IDENTITY" == "$PRIMARY_STOPPED_REPORT_IDENTITY" \
+      && "$STOPPED_REPORT_READ_DIRECTORIES" == "$PRIMARY_STOPPED_REPORT_DIRECTORIES" ]] \
+    && /usr/bin/cmp -s "$report" "${ARTIFACT_DIR}/before-primary-stopped-report.json" \
+    || fail "primary stopped report changed or became unsafe at ${prefix}"
+}
+
+function record_inactive_primary_stopped_report_baseline() {
+  local report="${ARTIFACT_DIR}/before-primary-stopped-report.json"
+  recheck_inactive_primary_stopped_report before
+  PRIMARY_BASELINE_MODE=inactivePrimary
+  PRIMARY_AUDIO_STATUS=unavailable.stopped
+  PRIMARY_SESSION_ID=$(jq -er '.heartbeat.i | ascii_downcase' "$report")
+  PRIMARY_PEER_GENERATION=$(jq -er '.peerGeneration' "$report")
+  PRIMARY_NEGOTIATION_EPOCH=$(jq -er '.negotiationEpoch' "$report")
+  PRIMARY_AUDIO_SEQUENCE_BEFORE=$(jq -er '.heartbeat.s' "$report")
+  PRIMARY_AUDIO_APP_ACTIVE=false
+  PRIMARY_MIC_BASELINE_MODE=inactivePrimary
+  PRIMARY_MIC_FORWARDING_PHASE=inactive
+  PRIMARY_CONTINUITY_ASSURANCE=inactivePrimaryNoAudioProof
+  jq '{proof:"inactive-terminal-report-and-completed-lifecycle",status,
+    session:.heartbeat.i,build:.heartbeat.b,peerGeneration,negotiationEpoch,
+    retainedSequence:.heartbeat.s,appActive:false,audioProof:false,microphoneProof:false}' \
+    "$report" > "${ARTIFACT_DIR}/before-primary-audio-continuity.json"
+  jq -n '{proof:"inactive-terminal-only",mode:"inactivePrimary",phase:"inactive",appActive:false}' \
+    > "${ARTIFACT_DIR}/before-primary-microphone-continuity.json"
 }
 
 function never_connected_primary_baseline_is_exact() {
@@ -2140,7 +2374,7 @@ function never_connected_primary_baseline_is_exact() {
         if (line != expected || !waiting) unsafe = 1
         else online = 1
       }
-      if (line ~ /Worldwide WebRTC peer state:|Starting screen video capture|Stopping screen video capture|Worldwide viewer disconnected;|Worldwide media ended;|Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange|peerConnected=true|controlOpen=true/) {
+      if (line ~ /Worldwide WebRTC peer state:|Starting screen video capture|Stopping screen video capture|Worldwide viewer disconnected;|Worldwide media ended;|Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange|Worldwide screen host is waiting for the paired iPhone media session|Fresh paired media rendezvous expires in about|peerConnected=true|controlOpen=true/) {
         unsafe = 1
       }
     }
@@ -2171,6 +2405,7 @@ function write_host_baseline_snapshot() {
   local current_size latest_audio latest_forwarding
   local start_offset window_bytes raw="${output}.raw"
   local deadline=$(( SECONDS + 40 ))
+  local complete_line_seen=0
   while (( SECONDS < deadline )); do
     [[ -f "$HOST_LOG" && ! -L "$HOST_LOG" \
         && "$(/usr/bin/stat -f '%d' "$HOST_LOG")" == "$HOST_LOG_DEVICE" \
@@ -2192,6 +2427,7 @@ function write_host_baseline_snapshot() {
     if [[ "$(/usr/bin/stat -f '%z' "$raw")" == "$window_bytes" \
         && "$(/usr/bin/tail -c 1 "$raw" | /usr/bin/od -An -tuC \
           | /usr/bin/tr -d '[:space:]')" == 10 ]]; then
+      complete_line_seen=1
       if (( start_offset > 1 )); then
         # The bounded byte window can begin in the middle of a log line. Drop
         # that one partial record so every retained diagnostic is parseable.
@@ -2222,10 +2458,18 @@ function write_host_baseline_snapshot() {
         /bin/rm -f "$raw"
         return
       fi
+      if [[ -n "$latest_audio" ]] && capture_inactive_primary_stopped_report "$output"; then
+        HOST_LOG_BASE_SIZE=$current_size
+        HOST_LOG_CONTINUITY_CURSOR=$current_size
+        /bin/rm -f "$raw"
+        return
+      fi
     fi
     /bin/sleep 0.05
   done
   /bin/rm -f "$raw"
+  (( complete_line_seen == 0 )) \
+    || fail 'Mac host complete-line baseline did not prove an admissible current primary lifecycle within 40 seconds'
   fail 'Mac host log did not reach a fresh complete-line baseline within 40 seconds'
 }
 
@@ -2554,11 +2798,13 @@ function write_inactive_primary_append_window() {
 }
 
 function inactive_primary_append_has_no_primary_activity() {
-  local file=$1
+  local file=$1 scan_status=0
   # Primary rendezvous/authentication can begin before the first peer or audio diagnostic.
-  ! rg -q \
-    'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange' \
-    "$file"
+  rg -q \
+    'Worldwide audio client diagnostics|Worldwide iPhone microphone forwarding|Worldwide iPhone microphone hidden writer selected|Worldwide authenticated media route selected virtual microphone|Worldwide media ended;|A fresh encrypted media rendezvous is ready for the paired iPhone|The paired iPhone left the availability exchange|Worldwide screen host is waiting for the paired iPhone media session|Fresh paired media rendezvous expires in about|Loaded the paired iPhone and started worldwide availability' \
+    "$file" || scan_status=$?
+  (( scan_status == 1 )) || return 1
+  inactive_primary_online_announcements_are_exact < "$file"
 }
 
 function capture_inactive_primary_continuity() {
@@ -2584,6 +2830,9 @@ function capture_inactive_primary_continuity() {
       fail "unsupported inactive primary continuity phase: ${prefix}"
       ;;
   esac
+  if [[ "${PRIMARY_INACTIVE_EVIDENCE:-log}" == stoppedReport ]]; then
+    recheck_inactive_primary_stopped_report "$prefix"
+  fi
   line_count=$(/usr/bin/wc -l < "$filtered" | /usr/bin/tr -d '[:space:]')
   jq -n --arg phase "$prefix" --arg assurance "$PRIMARY_CONTINUITY_ASSURANCE" \
     --argjson appendedLineCount "$line_count" \
@@ -2816,6 +3065,10 @@ function capture_host_baseline() {
   HOST_LOG_INODE=$(/usr/bin/stat -f '%i' "$HOST_LOG") \
     || fail 'Mac host log inode identity is unavailable'
   write_host_baseline_snapshot "${ARTIFACT_DIR}/before-host-baseline.log"
+  if [[ "${PRIMARY_INACTIVE_EVIDENCE:-log}" == stoppedReport ]]; then
+    record_inactive_primary_stopped_report_baseline
+    return
+  fi
   if never_connected_primary_baseline_is_exact "${ARTIFACT_DIR}/before-host-baseline.log"; then
     capture_host_generation_identity never-connected-baseline
     record_never_connected_primary_baseline "${ARTIFACT_DIR}/before-host-baseline.log"
@@ -2854,6 +3107,21 @@ function capture_host_baseline() {
 function write_host_delta() {
   local output=${1:-"${ARTIFACT_DIR}/test-host-lifecycle.log"}
   require_same_host
+  if [[ "${PRIMARY_BASELINE_MODE:-}" == inactivePrimary \
+      || "${PRIMARY_BASELINE_MODE:-}" == neverConnectedPrimary ]]; then
+    # Re-read the full bounded append at the final lifecycle fence, including events which
+    # arrived during the preceding continuity/report/manager probes. Filter only after the
+    # same complete-line snapshot has rejected primary reactivation; do not advance its cursor.
+    local HOST_LOG_CONTINUITY_CURSOR=$HOST_LOG_BASE_SIZE
+    local HOST_LOG_CONTINUITY_PENDING_CURSOR
+    local raw="${output}.primary-fence"
+    write_inactive_primary_append_window "$raw"
+    inactive_primary_append_has_no_primary_activity "$raw" \
+      || fail 'primary lifecycle reactivated at the final host lifecycle fence'
+    rg 'Worldwide WebRTC peer state:|Starting screen video capture|Stopping screen video capture|Worldwide viewer disconnected;' \
+      "$raw" > "$output" || true
+    return
+  fi
   [[ -f "$HOST_LOG" && ! -L "$HOST_LOG" \
       && "$(/usr/bin/stat -f '%d' "$HOST_LOG")" == "$HOST_LOG_DEVICE" \
       && "$(/usr/bin/stat -f '%i' "$HOST_LOG")" == "$HOST_LOG_INODE" ]] \
