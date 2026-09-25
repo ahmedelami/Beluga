@@ -24773,6 +24773,130 @@ private final class AudioSessionEventsStub: AudioSessionEventMonitoring {
 final class IOSAudioDiagnosticsJournalTests: XCTestCase {
     private let second: UInt64 = 1_000_000_000
 
+    func testRoutineHeartbeatCadenceKeepsNativeEvidenceFreshAcrossBoundedSamplingAndDeliveryDelay() throws {
+        let current = try routineHeartbeatDeliveries()
+        let legacy = try routineHeartbeatDeliveries(legacyFiveSecondCadence: true)
+        XCTAssertGreaterThan(current.count, 10)
+        XCTAssertTrue(current.allSatisfy { $0.nativeAgeMilliseconds == 1_001 })
+
+        // The host expires native evidence at five seconds even when the heartbeat
+        // itself remains fresh for ten seconds. Keep that receiver contract fixed.
+        let currentAges = nativeAgesImmediatelyBeforeNextDelivery(current)
+        let legacyAges = nativeAgesImmediatelyBeforeNextDelivery(legacy)
+        XCTAssertTrue(currentAges.allSatisfy { $0 <= 5_000 }, "\(currentAges)")
+        XCTAssertTrue(legacyAges.contains { $0 > 5_000 }, "The prior cadence must expose the routine evidence gap.")
+        XCTAssertTrue(legacyAges.allSatisfy { $0 < 10_000 })
+    }
+
+    func testHeartbeatSchedulePreservesOneSecondEventBurstForThirtySeconds() {
+        var schedule = IOSAudioClientDiagnosticsSchedule()
+        for tick in 0...30 {
+            let now = UInt64(tick) * second
+            XCTAssertTrue(schedule.shouldSend(at: now, latestEventSequence: 1))
+            schedule.recordSendAttempt(at: now)
+            XCTAssertFalse(schedule.shouldSend(at: now + second / 2, latestEventSequence: 1))
+        }
+        XCTAssertFalse(schedule.shouldSend(at: second * 31, latestEventSequence: 1))
+        XCTAssertTrue(schedule.shouldSend(at: second * 32, latestEventSequence: 1))
+        schedule.recordSendAttempt(at: second * 32)
+
+        // A new event renews the burst; repeated delivery of the same event does not.
+        XCTAssertTrue(schedule.shouldSend(at: second * 33, latestEventSequence: 2))
+        schedule.recordSendAttempt(at: second * 33)
+        for tick in 34...63 {
+            let now = UInt64(tick) * second
+            XCTAssertTrue(schedule.shouldSend(at: now, latestEventSequence: 2))
+            schedule.recordSendAttempt(at: now)
+        }
+        XCTAssertFalse(schedule.shouldSend(at: second * 64, latestEventSequence: 2))
+        XCTAssertTrue(schedule.shouldSend(at: second * 65, latestEventSequence: 2))
+    }
+
+    func testHeartbeatScheduleConsumesOnlyAttemptedSendAndResetsForNewSession() {
+        var schedule = IOSAudioClientDiagnosticsSchedule()
+        XCTAssertTrue(schedule.shouldSend(at: second, latestEventSequence: 1))
+        XCTAssertTrue(schedule.shouldSend(at: second, latestEventSequence: 1),
+                      "Missing negotiation context must not consume a send slot.")
+        schedule.recordSendAttempt(at: second)
+        XCTAssertFalse(schedule.shouldSend(at: second, latestEventSequence: 1))
+        schedule = IOSAudioClientDiagnosticsSchedule()
+        XCTAssertTrue(schedule.shouldSend(at: second, latestEventSequence: 1))
+    }
+
+    func testRoutineHeartbeatsDoNotRefreshMissingNativeSamplesOrUndeliveredEvidence() throws {
+        let frozen = try routineHeartbeatDeliveries(stopNativeSampling: true)
+        XCTAssertGreaterThan(frozen.count, 10)
+        XCTAssertTrue(zip(frozen, frozen.dropFirst()).allSatisfy { before, after in
+            before.sequence < after.sequence
+        })
+        XCTAssertTrue(frozen.contains { $0.nativeAgeMilliseconds > 5_000 },
+                      "Sending new heartbeats must preserve the age of a blocked native read.")
+        XCTAssertTrue(zip(frozen, frozen.dropFirst()).allSatisfy { before, after in
+            before.nativeAgeMilliseconds < after.nativeAgeMilliseconds
+        })
+        let last = try XCTUnwrap(try routineHeartbeatDeliveries().last)
+        let deadline = last.receivedAt + (5_000 - last.nativeAgeMilliseconds) * 1_000_000
+        XCTAssertEqual(nativeAge(at: deadline, since: last), 5_000)
+        XCTAssertGreaterThan(nativeAge(at: deadline + 1_000_000, since: last), 5_000,
+                             "A delivery outage must still expire the last native observation.")
+    }
+
+    private struct TimedAudioHeartbeat {
+        let receivedAt: UInt64
+        let nativeAgeMilliseconds: UInt64
+        let sequence: UInt64
+    }
+
+    private func routineHeartbeatDeliveries(
+        legacyFiveSecondCadence: Bool = false,
+        stopNativeSampling: Bool = false
+    ) throws -> [TimedAudioHeartbeat] {
+        var schedule = IOSAudioClientDiagnosticsSchedule()
+        var journal = IOSAudioDiagnosticsJournal()
+        let policy = UUID()
+        journal.reset(sessionID: UUID(), policyID: policy, at: 0)
+        XCTAssertTrue(schedule.shouldSend(at: 0, latestEventSequence: journal.events.last?.sequence))
+        schedule.recordSendAttempt(at: 0)
+        var legacyLastSent: UInt64 = 0
+        var deliveries: [TimedAudioHeartbeat] = []
+        let firstTick = second * 40
+        let sampleAge: UInt64 = 1_001_000_000
+        // Exercise the real send policy after its event burst. The existing one-second
+        // loop takes an extra 250ms per tick; delivery alternates between 0 and 750ms.
+        for tick in 0...32 {
+            let now = firstTick + UInt64(tick) * 1_250_000_000
+            if !stopNativeSampling || tick == 0 {
+                var native = WebRTCAudioClientNativeSnapshot()
+                native.playoutCallbackCount = UInt64(tick + 1)
+                native.playoutFrameCount = UInt64(tick + 1) * 480
+                journal.observeNative(native, policyID: policy, at: now - sampleAge)
+            }
+            let due = legacyFiveSecondCadence
+                ? now - legacyLastSent >= second * 5
+                : schedule.shouldSend(at: now, latestEventSequence: journal.events.last?.sequence)
+            guard due else { continue }
+            let heartbeat = try XCTUnwrap(journal.heartbeat(build: .init(), at: now))
+            schedule.recordSendAttempt(at: now)
+            legacyLastSent = now
+            deliveries.append(.init(
+                receivedAt: now + (deliveries.count.isMultiple(of: 2) ? 0 : 750_000_000),
+                nativeAgeMilliseconds: try XCTUnwrap(heartbeat.snapshot.nativeObservationAgeMilliseconds),
+                sequence: heartbeat.sequence
+            ))
+        }
+        return deliveries
+    }
+
+    private func nativeAgesImmediatelyBeforeNextDelivery(_ deliveries: [TimedAudioHeartbeat]) -> [UInt64] {
+        zip(deliveries, deliveries.dropFirst()).map { before, after in
+            nativeAge(at: after.receivedAt - 1, since: before)
+        }
+    }
+
+    private func nativeAge(at now: UInt64, since delivery: TimedAudioHeartbeat) -> UInt64 {
+        delivery.nativeAgeMilliseconds + (now - delivery.receivedAt) / 1_000_000
+    }
+
     func testCategoryObservationFirstDetailSurvivesGenericAuthorityAndLaterDetails() throws {
         var journal = IOSAudioDiagnosticsJournal()
         let policy = UUID()

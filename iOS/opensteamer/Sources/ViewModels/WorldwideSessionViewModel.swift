@@ -6,6 +6,28 @@ import RemoteSessionCore
 import UIKit
 import WebRTCTransport
 
+struct IOSAudioClientDiagnosticsSchedule {
+    private var lastSentAt: UInt64?
+    private var lastEventSequence: UInt64 = 0
+    private var fastUntil: UInt64 = 0
+
+    mutating func shouldSend(at now: UInt64, latestEventSequence: UInt64?) -> Bool {
+        if let latestEventSequence, latestEventSequence != lastEventSequence {
+            lastEventSequence = latestEventSequence
+            fastUntil = now.addingReportingOverflow(30_000_000_000).partialValue
+        }
+        // Leave room inside the host's five-second native-evidence lifetime for the
+        // independently sampled snapshot, the one-second poll and delivery delay.
+        let interval: UInt64 = now <= fastUntil ? 1_000_000_000 : 2_000_000_000
+        if let lastSentAt, now >= lastSentAt, now - lastSentAt < interval { return false }
+        return true
+    }
+
+    mutating func recordSendAttempt(at now: UInt64) {
+        lastSentAt = now
+    }
+}
+
 /// Session-local evidence only. A successful send never consumes the retained failure/history.
 struct IOSAudioDiagnosticsJournal {
     private(set) var sessionID = UUID()
@@ -1670,9 +1692,7 @@ final class WorldwideSessionViewModel: ObservableObject {
     private var audioClientDiagnosticsTask: Task<Void, Never>?
     private var audioDiagnosticsSampleTask: Task<Void, Never>?
     private var audioDiagnosticsSampleID: UUID?
-    private var audioDiagnosticsLastSentAt: UInt64?
-    private var audioDiagnosticsLastEventSequence: UInt64 = 0
-    private var audioDiagnosticsFastUntil: UInt64 = 0
+    private var audioDiagnosticsSchedule = IOSAudioClientDiagnosticsSchedule()
     private var screenMediaViewerAttempt: WorldwideScreenMediaViewerAttempt?
     private var screenMediaCoveredHideTask: Task<Void, Never>?
     private var screenMediaMarkerPresentationTask: Task<Void, Never>?
@@ -4075,9 +4095,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         audioClientDiagnosticsTask = nil
         // Keep the one in-flight slot until its reader actually returns, even across reconnects.
         audioDiagnosticsSampleTask?.cancel()
-        audioDiagnosticsLastSentAt = nil
-        audioDiagnosticsLastEventSequence = 0
-        audioDiagnosticsFastUntil = 0
+        audioDiagnosticsSchedule = IOSAudioClientDiagnosticsSchedule()
         guard let sourcePeer else { return }
         let generation = sessionGeneration
         audioDiagnostics.reset(
@@ -4099,13 +4117,9 @@ final class WorldwideSessionViewModel: ObservableObject {
     private func sendAudioClientDiagnostics(through sourcePeer: WebRTCPeer, generation: UUID) async {
         guard !Task.isCancelled, peer === sourcePeer, sessionGeneration == generation else { return }
         let now = Self.audioDiagnosticsNow()
-        if let latestEvent = audioDiagnostics.events.last,
-           latestEvent.sequence != audioDiagnosticsLastEventSequence {
-            audioDiagnosticsLastEventSequence = latestEvent.sequence
-            audioDiagnosticsFastUntil = now.addingReportingOverflow(30_000_000_000).partialValue
-        }
-        let interval: UInt64 = now <= audioDiagnosticsFastUntil ? 1_000_000_000 : 5_000_000_000
-        if let last = audioDiagnosticsLastSentAt, now >= last, now - last < interval { return }
+        guard audioDiagnosticsSchedule.shouldSend(
+            at: now, latestEventSequence: audioDiagnostics.events.last?.sequence
+        ) else { return }
         guard let context = await sourcePeer.audioClientDiagnosticsContext() else { return }
         guard !Task.isCancelled, context.isValid,
               peer === sourcePeer, sessionGeneration == generation else { return }
@@ -4113,7 +4127,7 @@ final class WorldwideSessionViewModel: ObservableObject {
         guard let heartbeat = audioDiagnostics.heartbeat(
             build: Self.audioDiagnosticsBuild, at: Self.audioDiagnosticsNow()
         ) else { return }
-        audioDiagnosticsLastSentAt = now
+        audioDiagnosticsSchedule.recordSendAttempt(at: now)
         do {
             try await sourcePeer.sendAudioClientDiagnosticsHeartbeat(heartbeat, context: context)
         } catch {
