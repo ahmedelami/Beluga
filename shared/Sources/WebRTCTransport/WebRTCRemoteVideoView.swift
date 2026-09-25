@@ -1787,6 +1787,11 @@ public final class WebRTCRemoteVideoView: UIView, LKRTCVideoViewDelegate {
 
         if let metalView = renderer.subviews.compactMap({ $0 as? MTKView }).first,
            let downstream = metalView.delegate {
+            // LiveKit normally assigns this in its first draw, but our presentation observer
+            // needs a drawable before admitting that draw. Break that initialization cycle.
+            if metalView.device == nil {
+                metalView.device = MTLCreateSystemDefaultDevice()
+            }
             let proxy = ObservedMTKViewDelegateProxy(downstream: downstream)
             metalDelegateProxy = proxy
             metalView.delegate = proxy

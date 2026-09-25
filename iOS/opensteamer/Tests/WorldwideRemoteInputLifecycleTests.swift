@@ -1,4 +1,5 @@
 import CoreVideo
+import MetalKit
 import RemoteSessionCore
 import SwiftUI
 import UIKit
@@ -2054,6 +2055,27 @@ final class WorldwideScreenMediaViewerSuspensionTests: XCTestCase {
 /// Focused tests for session-generation fences shared by statistics and signaling tasks.
 @MainActor
 final class WorldwideSessionGenerationFenceTests: XCTestCase {
+    func testNativeMetalViewHasDeviceBeforeFirstObservedFrame() throws {
+        let view = WebRTCRemoteVideoView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 640)
+        )
+        let nativeRenderer = try XCTUnwrap(
+            view.subviews.compactMap { $0 as? LKRTCMTLVideoView }.first
+        )
+        let metalView = try XCTUnwrap(
+            nativeRenderer.subviews.compactMap { $0 as? MTKView }.first
+        )
+        XCTAssertNotNil(MTLCreateSystemDefaultDevice(), "This renderer test requires Metal.")
+        XCTAssertNotNil(
+            metalView.device,
+            "The presentation observer needs a device before requesting its first drawable; "
+                + "waiting for LiveKit's first draw creates a nil-drawable startup cycle."
+        )
+        XCTAssertNotNil(metalView.delegate)
+        XCTAssertTrue(view.debugPresentationCoverIsVisible)
+        XCTAssertFalse(view.debugHasCurrentPresentedFrame)
+    }
+
     func testRendererPathTextReportsEveryPresentationGateWithoutPixels() {
         let unavailable = WorldwideSessionViewModel
             .screenRendererPathDiagnosticLines(for: nil)
