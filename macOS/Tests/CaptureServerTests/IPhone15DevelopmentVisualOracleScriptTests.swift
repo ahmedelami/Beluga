@@ -106,6 +106,11 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
                 "TestHostPath": "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app",
                 "TestBundlePath": "__TESTHOST__/PlugIns/opensteamerUITests.xctest",
                 "UITargetAppPath": "__TESTROOT__/Debug-iphoneos/Beluga.app",
+                "DependentProductPaths": [
+                    "__TESTROOT__/Debug-iphoneos/Beluga.app",
+                    "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app",
+                    "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app/PlugIns/opensteamerUITests.xctest",
+                ],
                 "ProductModuleName": "opensteamerUITests",
                 "IsUITestBundle": true,
                 "IsXCTRunnerHostedTestBundle": true,
@@ -128,7 +133,8 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
         let original = try PropertyListSerialization.data(fromPropertyList: fixture, format: .xml, options: 0)
         let function = try shellFunction("configure_destination_artifacts_xctestrun")
         var expected = try XCTUnwrap(fixture["opensteamerUITests"] as? [String: Any])
-        for key in ["TestHostPath", "TestBundlePath", "UITargetAppPath"] { expected.removeValue(forKey: key) }
+        let removedKeys = ["TestHostPath", "TestBundlePath", "UITargetAppPath", "DependentProductPaths"]
+        for key in removedKeys { expected.removeValue(forKey: key) }
         expected["UseDestinationArtifacts"] = true
         expected["TestBundleDestinationRelativePath"] = "__TESTHOST__/PlugIns/opensteamerUITests.xctest"
         expected["UITargetAppBundleIdentifier"] = "org.example.AudioStreamer.dev"
@@ -146,6 +152,7 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
                 from: Data(contentsOf: input), format: nil
             ) as? [String: Any])
             let target = try XCTUnwrap(transformed["opensteamerUITests"] as? [String: Any])
+            for key in removedKeys { XCTAssertNil(target[key], "Local artifact mapping retained: \(key)") }
             let exact = NSDictionary(dictionary: target).isEqual(to: expected)
             XCTAssertEqual(exact, !disablesInstalledMode)
             XCTAssertEqual((transformed["__xctestrun_metadata__"] as? [String: Int])?["FormatVersion"], 1)
@@ -176,6 +183,17 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
         var otherFormat = localArtifactXctestrunFixture
         otherFormat["__xctestrun_metadata__"] = ["FormatVersion": 2]
         invalid.append(otherFormat)
+        let invalidDependencies: [Any] = [
+            "__TESTROOT__/Debug-iphoneos/Beluga.app",
+            ["__TESTROOT__/Debug-iphoneos/Other.app"],
+        ]
+        for dependencies in invalidDependencies {
+            var fixture = localArtifactXctestrunFixture
+            var target = try XCTUnwrap(fixture["opensteamerUITests"] as? [String: Any])
+            target["DependentProductPaths"] = dependencies
+            fixture["opensteamerUITests"] = target
+            invalid.append(fixture)
+        }
         for fixture in invalid {
             let original = try PropertyListSerialization.data(fromPropertyList: fixture, format: .xml, options: 0)
             try original.write(to: input)

@@ -3863,6 +3863,11 @@ function configure_destination_artifacts_xctestrun() {
       "__TESTHOST__/PlugIns/opensteamerUITests.xctest" and
     .opensteamerUITests.UITargetAppPath ==
       "__TESTROOT__/Debug-iphoneos/Beluga.app" and
+    .opensteamerUITests.DependentProductPaths == [
+      "__TESTROOT__/Debug-iphoneos/Beluga.app",
+      "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app",
+      "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app/PlugIns/opensteamerUITests.xctest"
+    ] and
     .opensteamerUITests.ProductModuleName == "opensteamerUITests" and
     .opensteamerUITests.IsUITestBundle == true and
     .opensteamerUITests.IsXCTRunnerHostedTestBundle == true and
@@ -3874,8 +3879,9 @@ function configure_destination_artifacts_xctestrun() {
   ' "${ARTIFACT_DIR}/xctestrun.json" >/dev/null \
     || fail 'prepared xctestrun is not pinned to the development app and UI runner'
   # Xcode's xcodebuild.xctestrun(5) destination-artifact mode prevents installation after seeding.
+  # Its optional DependentProductPaths map binds UI-test apps to local products; omit it too.
   jq --arg app "$APP_BUNDLE_ID" '
-    .opensteamerUITests |= (del(.TestHostPath, .TestBundlePath, .UITargetAppPath) + {
+    .opensteamerUITests |= (del(.TestHostPath, .TestBundlePath, .UITargetAppPath, .DependentProductPaths) + {
       UseDestinationArtifacts: true,
       TestBundleDestinationRelativePath: "__TESTHOST__/PlugIns/opensteamerUITests.xctest",
       UITargetAppBundleIdentifier: $app
