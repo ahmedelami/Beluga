@@ -404,7 +404,6 @@ print -r -- 'static let opensteamerPairingService =
 print -r -- 'let store = WorldwidePairingStore(
     dataStore: WorldwideKeychainDataStore()
 )
-fflush(stdout)
 fflush(stdout)' >"$BASELINE/macOS/Sources/CaptureServer/CaptureServerMain.swift"
 print -r -- 'static let legacyRuntimeDirectoryName =
     "com.elamin.AudioStreamer.CaptureServer.runtime"' \
@@ -2820,9 +2819,9 @@ require_rejection "$CASE" 'explicit opensteamer pairing-store composition'
 
 CASE=$(new_case mac-pairing-code-flush)
 replace_once "$CASE/macOS/Sources/CaptureServer/CaptureServerMain.swift" \
-  $'fflush(stdout)\nfflush(stdout)' \
-  $'/* missing primary pairing-code flush */\nfflush(stdout)'
-require_rejection "$CASE" 'immediate primary and secondary one-time pairing-code flushes'
+  'fflush(stdout)' \
+  '/* missing primary pairing-code flush */'
+require_rejection "$CASE" 'immediate primary one-time pairing-code flush'
 
 CASE=$(new_case mac-runtime-lock-namespace)
 replace_once "$CASE/macOS/Sources/CaptureServer/WorldwideHostProcessLock.swift" \
