@@ -265,6 +265,8 @@ typeset -g UNLOCK_REQUEST_SHA256=''
 typeset -g VISUAL_MARKER=''
 typeset -g LOCAL_APP_BUILD=''
 typeset -g LOCAL_APP_URL=''
+typeset -g LOCAL_RUNNER_BUILD=''
+typeset -g LOCAL_RUNNER_URL=''
 typeset -g XCTESTRUN_FILE=''
 typeset -g PRIMARY_SESSION_ID=''
 typeset -g PRIMARY_PEER_GENERATION=''
@@ -3608,6 +3610,35 @@ function capture_installed_dev_app() {
     || fail 'installed development app identity changed during validation'
 }
 
+function capture_installed_ui_runner() {
+  local prefix=$1 apps="${ARTIFACT_DIR}/${1}-ui-runner-apps.json" observed_url
+  xcrun devicectl device info apps \
+    --device "$DEVICE_ID" --include-all-apps --bundle-id "$RUNNER_BUNDLE_ID" \
+    --timeout 30 --json-output "$apps" >/dev/null \
+    || fail "development UI runner metadata unavailable at ${prefix}"
+  jq -e --arg bundle "$RUNNER_BUNDLE_ID" --arg build "$LOCAL_RUNNER_BUILD" '
+    (.info.outcome == "success") and
+    ([.result.apps[] | select(.bundleIdentifier == $bundle)] | length == 1) and
+    ([.result.apps[] | select(.bundleIdentifier == $bundle)][0].bundleVersion == $build)
+  ' "$apps" >/dev/null \
+    || fail "expected installed development UI runner/build missing at ${prefix}"
+  jq -S --arg bundle "$RUNNER_BUNDLE_ID" \
+    '[.result.apps[] | select(.bundleIdentifier == $bundle)][0]' "$apps" \
+    > "${ARTIFACT_DIR}/${prefix}-ui-runner.json"
+  observed_url=$(jq -er '.url' "${ARTIFACT_DIR}/${prefix}-ui-runner.json") \
+    || fail "development UI runner URL is unavailable at ${prefix}"
+  [[ "$observed_url" == file:///private/var/containers/Bundle/Application/*/opensteamerUITests-Runner.app/ ]] \
+    || fail "development UI runner URL is malformed at ${prefix}"
+  if [[ -z "$LOCAL_RUNNER_URL" ]]; then LOCAL_RUNNER_URL=$observed_url; fi
+  [[ "$observed_url" == "$LOCAL_RUNNER_URL" ]] \
+    || fail 'installed development UI runner identity changed during validation'
+  if [[ "$prefix" != before-test ]]; then
+    /usr/bin/cmp -s "${ARTIFACT_DIR}/before-test-ui-runner.json" \
+      "${ARTIFACT_DIR}/${prefix}-ui-runner.json" \
+      || fail 'installed development UI runner metadata changed during validation'
+  fi
+}
+
 function dev_app_processes_are_absent() {
   local prefix=$1
   local processes="${ARTIFACT_DIR}/${prefix}-device-processes.json"
@@ -3818,6 +3849,43 @@ function build_current_development_test_products() {
     || fail 'Xcode produced an invalid development UI-test runner after bounded repair'
 }
 
+function configure_destination_artifacts_xctestrun() {
+  local file=$1
+  plutil -convert json -o "${ARTIFACT_DIR}/xctestrun.json" "$file" \
+    || fail 'prepared development UI-test xctestrun metadata is unavailable'
+  jq -e --arg runner "$RUNNER_BUNDLE_ID" --arg app "$APP_BUNDLE_ID" '
+    (keys | sort) == ["__xctestrun_metadata__", "opensteamerUITests"] and
+    .__xctestrun_metadata__.FormatVersion == 1 and
+    .opensteamerUITests.TestHostBundleIdentifier == $runner and
+    .opensteamerUITests.TestHostPath ==
+      "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app" and
+    .opensteamerUITests.TestBundlePath ==
+      "__TESTHOST__/PlugIns/opensteamerUITests.xctest" and
+    .opensteamerUITests.UITargetAppPath ==
+      "__TESTROOT__/Debug-iphoneos/Beluga.app" and
+    .opensteamerUITests.ProductModuleName == "opensteamerUITests" and
+    .opensteamerUITests.IsUITestBundle == true and
+    .opensteamerUITests.IsXCTRunnerHostedTestBundle == true and
+    .opensteamerUITests.UseDestinationArtifacts == null and
+    .opensteamerUITests.TestBundleDestinationRelativePath == null and
+    .opensteamerUITests.UITargetAppBundleIdentifier == null and
+    ([.. | strings | select(. == "com.elamin.opensteamer")] | length) == 0 and
+    ([.. | strings | select(. == $app)] | length) >= 1
+  ' "${ARTIFACT_DIR}/xctestrun.json" >/dev/null \
+    || fail 'prepared xctestrun is not pinned to the development app and UI runner'
+  # Xcode's xcodebuild.xctestrun(5) destination-artifact mode prevents installation after seeding.
+  jq --arg app "$APP_BUNDLE_ID" '
+    .opensteamerUITests |= (del(.TestHostPath, .TestBundlePath, .UITargetAppPath) + {
+      UseDestinationArtifacts: true,
+      TestBundleDestinationRelativePath: "__TESTHOST__/PlugIns/opensteamerUITests.xctest",
+      UITargetAppBundleIdentifier: $app
+    })
+  ' "${ARTIFACT_DIR}/xctestrun.json" > "${ARTIFACT_DIR}/destination-xctestrun.json" \
+    || fail 'installed-artifact xctestrun could not be prepared'
+  plutil -convert xml1 -o "$file" "${ARTIFACT_DIR}/destination-xctestrun.json" \
+    || fail 'installed-artifact xctestrun could not be serialized'
+}
+
 function prepare_signed_products() {
   local source_products="${DERIVED_DATA}/Build/Products"
   [[ -d "$source_products" && ! -L "$source_products" ]] \
@@ -3860,6 +3928,10 @@ function prepare_signed_products() {
   [[ "$(plutil -extract CFBundleIdentifier raw -o - \
       "${runner_apps[1]}/Info.plist")" == "$RUNNER_BUNDLE_ID" ]] \
     || fail 'prepared UI test runner bundle identity is unexpected'
+  LOCAL_RUNNER_BUILD=$(plutil -extract CFBundleVersion raw -o - \
+    "${runner_apps[1]}/Info.plist") || fail 'prepared UI test runner build is unavailable'
+  [[ -n "$LOCAL_RUNNER_BUILD" && "$LOCAL_RUNNER_BUILD" != *[^0-9]* ]] \
+    || fail 'prepared UI test runner build is malformed'
   codesign --verify --deep --strict "${runner_apps[1]}" \
     > "${ARTIFACT_DIR}/ui-runner-codesign-verify.log" 2>&1 \
     || fail 'prepared UI test runner signature verification failed'
@@ -3875,22 +3947,7 @@ function prepare_signed_products() {
   (( ${#xctestrun_files[@]} == 1 )) \
     || fail 'expected one exact prepared development UI-test xctestrun file'
   XCTESTRUN_FILE=${xctestrun_files[1]}
-  plutil -convert json -o "${ARTIFACT_DIR}/xctestrun.json" "$XCTESTRUN_FILE" \
-    || fail 'prepared development UI-test xctestrun metadata is unavailable'
-  jq -e --arg runner "$RUNNER_BUNDLE_ID" --arg app "$APP_BUNDLE_ID" '
-    (keys | sort) == ["__xctestrun_metadata__", "opensteamerUITests"] and
-    .opensteamerUITests.TestHostBundleIdentifier == $runner and
-    .opensteamerUITests.TestHostPath ==
-      "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app" and
-    .opensteamerUITests.TestBundlePath ==
-      "__TESTHOST__/PlugIns/opensteamerUITests.xctest" and
-    .opensteamerUITests.UITargetAppPath ==
-      "__TESTROOT__/Debug-iphoneos/Beluga.app" and
-    .opensteamerUITests.ProductModuleName == "opensteamerUITests" and
-    ([.. | strings | select(. == "com.elamin.opensteamer")] | length) == 0 and
-    ([.. | strings | select(. == $app)] | length) >= 1
-  ' "${ARTIFACT_DIR}/xctestrun.json" >/dev/null \
-    || fail 'prepared xctestrun is not pinned to the development app and UI runner'
+  configure_destination_artifacts_xctestrun "$XCTESTRUN_FILE"
   (
     cd "$PREPARED_PRODUCTS"
     /usr/bin/find -s . -type f -exec /usr/bin/shasum -a 256 {} +
@@ -4405,7 +4462,16 @@ xcrun devicectl device install app \
   || fail 'current-source development app could not be installed on the iPhone 15'
 jq -e '.info.outcome == "success"' "${ARTIFACT_DIR}/dev-app-install.json" \
   >/dev/null || fail 'development app install did not report success'
+xcrun devicectl device install app \
+  --device "$DEVICE_ID" \
+  "${PREPARED_PRODUCTS}/Debug-iphoneos/opensteamerUITests-Runner.app" \
+  --timeout 60 --json-output "${ARTIFACT_DIR}/ui-runner-install.json" \
+  > "${ARTIFACT_DIR}/ui-runner-install.stdout.log" 2>&1 \
+  || fail 'current-source UI test runner could not be installed on the iPhone 15'
+jq -e '.info.outcome == "success"' "${ARTIFACT_DIR}/ui-runner-install.json" \
+  >/dev/null || fail 'development UI test runner install did not report success'
 capture_installed_dev_app before-test
+capture_installed_ui_runner before-test
 
 STAGE=dev-secret-preclean
 run_device_secret_cleanup pre-mint-cleanup \
@@ -4420,6 +4486,7 @@ capture_host_generation_identity before-invitation-mint
 capture_device_identity before-invitation-mint
 require_device_power_assertion_healthy before-invitation-mint
 capture_installed_dev_app before-invitation-mint
+capture_installed_ui_runner before-invitation-mint
 /usr/bin/cmp -s "${ARTIFACT_DIR}/before-test-dev-app.json" \
   "${ARTIFACT_DIR}/before-invitation-mint-dev-app.json" \
   || fail 'installed development app metadata changed before invitation mint'
@@ -4549,6 +4616,7 @@ require_device_power_assertion_healthy after-device-secret-cleanup
 require_audio_route_monitor_healthy after-device-secret-cleanup
 capture_device_identity after-device-secret-cleanup unlocked
 capture_installed_dev_app after-test
+capture_installed_ui_runner after-test
 /usr/bin/cmp -s "${ARTIFACT_DIR}/before-test-dev-app.json" \
   "${ARTIFACT_DIR}/after-test-dev-app.json" \
   || fail 'installed development app metadata changed during the physical test'

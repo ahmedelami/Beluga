@@ -61,6 +61,177 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
         )
     }
 
+    private func shellFunction(_ name: String) throws -> String {
+        let source = try source
+        let start = try XCTUnwrap(source.range(of: "\nfunction \(name)() {\n"))
+        let end = try XCTUnwrap(source.range(of: "\nfunction ", range: start.upperBound..<source.endIndex))
+        return String(source[start.lowerBound..<end.lowerBound])
+    }
+
+    private func runInstalledArtifactFixture(
+        _ functions: String, commands: String, root: URL
+    ) throws -> (status: Int32, error: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-f", "-c", """
+        set -euo pipefail
+        ARTIFACT_DIR="$FIXTURE_ROOT"
+        APP_BUNDLE_ID=org.example.AudioStreamer.dev
+        RUNNER_BUNDLE_ID=org.example.AudioStreamerUITests.xctrunner
+        DEVICE_ID=fixture-device
+        LOCAL_RUNNER_BUILD=1
+        LOCAL_RUNNER_URL=''
+        function fail() { print -u2 -r -- "$1"; exit 41 }
+        \(functions)
+        \(commands)
+        """]
+        process.environment = [
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "FIXTURE_ROOT": root.path,
+        ]
+        let errors = Pipe()
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(
+            data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+        ) ?? "")
+    }
+
+    private var localArtifactXctestrunFixture: [String: Any] {
+        [
+            "__xctestrun_metadata__": ["FormatVersion": 1],
+            "opensteamerUITests": [
+                "TestHostBundleIdentifier": "org.example.AudioStreamerUITests.xctrunner",
+                "TestHostPath": "__TESTROOT__/Debug-iphoneos/opensteamerUITests-Runner.app",
+                "TestBundlePath": "__TESTHOST__/PlugIns/opensteamerUITests.xctest",
+                "UITargetAppPath": "__TESTROOT__/Debug-iphoneos/Beluga.app",
+                "ProductModuleName": "opensteamerUITests",
+                "IsUITestBundle": true,
+                "IsXCTRunnerHostedTestBundle": true,
+                "BundleIdentifiersForCrashReportEmphasis": ["org.example.AudioStreamer.dev"],
+                "TestingEnvironmentVariables": ["PRESERVED_FIXTURE": "test-environment"],
+                "UITargetAppEnvironmentVariables": ["PRESERVED_FIXTURE": "app-environment"],
+                "CommandLineArguments": ["preserved-argument"],
+            ],
+        ]
+    }
+
+    func testDestinationArtifactsModePreservesExactIdentityAndEnvironment() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "iphone15-destination-artifacts-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = root.appendingPathComponent("prepared.xctestrun")
+        let fixture = localArtifactXctestrunFixture
+        let original = try PropertyListSerialization.data(fromPropertyList: fixture, format: .xml, options: 0)
+        let function = try shellFunction("configure_destination_artifacts_xctestrun")
+        var expected = try XCTUnwrap(fixture["opensteamerUITests"] as? [String: Any])
+        for key in ["TestHostPath", "TestBundlePath", "UITargetAppPath"] { expected.removeValue(forKey: key) }
+        expected["UseDestinationArtifacts"] = true
+        expected["TestBundleDestinationRelativePath"] = "__TESTHOST__/PlugIns/opensteamerUITests.xctest"
+        expected["UITargetAppBundleIdentifier"] = "org.example.AudioStreamer.dev"
+
+        for disablesInstalledMode in [false, true] {
+            try original.write(to: input)
+            let executable = disablesInstalledMode
+                ? function.replacingOccurrences(of: "UseDestinationArtifacts: true", with: "UseDestinationArtifacts: false")
+                : function
+            let result = try runInstalledArtifactFixture(executable, commands: """
+            configure_destination_artifacts_xctestrun "$FIXTURE_ROOT/prepared.xctestrun"
+            """, root: root)
+            XCTAssertEqual(result.status, 0, result.error)
+            let transformed = try XCTUnwrap(PropertyListSerialization.propertyList(
+                from: Data(contentsOf: input), format: nil
+            ) as? [String: Any])
+            let target = try XCTUnwrap(transformed["opensteamerUITests"] as? [String: Any])
+            let exact = NSDictionary(dictionary: target).isEqual(to: expected)
+            XCTAssertEqual(exact, !disablesInstalledMode)
+            XCTAssertEqual((transformed["__xctestrun_metadata__"] as? [String: Int])?["FormatVersion"], 1)
+        }
+    }
+
+    func testDestinationArtifactsModeRejectsWrongIdentityOrSchemaBeforeMutation() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "iphone15-destination-rejection-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = root.appendingPathComponent("prepared.xctestrun")
+        let function = try shellFunction("configure_destination_artifacts_xctestrun")
+        var invalid: [[String: Any]] = []
+        for (key, value) in [
+            ("TestHostBundleIdentifier", "com.elamin.opensteamer"),
+            ("UITargetAppPath", "__TESTROOT__/Debug-iphoneos/Other.app"),
+            ("TestBundlePath", "__TESTHOST__/PlugIns/Other.xctest"),
+            ("UITargetAppBundleIdentifier", "com.elamin.opensteamer"),
+        ] {
+            var fixture = localArtifactXctestrunFixture
+            var target = try XCTUnwrap(fixture["opensteamerUITests"] as? [String: Any])
+            target[key] = value
+            fixture["opensteamerUITests"] = target
+            invalid.append(fixture)
+        }
+        var otherFormat = localArtifactXctestrunFixture
+        otherFormat["__xctestrun_metadata__"] = ["FormatVersion": 2]
+        invalid.append(otherFormat)
+        for fixture in invalid {
+            let original = try PropertyListSerialization.data(fromPropertyList: fixture, format: .xml, options: 0)
+            try original.write(to: input)
+            let result = try runInstalledArtifactFixture(function, commands: """
+            configure_destination_artifacts_xctestrun "$FIXTURE_ROOT/prepared.xctestrun"
+            """, root: root)
+            XCTAssertNotEqual(result.status, 0)
+            XCTAssertTrue(result.error.contains("not pinned"), result.error)
+            XCTAssertEqual(try Data(contentsOf: input), original)
+        }
+    }
+
+    func testInstalledUIRunnerRejectsChangedContainerBuildOrBundle() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "iphone15-installed-runner-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original: [String: String] = [
+            "bundleIdentifier": "org.example.AudioStreamerUITests.xctrunner", "bundleVersion": "1",
+            "url": "file:///private/var/containers/Bundle/Application/ORIGINAL/opensteamerUITests-Runner.app/",
+        ]
+        func writeMetadata(_ app: [String: String], name: String) throws {
+            try JSONSerialization.data(withJSONObject: [
+                "info": ["outcome": "success"], "result": ["apps": [app]],
+            ]).write(to: root.appendingPathComponent(name))
+        }
+        try writeMetadata(original, name: "original.json")
+        let function = try shellFunction("capture_installed_ui_runner")
+        let commands = """
+        FIXTURE_METADATA="$FIXTURE_ROOT/original.json"
+        function xcrun() {
+          [[ "$1 $2 $3 $4" == 'devicectl device info apps' ]] || return 73
+          while [[ $# -gt 0 && "$1" != --json-output ]]; do shift; done
+          [[ $# == 2 ]] || return 74
+          /bin/cp "$FIXTURE_METADATA" "$2"
+        }
+        capture_installed_ui_runner before-test
+        FIXTURE_METADATA="$FIXTURE_ROOT/after.json"
+        capture_installed_ui_runner after-test
+        """
+        try writeMetadata(original, name: "after.json")
+        let accepted = try runInstalledArtifactFixture(function, commands: commands, root: root)
+        XCTAssertEqual(accepted.status, 0, accepted.error)
+        for (key, value) in [
+            ("url", original["url"]!.replacingOccurrences(of: "ORIGINAL", with: "REINSTALLED")),
+            ("bundleVersion", "2"), ("bundleIdentifier", "com.elamin.opensteamer"),
+        ] {
+            var changed = original
+            changed[key] = value
+            try writeMetadata(changed, name: "after.json")
+            let rejected = try runInstalledArtifactFixture(function, commands: commands, root: root)
+            XCTAssertNotEqual(rejected.status, 0)
+        }
+    }
+
     func testRunnerBuildsCurrentSourcesBeforePublishingUnlockGate() throws {
         let source = try source
         let build = try XCTUnwrap(
@@ -2307,6 +2478,8 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
         let monitor = try XCTUnwrap(source.range(of: "\nstart_audio_route_monitor\n"))
         let install = try XCTUnwrap(source.range(of: "\nSTAGE=dev-app-install\n"))
         let mint = try XCTUnwrap(source.range(of: "\nSTAGE=invitation-mint\n"))
+        let runnerInstall = try XCTUnwrap(source.range(of: "\"${ARTIFACT_DIR}/ui-runner-install.json\""))
+        let runnerBaseline = try XCTUnwrap(source.range(of: "\ncapture_installed_ui_runner before-test\n"))
         let request = try XCTUnwrap(
             source.range(of: "\nif run_sealed_host_management_child invitation-mint \\\n")
         )
@@ -2337,11 +2510,19 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
 
         XCTAssertLessThan(monitor.lowerBound, install.lowerBound)
         XCTAssertLessThan(install.lowerBound, mint.lowerBound)
+        XCTAssertLessThan(install.lowerBound, runnerInstall.lowerBound)
+        XCTAssertLessThan(runnerInstall.lowerBound, runnerBaseline.lowerBound)
+        XCTAssertLessThan(runnerBaseline.lowerBound, mint.lowerBound)
         XCTAssertLessThan(mint.lowerBound, request.lowerBound)
         XCTAssertLessThan(request.lowerBound, validateReceipt.lowerBound)
         XCTAssertLessThan(validateReceipt.lowerBound, validate.lowerBound)
         XCTAssertLessThan(validate.lowerBound, copy.lowerBound)
         XCTAssertLessThan(copy.lowerBound, test.lowerBound)
+        XCTAssertTrue(source.contains("\ncapture_installed_ui_runner before-invitation-mint\n"))
+        XCTAssertTrue(source.contains("\ncapture_installed_ui_runner after-test\n"))
+        let configure = try XCTUnwrap(source.range(of: "\n  configure_destination_artifacts_xctestrun \"$XCTESTRUN_FILE\"\n"))
+        let seal = try XCTUnwrap(source.range(of: ") > \"$PREPARED_PRODUCTS_MANIFEST\"", range: configure.upperBound..<source.endIndex))
+        XCTAssertLessThan(configure.lowerBound, seal.lowerBound)
     }
 
     func testPhysicalTestSelectsBuiltArm64Architecture() throws {
