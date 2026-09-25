@@ -4502,7 +4502,7 @@ typeset -i test_status=0
 OWNED_CHILD_PUBLICATION_PENDING=1
 xcodebuild test-without-building \
   -xctestrun "$XCTESTRUN_FILE" \
-  -destination "platform=iOS,id=${HARDWARE_UDID}" \
+  -destination "platform=iOS,arch=arm64,id=${HARDWARE_UDID}" \
   -parallel-testing-enabled NO -maximum-parallel-testing-workers 1 \
   -test-timeouts-enabled YES \
   -default-test-execution-time-allowance 180 \

@@ -2344,6 +2344,55 @@ final class IPhone15DevelopmentVisualOracleScriptTests: XCTestCase {
         XCTAssertLessThan(copy.lowerBound, test.lowerBound)
     }
 
+    func testPhysicalTestSelectsBuiltArm64Architecture() throws {
+        let source = try source
+        let start = try XCTUnwrap(source.range(of: "\nxcodebuild test-without-building \\\n"))
+        let end = try XCTUnwrap(source.range(
+            of: "\nPHYSICAL_TEST_PID=$!", range: start.upperBound..<source.endIndex
+        ))
+        let invocation = String(source[start.lowerBound..<end.lowerBound])
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "iphone15-test-destination-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        func capturedDestination(_ command: String) throws -> String {
+            let argumentsFile = root.appendingPathComponent("arguments.txt")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-f", "-c", """
+            set -euo pipefail
+            HARDWARE_UDID=00008120-0000242E3E32201E
+            XCTESTRUN_FILE=/fixture/prepared.xctestrun
+            TEST_ID=fixture/selectedTest
+            RESULT_BUNDLE="$ARTIFACT_DIR/result.xcresult"
+            function xcodebuild() { printf '%s\\n' "$@" > "$CAPTURED_ARGS" }
+            \(command)
+            wait $!
+            """]
+            process.environment = [
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "ARTIFACT_DIR": root.path,
+                "CAPTURED_ARGS": argumentsFile.path,
+            ]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+            let arguments = try String(contentsOf: argumentsFile, encoding: .utf8)
+                .split(separator: "\n").map(String.init)
+            XCTAssertEqual(arguments.filter { $0 == "-destination" }.count, 1)
+            let index = try XCTUnwrap(arguments.firstIndex(of: "-destination"))
+            return arguments[index + 1]
+        }
+
+        let expected = "platform=iOS,arch=arm64,id=00008120-0000242E3E32201E"
+        XCTAssertEqual(try capturedDestination(invocation), expected)
+        let unpinned = invocation.replacingOccurrences(of: "platform=iOS,arch=arm64,id=",
+                                                       with: "platform=iOS,id=")
+        XCTAssertNotEqual(try capturedDestination(unpinned), expected)
+    }
+
     func testPhysicalTestIsSupervisedAndStoppedBeforeFinalizerDeviceCleanup() throws {
         let source = try source
         let launch = try XCTUnwrap(
